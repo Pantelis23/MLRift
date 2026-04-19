@@ -1,0 +1,39 @@
+// MLRift — M2b.2 HIP-binding load test.
+//
+// Exercises the dynamic-linking infrastructure for HIP:
+//
+//   1. Importing std/hip.kr registers the hip* bindings as @dynamic
+//      extern fns.
+//   2. The mlrc driver sees a "hip" prefix in the registry and auto-
+//      includes libamdhip64.so.7 in the ELF's DT_NEEDED list.
+//   3. The loader resolves libamdhip64 at load time (chains into
+//      librocprofiler, libhsa-runtime64, libstdc++, libm, ...).
+//
+// What this test does NOT verify: actually calling into libamdhip64.
+// Any hip* call currently segfaults because the HIP runtime's lazy
+// first-call initialisation assumes a full glibc startup chain
+// (pthread_self, TLS, environ, getenv, etc.) — MLRift's entry stub
+// goes straight to main without running __libc_start_main, so parts
+// of libc's threadlocal state are uninitialised. Fixing this needs a
+// proper crt-style entry or a switch to __libc_start_main; tracked as
+// M2b.3+ in docs/GPU_BACKEND.md.
+//
+// Verification:
+//   mlrc examples/hip_smoke.mlr -o /tmp/hip_smoke
+//   readelf -d /tmp/hip_smoke | grep NEEDED
+//     → libc.so.6 + libamdhip64.so.7
+//   ldd /tmp/hip_smoke | grep libamdhip64
+//     → resolves (~/opt/rocm-.../libamdhip64.so.7)
+//   /tmp/hip_smoke
+//     → prints "hip-smoke: linked" and exits 0
+
+import "../std/hip.kr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+fn main() {
+    uint64 msg = "hip-smoke: linked"
+    puts(msg)
+    exit(0)
+}

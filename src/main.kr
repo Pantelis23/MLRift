@@ -2484,17 +2484,27 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
             si_dyn = si_dyn + 1
         }
 
-        // Build a lib list (for now: just libc.so.6). M2b.2+ will add
-        // more entries as other `@dynamic` sources land (libamdhip64,
-        // etc.); the API already accepts a packed list.
-        uint64 lib_list = alloc(1 * 16)
+        // Build the lib list. libc.so.6 is always there; libamdhip64.so.7
+        // joins it when any registered @dynamic symbol starts with "hip"
+        // (i.e. the program imported std/hip.kr bindings). M2c-era work
+        // can replace this heuristic with a per-symbol library annotation.
+        uint64 add_hip = dyn_sym_any_hip_prefix()
+        uint64 lib_count = 1
+        if add_hip != 0 { lib_count = 2 }
+        uint64 lib_list = alloc(lib_count * 16)
         uint64 libc_s = "libc.so.6"
         unsafe { *((lib_list + 0) as uint64) = libc_s }
         uint64 libc_l = 9
         unsafe { *((lib_list + 8) as uint64) = libc_l }
+        if add_hip != 0 {
+            uint64 libhip_s = "libamdhip64.so.7"
+            unsafe { *((lib_list + 16) as uint64) = libhip_s }
+            uint64 libhip_l = 16
+            unsafe { *((lib_list + 24) as uint64) = libhip_l }
+        }
 
         // Pass 1: compute layout so va_text + plt_va(i) are known.
-        edyn_compute_dyn_layout_for(lib_list, 1, sym_list, nsym, text_len_dyn)
+        edyn_compute_dyn_layout_for(lib_list, lib_count, sym_list, nsym, text_len_dyn)
 
         // Pass 2: patch recorded @dynamic call sites. text_ptr must
         // point at the start of .text (not at out_buf[0]) so the
@@ -2506,7 +2516,7 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
 
         // Pass 3: emit the dynamic ELF into edyn_buf.
         uint64 text_ptr_dyn = cg_buf + text_start_dyn
-        uint64 elf_size = emit_dynamic_elf(lib_list, 1,
+        uint64 elf_size = emit_dynamic_elf(lib_list, lib_count,
                                             sym_list, nsym,
                                             text_ptr_dyn, text_len_dyn,
                                             entry_off_dyn)

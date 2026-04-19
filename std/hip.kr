@@ -1,0 +1,59 @@
+// MLRift std/hip.kr — HIP runtime bindings (libamdhip64.so.7).
+//
+// Import from a user program to call into AMD's HIP runtime directly
+// via dynamic linking. mlrc detects the `hip*` prefix on the registered
+// @dynamic symbol names and adds libamdhip64.so.7 to the ELF's
+// DT_NEEDED list, so the binary resolves these at load time against the
+// system-installed ROCm runtime. Users don't need ROCm headers or
+// -lamdhip64 at build time — only at run time.
+//
+// Usage:
+//   import "../std/hip.kr"     # or absolute path from your source
+//
+//   fn main() {
+//       uint64 count = 0
+//       uint32 err = hipGetDeviceCount(&count as uint64)
+//       if err != 0 {
+//           uint64 msg = hipGetErrorString(err)
+//           ...
+//       }
+//       ...
+//   }
+//
+// Bindings are added on demand — start with the handful M2b.2 needs
+// to prove end-to-end resolution, extend for M2c's kernel launch.
+//
+// See docs/GPU_BACKEND.md for the wider plan; see src/format_elf_dyn.kr
+// for the binding machinery.
+
+// --- Error handling ----------------------------------------------------------
+
+// Return a human-readable description of a HIP error code.
+// Returns a `const char *` into static libamdhip64 data.
+@dynamic extern fn hipGetErrorString(uint32 err) -> uint64
+
+// --- Device enumeration + selection -----------------------------------------
+
+// Write the number of HIP-capable devices into *count_ptr.
+// Returns hipError_t (0 = hipSuccess).
+@dynamic extern fn hipGetDeviceCount(uint64 count_ptr) -> uint32
+
+// Make `dev_id` the active HIP device for the current thread.
+// (`device` would collide with the KwDevice reserved keyword.)
+@dynamic extern fn hipSetDevice(uint32 dev_id) -> uint32
+
+// --- Device memory (M2c will exercise these) --------------------------------
+
+// hipMalloc(void **devPtr, size_t size). Caller supplies a pointer to
+// a uint64 slot; on success, that slot receives the device pointer.
+@dynamic extern fn hipMalloc(uint64 dev_ptr_ptr, uint64 size) -> uint32
+
+@dynamic extern fn hipFree(uint64 dev_ptr) -> uint32
+
+// hipMemcpy(dst, src, size, kind).
+// kind: 0 = hipMemcpyHostToHost, 1 = H2D, 2 = D2H, 3 = D2D, 4 = Default.
+@dynamic extern fn hipMemcpy(uint64 dst, uint64 src, uint64 size, uint32 kind) -> uint32
+
+// --- Synchronisation --------------------------------------------------------
+
+@dynamic extern fn hipDeviceSynchronize() -> uint32
