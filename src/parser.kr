@@ -1636,12 +1636,13 @@ fn parse_module() -> uint64 {
     while cur_kind() != 0 {
         uint32 kind = cur_kind()
 
-        // Parse annotations (@export, @noreturn, @naked, @packed, @section, @kernel, etc)
+        // Parse annotations (@export, @noreturn, @naked, @packed, @section, @kernel, @dynamic, etc)
         uint64 ann_noreturn = 0
         uint64 ann_naked = 0
         uint64 ann_packed = 0
         uint64 ann_export = 0
         uint64 ann_kernel = 0
+        uint64 ann_dynamic = 0
         uint64 ann_section_start = 0
         uint64 ann_section_len = 0
         while kind == 21 {
@@ -1682,13 +1683,17 @@ fn parse_module() -> uint64 {
                 // docs/GPU_BACKEND.md and src/ir_hip.kr.
                 if ann_ch4 == 107 { ann_kernel = 1 }
             }
-            // Check section (7 chars, starts with 's')
+            // Check section (7 chars, starts with 's') and dynamic (7 chars, starts with 'd')
             uint64 is_section = 0
             if ann_len_v == 7 {
                 uint64 ann_a5 = src_ptr + ann_start
                 uint64 ann_ch5 = 0
                 unsafe { *(ann_a5 as uint8) -> ann_ch5 }
-                if ann_ch5 == 115 { is_section = 1 }  // 's' = 115
+                if ann_ch5 == 115 { is_section = 1 }       // 's' = 115
+                // @dynamic — marks an extern fn for dynamic linking via
+                // PLT/GOT (see src/format_elf_dyn.kr and M2a.2 plan in
+                // docs/GPU_BACKEND.md).
+                if ann_ch5 == 100 { ann_dynamic = 1 }      // 'd' = 100
             }
             // Annotation arguments: for @section, capture the string
             // literal (minus its quotes). For everything else, skip.
@@ -1713,11 +1718,11 @@ fn parse_module() -> uint64 {
 
         if kind == 60 {
             uint64 fn_node = parse_fn_decl()
-            // Store annotation flags in data4: bit 0 = noreturn, bit 1 = naked, bit 2 = export
             // Annotation flags in data4:
             //   bit 0 = noreturn, bit 1 = naked, bit 2 = export,
             //   bit 3 = extern (set by the `extern fn` path below, not here),
-            //   bit 4 = kernel (@kernel; see src/format_hip.kr).
+            //   bit 4 = kernel (@kernel; see src/format_hip.kr),
+            //   bit 5 = dynamic (@dynamic; set by the extern fn path).
             uint32 ann_flags = ann_noreturn | (ann_naked << 1) | (ann_export << 2) | (ann_kernel << 4)
             if ann_flags != 0 {
                 ast_set_data4(fn_node, ann_flags)
@@ -1769,10 +1774,18 @@ fn parse_module() -> uint64 {
                 ast_set_data2(ext_fn_node, rt)
             }
 
-            // data3 = body (0 for extern). data4 bit 3 = extern flag.
+            // data3 = body (0 for extern). data4 bit 3 = extern,
+            // bit 5 = @dynamic (when set by an annotation preceding the
+            // extern decl). @dynamic also registers the symbol in the
+            // dyn-symbol table so format_elf_dyn's emitter + codegen's
+            // call-through-PLT path can find it later.
             ast_set_data3(ext_fn_node, 0)
-            uint32 ext_flag = 8
+            uint32 ext_flag = 8 | (ann_dynamic << 5)
             ast_set_data4(ext_fn_node, ext_flag)
+
+            if ann_dynamic != 0 {
+                dyn_sym_register(ext_name_tok)
+            }
 
             ast_append_child(mod_node, ext_fn_node)
             eat(18)  // optional trailing semicolon

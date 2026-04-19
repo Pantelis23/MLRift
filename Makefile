@@ -12,7 +12,7 @@ DIST_DIR = dist
 
 SRCS = src/lexer.kr src/ast.kr src/parser.kr src/codegen.kr \
        src/codegen_aarch64.kr src/ir.kr src/ir_aarch64.kr src/ir_hip.kr \
-       src/format_macho.kr src/format_pe.kr src/format_hip.kr \
+       src/format_macho.kr src/format_pe.kr src/format_hip.kr src/format_elf_dyn.kr \
        src/format_archive.kr src/format_android.kr src/bcj.kr src/analysis.kr src/living.kr \
        src/runtime.kr src/formatter.kr src/main.kr
 

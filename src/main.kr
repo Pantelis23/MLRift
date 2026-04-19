@@ -2172,6 +2172,19 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
         exit(1)
     }
 
+    // @dynamic extern fn count: the parser registered these in
+    // format_elf_dyn.kr's symbol table. Until M2a.3/M2a.4 actually
+    // emit a dynamic ELF, report the count so the frontend plumbing
+    // is observable in isolation.
+    uint64 dyn_n = dyn_sym_count_get()
+    if dyn_n > 0 {
+        uint8[24] dn_buf
+        uint64 dn_len = fmt_uint(dn_buf, dyn_n)
+        write(2, "mlrc: registered ", 17)
+        write(2, dn_buf, dn_len)
+        write(2, " @dynamic symbol(s)\n", 20)
+    }
+
     // GPU target: emit a `<output>.hip` side-file for every @kernel fn,
     // then fork hipcc to compile it into a `.co` code object. The CPU
     // binary is still produced (host side is hand-written C during

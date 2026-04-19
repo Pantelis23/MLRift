@@ -1,0 +1,18 @@
+// MLRift — M2a.2 parser test for `@dynamic extern fn`.
+//
+// Declares two dynamic externs (not called from main so no relocations
+// are emitted). Compilation should succeed; mlrc will print a one-line
+// diagnostic to stderr reporting the registered symbol count — proof
+// that parser → dyn_sym_register wiring works end-to-end.
+//
+// The symbols themselves become real imports in M2a.4 when the driver
+// gates on dyn_sym_count_get() > 0 and switches the executable-output
+// path through format_elf_dyn.kr.
+
+@dynamic extern fn my_dyn_puts(uint64 s) -> uint32
+@dynamic extern fn my_dyn_exit(uint64 code)
+
+fn main() {
+    // Intentionally empty — the test is "does this parse + compile?".
+    exit(0)
+}
