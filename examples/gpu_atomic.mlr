@@ -1,0 +1,41 @@
+// MLRift — M4 kernel-side atomic-add infrastructure test.
+//
+// N threads concurrently add their own thread index into a single
+// uint64 counter using `atomic_add_u64(ptr, val)`. When the kernel
+// exits, the counter should equal the triangular number
+// N * (N - 1) / 2 — any race condition from non-atomic updates would
+// silently lose increments and the final sum would be short.
+//
+// This is the scatter-add infrastructure stage-13's CSR delivery
+// needs: multiple source threads racing to update `s_exc[tgt]`
+// (or s_inh) at unpredictable offsets. Once this test is green,
+// the CSR delivery kernel is just a straightforward port.
+
+// CPU stubs so these intrinsics resolve during --target=hip-amd's
+// pre-GPU CPU codegen. format_hip.kr replaces the Call with the
+// matching `atomicAdd` expression at HIP emission time — the CPU
+// body is only reached if someone calls the @kernel fn on CPU
+// (single-threaded, so non-atomic load-add-store is correct).
+fn tid_x() -> uint64 {
+    return 0
+}
+
+fn atomic_add_u64(uint64 ptr, uint64 val) -> uint64 {
+    uint64 old = 0
+    unsafe { *(ptr as uint64) -> old }
+    uint64 nv = old + val
+    unsafe { *(ptr as uint64) = nv }
+    return old
+}
+
+@kernel
+fn atomic_sum(uint64 counter_ptr, uint64 n) {
+    uint64 i = tid_x()
+    if i < n {
+        atomic_add_u64(counter_ptr, i)
+    }
+}
+
+fn main() {
+    exit(0)
+}

@@ -250,6 +250,46 @@ fn hip_emit_expr(uint64 node) {
             hip_emit_cstr("gridDim.x")
             return
         }
+        // Atomic adds — map MLRift `atomic_add_<ty>(ptr, val)` onto
+        // HIP's overloaded atomicAdd. Return value is the pre-update
+        // memory contents (C11 atomic_fetch_add semantics); kernel
+        // code that ignores it just produces an expression statement.
+        if tok_matches(callee_tok, "atomic_add_f64", 14) != 0 {
+            uint32 aa1 = ast_child(node)
+            uint32 aa2 = ast_next(aa1)
+            uint64 waa1 = aa1
+            uint64 waa2 = aa2
+            hip_emit_cstr("atomicAdd((double*)")
+            hip_emit_expr(waa1)
+            hip_emit_cstr(", ")
+            hip_emit_expr(waa2)
+            hip_emit_byte(41)
+            return
+        }
+        if tok_matches(callee_tok, "atomic_add_u64", 14) != 0 {
+            uint32 ab1 = ast_child(node)
+            uint32 ab2 = ast_next(ab1)
+            uint64 wab1 = ab1
+            uint64 wab2 = ab2
+            hip_emit_cstr("atomicAdd((unsigned long long*)")
+            hip_emit_expr(wab1)
+            hip_emit_cstr(", (unsigned long long)(")
+            hip_emit_expr(wab2)
+            hip_emit_cstr("))")
+            return
+        }
+        if tok_matches(callee_tok, "atomic_add_u32", 14) != 0 {
+            uint32 ac1 = ast_child(node)
+            uint32 ac2 = ast_next(ac1)
+            uint64 wac1 = ac1
+            uint64 wac2 = ac2
+            hip_emit_cstr("atomicAdd((unsigned int*)")
+            hip_emit_expr(wac1)
+            hip_emit_cstr(", (unsigned int)(")
+            hip_emit_expr(wac2)
+            hip_emit_cstr("))")
+            return
+        }
         hip_emit_cstr("/* unsupported kernel call: ")
         uint64 cs = tok_text_start(callee_tok)
         uint64 cl = tok_text_len(callee_tok)
