@@ -203,9 +203,13 @@ static uint64 EDYN_OFF_INTERP  = 0x190
 static uint64 EDYN_OFF_DYNSTR  = 0x1AC
 static uint64 EDYN_INTERP_SIZE = 28            // "/lib64/ld-linux-x86-64.so.2\0"
 static uint64 EDYN_OFF_PLT     = 0x1000
-static uint64 EDYN_OFF_GOTPLT  = 0x2000
 static uint64 EDYN_VA_PLT      = 0x401000
-static uint64 EDYN_VA_GOTPLT   = 0x402000
+// The RW segment (.got.plt) used to be pinned at 0x2000/0x402000, but
+// that locks the RX segment to a single 4K page. When .plt + .text
+// overflows a page (as happens for non-toy host programs), edyn_compute
+// _layout now bumps the RW offset to the next page boundary and these
+// become computed statics instead of constants — see edyn_off_gotplt /
+// edyn_va_gotplt below.
 
 // .dynamic carries 10 fixed entries (STRTAB, STRSZ, SYMTAB, SYMENT,
 // HASH, PLTGOT, PLTRELSZ, PLTREL, JMPREL, NULL) plus one DT_NEEDED
@@ -252,6 +256,8 @@ static uint64 edyn_va_hash        = 0
 static uint64 edyn_va_relaplt     = 0
 static uint64 edyn_va_dynamic     = 0
 static uint64 edyn_va_text        = 0
+static uint64 edyn_off_gotplt     = 0    // page-aligned, follows RX
+static uint64 edyn_va_gotplt      = 0
 
 // ---------------------------------------------------------------------------
 // Library-list accessors (16 bytes per entry: name_ptr + name_len)
@@ -330,7 +336,7 @@ fn edyn_sym_plt_va(uint64 i) -> uint64 {
 }
 
 fn edyn_sym_got_va(uint64 i) -> uint64 {
-    return EDYN_VA_GOTPLT + (3 + i) * 8
+    return edyn_va_gotplt + (3 + i) * 8
 }
 
 // ---------------------------------------------------------------------------
@@ -367,9 +373,16 @@ fn edyn_compute_layout() {
     edyn_off_text  = EDYN_OFF_PLT + edyn_plt_size
     edyn_size_rx   = edyn_plt_size + edyn_in_text_len
 
+    // Page-align the RW segment onto the next boundary after RX ends.
+    // RX starts at EDYN_OFF_PLT = 0x1000; pre-M3 it was capped at one
+    // page so RW pinned at 0x2000 worked. Real host programs bust that
+    // ceiling — compute dynamically.
+    uint64 rx_end      = EDYN_OFF_PLT + edyn_size_rx
+    edyn_off_gotplt    = (rx_end + 0xFFF) & 0xFFFFFFFFFFFFF000
+
     edyn_gotplt_size = 8 * (3 + n)
     edyn_size_rw     = edyn_gotplt_size
-    edyn_file_end    = EDYN_OFF_GOTPLT + edyn_size_rw
+    edyn_file_end    = edyn_off_gotplt + edyn_size_rw
 
     edyn_va_dynstr  = EDYN_BASE_VADDR + EDYN_OFF_DYNSTR
     edyn_va_dynsym  = EDYN_BASE_VADDR + edyn_off_dynsym
@@ -377,14 +390,14 @@ fn edyn_compute_layout() {
     edyn_va_relaplt = EDYN_BASE_VADDR + edyn_off_relaplt
     edyn_va_dynamic = EDYN_BASE_VADDR + edyn_off_dynamic
     edyn_va_text    = EDYN_VA_PLT + edyn_plt_size
+    edyn_va_gotplt  = EDYN_BASE_VADDR + edyn_off_gotplt
 
-    // Page-overflow guards (< 0x1000 per PT_LOAD under current layout)
+    // Only the R segment is still hardcapped: it carries ELF header +
+    // phdrs + dyn tables, and those fit well under one page for any
+    // realistic import set. Larger libraries or symbol counts would
+    // need the same page-aligned-bump treatment.
     if edyn_size_r > 0x1000 {
         write(2, "format_elf_dyn: R segment exceeds one page\n", 43)
-        exit(1)
-    }
-    if edyn_size_rx > 0x1000 {
-        write(2, "format_elf_dyn: RX segment exceeds one page\n", 44)
         exit(1)
     }
 }
@@ -444,7 +457,7 @@ fn edyn_write_phdrs() {
                     EDYN_OFF_PLT, EDYN_VA_PLT,
                     edyn_size_rx, edyn_size_rx, 0x1000)
     edyn_write_phdr(1, 6,
-                    EDYN_OFF_GOTPLT, EDYN_VA_GOTPLT,
+                    edyn_off_gotplt, edyn_va_gotplt,
                     edyn_size_rw, edyn_size_rw, 0x1000)
     edyn_write_phdr(2, 4,
                     edyn_off_dynamic, edyn_va_dynamic,
@@ -563,7 +576,7 @@ fn edyn_write_dynamic() {
     edyn_write_dyn(6,  edyn_va_dynsym)           // DT_SYMTAB
     edyn_write_dyn(11, 24)                       // DT_SYMENT
     edyn_write_dyn(4,  edyn_va_hash)             // DT_HASH
-    edyn_write_dyn(3,  EDYN_VA_GOTPLT)           // DT_PLTGOT
+    edyn_write_dyn(3,  edyn_va_gotplt)           // DT_PLTGOT
     edyn_write_dyn(2,  edyn_relaplt_size)        // DT_PLTRELSZ
     edyn_write_dyn(20, 7)                        // DT_PLTREL = DT_RELA
     edyn_write_dyn(23, edyn_va_relaplt)          // DT_JMPREL
@@ -577,12 +590,12 @@ fn edyn_write_dynamic() {
 fn edyn_write_plt0() {
     // push [rip + disp_to_GOT[1]] (6 bytes; rip after = VA_PLT+6)
     edyn_byte(0xFF); edyn_byte(0x35)
-    uint64 disp1 = (EDYN_VA_GOTPLT + 8) - (EDYN_VA_PLT + 6)
+    uint64 disp1 = (edyn_va_gotplt + 8) - (EDYN_VA_PLT + 6)
     edyn_u32(disp1)
 
     // jmp [rip + disp_to_GOT[2]] (6 bytes; rip after = VA_PLT+12)
     edyn_byte(0xFF); edyn_byte(0x25)
-    uint64 disp2 = (EDYN_VA_GOTPLT + 16) - (EDYN_VA_PLT + 12)
+    uint64 disp2 = (edyn_va_gotplt + 16) - (EDYN_VA_PLT + 12)
     edyn_u32(disp2)
 
     edyn_byte(0x0F); edyn_byte(0x1F); edyn_byte(0x40); edyn_byte(0x00)
@@ -749,7 +762,7 @@ fn emit_dynamic_elf(uint64 lib_list_ptr, uint64 lib_count,
     edyn_in_entry_off = entry_off
 
     edyn_compute_layout()
-    edyn_init(16384)
+    edyn_init(262144)
 
     edyn_write_elf_header()
     edyn_pad_to(EDYN_OFF_PHDR)
@@ -770,7 +783,7 @@ fn emit_dynamic_elf(uint64 lib_list_ptr, uint64 lib_count,
     edyn_write_plt()
     edyn_pad_to(edyn_off_text)
     edyn_write_text()
-    edyn_pad_to(EDYN_OFF_GOTPLT)
+    edyn_pad_to(edyn_off_gotplt)
     edyn_write_gotplt()
     edyn_pad_to(edyn_file_end)
 

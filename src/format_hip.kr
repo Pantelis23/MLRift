@@ -185,6 +185,15 @@ fn hip_emit_expr(uint64 node) {
         hip_emit_str(hip_src + ts, tl)
         return
     }
+    if k == 46 {
+        // FloatLitNode: data1 = token — float literals like 0.0 / 1.5e-3
+        // come through as source text; C++ parses them the same way.
+        uint32 tok = ast_data1(node)
+        uint64 ts = tok_text_start(tok)
+        uint64 tl = tok_text_len(tok)
+        hip_emit_str(hip_src + ts, tl)
+        return
+    }
     if k == 33 {
         // BinOp: child=lhs, data1=op_tok, data2=rhs
         hip_emit_byte(40)
@@ -213,6 +222,39 @@ fn hip_emit_expr(uint64 node) {
         uint64 wr = rhs
         hip_emit_expr(wr)
         hip_emit_byte(41)
+        return
+    }
+    if k == 35 {
+        // Call: a handful of call-site intrinsics map to HIP built-in
+        // expressions (threadIdx / blockIdx math). Everything else is
+        // unsupported inside a @kernel body for now — device-side
+        // function calls need their own codegen story.
+        uint32 callee_tok = ast_data1(node)
+        if tok_matches(callee_tok, "tid_x", 5) != 0 {
+            hip_emit_cstr("(blockIdx.x * blockDim.x + threadIdx.x)")
+            return
+        }
+        if tok_matches(callee_tok, "tid_y", 5) != 0 {
+            hip_emit_cstr("(blockIdx.y * blockDim.y + threadIdx.y)")
+            return
+        }
+        if tok_matches(callee_tok, "tid_z", 5) != 0 {
+            hip_emit_cstr("(blockIdx.z * blockDim.z + threadIdx.z)")
+            return
+        }
+        if tok_matches(callee_tok, "block_dim_x", 11) != 0 {
+            hip_emit_cstr("blockDim.x")
+            return
+        }
+        if tok_matches(callee_tok, "grid_dim_x", 10) != 0 {
+            hip_emit_cstr("gridDim.x")
+            return
+        }
+        hip_emit_cstr("/* unsupported kernel call: ")
+        uint64 cs = tok_text_start(callee_tok)
+        uint64 cl = tok_text_len(callee_tok)
+        hip_emit_str(hip_src + cs, cl)
+        hip_emit_cstr(" */")
         return
     }
     hip_emit_cstr("/* unsupported expr kind=")
@@ -353,16 +395,17 @@ fn hip_emit_stmt(uint64 node, uint64 depth) {
     }
     if k == 41 {
         // PtrLoad: data1=size, data2=dest_tok, data3=float_kind, child=addr_expr
+        // MLRift idiom is `f64 v = 0.0; unsafe { *(p as f64) -> v }`,
+        // i.e. the destination has already been declared via VarDecl.
+        // Emit a plain assignment — re-declaring would be a C++ error.
         hip_emit_indent(depth)
-        uint64 size = ast_data1(node)
-        uint32 fk = ast_data3(node)
-        hip_emit_ptr_elem_type(size, fk)
-        hip_emit_byte(32)
         uint32 dest_tok = ast_data2(node)
         uint64 ds = tok_text_start(dest_tok)
         uint64 dl = tok_text_len(dest_tok)
         hip_emit_str(hip_src + ds, dl)
         hip_emit_cstr(" = *((")
+        uint64 size = ast_data1(node)
+        uint32 fk = ast_data3(node)
         hip_emit_ptr_elem_type(size, fk)
         hip_emit_cstr("*)")
         uint32 addr = ast_child(node)
@@ -372,11 +415,16 @@ fn hip_emit_stmt(uint64 node, uint64 depth) {
         return
     }
     if k == 42 {
-        // PtrStore: data1=size, child=addr_expr, data2=val_expr
+        // PtrStore: data1=size, child=addr_expr, data2=val_expr,
+        // data3=float_kind (0=int, 1=f64, 2=f32, 3=f16). Using the
+        // float kind lets f64 stores emit `*((f64*)p) = v` instead of
+        // the type-mismatched `*((uint64*)p) = v` that falls out of
+        // pure size-based dispatch.
         hip_emit_indent(depth)
         uint64 size = ast_data1(node)
+        uint32 fk_store = ast_data3(node)
         hip_emit_cstr("*((")
-        hip_emit_type_for_size(size)
+        hip_emit_ptr_elem_type(size, fk_store)
         hip_emit_cstr("*)")
         uint32 addr = ast_child(node)
         uint64 wa = addr

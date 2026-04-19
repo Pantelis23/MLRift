@@ -1309,6 +1309,15 @@ fn parse_stmt() -> uint64 {
             ast_set_child(node, ae)
             uint32 ve = val_expr
             ast_set_data2(node, ve)
+            // Mirror PtrLoad: stash fkind so downstream emitters
+            // (notably format_hip.kr's body translator) can pick the
+            // right C++ cast type for float stores instead of
+            // defaulting to uint64*.
+            uint32 fks = 0
+            if type_kind == 96 { fks = 1 }
+            else if type_kind == 95 { fks = 2 }
+            else if type_kind == 94 { fks = 3 }
+            ast_set_data3(node, fks)
             return node
         }
         expect(13)
