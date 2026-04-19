@@ -1,0 +1,4514 @@
+import "lexer.kr"
+import "ast.kr"
+import "parser.kr"
+import "codegen.kr"
+import "codegen_aarch64.kr"
+import "format_macho.kr"
+import "format_pe.kr"
+import "format_archive.kr"
+import "format_android.kr"
+import "bcj.kr"
+import "analysis.kr"
+import "living.kr"
+import "runtime.kr"
+import "formatter.kr"
+// formatter.kr is included via cat command, not import
+
+// KernRift self-hosted compiler — main
+
+// Windows command line parser: called from main() when cli_argc == 0xFFFFFFFF
+// cli_argv contains the raw GetCommandLineA pointer; parse it into proper argc/argv
+fn win_init_args() {
+    uint64 cmdline = cli_argv
+    // Allocate argv buffer (up to 64 pointers = 512 bytes)
+    uint64 argv_buf = alloc(512)
+    uint64 argc = 0
+    uint64 pos = cmdline
+    uint64 ch = 0
+    unsafe { *(pos as uint8) -> ch }
+    while ch != 0 {
+        // Skip spaces
+        while ch == 32 {
+            pos = pos + 1
+            unsafe { *(pos as uint8) -> ch }
+        }
+        if ch == 0 { break }
+        // Store start of this arg
+        uint64 slot = argv_buf + argc * 8
+        unsafe { *(slot as uint64) = pos }
+        argc = argc + 1
+        // Advance to next space or null
+        while ch != 0 && ch != 32 {
+            pos = pos + 1
+            unsafe { *(pos as uint8) -> ch }
+        }
+        // Null-terminate this arg (replace space with 0)
+        if ch == 32 {
+            uint8 z = 0
+            unsafe { *(pos as uint8) = z }
+            pos = pos + 1
+            unsafe { *(pos as uint8) -> ch }
+        }
+    }
+    cli_argc = argc
+    cli_argv = argv_buf
+}
+
+fn str_len(uint64 s) -> uint64 {
+    uint64 i = 0
+    uint64 p = s + i
+    uint64 c = 0
+    unsafe { *(p as uint8) -> c }
+    while c != 0 {
+        i = i + 1
+        p = s + i
+        unsafe { *(p as uint8) -> c }
+    }
+    return i
+}
+
+fn str_starts_with(uint64 s, uint64 prefix, uint64 plen) -> uint64 {
+    uint64 i = 0
+    while i < plen {
+        uint64 pa = s + i
+        uint64 pb = prefix + i
+        uint64 ca = 0
+        uint64 cb = 0
+        unsafe { *(pa as uint8) -> ca }
+        unsafe { *(pb as uint8) -> cb }
+        if ca != cb { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn str_eq_full(uint64 a, uint64 b) -> uint64 {
+    uint64 la = str_len(a)
+    uint64 lb = str_len(b)
+    if la != lb { return 0 }
+    return str_starts_with(a, b, la)
+}
+
+// Import system state
+static uint64 import_buf = 0
+static uint64 import_buf_len = 0
+static uint64 import_buf_cap = 0
+static uint64 import_seen = 0
+static uint64 import_seen_count = 0
+static uint64 srcmap_table = 0
+static uint64 srcmap_count = 0
+
+fn import_init() {
+    import_buf_cap = 4194304
+    import_buf = alloc(import_buf_cap)
+    import_buf_len = 0
+    import_seen = alloc(16384)
+    import_seen_count = 0
+    srcmap_table = alloc(1024 * 16)
+    srcmap_count = 0
+}
+
+fn import_is_seen(uint64 path) -> uint64 {
+    uint64 plen = str_len(path)
+    uint64 i = 0
+    while i < import_seen_count {
+        uint64 entry = import_seen + i * 256
+        if str_starts_with(entry, path, plen) != 0 {
+            uint64 elen = str_len(entry)
+            if elen == plen { return 1 }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn import_mark_seen(uint64 path) {
+    uint64 plen = str_len(path)
+    uint64 entry = import_seen + import_seen_count * 256
+    uint64 i = 0
+    while i < plen && i < 255 {
+        uint64 sp = path + i
+        uint64 dp = entry + i
+        uint64 ch = 0
+        unsafe { *(sp as uint8) -> ch }
+        uint8 cb = ch
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 tp = entry + i
+    uint8 z = 0
+    unsafe { *(tp as uint8) = z }
+    import_seen_count = import_seen_count + 1
+}
+
+fn import_append(uint64 src, uint64 len, uint64 file_path) {
+    uint64 sm_entry = srcmap_table + srcmap_count * 16
+    uint64 sm_off = import_buf_len
+    unsafe { *(sm_entry as uint64) = sm_off }
+    uint64 sm_fp = sm_entry + 8
+    unsafe { *(sm_fp as uint64) = file_path }
+    srcmap_count = srcmap_count + 1
+    uint64 i = 0
+    while i < len {
+        uint64 sp = src + i
+        uint64 dp = import_buf + import_buf_len
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        uint8 bb = b
+        unsafe { *(dp as uint8) = bb }
+        import_buf_len = import_buf_len + 1
+        i = i + 1
+    }
+    // Add newline separator
+    uint64 np = import_buf + import_buf_len
+    uint8 nl = 10
+    unsafe { *(np as uint8) = nl }
+    import_buf_len = import_buf_len + 1
+}
+
+@export
+fn srcmap_file(uint64 byte_offset) -> uint64 {
+    uint64 file_path = 0
+    uint64 i = 0
+    while i < srcmap_count {
+        uint64 entry = srcmap_table + i * 16
+        uint64 entry_off = 0
+        unsafe { *(entry as uint64) -> entry_off }
+        if entry_off > byte_offset { break }
+        uint64 fp_ptr = entry + 8
+        unsafe { *(fp_ptr as uint64) -> file_path }
+        i = i + 1
+    }
+    return file_path
+}
+
+@export
+fn srcmap_line(uint64 byte_offset) -> uint64 {
+    uint64 file_start = 0
+    uint64 i = 0
+    while i < srcmap_count {
+        uint64 entry = srcmap_table + i * 16
+        uint64 entry_off = 0
+        unsafe { *(entry as uint64) -> entry_off }
+        if entry_off > byte_offset { break }
+        file_start = entry_off
+        i = i + 1
+    }
+    uint64 line = 1
+    uint64 p = file_start
+    while p < byte_offset {
+        uint64 cp = import_buf + p
+        uint64 ch = 0
+        unsafe { *(cp as uint8) -> ch }
+        if ch == 10 { line = line + 1 }
+        p = p + 1
+    }
+    return line
+}
+
+@export
+fn report_error_at(uint64 tok_idx, uint64 msg) {
+    uint64 tok_start = tok_text_start(tok_idx)
+    uint64 file_path = srcmap_file(tok_start)
+    if file_path != 0 {
+        write(2, file_path, str_len(file_path))
+    }
+    write(2, ":", 1)
+    uint8[24] lbuf
+    uint64 llen = fmt_uint(lbuf, srcmap_line(tok_start))
+    write(2, lbuf, llen)
+    write(2, ": error: ", 9)
+    write(2, msg, str_len(msg))
+    write(2, "\n", 1)
+}
+
+@export
+fn report_warn_at(uint64 tok_idx, uint64 msg) {
+    uint64 tok_start = tok_text_start(tok_idx)
+    uint64 file_path = srcmap_file(tok_start)
+    if file_path != 0 {
+        write(2, file_path, str_len(file_path))
+    }
+    write(2, ":", 1)
+    uint8[24] lbuf
+    uint64 llen = fmt_uint(lbuf, srcmap_line(tok_start))
+    write(2, lbuf, llen)
+    write(2, ": warning: ", 11)
+    write(2, msg, str_len(msg))
+    write(2, "\n", 1)
+    // Keep the end-of-compile summary accurate — same counter used
+    // by diag_emit so 'N error(s), M warning(s)' reflects every warning.
+    diag_warn_count = diag_warn_count + 1
+}
+
+fn import_dir_of(uint64 path) -> uint64 {
+    // Find last '/' in path, return length including the slash
+    uint64 len = str_len(path)
+    uint64 last_slash = 0
+    uint64 i = 0
+    while i < len {
+        uint64 pp = path + i
+        uint64 ch = 0
+        unsafe { *(pp as uint8) -> ch }
+        if ch == 47 { last_slash = i + 1 }
+        i = i + 1
+    }
+    return last_slash
+}
+
+fn import_resolve(uint64 base_path, uint64 name, uint64 name_len) -> uint64 {
+    uint64 dir_len = import_dir_of(base_path)
+    uint64 result = alloc(dir_len + name_len + 1)
+    uint64 i = 0
+    while i < dir_len {
+        uint64 sp = base_path + i
+        uint64 dp = result + i
+        uint64 ch = 0
+        unsafe { *(sp as uint8) -> ch }
+        uint8 cb = ch
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 j = 0
+    while j < name_len {
+        uint64 sp = name + j
+        uint64 dp = result + dir_len + j
+        uint64 ch = 0
+        unsafe { *(sp as uint8) -> ch }
+        uint8 cb = ch
+        unsafe { *(dp as uint8) = cb }
+        j = j + 1
+    }
+    uint64 tp = result + dir_len + name_len
+    uint8 z = 0
+    unsafe { *(tp as uint8) = z }
+    return result
+}
+
+fn import_check_import_line(uint64 buf, uint64 size, uint64 pos) -> uint64 {
+    // Check if buf[pos..] starts with: import "filename"
+    // Returns 0 if not import, or the position just past the opening quote
+    if pos + 8 >= size { return 0 }
+    uint64 bp = buf + pos
+    uint64 c0 = 0; uint64 c1 = 0; uint64 c2 = 0; uint64 c3 = 0; uint64 c4 = 0; uint64 c5 = 0
+    unsafe { *(bp as uint8) -> c0 }
+    uint64 bp1 = bp + 1; unsafe { *(bp1 as uint8) -> c1 }
+    uint64 bp2 = bp + 2; unsafe { *(bp2 as uint8) -> c2 }
+    uint64 bp3 = bp + 3; unsafe { *(bp3 as uint8) -> c3 }
+    uint64 bp4 = bp + 4; unsafe { *(bp4 as uint8) -> c4 }
+    uint64 bp5 = bp + 5; unsafe { *(bp5 as uint8) -> c5 }
+    // "import" = 105 109 112 111 114 116
+    if c0 != 105 || c1 != 109 || c2 != 112 || c3 != 111 || c4 != 114 || c5 != 116 { return 0 }
+    // Skip whitespace after "import"
+    uint64 p = pos + 6
+    uint64 ch = 0
+    uint64 pp = buf + p
+    if p < size { unsafe { *(pp as uint8) -> ch } }
+    while p < size && (ch == 32 || ch == 9) {
+        p = p + 1
+        pp = buf + p
+        if p < size { unsafe { *(pp as uint8) -> ch } }
+    }
+    // Expect opening quote
+    if ch != 34 { return 0 }
+    p = p + 1
+    return p
+}
+
+// Stdlib search paths for imports not found relative to source file
+static uint64 import_search_paths = 0
+static uint64 import_search_count = 0
+
+// Stub for bootstrap: overridden by get_module_path built-in in new compiler
+fn get_module_path(uint64 buf, uint64 size) -> uint64 { return 0 }
+
+// Stub for bootstrap: overridden by exec_process built-in in new compiler
+fn exec_process(uint64 path) { exit(1) }
+
+fn import_read_home() -> uint64 {
+    // Read HOME from /proc/self/environ (Linux-specific)
+    uint64 fd = file_open("/proc/self/environ", 0)
+    if fd >= 0xFFFFFFFF { return 0 }
+    uint64 buf = alloc(4096)
+    file_read(fd, buf, 4096)
+    file_close(fd)
+    // environ is null-separated: VAR=VALUE\0VAR=VALUE\0...
+    uint64 pos = 0
+    while pos < 4096 {
+        uint64 p = buf + pos
+        uint64 ch = 0
+        unsafe { *(p as uint8) -> ch }
+        if ch == 0 { break }
+        // Check for "HOME="
+        if ch == 72 {
+            uint64 p1 = p + 1; uint64 c1 = 0; unsafe { *(p1 as uint8) -> c1 }
+            uint64 p2 = p + 2; uint64 c2 = 0; unsafe { *(p2 as uint8) -> c2 }
+            uint64 p3 = p + 3; uint64 c3 = 0; unsafe { *(p3 as uint8) -> c3 }
+            uint64 p4 = p + 4; uint64 c4 = 0; unsafe { *(p4 as uint8) -> c4 }
+            if c1 == 79 && c2 == 77 && c3 == 69 && c4 == 61 {
+                // Found HOME=, copy value to new buffer
+                uint64 home_ptr = p + 5
+                uint64 home_len = str_len(home_ptr)
+                uint64 home_copy = alloc(home_len + 1)
+                memcpy(home_copy, home_ptr, home_len)
+                uint64 htp = home_copy + home_len
+                uint8 hz = 0
+                unsafe { *(htp as uint8) = hz }
+                return home_copy
+            }
+        }
+        // Skip to next null
+        while pos < 4096 {
+            p = buf + pos
+            unsafe { *(p as uint8) -> ch }
+            if ch == 0 { pos = pos + 1; break }
+            pos = pos + 1
+        }
+    }
+    return 0
+}
+
+fn import_init_search_paths() {
+    if import_search_paths != 0 { return }
+    import_search_paths = alloc(2048)
+    import_search_count = 0
+
+    uint64 host_os = get_target_os()
+    if host_os == 2 {
+        // Windows: look relative to exe location
+        // Get exe path via GetModuleFileNameA
+        uint64 exe_buf = alloc(512)
+        uint64 exe_len = get_module_path(exe_buf, 512)
+        if exe_len > 0 {
+            // Strip filename: walk backwards to last backslash
+            uint64 dir_len = exe_len
+            while dir_len > 0 {
+                dir_len = dir_len - 1
+                uint64 cp = exe_buf + dir_len
+                uint64 ch = 0
+                unsafe { *(cp as uint8) -> ch }
+                if ch == 92 { dir_len = dir_len + 1; break }
+            }
+            // Try <exe_dir>..\std\ (install.ps1 puts std next to bin)
+            uint64 up_std = alloc(dir_len + 8)
+            memcpy(up_std, exe_buf, dir_len)
+            uint64 suffix = "..\\std\\"
+            memcpy(up_std + dir_len, suffix, 7)
+            uint8 z = 0
+            uint64 tp = up_std + dir_len + 7
+            unsafe { *(tp as uint8) = z }
+            import_add_search_path(up_std)
+            // Also try <exe_dir>std\ (alternative layout)
+            uint64 dir_std = alloc(dir_len + 5)
+            memcpy(dir_std, exe_buf, dir_len)
+            uint64 suffix2 = "std\\"
+            memcpy(dir_std + dir_len, suffix2, 4)
+            uint64 tp2 = dir_std + dir_len + 4
+            unsafe { *(tp2 as uint8) = z }
+            import_add_search_path(dir_std)
+        }
+    } else {
+        // Linux/macOS: system paths
+        import_add_search_path("/usr/local/share/kernrift/")
+        import_add_search_path("/usr/share/kernrift/")
+        // Add user path: $HOME/.local/share/kernrift/
+        uint64 home = import_read_home()
+        if home != 0 {
+            uint64 hlen = str_len(home)
+            uint64 suffix = "/.local/share/kernrift/"
+            uint64 slen = 23
+            uint64 full = alloc(hlen + slen + 1)
+            memcpy(full, home, hlen)
+            memcpy(full + hlen, suffix, slen)
+            uint8 z = 0
+            uint64 tp = full + hlen + slen
+            unsafe { *(tp as uint8) = z }
+            import_add_search_path(full)
+        }
+    }
+}
+
+fn import_add_search_path(uint64 path) {
+    uint64 plen = str_len(path)
+    uint64 entry = import_search_paths + import_search_count * 256
+    memcpy(entry, path, plen)
+    uint64 tp = entry + plen
+    uint8 z = 0
+    unsafe { *(tp as uint8) = z }
+    import_search_count = import_search_count + 1
+}
+
+fn import_resolve_stdlib(uint64 import_path) -> uint64 {
+    import_init_search_paths()
+    uint64 plen = str_len(import_path)
+    uint64 i = 0
+    while i < import_search_count {
+        uint64 base = import_search_paths + i * 256
+        uint64 blen = str_len(base)
+        uint64 full = alloc(blen + plen + 1)
+        memcpy(full, base, blen)
+        memcpy(full + blen, import_path, plen)
+        uint64 tp = full + blen + plen
+        uint8 z = 0
+        unsafe { *(tp as uint8) = z }
+        uint64 fd = file_open(full, 0)
+        if fd < 0xFFFFFFFF {
+            file_close(fd)
+            return full
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn import_check_file(uint64 path) {
+    uint64 fd = file_open(path, 0)
+    if fd >= 0xFFFFFFFF {
+        write(2, "error: cannot open '", 20)
+        write(2, path, str_len(path))
+        write(2, "': file not found\n", 18)
+        exit(1)
+    }
+    file_close(fd)
+}
+
+fn import_process(uint64 file_path) {
+    if import_is_seen(file_path) != 0 { return }
+    import_mark_seen(file_path)
+
+    uint64 fd = file_open(file_path, 0)
+    // If not found, try ~/.local/share/kernrift/ as fallback
+    if fd >= 0xFFFFFFFF {
+        uint64 fallback = import_resolve_stdlib(file_path)
+        if fallback != 0 {
+            fd = file_open(fallback, 0)
+        }
+    }
+    if fd >= 0xFFFFFFFF {
+        uint64 msg = "error: cannot open import: "
+        write(2, msg, 27)
+        write(2, file_path, str_len(file_path))
+        write(2, "\n", 1)
+        // Don't exit — let compilation continue with what we have
+        // This allows the parser to report the actual error
+        return
+    }
+    uint64 size = file_size(fd)
+    uint64 tmp = alloc(size + 1)
+    file_read(fd, tmp, size)
+    file_close(fd)
+
+    // Scan for import lines at the beginning
+    uint64 pos = 0
+    while pos < size {
+        // Skip whitespace/newlines and // line comments so imports can live
+        // after header comments. Block comments (/* */) are not supported.
+        uint64 skipped = 1
+        while skipped != 0 {
+            skipped = 0
+            uint64 ch = 0
+            uint64 pp = tmp + pos
+            if pos < size { unsafe { *(pp as uint8) -> ch } }
+            while pos < size && (ch == 32 || ch == 9 || ch == 13 || ch == 10) {
+                pos = pos + 1
+                pp = tmp + pos
+                if pos < size { unsafe { *(pp as uint8) -> ch } }
+                skipped = 1
+            }
+            // Line comment // — consume until newline
+            if pos + 1 < size {
+                uint64 cp0 = tmp + pos
+                uint64 cp1 = tmp + pos + 1
+                uint64 cc0 = 0
+                uint64 cc1 = 0
+                unsafe { *(cp0 as uint8) -> cc0 }
+                unsafe { *(cp1 as uint8) -> cc1 }
+                if cc0 == 47 && cc1 == 47 {
+                    pos = pos + 2
+                    uint64 lc = 0
+                    uint64 lcp = tmp + pos
+                    if pos < size { unsafe { *(lcp as uint8) -> lc } }
+                    while pos < size && lc != 10 {
+                        pos = pos + 1
+                        lcp = tmp + pos
+                        if pos < size { unsafe { *(lcp as uint8) -> lc } }
+                    }
+                    skipped = 1
+                }
+            }
+        }
+        if pos >= size { break }
+
+        // Check if this line starts with "import"
+        uint64 name_start = import_check_import_line(tmp, size, pos)
+        if name_start != 0 {
+            // Extract filename between quotes
+            uint64 ns = name_start
+            uint64 ne = ns
+            uint64 qch = 0
+            uint64 qp = tmp + ne
+            if ne < size { unsafe { *(qp as uint8) -> qch } }
+            while ne < size && qch != 34 {
+                ne = ne + 1
+                qp = tmp + ne
+                if ne < size { unsafe { *(qp as uint8) -> qch } }
+            }
+            uint64 name_len = ne - ns
+            uint64 name_ptr = tmp + ns
+            // Resolve full path relative to source file
+            uint64 full_path = import_resolve(file_path, name_ptr, name_len)
+            // Check if resolved path exists
+            uint64 check_fd = file_open(full_path, 0)
+            if check_fd < 0xFFFFFFFF {
+                file_close(check_fd)
+            } else {
+                // Not found locally — try stdlib search paths
+                // Build a null-terminated copy of the import name
+                uint64 name_copy = alloc(name_len + 1)
+                memcpy(name_copy, name_ptr, name_len)
+                uint64 ntp = name_copy + name_len
+                uint8 nz = 0
+                unsafe { *(ntp as uint8) = nz }
+                uint64 stdlib_path = import_resolve_stdlib(name_copy)
+                if stdlib_path != 0 { full_path = stdlib_path }
+            }
+            // Recurse
+            import_process(full_path)
+            // Skip past closing quote and rest of line
+            pos = ne + 1
+        }
+        if name_start == 0 {
+            // Not an import — stop scanning for imports (only imports at top of file)
+            break
+        }
+    }
+
+    // Append entire file content (including import lines — parser ignores them)
+    import_append(tmp, size, file_path)
+}
+
+fn hex_nibble(uint64 v) -> uint64 {
+    if v < 10 { return v + 48 }
+    return v + 87
+}
+
+fn write_hex8(uint64 fd, uint64 val) {
+    uint8 h = hex_nibble((val >> 4) & 0xF)
+    uint8 l = hex_nibble(val & 0xF)
+    uint8[2] hb
+    unsafe { *(hb as uint8) = h }
+    uint64 p1 = hb + 1
+    unsafe { *(p1 as uint8) = l }
+    write(fd, hb, 2)
+}
+
+fn write_hex32(uint64 fd, uint64 val) {
+    write_hex8(fd, (val >> 24) & 0xFF)
+    write_hex8(fd, (val >> 16) & 0xFF)
+    write_hex8(fd, (val >> 8) & 0xFF)
+    write_hex8(fd, val & 0xFF)
+}
+
+fn write_a64_xreg(uint64 fd, uint64 reg) {
+    uint8[4] rb
+    if reg == 31 {
+        write(fd, "sp", 2)
+    } else {
+        write(fd, "x", 1)
+        uint64 rl = fmt_uint(rb, reg)
+        write(fd, rb, rl)
+    }
+}
+
+fn write_a64_wreg(uint64 fd, uint64 reg) {
+    uint8[4] rb
+    if reg == 31 {
+        write(fd, "wzr", 3)
+    } else {
+        write(fd, "w", 1)
+        uint64 rl = fmt_uint(rb, reg)
+        write(fd, rb, rl)
+    }
+}
+
+fn write_a64_sysreg(uint64 fd, uint64 op0, uint64 op1, uint64 crn, uint64 crm, uint64 op2) {
+    // Common system registers
+    if op0 == 3 && op1 == 3 && crn == 13 && crm == 0 && op2 == 2 {
+        write(fd, "tpidr_el0", 9)
+    } else if op0 == 3 && op1 == 0 && crn == 4 && crm == 0 && op2 == 1 {
+        write(fd, "elr_el1", 7)
+    } else if op0 == 3 && op1 == 0 && crn == 4 && crm == 0 && op2 == 0 {
+        write(fd, "spsr_el1", 8)
+    } else if op0 == 3 && op1 == 0 && crn == 5 && crm == 2 && op2 == 0 {
+        write(fd, "esr_el1", 7)
+    } else if op0 == 3 && op1 == 0 && crn == 6 && crm == 0 && op2 == 0 {
+        write(fd, "far_el1", 7)
+    } else if op0 == 3 && op1 == 0 && crn == 1 && crm == 0 && op2 == 0 {
+        write(fd, "sctlr_el1", 9)
+    } else if op0 == 3 && op1 == 0 && crn == 2 && crm == 0 && op2 == 0 {
+        write(fd, "ttbr0_el1", 9)
+    } else if op0 == 3 && op1 == 0 && crn == 2 && crm == 0 && op2 == 1 {
+        write(fd, "ttbr1_el1", 9)
+    } else if op0 == 3 && op1 == 0 && crn == 12 && crm == 0 && op2 == 0 {
+        write(fd, "vbar_el1", 8)
+    } else if op0 == 3 && op1 == 3 && crn == 4 && crm == 2 && op2 == 0 {
+        write(fd, "nzcv", 4)
+    } else if op0 == 3 && op1 == 3 && crn == 4 && crm == 2 && op2 == 1 {
+        write(fd, "daif", 4)
+    } else if op0 == 3 && op1 == 0 && crn == 0 && crm == 0 && op2 == 0 {
+        write(fd, "midr_el1", 8)
+    } else if op0 == 3 && op1 == 0 && crn == 0 && crm == 0 && op2 == 5 {
+        write(fd, "mpidr_el1", 9)
+    } else if op0 == 3 && op1 == 3 && crn == 14 && crm == 0 && op2 == 1 {
+        write(fd, "cntpct_el0", 10)
+    } else {
+        // Fallback: print s<op0>_<op1>_c<crn>_c<crm>_<op2>
+        uint8[4] rb
+        write(fd, "s", 1)
+        uint64 rl = fmt_uint(rb, op0)
+        write(fd, rb, rl)
+        write(fd, "_", 1)
+        rl = fmt_uint(rb, op1)
+        write(fd, rb, rl)
+        write(fd, "_c", 2)
+        rl = fmt_uint(rb, crn)
+        write(fd, rb, rl)
+        write(fd, "_c", 2)
+        rl = fmt_uint(rb, crm)
+        write(fd, rb, rl)
+        write(fd, "_", 1)
+        rl = fmt_uint(rb, op2)
+        write(fd, rb, rl)
+    }
+}
+
+// x86_64 64-bit register name. Accepts 0..15; the high-bit encoded
+// r8..r15 come from the REX.R/B prefix bits added upstream.
+fn write_x86_reg64(uint64 fd, uint64 r) {
+    uint8[4] rb
+    if r == 0 { write(fd, "rax", 3) }
+    else if r == 1 { write(fd, "rcx", 3) }
+    else if r == 2 { write(fd, "rdx", 3) }
+    else if r == 3 { write(fd, "rbx", 3) }
+    else if r == 4 { write(fd, "rsp", 3) }
+    else if r == 5 { write(fd, "rbp", 3) }
+    else if r == 6 { write(fd, "rsi", 3) }
+    else if r == 7 { write(fd, "rdi", 3) }
+    else {
+        write(fd, "r", 1)
+        uint64 rl = fmt_uint(rb, r)
+        write(fd, rb, rl)
+    }
+}
+
+// Decode and print an x86_64 memory operand from a ModR/M byte.
+// `bp_modrm` points to the ModR/M byte; disp/SIB bytes follow.
+// `base_hi` is 1 if REX.B is set (base register is r8..r15).
+// Returns the number of bytes consumed after the ModR/M (SIB + disp).
+fn write_x86_mem(uint64 fd, uint64 bp_modrm, uint64 base_hi) -> uint64 {
+    uint64 modrm = 0
+    unsafe { *(bp_modrm as uint8) -> modrm }
+    uint64 mod_f = (modrm >> 6) & 3
+    uint64 rm_f  = modrm & 7
+    uint64 base_r = rm_f | (base_hi << 3)
+    uint64 disp_ofs = 1
+    uint64 has_sib = 0
+    uint64 sib_base = 0
+    if mod_f != 3 && rm_f == 4 {
+        uint64 bp_s = bp_modrm + 1
+        uint64 sib_b = 0
+        unsafe { *(bp_s as uint8) -> sib_b }
+        sib_base = (sib_b & 7) | (base_hi << 3)
+        base_r = sib_base
+        has_sib = 1
+        disp_ofs = 2
+    }
+    write(fd, "[", 1)
+    if mod_f == 0 && rm_f == 5 {
+        write(fd, "rip", 3)
+    } else {
+        write_x86_reg64(fd, base_r)
+    }
+    uint64 consumed = disp_ofs - 1
+    if mod_f == 1 {
+        uint64 bp_d = bp_modrm + disp_ofs
+        uint64 d8v = 0
+        unsafe { *(bp_d as uint8) -> d8v }
+        write(fd, "+0x", 3)
+        write_hex8(fd, d8v)
+        consumed = consumed + 1
+    } else if mod_f == 2 || (mod_f == 0 && rm_f == 5) {
+        uint64 bp_d0 = bp_modrm + disp_ofs
+        uint64 bp_d1 = bp_modrm + disp_ofs + 1
+        uint64 bp_d2 = bp_modrm + disp_ofs + 2
+        uint64 bp_d3 = bp_modrm + disp_ofs + 3
+        uint64 d32_0 = 0
+        uint64 d32_1 = 0
+        uint64 d32_2 = 0
+        uint64 d32_3 = 0
+        unsafe { *(bp_d0 as uint8) -> d32_0 }
+        unsafe { *(bp_d1 as uint8) -> d32_1 }
+        unsafe { *(bp_d2 as uint8) -> d32_2 }
+        unsafe { *(bp_d3 as uint8) -> d32_3 }
+        uint64 d32 = d32_0 | (d32_1 << 8) | (d32_2 << 16) | (d32_3 << 24)
+        write(fd, "+0x", 3)
+        write_hex32(fd, d32)
+        consumed = consumed + 4
+    }
+    write(fd, "]", 1)
+    return consumed
+}
+
+// Length of an x86_64 ModR/M operand (SIB + displacement), not counting the
+// ModR/M byte itself. Mirrors the consumed-bytes computation in write_x86_mem.
+fn x86_modrm_extra(uint64 modrm) -> uint64 {
+    uint64 mod_f = (modrm >> 6) & 3
+    uint64 rm_f  = modrm & 7
+    if mod_f == 3 { return 0 }
+    uint64 extra = 0
+    if rm_f == 4 { extra = extra + 1 }
+    if mod_f == 1 { extra = extra + 1 }
+    if mod_f == 2 { extra = extra + 4 }
+    if mod_f == 0 && rm_f == 5 { extra = extra + 4 }
+    return extra
+}
+
+fn emit_asm_listing(uint64 output_path, uint64 arch, uint64 text_start, uint64 source, uint64 tokens) {
+    uint64 fd = file_open(output_path, 1)
+    uint64 code_end = codegen_output_len()
+    write(fd, "; KernRift assembly listing\n", 27)
+    if arch == 0 {
+        write(fd, "; Architecture: x86_64\n", 23)
+    } else {
+        write(fd, "; Architecture: ARM64\n", 22)
+    }
+    write(fd, "\n", 1)
+
+    // Build sorted function offset list for labeling
+    uint64 fi = 0
+    while fi < fn_count {
+        uint64 fentry = fn_table + fi * 8
+        uint32 fn_tok = 0
+        unsafe { *(fentry as uint32) -> fn_tok }
+        uint64 fe4 = fentry + 4
+        uint32 fn_off = 0
+        unsafe { *(fe4 as uint32) -> fn_off }
+        uint64 woff = fn_off
+
+        // If this function carries a @section("name") annotation, emit
+        // a gas-style `.section <name>,"ax",@progbits` directive so the
+        // listing round-trips cleanly through an external assembler.
+        uint64 sect_info = fn_section_lookup(fn_tok)
+        if sect_info != 0 {
+            uint64 sect_start = (sect_info >> 32) & 0xFFFFFFFF
+            uint64 sect_len = sect_info & 0xFFFFFFFF
+            write(fd, "\n.section ", 10)
+            write(fd, source + sect_start, sect_len)
+            if arch == 0 {
+                write(fd, ",\"ax\",@progbits\n", 16)
+            } else {
+                write(fd, ",\"ax\",%progbits\n", 16)
+            }
+        }
+        // Print function label
+        write(fd, "\n", 1)
+        uint64 tstart = tok_text_start(fn_tok)
+        uint64 tlen = tok_text_len(fn_tok)
+        uint64 name_ptr = source + tstart
+        write(fd, name_ptr, tlen)
+        write(fd, ":\n", 2)
+
+        // Find end of this function (next function offset or code_end)
+        uint64 fn_end = code_end
+        uint64 fj = 0
+        while fj < fn_count {
+            uint64 fe2 = fn_table + fj * 8 + 4
+            uint32 next_off = 0
+            unsafe { *(fe2 as uint32) -> next_off }
+            uint64 wnext = next_off
+            if wnext > woff && wnext < fn_end {
+                fn_end = wnext
+            }
+            fj = fj + 1
+        }
+
+        // Dump instructions
+        uint64 pos = woff
+        if arch == 1 {
+            // ARM64: fixed 4-byte instructions
+            while pos + 4 <= fn_end {
+                write(fd, "  ", 2)
+                write_hex32(fd, pos - text_start)
+                write(fd, ": ", 2)
+                uint64 bp = out_buf + pos
+                uint32 insn = 0
+                unsafe { *(bp as uint32) -> insn }
+                uint64 wi = insn
+                write_hex32(fd, wi)
+                write(fd, "  ", 2)
+                uint8[16] drb
+                uint64 drl = 0
+                uint64 rd = wi & 0x1F
+                uint64 rn = (wi >> 5) & 0x1F
+                uint64 rm = (wi >> 16) & 0x1F
+                // Decode common ARM64 instructions
+                if wi == 0xD503201F { write(fd, "nop", 3) }
+                else if wi == 0xD65F03C0 { write(fd, "ret", 3) }
+                else if wi == 0xD503207F { write(fd, "wfi", 3) }
+                else if wi == 0xD5033FDF { write(fd, "isb", 3) }
+                else if wi == 0xD5033BBF { write(fd, "dmb ish", 7) }
+                else if wi == 0xD5033B9F { write(fd, "dsb ish", 7) }
+                else if wi == 0xD5033F9F { write(fd, "dsb sy", 6) }
+                else if wi == 0xD5033FBF { write(fd, "dmb sy", 6) }
+                else if (wi & 0xFFFFFFE0) == 0xD50B7E20 {
+                    write(fd, "dc civac, ", 10)
+                    write_a64_xreg(fd, rd)
+                }
+                else if (wi & 0xFFFFFFE0) == 0xD50B7520 {
+                    write(fd, "ic ivau, ", 9)
+                    write_a64_xreg(fd, rd)
+                }
+                else if wi == 0xD69F03E0 { write(fd, "eret", 4) }
+                else if wi == 0xD4000001 { write(fd, "svc #0", 6) }
+                // MOVZ 64-bit
+                else if (wi & 0xFF800000) == 0xD2800000 {
+                    write(fd, "movz ", 5)
+                    write_a64_xreg(fd, rd)
+                    write(fd, ", #", 3)
+                    uint64 imm16 = (wi >> 5) & 0xFFFF
+                    drl = fmt_uint(drb, imm16)
+                    write(fd, drb, drl)
+                    uint64 hw = (wi >> 21) & 0x3
+                    if hw != 0 {
+                        write(fd, ", lsl #", 7)
+                        drl = fmt_uint(drb, hw * 16)
+                        write(fd, drb, drl)
+                    }
+                }
+                // MOVK 64-bit
+                else if (wi & 0xFF800000) == 0xF2800000 {
+                    write(fd, "movk ", 5)
+                    write_a64_xreg(fd, rd)
+                    write(fd, ", #", 3)
+                    uint64 imm16 = (wi >> 5) & 0xFFFF
+                    drl = fmt_uint(drb, imm16)
+                    write(fd, drb, drl)
+                    uint64 hw = (wi >> 21) & 0x3
+                    if hw != 0 {
+                        write(fd, ", lsl #", 7)
+                        drl = fmt_uint(drb, hw * 16)
+                        write(fd, drb, drl)
+                    }
+                }
+                // ADD/SUB immediate (bits 28:24 = 10001)
+                else if (wi & 0x1F000000) == 0x11000000 && (wi & 0x20000000) == 0 {
+                    uint64 is_64 = (wi >> 31) & 1
+                    if (wi & 0x40000000) != 0 {
+                        write(fd, "sub ", 4)
+                    } else {
+                        write(fd, "add ", 4)
+                    }
+                    if is_64 != 0 {
+                        write_a64_xreg(fd, rd)
+                        write(fd, ", ", 2)
+                        write_a64_xreg(fd, rn)
+                    } else {
+                        write_a64_wreg(fd, rd)
+                        write(fd, ", ", 2)
+                        write_a64_wreg(fd, rn)
+                    }
+                    write(fd, ", #", 3)
+                    uint64 imm12 = (wi >> 10) & 0xFFF
+                    drl = fmt_uint(drb, imm12)
+                    write(fd, drb, drl)
+                }
+                // ADD/SUB register (shifted): bits 28:24 = 01011, bit 21 = 0
+                else if (wi & 0x1F200000) == 0x0B000000 {
+                    uint64 is_64 = (wi >> 31) & 1
+                    if (wi & 0x40000000) != 0 {
+                        write(fd, "sub ", 4)
+                    } else {
+                        write(fd, "add ", 4)
+                    }
+                    if is_64 != 0 {
+                        write_a64_xreg(fd, rd)
+                        write(fd, ", ", 2)
+                        write_a64_xreg(fd, rn)
+                        write(fd, ", ", 2)
+                        write_a64_xreg(fd, rm)
+                    } else {
+                        write_a64_wreg(fd, rd)
+                        write(fd, ", ", 2)
+                        write_a64_wreg(fd, rn)
+                        write(fd, ", ", 2)
+                        write_a64_wreg(fd, rm)
+                    }
+                }
+                // LDR 64-bit unsigned offset
+                else if (wi & 0xFFC00000) == 0xF9400000 {
+                    write(fd, "ldr ", 4)
+                    write_a64_xreg(fd, rd)
+                    write(fd, ", [", 3)
+                    write_a64_xreg(fd, rn)
+                    uint64 imm12 = (wi >> 10) & 0xFFF
+                    uint64 off = imm12 * 8
+                    if off != 0 {
+                        write(fd, ", #", 3)
+                        drl = fmt_uint(drb, off)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, "]", 1)
+                }
+                // STR 64-bit unsigned offset
+                else if (wi & 0xFFC00000) == 0xF9000000 {
+                    write(fd, "str ", 4)
+                    write_a64_xreg(fd, rd)
+                    write(fd, ", [", 3)
+                    write_a64_xreg(fd, rn)
+                    uint64 imm12 = (wi >> 10) & 0xFFF
+                    uint64 off = imm12 * 8
+                    if off != 0 {
+                        write(fd, ", #", 3)
+                        drl = fmt_uint(drb, off)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, "]", 1)
+                }
+                // LDR 32-bit unsigned offset
+                else if (wi & 0xFFC00000) == 0xB9400000 {
+                    write(fd, "ldr ", 4)
+                    write_a64_wreg(fd, rd)
+                    write(fd, ", [", 3)
+                    write_a64_xreg(fd, rn)
+                    uint64 imm12 = (wi >> 10) & 0xFFF
+                    uint64 off = imm12 * 4
+                    if off != 0 {
+                        write(fd, ", #", 3)
+                        drl = fmt_uint(drb, off)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, "]", 1)
+                }
+                // STR 32-bit unsigned offset
+                else if (wi & 0xFFC00000) == 0xB9000000 {
+                    write(fd, "str ", 4)
+                    write_a64_wreg(fd, rd)
+                    write(fd, ", [", 3)
+                    write_a64_xreg(fd, rn)
+                    uint64 imm12 = (wi >> 10) & 0xFFF
+                    uint64 off = imm12 * 4
+                    if off != 0 {
+                        write(fd, ", #", 3)
+                        drl = fmt_uint(drb, off)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, "]", 1)
+                }
+                // LDRB unsigned offset
+                else if (wi & 0xFFC00000) == 0x39400000 {
+                    write(fd, "ldrb ", 5)
+                    write_a64_wreg(fd, rd)
+                    write(fd, ", [", 3)
+                    write_a64_xreg(fd, rn)
+                    uint64 imm12 = (wi >> 10) & 0xFFF
+                    if imm12 != 0 {
+                        write(fd, ", #", 3)
+                        drl = fmt_uint(drb, imm12)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, "]", 1)
+                }
+                // STRB unsigned offset
+                else if (wi & 0xFFC00000) == 0x39000000 {
+                    write(fd, "strb ", 5)
+                    write_a64_wreg(fd, rd)
+                    write(fd, ", [", 3)
+                    write_a64_xreg(fd, rn)
+                    uint64 imm12 = (wi >> 10) & 0xFFF
+                    if imm12 != 0 {
+                        write(fd, ", #", 3)
+                        drl = fmt_uint(drb, imm12)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, "]", 1)
+                }
+                // STP 64-bit: signed offset / pre-index / post-index
+                else if (wi & 0xFFC00000) == 0xA9000000 || (wi & 0xFFC00000) == 0xA9800000 || (wi & 0xFFC00000) == 0xA8800000 {
+                    write(fd, "stp ", 4)
+                    write_a64_xreg(fd, rd)
+                    write(fd, ", ", 2)
+                    uint64 rt2 = (wi >> 10) & 0x1F
+                    write_a64_xreg(fd, rt2)
+                    write(fd, ", [", 3)
+                    write_a64_xreg(fd, rn)
+                    uint64 imm7 = (wi >> 15) & 0x7F
+                    uint64 soff = imm7
+                    if (imm7 & 0x40) != 0 { soff = soff | 0xFFFFFFFFFFFFFF80 }
+                    soff = soff * 8
+                    if soff != 0 {
+                        write(fd, ", #", 3)
+                        if (soff & 0x8000000000000000) != 0 {
+                            write(fd, "-", 1)
+                            soff = 0 - soff
+                        }
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, "]", 1)
+                    if (wi & 0xFFC00000) == 0xA9800000 {
+                        write(fd, "!", 1)
+                    }
+                }
+                // LDP 64-bit: signed offset / pre-index / post-index
+                else if (wi & 0xFFC00000) == 0xA9400000 || (wi & 0xFFC00000) == 0xA9C00000 || (wi & 0xFFC00000) == 0xA8C00000 {
+                    write(fd, "ldp ", 4)
+                    write_a64_xreg(fd, rd)
+                    write(fd, ", ", 2)
+                    uint64 rt2 = (wi >> 10) & 0x1F
+                    write_a64_xreg(fd, rt2)
+                    write(fd, ", [", 3)
+                    write_a64_xreg(fd, rn)
+                    uint64 imm7 = (wi >> 15) & 0x7F
+                    uint64 soff = imm7
+                    if (imm7 & 0x40) != 0 { soff = soff | 0xFFFFFFFFFFFFFF80 }
+                    soff = soff * 8
+                    if soff != 0 {
+                        write(fd, ", #", 3)
+                        if (soff & 0x8000000000000000) != 0 {
+                            write(fd, "-", 1)
+                            soff = 0 - soff
+                        }
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, "]", 1)
+                    if (wi & 0xFFC00000) == 0xA9C00000 {
+                        write(fd, "!", 1)
+                    }
+                }
+                // BL: 1001 01 imm26
+                else if (wi & 0xFC000000) == 0x94000000 {
+                    write(fd, "bl ", 3)
+                    uint64 imm26 = wi & 0x3FFFFFF
+                    if (imm26 & 0x2000000) != 0 {
+                        uint64 soff = (0x4000000 - imm26) * 4
+                        write(fd, "<-", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    } else {
+                        uint64 soff = imm26 * 4
+                        write(fd, "<+", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, ">", 1)
+                }
+                // B: 0001 01 imm26
+                else if (wi & 0xFC000000) == 0x14000000 {
+                    write(fd, "b ", 2)
+                    uint64 imm26 = wi & 0x3FFFFFF
+                    if (imm26 & 0x2000000) != 0 {
+                        uint64 soff = (0x4000000 - imm26) * 4
+                        write(fd, "<-", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    } else {
+                        uint64 soff = imm26 * 4
+                        write(fd, "<+", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, ">", 1)
+                }
+                // B.cond: 0101 0100 imm19 0 cond
+                else if (wi & 0xFF000010) == 0x54000000 {
+                    write(fd, "b.", 2)
+                    uint64 cond = wi & 0xF
+                    if cond == 0 { write(fd, "eq", 2) }
+                    else if cond == 1 { write(fd, "ne", 2) }
+                    else if cond == 2 { write(fd, "cs", 2) }
+                    else if cond == 3 { write(fd, "cc", 2) }
+                    else if cond == 4 { write(fd, "mi", 2) }
+                    else if cond == 5 { write(fd, "pl", 2) }
+                    else if cond == 6 { write(fd, "vs", 2) }
+                    else if cond == 7 { write(fd, "vc", 2) }
+                    else if cond == 8 { write(fd, "hi", 2) }
+                    else if cond == 9 { write(fd, "ls", 2) }
+                    else if cond == 10 { write(fd, "ge", 2) }
+                    else if cond == 11 { write(fd, "lt", 2) }
+                    else if cond == 12 { write(fd, "gt", 2) }
+                    else if cond == 13 { write(fd, "le", 2) }
+                    else if cond == 14 { write(fd, "al", 2) }
+                    else { write(fd, "nv", 2) }
+                    write(fd, " ", 1)
+                    uint64 imm19 = (wi >> 5) & 0x7FFFF
+                    if (imm19 & 0x40000) != 0 {
+                        uint64 soff = (0x80000 - imm19) * 4
+                        write(fd, "<-", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    } else {
+                        uint64 soff = imm19 * 4
+                        write(fd, "<+", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, ">", 1)
+                }
+                // CBNZ 64-bit
+                else if (wi & 0xFF000000) == 0xB5000000 {
+                    write(fd, "cbnz ", 5)
+                    write_a64_xreg(fd, rd)
+                    write(fd, ", ", 2)
+                    uint64 imm19 = (wi >> 5) & 0x7FFFF
+                    if (imm19 & 0x40000) != 0 {
+                        uint64 soff = (0x80000 - imm19) * 4
+                        write(fd, "<-", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    } else {
+                        uint64 soff = imm19 * 4
+                        write(fd, "<+", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, ">", 1)
+                }
+                // CBZ 64-bit
+                else if (wi & 0xFF000000) == 0xB4000000 {
+                    write(fd, "cbz ", 4)
+                    write_a64_xreg(fd, rd)
+                    write(fd, ", ", 2)
+                    uint64 imm19 = (wi >> 5) & 0x7FFFF
+                    if (imm19 & 0x40000) != 0 {
+                        uint64 soff = (0x80000 - imm19) * 4
+                        write(fd, "<-", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    } else {
+                        uint64 soff = imm19 * 4
+                        write(fd, "<+", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, ">", 1)
+                }
+                // CBNZ 32-bit
+                else if (wi & 0xFF000000) == 0x35000000 {
+                    write(fd, "cbnz ", 5)
+                    write_a64_wreg(fd, rd)
+                    write(fd, ", ", 2)
+                    uint64 imm19 = (wi >> 5) & 0x7FFFF
+                    if (imm19 & 0x40000) != 0 {
+                        uint64 soff = (0x80000 - imm19) * 4
+                        write(fd, "<-", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    } else {
+                        uint64 soff = imm19 * 4
+                        write(fd, "<+", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, ">", 1)
+                }
+                // CBZ 32-bit
+                else if (wi & 0xFF000000) == 0x34000000 {
+                    write(fd, "cbz ", 4)
+                    write_a64_wreg(fd, rd)
+                    write(fd, ", ", 2)
+                    uint64 imm19 = (wi >> 5) & 0x7FFFF
+                    if (imm19 & 0x40000) != 0 {
+                        uint64 soff = (0x80000 - imm19) * 4
+                        write(fd, "<-", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    } else {
+                        uint64 soff = imm19 * 4
+                        write(fd, "<+", 2)
+                        drl = fmt_uint(drb, soff)
+                        write(fd, drb, drl)
+                    }
+                    write(fd, ">", 1)
+                }
+                // MRS
+                else if (wi & 0xFFF00000) == 0xD5300000 {
+                    write(fd, "mrs ", 4)
+                    write_a64_xreg(fd, rd)
+                    write(fd, ", ", 2)
+                    uint64 sop0 = ((wi >> 19) & 1) + 2
+                    uint64 sop1 = (wi >> 16) & 0x7
+                    uint64 scrn = (wi >> 12) & 0xF
+                    uint64 scrm = (wi >> 8) & 0xF
+                    uint64 sop2 = (wi >> 5) & 0x7
+                    write_a64_sysreg(fd, sop0, sop1, scrn, scrm, sop2)
+                }
+                // MSR
+                else if (wi & 0xFFF00000) == 0xD5100000 {
+                    write(fd, "msr ", 4)
+                    uint64 sop0 = ((wi >> 19) & 1) + 2
+                    uint64 sop1 = (wi >> 16) & 0x7
+                    uint64 scrn = (wi >> 12) & 0xF
+                    uint64 scrm = (wi >> 8) & 0xF
+                    uint64 sop2 = (wi >> 5) & 0x7
+                    write_a64_sysreg(fd, sop0, sop1, scrn, scrm, sop2)
+                    write(fd, ", ", 2)
+                    write_a64_xreg(fd, rd)
+                }
+                // LDXR/LDAR
+                else if (wi & 0x3FE00000) == 0x08400000 {
+                    if (wi & 0x00800000) != 0 {
+                        write(fd, "ldar ", 5)
+                    } else {
+                        write(fd, "ldxr ", 5)
+                    }
+                    uint64 is_64 = (wi >> 30) & 1
+                    if is_64 != 0 {
+                        write_a64_xreg(fd, rd)
+                    } else {
+                        write_a64_wreg(fd, rd)
+                    }
+                    write(fd, ", [", 3)
+                    write_a64_xreg(fd, rn)
+                    write(fd, "]", 1)
+                }
+                // STXR/STLR
+                else if (wi & 0x3FE00000) == 0x08000000 {
+                    if (wi & 0x00800000) != 0 {
+                        write(fd, "stlr ", 5)
+                    } else {
+                        write(fd, "stxr ", 5)
+                    }
+                    uint64 is_64 = (wi >> 30) & 1
+                    if is_64 != 0 {
+                        write_a64_xreg(fd, rd)
+                    } else {
+                        write_a64_wreg(fd, rd)
+                    }
+                    write(fd, ", [", 3)
+                    write_a64_xreg(fd, rn)
+                    write(fd, "]", 1)
+                }
+                write(fd, "\n", 1)
+                pos = pos + 4
+            }
+        } else {
+            // x86_64: variable length — hex dump with basic decode
+            while pos < fn_end {
+                write(fd, "  ", 2)
+                write_hex32(fd, pos - text_start)
+                write(fd, ": ", 2)
+                uint64 bp = out_buf + pos
+                uint64 b0 = 0
+                unsafe { *(bp as uint8) -> b0 }
+                // Decode some common patterns
+                if b0 == 0xC3 {
+                    write_hex8(fd, b0)
+                    write(fd, "                 ret", 20)
+                    pos = pos + 1
+                } else if b0 == 0x0F {
+                    uint64 bp1 = bp + 1
+                    uint64 b1 = 0
+                    unsafe { *(bp1 as uint8) -> b1 }
+                    if b1 == 0x05 {
+                        write_hex8(fd, b0)
+                        write(fd, " ", 1)
+                        write_hex8(fd, b1)
+                        write(fd, "              syscall", 21)
+                        pos = pos + 2
+                    } else if b1 == 0xAE {
+                        uint64 bp2 = bp + 2
+                        uint64 b2 = 0
+                        unsafe { *(bp2 as uint8) -> b2 }
+                        if b2 == 0xF0 {
+                            write_hex8(fd, b0)
+                            write(fd, " ", 1)
+                            write_hex8(fd, b1)
+                            write(fd, " ", 1)
+                            write_hex8(fd, b2)
+                            write(fd, "           mfence", 18)
+                            pos = pos + 3
+                        } else {
+                            write_hex8(fd, b0)
+                            write(fd, " ", 1)
+                            write_hex8(fd, b1)
+                            write(fd, " ", 1)
+                            write_hex8(fd, b2)
+                            pos = pos + 3
+                        }
+                    } else if b1 >= 0x80 && b1 <= 0x8F && pos + 6 <= fn_end {
+                        // jcc rel32: 0F 80-8F + imm32
+                        uint64 bp2 = bp + 2
+                        uint64 i0 = 0
+                        uint64 i1 = 0
+                        uint64 i2 = 0
+                        uint64 i3 = 0
+                        unsafe { *(bp2 as uint8) -> i0 }
+                        uint64 bp3 = bp + 3
+                        unsafe { *(bp3 as uint8) -> i1 }
+                        uint64 bp4 = bp + 4
+                        unsafe { *(bp4 as uint8) -> i2 }
+                        uint64 bp5 = bp + 5
+                        unsafe { *(bp5 as uint8) -> i3 }
+                        write_hex8(fd, b0)
+                        write(fd, " ", 1)
+                        write_hex8(fd, b1)
+                        write(fd, " ", 1)
+                        write_hex8(fd, i0)
+                        write(fd, " ", 1)
+                        write_hex8(fd, i1)
+                        write(fd, " ", 1)
+                        write_hex8(fd, i2)
+                        write(fd, " ", 1)
+                        write_hex8(fd, i3)
+                        write(fd, "  ", 2)
+                        uint64 jcc32_cc = b1 - 0x80
+                        if jcc32_cc == 0 { write(fd, "jo 0x", 5) }
+                        else if jcc32_cc == 1 { write(fd, "jno 0x", 6) }
+                        else if jcc32_cc == 2 { write(fd, "jb 0x", 5) }
+                        else if jcc32_cc == 3 { write(fd, "jnb 0x", 6) }
+                        else if jcc32_cc == 4 { write(fd, "je 0x", 5) }
+                        else if jcc32_cc == 5 { write(fd, "jne 0x", 6) }
+                        else if jcc32_cc == 6 { write(fd, "jbe 0x", 6) }
+                        else if jcc32_cc == 7 { write(fd, "ja 0x", 5) }
+                        else if jcc32_cc == 8 { write(fd, "js 0x", 5) }
+                        else if jcc32_cc == 9 { write(fd, "jns 0x", 6) }
+                        else if jcc32_cc == 10 { write(fd, "jp 0x", 5) }
+                        else if jcc32_cc == 11 { write(fd, "jnp 0x", 6) }
+                        else if jcc32_cc == 12 { write(fd, "jl 0x", 5) }
+                        else if jcc32_cc == 13 { write(fd, "jge 0x", 6) }
+                        else if jcc32_cc == 14 { write(fd, "jle 0x", 6) }
+                        else { write(fd, "jg 0x", 5) }
+                        uint64 jcc32_imm = i0 | (i1 << 8) | (i2 << 16) | (i3 << 24)
+                        write_hex32(fd, jcc32_imm)
+                        pos = pos + 6
+                    } else {
+                        // Dump up to 4 bytes
+                        uint64 cnt = 2
+                        uint64 di = 0
+                        while di < cnt {
+                            uint64 dp = bp + di
+                            uint64 db = 0
+                            unsafe { *(dp as uint8) -> db }
+                            write_hex8(fd, db)
+                            write(fd, " ", 1)
+                            di = di + 1
+                        }
+                        pos = pos + cnt
+                    }
+                } else if b0 == 0xF0 {
+                    // LOCK prefix
+                    write_hex8(fd, b0)
+                    write(fd, " ", 1)
+                    write(fd, "...          lock ...", 20)
+                    // Dump rest of instruction (up to 7 more bytes)
+                    uint64 li = 1
+                    while li < 8 && pos + li < fn_end {
+                        uint64 lp = bp + li
+                        uint64 lb = 0
+                        unsafe { *(lp as uint8) -> lb }
+                        if lb == 0x48 || lb == 0x0F || (lb >= 0x80 && lb <= 0xCF) {
+                            li = li + 1
+                        } else {
+                            li = li + 1
+                            break
+                        }
+                    }
+                    pos = pos + li
+                } else if b0 >= 0x50 && b0 <= 0x57 {
+                    // push reg (0x50-0x57)
+                    write_hex8(fd, b0)
+                    write(fd, "                 push ", 22)
+                    uint64 push_r = b0 - 0x50
+                    if push_r == 0 { write(fd, "rax", 3) }
+                    else if push_r == 1 { write(fd, "rcx", 3) }
+                    else if push_r == 2 { write(fd, "rdx", 3) }
+                    else if push_r == 3 { write(fd, "rbx", 3) }
+                    else if push_r == 4 { write(fd, "rsp", 3) }
+                    else if push_r == 5 { write(fd, "rbp", 3) }
+                    else if push_r == 6 { write(fd, "rsi", 3) }
+                    else { write(fd, "rdi", 3) }
+                    pos = pos + 1
+                } else if b0 >= 0x58 && b0 <= 0x5F {
+                    // pop reg (0x58-0x5F)
+                    write_hex8(fd, b0)
+                    write(fd, "                 pop ", 21)
+                    uint64 pop_r = b0 - 0x58
+                    if pop_r == 0 { write(fd, "rax", 3) }
+                    else if pop_r == 1 { write(fd, "rcx", 3) }
+                    else if pop_r == 2 { write(fd, "rdx", 3) }
+                    else if pop_r == 3 { write(fd, "rbx", 3) }
+                    else if pop_r == 4 { write(fd, "rsp", 3) }
+                    else if pop_r == 5 { write(fd, "rbp", 3) }
+                    else if pop_r == 6 { write(fd, "rsi", 3) }
+                    else { write(fd, "rdi", 3) }
+                    pos = pos + 1
+                } else if b0 == 0x90 {
+                    // nop
+                    write_hex8(fd, b0)
+                    write(fd, "                 nop", 20)
+                    pos = pos + 1
+                } else if b0 == 0xE8 && pos + 5 <= fn_end {
+                    // call rel32
+                    uint64 bp1 = bp + 1
+                    uint64 bp2 = bp + 2
+                    uint64 bp3 = bp + 3
+                    uint64 bp4 = bp + 4
+                    uint64 c0 = 0
+                    uint64 c1 = 0
+                    uint64 c2 = 0
+                    uint64 c3 = 0
+                    unsafe { *(bp1 as uint8) -> c0 }
+                    unsafe { *(bp2 as uint8) -> c1 }
+                    unsafe { *(bp3 as uint8) -> c2 }
+                    unsafe { *(bp4 as uint8) -> c3 }
+                    write_hex8(fd, b0)
+                    write(fd, " ", 1)
+                    write_hex8(fd, c0)
+                    write(fd, " ", 1)
+                    write_hex8(fd, c1)
+                    write(fd, " ", 1)
+                    write_hex8(fd, c2)
+                    write(fd, " ", 1)
+                    write_hex8(fd, c3)
+                    write(fd, "     call 0x", 12)
+                    uint64 call_imm = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24)
+                    write_hex32(fd, call_imm)
+                    pos = pos + 5
+                } else if b0 == 0xE9 && pos + 5 <= fn_end {
+                    // jmp rel32
+                    uint64 bp1 = bp + 1
+                    uint64 bp2 = bp + 2
+                    uint64 bp3 = bp + 3
+                    uint64 bp4 = bp + 4
+                    uint64 j0 = 0
+                    uint64 j1 = 0
+                    uint64 j2 = 0
+                    uint64 j3 = 0
+                    unsafe { *(bp1 as uint8) -> j0 }
+                    unsafe { *(bp2 as uint8) -> j1 }
+                    unsafe { *(bp3 as uint8) -> j2 }
+                    unsafe { *(bp4 as uint8) -> j3 }
+                    write_hex8(fd, b0)
+                    write(fd, " ", 1)
+                    write_hex8(fd, j0)
+                    write(fd, " ", 1)
+                    write_hex8(fd, j1)
+                    write(fd, " ", 1)
+                    write_hex8(fd, j2)
+                    write(fd, " ", 1)
+                    write_hex8(fd, j3)
+                    write(fd, "     jmp 0x", 11)
+                    uint64 jmp32_imm = j0 | (j1 << 8) | (j2 << 16) | (j3 << 24)
+                    write_hex32(fd, jmp32_imm)
+                    pos = pos + 5
+                } else if b0 == 0xEB && pos + 2 <= fn_end {
+                    // jmp rel8
+                    uint64 bp1 = bp + 1
+                    uint64 jmp8_off = 0
+                    unsafe { *(bp1 as uint8) -> jmp8_off }
+                    write_hex8(fd, b0)
+                    write(fd, " ", 1)
+                    write_hex8(fd, jmp8_off)
+                    write(fd, "              jmp 0x", 20)
+                    write_hex8(fd, jmp8_off)
+                    pos = pos + 2
+                } else if b0 >= 0x70 && b0 <= 0x7F && pos + 2 <= fn_end {
+                    // jcc rel8 (0x70-0x7F)
+                    uint64 bp1 = bp + 1
+                    uint64 jcc8_off = 0
+                    unsafe { *(bp1 as uint8) -> jcc8_off }
+                    write_hex8(fd, b0)
+                    write(fd, " ", 1)
+                    write_hex8(fd, jcc8_off)
+                    write(fd, "              ", 14)
+                    uint64 jcc8_cc = b0 - 0x70
+                    if jcc8_cc == 0 { write(fd, "jo 0x", 5) }
+                    else if jcc8_cc == 1 { write(fd, "jno 0x", 6) }
+                    else if jcc8_cc == 2 { write(fd, "jb 0x", 5) }
+                    else if jcc8_cc == 3 { write(fd, "jnb 0x", 6) }
+                    else if jcc8_cc == 4 { write(fd, "je 0x", 5) }
+                    else if jcc8_cc == 5 { write(fd, "jne 0x", 6) }
+                    else if jcc8_cc == 6 { write(fd, "jbe 0x", 6) }
+                    else if jcc8_cc == 7 { write(fd, "ja 0x", 5) }
+                    else if jcc8_cc == 8 { write(fd, "js 0x", 5) }
+                    else if jcc8_cc == 9 { write(fd, "jns 0x", 6) }
+                    else if jcc8_cc == 10 { write(fd, "jp 0x", 5) }
+                    else if jcc8_cc == 11 { write(fd, "jnp 0x", 6) }
+                    else if jcc8_cc == 12 { write(fd, "jl 0x", 5) }
+                    else if jcc8_cc == 13 { write(fd, "jge 0x", 6) }
+                    else if jcc8_cc == 14 { write(fd, "jle 0x", 6) }
+                    else { write(fd, "jg 0x", 5) }
+                    write_hex8(fd, jcc8_off)
+                    pos = pos + 2
+                } else if b0 == 0xB8 && pos + 5 <= fn_end {
+                    // mov eax, imm32
+                    uint64 bp1 = bp + 1
+                    uint64 bp2 = bp + 2
+                    uint64 bp3 = bp + 3
+                    uint64 bp4 = bp + 4
+                    uint64 m0 = 0
+                    uint64 m1 = 0
+                    uint64 m2 = 0
+                    uint64 m3 = 0
+                    unsafe { *(bp1 as uint8) -> m0 }
+                    unsafe { *(bp2 as uint8) -> m1 }
+                    unsafe { *(bp3 as uint8) -> m2 }
+                    unsafe { *(bp4 as uint8) -> m3 }
+                    write_hex8(fd, b0)
+                    write(fd, " ", 1)
+                    write_hex8(fd, m0)
+                    write(fd, " ", 1)
+                    write_hex8(fd, m1)
+                    write(fd, " ", 1)
+                    write_hex8(fd, m2)
+                    write(fd, " ", 1)
+                    write_hex8(fd, m3)
+                    write(fd, "     mov eax, 0x", 16)
+                    uint64 mov_eax_imm = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24)
+                    write_hex32(fd, mov_eax_imm)
+                    pos = pos + 5
+                } else if (b0 == 0x4C) && pos + 3 <= fn_end {
+                    // REX.WR prefix (r8-r15 in reg field) + mov r/m,r or mov r,r/m
+                    uint64 bp1_c = bp + 1
+                    uint64 b1_c = 0
+                    unsafe { *(bp1_c as uint8) -> b1_c }
+                    if (b1_c == 0x89 || b1_c == 0x8B) && pos + 3 <= fn_end {
+                        uint64 bp2c = bp + 2
+                        uint64 modrm_c = 0
+                        unsafe { *(bp2c as uint8) -> modrm_c }
+                        uint64 mod_c = (modrm_c >> 6) & 3
+                        uint64 rm_c  = modrm_c & 7
+                        uint64 reg_c = (modrm_c >> 3) & 7
+                        uint64 extra_c = x86_modrm_extra(modrm_c)
+                        uint64 tlen_c = 3 + extra_c
+                        if pos + tlen_c > fn_end { tlen_c = fn_end - pos }
+                        uint64 dbic = 0
+                        while dbic < tlen_c {
+                            uint64 dppc = bp + dbic
+                            uint64 dbbc = 0
+                            unsafe { *(dppc as uint8) -> dbbc }
+                            write_hex8(fd, dbbc)
+                            if dbic + 1 < tlen_c { write(fd, " ", 1) }
+                            dbic = dbic + 1
+                        }
+                        write(fd, "  mov ", 6)
+                        // REX.R → reg field (bit 3); REX.B would be 0x4D, unhandled here
+                        // so rm stays 0..7 (rax..rdi), reg becomes r8..r15.
+                        uint64 reg_hi = reg_c | 8
+                        if mod_c == 3 {
+                            if b1_c == 0x89 {
+                                write_x86_reg64(fd, rm_c)
+                                write(fd, ", ", 2)
+                                write_x86_reg64(fd, reg_hi)
+                            } else {
+                                write_x86_reg64(fd, reg_hi)
+                                write(fd, ", ", 2)
+                                write_x86_reg64(fd, rm_c)
+                            }
+                        } else {
+                            if b1_c == 0x89 {
+                                write_x86_mem(fd, bp2c, 0)
+                                write(fd, ", ", 2)
+                                write_x86_reg64(fd, reg_hi)
+                            } else {
+                                write_x86_reg64(fd, reg_hi)
+                                write(fd, ", ", 2)
+                                write_x86_mem(fd, bp2c, 0)
+                            }
+                        }
+                        pos = pos + tlen_c
+                    } else {
+                        // Unknown 4C-prefixed — dump 3 bytes raw
+                        uint64 cnt_c = 3
+                        if cnt_c + pos > fn_end { cnt_c = fn_end - pos }
+                        uint64 dic = 0
+                        while dic < cnt_c {
+                            uint64 dpc = bp + dic
+                            uint64 dbc = 0
+                            unsafe { *(dpc as uint8) -> dbc }
+                            write_hex8(fd, dbc)
+                            write(fd, " ", 1)
+                            dic = dic + 1
+                        }
+                        pos = pos + cnt_c
+                    }
+                } else if b0 == 0x48 && pos + 3 <= fn_end {
+                    // REX.W instructions
+                    uint64 bp1 = bp + 1
+                    uint64 b1 = 0
+                    unsafe { *(bp1 as uint8) -> b1 }
+                    if b1 == 0xC7 && pos + 7 <= fn_end {
+                        // REX.W mov r64, imm32: 48 C7 C0+reg imm32
+                        uint64 bp2 = bp + 2
+                        uint64 modrm = 0
+                        unsafe { *(bp2 as uint8) -> modrm }
+                        if modrm >= 0xC0 && modrm <= 0xC7 {
+                            uint64 bp3 = bp + 3
+                            uint64 bp4 = bp + 4
+                            uint64 bp5 = bp + 5
+                            uint64 bp6 = bp + 6
+                            uint64 ri0 = 0
+                            uint64 ri1 = 0
+                            uint64 ri2 = 0
+                            uint64 ri3 = 0
+                            unsafe { *(bp3 as uint8) -> ri0 }
+                            unsafe { *(bp4 as uint8) -> ri1 }
+                            unsafe { *(bp5 as uint8) -> ri2 }
+                            unsafe { *(bp6 as uint8) -> ri3 }
+                            write_hex8(fd, b0)
+                            write(fd, " ", 1)
+                            write_hex8(fd, b1)
+                            write(fd, " ", 1)
+                            write_hex8(fd, modrm)
+                            write(fd, " ", 1)
+                            write_hex8(fd, ri0)
+                            write(fd, " ", 1)
+                            write_hex8(fd, ri1)
+                            write(fd, " ", 1)
+                            write_hex8(fd, ri2)
+                            write(fd, " ", 1)
+                            write_hex8(fd, ri3)
+                            write(fd, " mov ", 5)
+                            uint64 mov_reg = modrm - 0xC0
+                            if mov_reg == 0 { write(fd, "rax", 3) }
+                            else if mov_reg == 1 { write(fd, "rcx", 3) }
+                            else if mov_reg == 2 { write(fd, "rdx", 3) }
+                            else if mov_reg == 3 { write(fd, "rbx", 3) }
+                            else if mov_reg == 4 { write(fd, "rsp", 3) }
+                            else if mov_reg == 5 { write(fd, "rbp", 3) }
+                            else if mov_reg == 6 { write(fd, "rsi", 3) }
+                            else { write(fd, "rdi", 3) }
+                            write(fd, ", 0x", 4)
+                            uint64 mov_imm = ri0 | (ri1 << 8) | (ri2 << 16) | (ri3 << 24)
+                            write_hex32(fd, mov_imm)
+                            pos = pos + 7
+                        } else {
+                            // C7 with non-register modrm, dump 7 bytes raw
+                            uint64 cnt = 7
+                            if cnt + pos > fn_end { cnt = fn_end - pos }
+                            uint64 di = 0
+                            while di < cnt {
+                                uint64 dp = bp + di
+                                uint64 db = 0
+                                unsafe { *(dp as uint8) -> db }
+                                write_hex8(fd, db)
+                                write(fd, " ", 1)
+                                di = di + 1
+                            }
+                            pos = pos + cnt
+                        }
+                    } else if b1 == 0x81 && pos + 7 <= fn_end {
+                        // REX.W op rsp, imm32: 48 81 EC/C4 imm32
+                        uint64 bp2 = bp + 2
+                        uint64 modrm81 = 0
+                        unsafe { *(bp2 as uint8) -> modrm81 }
+                        if modrm81 == 0xEC || modrm81 == 0xC4 {
+                            uint64 bp3 = bp + 3
+                            uint64 bp4 = bp + 4
+                            uint64 bp5 = bp + 5
+                            uint64 bp6 = bp + 6
+                            uint64 si0 = 0
+                            uint64 si1 = 0
+                            uint64 si2 = 0
+                            uint64 si3 = 0
+                            unsafe { *(bp3 as uint8) -> si0 }
+                            unsafe { *(bp4 as uint8) -> si1 }
+                            unsafe { *(bp5 as uint8) -> si2 }
+                            unsafe { *(bp6 as uint8) -> si3 }
+                            write_hex8(fd, b0)
+                            write(fd, " ", 1)
+                            write_hex8(fd, b1)
+                            write(fd, " ", 1)
+                            write_hex8(fd, modrm81)
+                            write(fd, " ", 1)
+                            write_hex8(fd, si0)
+                            write(fd, " ", 1)
+                            write_hex8(fd, si1)
+                            write(fd, " ", 1)
+                            write_hex8(fd, si2)
+                            write(fd, " ", 1)
+                            write_hex8(fd, si3)
+                            if modrm81 == 0xEC {
+                                write(fd, " sub rsp, 0x", 12)
+                            } else {
+                                write(fd, " add rsp, 0x", 12)
+                            }
+                            uint64 sub_imm32 = si0 | (si1 << 8) | (si2 << 16) | (si3 << 24)
+                            write_hex32(fd, sub_imm32)
+                            pos = pos + 7
+                        } else {
+                            // 81 with other modrm, dump 7 bytes raw
+                            uint64 cnt = 7
+                            if cnt + pos > fn_end { cnt = fn_end - pos }
+                            uint64 di = 0
+                            while di < cnt {
+                                uint64 dp = bp + di
+                                uint64 db = 0
+                                unsafe { *(dp as uint8) -> db }
+                                write_hex8(fd, db)
+                                write(fd, " ", 1)
+                                di = di + 1
+                            }
+                            pos = pos + cnt
+                        }
+                    } else if b1 == 0x83 && pos + 4 <= fn_end {
+                        // REX.W op rsp, imm8: 48 83 EC/C4 imm8
+                        uint64 bp2 = bp + 2
+                        uint64 modrm83 = 0
+                        unsafe { *(bp2 as uint8) -> modrm83 }
+                        if modrm83 == 0xEC || modrm83 == 0xC4 {
+                            uint64 bp3 = bp + 3
+                            uint64 si8 = 0
+                            unsafe { *(bp3 as uint8) -> si8 }
+                            write_hex8(fd, b0)
+                            write(fd, " ", 1)
+                            write_hex8(fd, b1)
+                            write(fd, " ", 1)
+                            write_hex8(fd, modrm83)
+                            write(fd, " ", 1)
+                            write_hex8(fd, si8)
+                            if modrm83 == 0xEC {
+                                write(fd, "        sub rsp, 0x", 19)
+                            } else {
+                                write(fd, "        add rsp, 0x", 19)
+                            }
+                            write_hex8(fd, si8)
+                            pos = pos + 4
+                        } else {
+                            // 83 with other modrm, dump 4 bytes raw
+                            uint64 cnt = 4
+                            if cnt + pos > fn_end { cnt = fn_end - pos }
+                            uint64 di = 0
+                            while di < cnt {
+                                uint64 dp = bp + di
+                                uint64 db = 0
+                                unsafe { *(dp as uint8) -> db }
+                                write_hex8(fd, db)
+                                write(fd, " ", 1)
+                                di = di + 1
+                            }
+                            pos = pos + cnt
+                        }
+                    } else if b1 == 0x31 && pos + 3 <= fn_end {
+                        // REX.W xor reg, reg: 48 31 XX
+                        uint64 bp2 = bp + 2
+                        uint64 modrm_xor = 0
+                        unsafe { *(bp2 as uint8) -> modrm_xor }
+                        write_hex8(fd, b0)
+                        write(fd, " ", 1)
+                        write_hex8(fd, b1)
+                        write(fd, " ", 1)
+                        write_hex8(fd, modrm_xor)
+                        write(fd, "           xor ", 15)
+                        // rm field = modrm & 0x07, reg field = (modrm >> 3) & 0x07
+                        uint64 xor_rm = modrm_xor & 0x07
+                        uint64 xor_reg = (modrm_xor >> 3) & 0x07
+                        if xor_rm == 0 { write(fd, "rax", 3) }
+                        else if xor_rm == 1 { write(fd, "rcx", 3) }
+                        else if xor_rm == 2 { write(fd, "rdx", 3) }
+                        else if xor_rm == 3 { write(fd, "rbx", 3) }
+                        else if xor_rm == 4 { write(fd, "rsp", 3) }
+                        else if xor_rm == 5 { write(fd, "rbp", 3) }
+                        else if xor_rm == 6 { write(fd, "rsi", 3) }
+                        else { write(fd, "rdi", 3) }
+                        write(fd, ", ", 2)
+                        if xor_reg == 0 { write(fd, "rax", 3) }
+                        else if xor_reg == 1 { write(fd, "rcx", 3) }
+                        else if xor_reg == 2 { write(fd, "rdx", 3) }
+                        else if xor_reg == 3 { write(fd, "rbx", 3) }
+                        else if xor_reg == 4 { write(fd, "rsp", 3) }
+                        else if xor_reg == 5 { write(fd, "rbp", 3) }
+                        else if xor_reg == 6 { write(fd, "rsi", 3) }
+                        else { write(fd, "rdi", 3) }
+                        pos = pos + 3
+                    } else if b1 == 0x87 && pos + 3 <= fn_end {
+                        // xchg reg, r/m
+                        uint64 bp2x = bp + 2
+                        uint64 modrm_x = 0
+                        unsafe { *(bp2x as uint8) -> modrm_x }
+                        uint64 extra_x = x86_modrm_extra(modrm_x)
+                        uint64 tlen_x = 3 + extra_x
+                        if pos + tlen_x > fn_end { tlen_x = fn_end - pos }
+                        uint64 dbi_x = 0
+                        while dbi_x < tlen_x {
+                            uint64 dp_x = bp + dbi_x
+                            uint64 db_x = 0
+                            unsafe { *(dp_x as uint8) -> db_x }
+                            write_hex8(fd, db_x)
+                            if dbi_x + 1 < tlen_x { write(fd, " ", 1) }
+                            dbi_x = dbi_x + 1
+                        }
+                        write(fd, "  xchg ", 7)
+                        uint64 xch_reg = (modrm_x >> 3) & 7
+                        write_x86_reg64(fd, xch_reg)
+                        write(fd, ", ", 2)
+                        if (modrm_x >> 6) == 3 {
+                            write_x86_reg64(fd, modrm_x & 7)
+                        } else {
+                            write_x86_mem(fd, bp2x, 0)
+                        }
+                        pos = pos + tlen_x
+                    } else if (b1 == 0x01 || b1 == 0x29) && pos + 3 <= fn_end {
+                        // 0x01 = add r/m, reg ; 0x29 = sub r/m, reg
+                        uint64 bp2a = bp + 2
+                        uint64 modrm_a = 0
+                        unsafe { *(bp2a as uint8) -> modrm_a }
+                        uint64 extra_a = x86_modrm_extra(modrm_a)
+                        uint64 tlen_a = 3 + extra_a
+                        if pos + tlen_a > fn_end { tlen_a = fn_end - pos }
+                        uint64 dbi_a = 0
+                        while dbi_a < tlen_a {
+                            uint64 dp_a = bp + dbi_a
+                            uint64 db_a = 0
+                            unsafe { *(dp_a as uint8) -> db_a }
+                            write_hex8(fd, db_a)
+                            if dbi_a + 1 < tlen_a { write(fd, " ", 1) }
+                            dbi_a = dbi_a + 1
+                        }
+                        if b1 == 0x01 { write(fd, "  add ", 6) }
+                        else           { write(fd, "  sub ", 6) }
+                        if (modrm_a >> 6) == 3 {
+                            write_x86_reg64(fd, modrm_a & 7)
+                        } else {
+                            write_x86_mem(fd, bp2a, 0)
+                        }
+                        write(fd, ", ", 2)
+                        write_x86_reg64(fd, (modrm_a >> 3) & 7)
+                        pos = pos + tlen_a
+                    } else if b1 == 0x0F && pos + 4 <= fn_end {
+                        // Two-byte opcode under REX.W
+                        uint64 bp2o = bp + 2
+                        uint64 b2 = 0
+                        unsafe { *(bp2o as uint8) -> b2 }
+                        if b2 == 0xAF && pos + 4 <= fn_end {
+                            // imul reg, r/m
+                            uint64 bp3o = bp + 3
+                            uint64 modrm_im = 0
+                            unsafe { *(bp3o as uint8) -> modrm_im }
+                            uint64 extra_im = x86_modrm_extra(modrm_im)
+                            uint64 tlen_im = 4 + extra_im
+                            if pos + tlen_im > fn_end { tlen_im = fn_end - pos }
+                            uint64 dbi2 = 0
+                            while dbi2 < tlen_im {
+                                uint64 dpp2 = bp + dbi2
+                                uint64 dbb2 = 0
+                                unsafe { *(dpp2 as uint8) -> dbb2 }
+                                write_hex8(fd, dbb2)
+                                if dbi2 + 1 < tlen_im { write(fd, " ", 1) }
+                                dbi2 = dbi2 + 1
+                            }
+                            write(fd, "  imul ", 7)
+                            uint64 im_reg = (modrm_im >> 3) & 7
+                            write_x86_reg64(fd, im_reg)
+                            write(fd, ", ", 2)
+                            if (modrm_im >> 6) == 3 {
+                                write_x86_reg64(fd, modrm_im & 7)
+                            } else {
+                                write_x86_mem(fd, bp3o, 0)
+                            }
+                            pos = pos + tlen_im
+                        } else {
+                            // Other 0F xx under REX.W — dump 4 bytes raw
+                            uint64 cnt_o = 4
+                            if cnt_o + pos > fn_end { cnt_o = fn_end - pos }
+                            uint64 di_o = 0
+                            while di_o < cnt_o {
+                                uint64 dp_o = bp + di_o
+                                uint64 db_o = 0
+                                unsafe { *(dp_o as uint8) -> db_o }
+                                write_hex8(fd, db_o)
+                                write(fd, " ", 1)
+                                di_o = di_o + 1
+                            }
+                            pos = pos + cnt_o
+                        }
+                    } else if (b1 == 0x89 || b1 == 0x8B) && pos + 3 <= fn_end {
+                        // REX.W mov  — 0x89 = mov r/m, reg (store direction)
+                        //               0x8B = mov reg, r/m (load direction)
+                        // ModR/M: mod:2, reg:3, rm:3.
+                        // mod==3 → reg-reg (3 bytes total)
+                        // mod!=3 → memory operand; rm==4 adds SIB;
+                        //          mod==1 adds disp8; mod==2 adds disp32;
+                        //          mod==0 && rm==5 is RIP-relative disp32.
+                        uint64 bp2 = bp + 2
+                        uint64 modrm_mov = 0
+                        unsafe { *(bp2 as uint8) -> modrm_mov }
+                        uint64 mod_f = (modrm_mov >> 6) & 3
+                        uint64 rm_f  = modrm_mov & 7
+                        uint64 reg_f = (modrm_mov >> 3) & 7
+                        // Compute number of bytes after ModR/M
+                        uint64 extra = 0
+                        if mod_f != 3 {
+                            if rm_f == 4 { extra = extra + 1 }   // SIB
+                            if mod_f == 1 { extra = extra + 1 }  // disp8
+                            if mod_f == 2 { extra = extra + 4 }  // disp32
+                            if mod_f == 0 && rm_f == 5 { extra = extra + 4 }  // rip+disp32
+                        }
+                        uint64 total_len = 3 + extra
+                        if pos + total_len > fn_end { total_len = fn_end - pos }
+                        // Dump raw bytes (space-separated)
+                        uint64 dbi = 0
+                        while dbi < total_len {
+                            uint64 dpp = bp + dbi
+                            uint64 dbb = 0
+                            unsafe { *(dpp as uint8) -> dbb }
+                            write_hex8(fd, dbb)
+                            if dbi + 1 < total_len { write(fd, " ", 1) }
+                            dbi = dbi + 1
+                        }
+                        write(fd, "  mov ", 6)
+                        if mod_f == 3 {
+                            // reg-reg: "mov <rm>, <reg>" for 0x89; "mov <reg>, <rm>" for 0x8B
+                            uint64 left = rm_f
+                            uint64 right = reg_f
+                            if b1 == 0x8B { left = reg_f; right = rm_f }
+                            if left == 0 { write(fd, "rax", 3) }
+                            else if left == 1 { write(fd, "rcx", 3) }
+                            else if left == 2 { write(fd, "rdx", 3) }
+                            else if left == 3 { write(fd, "rbx", 3) }
+                            else if left == 4 { write(fd, "rsp", 3) }
+                            else if left == 5 { write(fd, "rbp", 3) }
+                            else if left == 6 { write(fd, "rsi", 3) }
+                            else { write(fd, "rdi", 3) }
+                            write(fd, ", ", 2)
+                            if right == 0 { write(fd, "rax", 3) }
+                            else if right == 1 { write(fd, "rcx", 3) }
+                            else if right == 2 { write(fd, "rdx", 3) }
+                            else if right == 3 { write(fd, "rbx", 3) }
+                            else if right == 4 { write(fd, "rsp", 3) }
+                            else if right == 5 { write(fd, "rbp", 3) }
+                            else if right == 6 { write(fd, "rsi", 3) }
+                            else { write(fd, "rdi", 3) }
+                        } else {
+                            // Memory operand. Resolve base register (SIB if rm==4).
+                            uint64 base_r = rm_f
+                            uint64 disp_ofs = 3
+                            if rm_f == 4 {
+                                uint64 bp_s = bp + 3
+                                uint64 sib_b = 0
+                                unsafe { *(bp_s as uint8) -> sib_b }
+                                base_r = sib_b & 7
+                                disp_ofs = 4
+                            }
+                            if b1 == 0x89 {
+                                // store: mov [base+disp], reg
+                                write(fd, "[", 1)
+                            } else {
+                                // load: mov reg, [base+disp]
+                                if reg_f == 0 { write(fd, "rax", 3) }
+                                else if reg_f == 1 { write(fd, "rcx", 3) }
+                                else if reg_f == 2 { write(fd, "rdx", 3) }
+                                else if reg_f == 3 { write(fd, "rbx", 3) }
+                                else if reg_f == 4 { write(fd, "rsp", 3) }
+                                else if reg_f == 5 { write(fd, "rbp", 3) }
+                                else if reg_f == 6 { write(fd, "rsi", 3) }
+                                else { write(fd, "rdi", 3) }
+                                write(fd, ", [", 3)
+                            }
+                            if mod_f == 0 && rm_f == 5 {
+                                write(fd, "rip", 3)
+                            } else if base_r == 0 { write(fd, "rax", 3) }
+                            else if base_r == 1 { write(fd, "rcx", 3) }
+                            else if base_r == 2 { write(fd, "rdx", 3) }
+                            else if base_r == 3 { write(fd, "rbx", 3) }
+                            else if base_r == 4 { write(fd, "rsp", 3) }
+                            else if base_r == 5 { write(fd, "rbp", 3) }
+                            else if base_r == 6 { write(fd, "rsi", 3) }
+                            else { write(fd, "rdi", 3) }
+                            if mod_f == 1 {
+                                write(fd, "+0x", 3)
+                                uint64 bp_d = bp + disp_ofs
+                                uint64 d8v = 0
+                                unsafe { *(bp_d as uint8) -> d8v }
+                                write_hex8(fd, d8v)
+                            } else if mod_f == 2 || (mod_f == 0 && rm_f == 5) {
+                                write(fd, "+0x", 3)
+                                uint64 bp_d0 = bp + disp_ofs
+                                uint64 bp_d1 = bp + disp_ofs + 1
+                                uint64 bp_d2 = bp + disp_ofs + 2
+                                uint64 bp_d3 = bp + disp_ofs + 3
+                                uint64 d32_0 = 0
+                                uint64 d32_1 = 0
+                                uint64 d32_2 = 0
+                                uint64 d32_3 = 0
+                                unsafe { *(bp_d0 as uint8) -> d32_0 }
+                                unsafe { *(bp_d1 as uint8) -> d32_1 }
+                                unsafe { *(bp_d2 as uint8) -> d32_2 }
+                                unsafe { *(bp_d3 as uint8) -> d32_3 }
+                                uint64 d32 = d32_0 | (d32_1 << 8) | (d32_2 << 16) | (d32_3 << 24)
+                                write_hex32(fd, d32)
+                            }
+                            if b1 == 0x89 {
+                                write(fd, "], ", 3)
+                                if reg_f == 0 { write(fd, "rax", 3) }
+                                else if reg_f == 1 { write(fd, "rcx", 3) }
+                                else if reg_f == 2 { write(fd, "rdx", 3) }
+                                else if reg_f == 3 { write(fd, "rbx", 3) }
+                                else if reg_f == 4 { write(fd, "rsp", 3) }
+                                else if reg_f == 5 { write(fd, "rbp", 3) }
+                                else if reg_f == 6 { write(fd, "rsi", 3) }
+                                else { write(fd, "rdi", 3) }
+                            } else {
+                                write(fd, "]", 1)
+                            }
+                        }
+                        pos = pos + total_len
+                    } else if b1 == 0x8D && pos + 3 <= fn_end {
+                        // LEA reg, [mem]: 48 8D <modrm> [sib] [disp]
+                        uint64 bp2 = bp + 2
+                        uint64 modrm_lea = 0
+                        unsafe { *(bp2 as uint8) -> modrm_lea }
+                        uint64 extra_lea = x86_modrm_extra(modrm_lea)
+                        uint64 total_len = 3 + extra_lea
+                        if pos + total_len > fn_end { total_len = fn_end - pos }
+                        uint64 dbi = 0
+                        while dbi < total_len {
+                            uint64 dpp = bp + dbi
+                            uint64 dbb = 0
+                            unsafe { *(dpp as uint8) -> dbb }
+                            write_hex8(fd, dbb)
+                            if dbi + 1 < total_len { write(fd, " ", 1) }
+                            dbi = dbi + 1
+                        }
+                        write(fd, "  lea ", 6)
+                        uint64 lea_reg = (modrm_lea >> 3) & 7
+                        write_x86_reg64(fd, lea_reg)
+                        write(fd, ", ", 2)
+                        write_x86_mem(fd, bp2, 0)
+                        pos = pos + total_len
+                    } else {
+                        // Other REX.W instructions — dump with byte count heuristic
+                        uint64 cnt = 3
+                        if b1 == 0x8B { cnt = 3 }
+                        else if b1 >= 0x00 && b1 <= 0x3F { cnt = 3 }
+                        if cnt + pos > fn_end { cnt = fn_end - pos }
+                        uint64 di = 0
+                        while di < cnt {
+                            uint64 dp = bp + di
+                            uint64 db = 0
+                            unsafe { *(dp as uint8) -> db }
+                            write_hex8(fd, db)
+                            write(fd, " ", 1)
+                            di = di + 1
+                        }
+                        pos = pos + cnt
+                    }
+                } else {
+                    // Generic: dump 1 byte per line for simple format
+                    uint64 cnt = 1
+                    // REX prefix? Read more bytes
+                    if b0 >= 0x40 && b0 <= 0x4F { cnt = 2 }
+                    if b0 == 0x49 {
+                        uint64 bp1 = bp + 1
+                        uint64 b1 = 0
+                        unsafe { *(bp1 as uint8) -> b1 }
+                        if b1 == 0xC7 { cnt = 7 }
+                        else if b1 == 0x89 || b1 == 0x8B { cnt = 3 }
+                        else if b1 == 0x81 { cnt = 7 }
+                        else if b1 == 0x83 { cnt = 4 }
+                        else if b1 == 0x31 { cnt = 3 }
+                        else { cnt = 3 }
+                    }
+                    if b0 == 0xB9 || b0 == 0xBA { cnt = 5 }
+                    if cnt + pos > fn_end { cnt = fn_end - pos }
+                    uint64 di = 0
+                    while di < cnt {
+                        uint64 dp = bp + di
+                        uint64 db = 0
+                        unsafe { *(dp as uint8) -> db }
+                        write_hex8(fd, db)
+                        write(fd, " ", 1)
+                        di = di + 1
+                    }
+                    pos = pos + cnt
+                }
+                write(fd, "\n", 1)
+            }
+        }
+        fi = fi + 1
+    }
+    file_close(fd)
+}
+
+// time_ns — monotonic nanoseconds. Recognized as a built-in by krc ≥ 2.6.2
+// (emits inline clock_gettime on Linux x86_64). This fallback body exists
+// only so that pre-2.6.2 compilers can resolve the symbol during bootstrap;
+// in the new compiler the built-in dispatch matches first and this body is
+// never reached.
+fn time_ns() -> uint64 {
+    return 0
+}
+
+// arch: 0=x86_64, 1=arm64
+// emit: 0=elfexe, 1=machoexe, 2=peexe, 3=obj (ELF relocatable), 5=asm listing, 6=ir dump
+fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode) {
+    uint64 t_start = time_ns()
+    set_target_arch(arch)
+    import_init()
+    import_check_file(input_path)
+    import_process(input_path)
+    uint64 source = import_buf
+    uint64 size = import_buf_len
+
+    uint64 max_tok = 262144
+    uint64 my_tokens = alloc(max_tok * 16)
+    lexer_init(source, size, my_tokens, max_tok)
+    uint64 tcount = lexer_run()
+
+    ast_init(262144)
+    codegen_init(4194304, source, my_tokens)
+    parser_init(my_tokens, tcount)
+    uint64 root = parse_module()
+
+    // Semantic validation: check arg counts, missing returns, duplicate functions
+    uint64 sema_errs = run_semantic_checks(root, source, my_tokens)
+    diag_report_all()
+    if sema_errs != 0 {
+        uint8[24] ebuf
+        uint64 elen = fmt_uint(ebuf, sema_errs)
+        write(2, ebuf, elen)
+        write(2, " error(s) found\n", 16)
+        exit(1)
+    }
+
+    // Dead code elimination: scan AST for reachable functions
+    dce_init()
+    dce_scan(root)
+
+    // IR dump: lower each function to IR and print, then exit early
+    if emit_mode == 6 {
+        ir_init()
+        uint32 child = ast_child(root)
+        uint64 wchild = child
+        while wchild != 0 {
+            uint32 ck = ast_kind(wchild)
+            if ck == 2 {
+                uint32 fn_name = ast_data1(wchild)
+                if dce_is_live(fn_name) != 0 {
+                    uint64 ns = tok_text_start(fn_name)
+                    uint64 nl = tok_text_len(fn_name)
+                    write(1, "function ", 9)
+                    write(1, source + ns, nl)
+                    write(1, ":\n", 2)
+                    ir_lower_function(wchild)
+                    ir_dump()
+                    write(1, "\n", 1)
+                }
+            }
+            uint32 nxt = ast_next(wchild)
+            wchild = nxt
+        }
+        // Print summary
+        uint8[64] nb
+        uint64 tl = fmt_uint(nb, tcount)
+        write(1, nb, tl)
+        write(1, " tokens, ", 9)
+        uint64 nl2 = fmt_uint(nb, ast_count)
+        write(1, nb, nl2)
+        write(1, " nodes -> IR dump\n", 18)
+        exit(0)
+    }
+
+    // Emit headers based on format (skip for .o — code goes at offset 0)
+    uint64 header_size = 120
+    if emit_mode == 0 {
+        // ELF
+        if arch == 0 {
+            emit_elf_header()
+        } else {
+            emit_elf_header_a64()
+        }
+        emit_program_header(0)
+    } else if emit_mode == 1 {
+        // Mach-O
+        if arch == 0 {
+            header_size = emit_macho_headers_x64(0)
+        } else {
+            header_size = emit_macho_headers_a64(0)
+        }
+    } else if emit_mode == 2 {
+        // PE
+        if arch == 0 {
+            header_size = emit_pe_headers_x64(0)
+        } else {
+            header_size = emit_pe_headers_a64(0)
+        }
+    } else if emit_mode == 3 {
+        // ELF relocatable (.o) — no header at start, code goes at offset 0
+        header_size = 0
+    } else if emit_mode == 4 {
+        // Android PIE ELF (ARM64 or x86_64)
+        if arch == 0 {
+            emit_elf_header_android_x86_64()
+        } else {
+            emit_elf_header_android_a64()
+        }
+        header_size = 1024
+    } else if emit_mode == 5 {
+        // ASM listing — no header, code at offset 0
+        header_size = 0
+    }
+
+    uint64 text_start = codegen_output_len()
+
+    // Generate code for each function (skip dead functions via DCE)
+    uint32 child = ast_child(root)
+    uint64 wchild = child
+    while wchild != 0 {
+        uint32 ck = ast_kind(wchild)
+        if ck == 2 {
+            uint32 fn_name = ast_data1(wchild)
+            if dce_is_live(fn_name) != 0 {
+                if emit_ir_mode != 0 && arch == 0 && emit_mode != 3 {
+                    // IR codegen (skip for --emit=obj which needs legacy for extern relocations)
+                    fn_register(fn_name, out_len)
+                    // Record a DWARF line-table entry at the function's
+                    // entry address so GDB can correlate `break <name>`
+                    // with the first source line.
+                    line_table_record_fn_entry(fn_name)
+                    ir_init()
+                    ir_emit_x86_function(wchild)
+                } else if emit_ir_mode != 0 && arch == 1 && emit_mode != 3 {
+                    // IR codegen ARM64 (default; --legacy bypasses)
+                    fn_register(fn_name, out_len)
+                    line_table_record_fn_entry(fn_name)
+                    ir_init()
+                    ir_emit_arm64_function(wchild)
+                } else if arch == 0 {
+                    // Legacy x86: gen_function registers internally.
+                    // Record the entry-address line first so DWARF sees it.
+                    line_table_record_fn_entry(fn_name)
+                    gen_function(wchild)
+                } else {
+                    // Legacy ARM64: gen_function_a64 registers internally.
+                    line_table_record_fn_entry(fn_name)
+                    gen_function_a64(wchild)
+                }
+            }
+        }
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+
+    // Resolve call fixups
+    if arch == 0 {
+        resolve_fixups()
+        resolve_fnaddr_fixups()
+    } else {
+        resolve_fixups_a64()
+        resolve_fnaddr_fixups_a64()
+    }
+
+    // Emit static + string data. Align to 8 bytes on arm64 so the 64-bit
+    // LDR (imm12 scaled by 8) can encode any slot offset exactly — without
+    // padding, a static at a non-8-aligned offset silently rounds down and
+    // reads trailing code bytes instead of its own value.
+    if arch == 1 {
+        while (codegen_output_len() & 7) != 0 { emit_byte(0) }
+    }
+    uint64 data_start = codegen_output_len()
+    emit_static_data()
+    if arch == 0 {
+        resolve_static_fixups(data_start)
+    } else {
+        resolve_static_fixups_a64(data_start)
+    }
+    uint64 str_start = codegen_output_len()
+    emit_string_data()
+    if arch == 0 {
+        resolve_string_fixups(str_start)
+    } else {
+        resolve_string_fixups_a64(str_start)
+    }
+
+    uint64 text_size = codegen_output_len() - text_start
+
+    // For .o relocatable, pick format from target_os:
+    //   0 linux  → ELF
+    //   1 macOS  → Mach-O
+    //   2 win    → COFF (PE object)
+    //   3 android → ELF
+    //   4 freebsd → ELF
+    if emit_mode == 3 {
+        uint64 total_code = codegen_output_len()
+        if target_os == 1 {
+            emit_macho_relocatable(total_code, 0, arch)
+        } else if target_os == 2 {
+            emit_coff_relocatable(total_code, 0, arch)
+        } else {
+            emit_elf_relocatable(total_code, 0, arch)
+        }
+        codegen_write_output(output_path)
+
+        uint8[64] nb
+        uint64 tl = fmt_uint(nb, tcount)
+        write(1, nb, tl)
+        uint64 msg = " tokens, "
+        write(1, msg, 9)
+        uint64 al = fmt_uint(nb, ast_count)
+        write(1, nb, al)
+        msg = " nodes, "
+        write(1, msg, 8)
+        uint64 cl = fmt_uint(nb, text_size)
+        write(1, nb, cl)
+        msg = " bytes -> "
+        write(1, msg, 10)
+        uint64 olen = str_len(output_path)
+        write(1, output_path, olen)
+        msg = " (relocatable)\n"
+        write(1, msg, 15)
+        return
+    }
+
+    // For ASM listing, output text disassembly
+    if emit_mode == 5 {
+        emit_asm_listing(output_path, arch, text_start, source, 0)
+
+        uint8[64] nb
+        uint64 tl = fmt_uint(nb, tcount)
+        write(1, nb, tl)
+        uint64 msg = " tokens, "
+        write(1, msg, 9)
+        uint64 al = fmt_uint(nb, ast_count)
+        write(1, nb, al)
+        msg = " nodes, "
+        write(1, msg, 8)
+        uint64 cl = fmt_uint(nb, text_size)
+        write(1, nb, cl)
+        msg = " bytes -> "
+        write(1, msg, 10)
+        uint64 olen = str_len(output_path)
+        write(1, output_path, olen)
+        msg = " (asm listing)\n"
+        write(1, msg, 15)
+        return
+    }
+
+    // Patch headers
+    uint64 entry_off = find_main_offset()
+    if entry_off == 0xFFFFFFFF {
+        write(2, "error: no 'main' function found\n", 32)
+        write(2, "Every KernRift program needs: fn main() { ... }\n", 49)
+        exit(1)
+    }
+    if emit_mode == 0 {
+        // ELF entry point
+        uint64 entry_va = 0x400000 + entry_off
+        patch_u32(24, entry_va & 0xFFFFFFFF)
+        patch_u32(28, (entry_va >> 32) & 0xFFFFFFFF)
+        uint64 total_size = header_size + text_size
+        patch_u32(96, total_size & 0xFFFFFFFF)
+        patch_u32(100, (total_size >> 32) & 0xFFFFFFFF)
+        patch_u32(104, total_size & 0xFFFFFFFF)
+        patch_u32(108, (total_size >> 32) & 0xFFFFFFFF)
+        // Emit DWARF debug sections if -g active
+        if debug_info_mode != 0 {
+            emit_elf_debug_footer(text_start, input_path)
+        }
+    } else if emit_mode == 1 {
+        // Mach-O
+        uint64 page_size = 4096
+        if arch == 1 { page_size = 16384 }
+        uint64 total_file = codegen_output_len()
+        uint64 total_aligned = (total_file + page_size - 1) & ~(page_size - 1)
+        while codegen_output_len() < total_aligned { emit_byte(0) }
+        patch_u32(136, total_aligned & 0xFFFFFFFF)
+        patch_u32(140, (total_aligned >> 32) & 0xFFFFFFFF)
+        patch_u32(152, total_aligned & 0xFFFFFFFF)
+        patch_u32(156, (total_aligned >> 32) & 0xFFFFFFFF)
+        uint64 main_off_macho = find_main_offset()
+        if arch == 0 {
+            // x86_64: LC_UNIXTHREAD — absolute VA
+            uint64 entry_va = 0x100000000 + main_off_macho
+            patch_u32(320, entry_va & 0xFFFFFFFF)
+            patch_u32(324, (entry_va >> 32) & 0xFFFFFFFF)
+        } else {
+            // ARM64 LC_MAIN entryoff = file offset of main
+            patch_u32(608, main_off_macho & 0xFFFFFFFF)
+            patch_u32(612, (main_off_macho >> 32) & 0xFFFFFFFF)
+        }
+        // ARM64 Mach-O: patch __text section + separate __DATA segment for W^X
+        if arch == 1 {
+            // __text section size at offset 216
+            uint64 m_textsz = total_aligned - 16384
+            patch_u32(216, m_textsz & 0xFFFFFFFF)
+            patch_u32(220, (m_textsz >> 32) & 0xFFFFFFFF)
+            uint64 m_dfoff = codegen_output_len()
+            emit_static_data()
+            uint64 m_draw = codegen_output_len() - m_dfoff
+            uint64 m_dal = (m_draw + 16383) & ~16383
+            if m_dal == 0 { m_dal = 16384 }
+            while codegen_output_len() < m_dfoff + m_dal { emit_byte(0) }
+            resolve_static_fixups_a64(m_dfoff)
+            uint64 m_dva = 0x100000000 + total_aligned
+            patch_u32(280, m_dva & 0xFFFFFFFF)
+            patch_u32(284, (m_dva >> 32) & 0xFFFFFFFF)
+            patch_u32(288, m_dal & 0xFFFFFFFF)
+            patch_u32(292, (m_dal >> 32) & 0xFFFFFFFF)
+            patch_u32(296, total_aligned & 0xFFFFFFFF)
+            patch_u32(300, (total_aligned >> 32) & 0xFFFFFFFF)
+            patch_u32(304, m_dal & 0xFFFFFFFF)
+            patch_u32(308, (m_dal >> 32) & 0xFFFFFFFF)
+            // __LINKEDIT: call helper to emit chained fixups + symtab + strtab
+            uint64 m_lva = m_dva + m_dal
+            uint64 m_lfoff = m_dfoff + m_dal
+            emit_macho_linkedit_a64(m_lfoff, main_off_macho)
+            uint64 m_lraw = codegen_output_len() - m_lfoff
+            uint64 m_lsz = (m_lraw + 16383) & ~16383
+            if m_lsz == 0 { m_lsz = 16384 }
+            while codegen_output_len() < m_lfoff + m_lsz { emit_byte(0) }
+            patch_u32(352, m_lva & 0xFFFFFFFF)
+            patch_u32(356, (m_lva >> 32) & 0xFFFFFFFF)
+            patch_u32(360, m_lsz & 0xFFFFFFFF)
+            patch_u32(364, (m_lsz >> 32) & 0xFFFFFFFF)
+            patch_u32(368, m_lfoff & 0xFFFFFFFF)
+            patch_u32(372, (m_lfoff >> 32) & 0xFFFFFFFF)
+            patch_u32(376, m_lraw & 0xFFFFFFFF)
+            patch_u32(380, (m_lraw >> 32) & 0xFFFFFFFF)
+        }
+    } else if emit_mode == 2 {
+        // PE: patch entry point to main function
+        uint64 main_off = find_main_offset()
+        uint64 pe_entry = 0x1000 + main_off - text_start
+        patch_u32(0x68, pe_entry)
+
+        uint64 text_aligned = 0
+        uint64 text_va_size = 0
+        uint64 idata_rva = 0
+
+        if arch == 1 {
+            // ARM64 PE: separate .data section for statics (W^X enforcement)
+            // .text = code + strings only (RX)
+            // .data = statics (RW)
+            // .idata = imports (RW)
+            uint64 code_end = data_start  // data_start from earlier = end of code
+            uint64 code_with_strings = codegen_output_len() - text_start
+            // Rewind: remove statics from output (they were emitted into .text)
+            // We can't rewind, but we can just note where code+strings end vs statics begin
+            // Actually, statics are already in the buffer. We'll re-emit them into .data.
+            // For the .text section, include code + statics + strings (the whole text_size)
+            // but mark it as RX. Then emit .data with a copy of statics.
+            text_aligned = (text_size + 0x1FF) & ~0x1FF
+            while codegen_output_len() < header_size + text_aligned { emit_byte(0) }
+            // Emit .data section: re-emit statics
+            uint64 data_file_off = codegen_output_len()
+            emit_static_data()
+            uint64 data_raw_size = codegen_output_len() - data_file_off
+            uint64 data_aligned = (data_raw_size + 0x1FF) & ~0x1FF
+            if data_aligned == 0 { data_aligned = 0x200 }
+            while codegen_output_len() < data_file_off + data_aligned { emit_byte(0) }
+            // Re-resolve static fixups to point into .data
+            text_va_size = (text_size + 0xFFF) & ~0xFFF
+            uint64 data_rva = 0x1000 + text_va_size
+            uint64 data_va_size = (data_raw_size + 0xFFF) & ~0xFFF
+            if data_va_size == 0 { data_va_size = 0x1000 }
+            // Static fixups: re-resolve for .data section
+            // For PE ADRP: the resolve function uses a64_compute_va which adds 0x140000E00.
+            // We need target_va = 0x140000000 + data_rva + offset.
+            // Pass data_rva - 0xE00 so that a64_compute_va(base + offset) = correct VA.
+            // BUT for ADRP mode, code_va is also computed via a64_compute_va — which IS correct
+            // for code in .text. So we need data_start such that:
+            // a64_compute_va(data_start + offset) = 0x140000000 + data_rva + offset
+            // 0x140000E00 + data_start + offset = 0x140000000 + data_rva + offset
+            // data_start = data_rva - 0xE00
+            uint64 data_va_base = data_rva - 0xE00
+            resolve_static_fixups_a64(data_va_base)
+            // Emit .idata
+            idata_rva = 0x1000 + text_va_size + data_va_size
+            uint64 iat_rva_val = emit_pe_idata(idata_rva)
+            pe_iat_rva = iat_rva_val
+            // Patch .text header at 0x148
+            uint64 t_hdr = 0x148
+            patch_u32(t_hdr + 8, text_size)        // VirtualSize
+            patch_u32(t_hdr + 16, text_aligned)     // RawSize
+            // Patch .data header at 0x170
+            uint64 d_hdr = 0x170
+            patch_u32(d_hdr + 8, data_raw_size)     // VirtualSize
+            patch_u32(d_hdr + 12, data_rva)          // VirtualAddress
+            patch_u32(d_hdr + 16, data_aligned)      // RawSize
+            patch_u32(d_hdr + 20, data_file_off)     // PointerToRawData
+            // Patch .idata header at 0x198
+            uint64 i_hdr = 0x198
+            uint64 idata_file_off = data_file_off + data_aligned
+            patch_u32(i_hdr + 8, pe_idata_size())    // VirtualSize
+            patch_u32(i_hdr + 12, idata_rva)          // VirtualAddress
+            patch_u32(i_hdr + 16, pe_idata_size())    // RawSize
+            patch_u32(i_hdr + 20, idata_file_off)     // PointerToRawData
+            // Patch import directory RVA
+            patch_u32(0xD0, idata_rva)
+            // Patch SizeOfCode
+            patch_u32(0x5C, text_aligned)
+            // Patch ImageSize
+            uint64 image_size = 0x1000 + text_va_size + data_va_size + 0x1000
+            patch_u32(0x90, image_size)
+            // Resolve ARM64 IAT fixups
+            resolve_a64_win_iat_fixups(text_start, iat_rva_val)
+        } else {
+            // x86_64 PE: statics in .text (RWX) — x86_64 allows this
+            text_aligned = (text_size + 0x1FF) & ~0x1FF
+            while codegen_output_len() < header_size + text_aligned { emit_byte(0) }
+            text_va_size = (text_size + 0xFFF) & ~0xFFF
+            idata_rva = 0x1000 + text_va_size
+            uint64 iat_rva_val = emit_pe_idata(idata_rva)
+            pe_iat_rva = iat_rva_val
+            // Patch .text header at 0x148
+            uint64 text_hdr = 0x148
+            patch_u32(text_hdr + 8, text_size)
+            patch_u32(text_hdr + 16, text_aligned)
+            // Patch .idata header at 0x170
+            uint64 idata_hdr = 0x170
+            patch_u32(idata_hdr + 12, idata_rva)
+            uint64 idata_file_off = header_size + text_aligned
+            patch_u32(idata_hdr + 20, idata_file_off)
+            // Import directory RVA
+            patch_u32(0xD0, idata_rva)
+            // SizeOfCode
+            patch_u32(0x5C, text_aligned)
+            // ImageSize
+            uint64 image_size = 0x1000 + text_va_size + 0x1000
+            patch_u32(0x90, image_size)
+            // Resolve x86_64 IAT fixups
+            resolve_win_iat_fixups(text_start, iat_rva_val)
+        }
+    } else if emit_mode == 4 {
+        // Android PIE ELF: separate RX code + RW data segments
+        uint64 android_entry = entry_off
+        patch_u32(24, android_entry & 0xFFFFFFFF)
+        patch_u32(28, (android_entry >> 32) & 0xFFFFFFFF)
+        // PT_LOAD RX: code + strings only (up to current output)
+        uint64 rx_size = codegen_output_len()
+        patch_u32(208, rx_size & 0xFFFFFFFF)
+        patch_u32(212, (rx_size >> 32) & 0xFFFFFFFF)
+        patch_u32(216, rx_size & 0xFFFFFFFF)
+        patch_u32(220, (rx_size >> 32) & 0xFFFFFFFF)
+        // Pad to 64KB page boundary for PT_LOAD RW
+        uint64 rx_aligned = (rx_size + 0xFFFF) & ~0xFFFF
+        while codegen_output_len() < rx_aligned { emit_byte(0) }
+        // Emit data segment (statics)
+        uint64 a_dfoff = codegen_output_len()
+        emit_static_data()
+        uint64 a_draw = codegen_output_len() - a_dfoff
+        uint64 a_dal = (a_draw + 0xFFFF) & ~0xFFFF
+        if a_dal == 0 { a_dal = 0x10000 }
+        while codegen_output_len() < a_dfoff + a_dal { emit_byte(0) }
+        // Re-resolve static fixups to point into RW segment.
+        // x86_64: RIP-relative disp from (code_off + 4) to (a_dfoff + data_off).
+        // arm64: a64_compute_va returns file_offset for target_os==3, so
+        // passing a_dfoff directly gives the right VA for the RW data copy.
+        if arch == 0 {
+            resolve_static_fixups(a_dfoff)
+        } else {
+            resolve_static_fixups_a64(a_dfoff)
+        }
+        // Patch PT_LOAD RW @288: p_offset, p_vaddr, p_paddr, p_filesz, p_memsz
+        patch_u32(296, a_dfoff & 0xFFFFFFFF)
+        patch_u32(300, (a_dfoff >> 32) & 0xFFFFFFFF)
+        // vaddr = rx_aligned (page-aligned, contiguous after RX in VA space)
+        patch_u32(304, rx_aligned & 0xFFFFFFFF)
+        patch_u32(308, (rx_aligned >> 32) & 0xFFFFFFFF)
+        // paddr = same as vaddr
+        patch_u32(312, rx_aligned & 0xFFFFFFFF)
+        patch_u32(316, (rx_aligned >> 32) & 0xFFFFFFFF)
+        patch_u32(320, a_draw & 0xFFFFFFFF)
+        patch_u32(324, (a_draw >> 32) & 0xFFFFFFFF)
+        // p_memsz uses the page-aligned size (a_dal), not the raw data size.
+        // Android's bionic linker refuses to map a LOAD segment whose p_memsz
+        // is 0 — the resulting process SIGBUSes the moment it touches the
+        // corresponding VA. Pinning p_memsz to at least one page keeps the
+        // linker happy even for programs with no declared statics.
+        patch_u32(328, a_dal & 0xFFFFFFFF)
+        patch_u32(332, (a_dal >> 32) & 0xFFFFFFFF)
+    }
+
+    codegen_write_output(output_path)
+    // Mark the output executable so `./out` works immediately.
+    // No-op on Windows; safe on Linux/macOS/Android.
+    set_executable(output_path)
+
+    uint64 t_end = time_ns()
+    uint64 elapsed_ns = t_end - t_start
+
+    uint8[64] nb
+    uint64 tl = fmt_uint(nb, tcount)
+    write(1, nb, tl)
+    uint64 msg = " tokens, "
+    write(1, msg, 9)
+    uint64 al = fmt_uint(nb, ast_count)
+    write(1, nb, al)
+    msg = " nodes, "
+    write(1, msg, 8)
+    uint64 cl = fmt_uint(nb, text_size)
+    write(1, nb, cl)
+    msg = " bytes -> "
+    write(1, msg, 10)
+    uint64 olen = str_len(output_path)
+    write(1, output_path, olen)
+    if t_start != 0 {
+        // Format as "x.xx ms" — hundredths-of-ms precision from ns.
+        // ms_whole = ns / 1_000_000; hundredths = (ns / 10_000) % 100
+        uint64 ms_whole = elapsed_ns / 1000000
+        uint64 ms_hund  = (elapsed_ns / 10000) % 100
+        msg = "  ("
+        write(1, msg, 3)
+        uint64 w_len = fmt_uint(nb, ms_whole)
+        write(1, nb, w_len)
+        msg = "."
+        write(1, msg, 1)
+        // Two-digit hundredths with leading zero
+        uint8[2] hb
+        uint8 d0 = 48 + (ms_hund / 10)
+        uint8 d1 = 48 + (ms_hund % 10)
+        unsafe { *(hb as uint8) = d0 }
+        uint64 hb1 = hb + 1
+        unsafe { *(hb1 as uint8) = d1 }
+        write(1, hb, 2)
+        msg = " ms)\n"
+        write(1, msg, 5)
+    } else {
+        msg = "\n"
+        write(1, msg, 1)
+    }
+}
+
+// Produce KrboFat: compile for both x86_64 and ARM64, LZ4-compress, wrap in fat binary
+// Restore source and token buffers from snapshot before a re-parse in compile_fat.
+// The for-loop parser (and others) destructively mutate both; this rolls them back.
+fn restore_src_and_tokens(uint64 source, uint64 size, uint64 src_snap, uint64 tokens, uint64 tok_bytes, uint64 tok_snap) {
+    memcpy(source, src_snap, size)
+    memcpy(tokens, tok_snap, tok_bytes)
+}
+
+// --targets=<list> bitmask. 0 = unset (default: all 8, paired layout).
+// Bit i (0..7) maps to KrboFat arch_id i+1:
+//   0 linux-x64, 1 linux-arm64, 2 win-x64, 3 win-arm64,
+//   4 macos-x64, 5 macos-arm64, 6 android-arm64, 7 android-x64.
+static uint64 target_mask = 0
+
+// Compare a fixed-length string `s` of length `len` against a nul-terminated
+// literal `lit`. Return 1 iff they match exactly (including length).
+fn targets_name_eq(uint64 s, uint64 len, uint64 lit) -> uint64 {
+    uint64 llen = str_len(lit)
+    if len != llen { return 0 }
+    return str_starts_with(s, lit, len)
+}
+
+// Return the target bit (0..7) for a platform name slice, or 0xFF if
+// unrecognised. Accepts several common aliases.
+fn parse_target_name(uint64 s, uint64 len) -> uint64 {
+    if targets_name_eq(s, len, "linux-x64") != 0 { return 0 }
+    if targets_name_eq(s, len, "linux-x86_64") != 0 { return 0 }
+    if targets_name_eq(s, len, "linux-arm64") != 0 { return 1 }
+    if targets_name_eq(s, len, "linux-aarch64") != 0 { return 1 }
+    if targets_name_eq(s, len, "win-x64") != 0 { return 2 }
+    if targets_name_eq(s, len, "windows-x64") != 0 { return 2 }
+    if targets_name_eq(s, len, "win-arm64") != 0 { return 3 }
+    if targets_name_eq(s, len, "windows-arm64") != 0 { return 3 }
+    if targets_name_eq(s, len, "mac-x64") != 0 { return 4 }
+    if targets_name_eq(s, len, "macos-x64") != 0 { return 4 }
+    if targets_name_eq(s, len, "mac-arm64") != 0 { return 5 }
+    if targets_name_eq(s, len, "macos-arm64") != 0 { return 5 }
+    if targets_name_eq(s, len, "android-arm64") != 0 { return 6 }
+    if targets_name_eq(s, len, "android-x64") != 0 { return 7 }
+    if targets_name_eq(s, len, "android-x86_64") != 0 { return 7 }
+    return 0xFF
+}
+
+// Parse "a,b,c" or "all" into target_mask. Unknown names produce a warning
+// on stderr; recognised ones each flip one bit. "all" sets all 8 bits.
+fn parse_targets_arg(uint64 list) {
+    uint64 mask = 0
+    uint64 i = 0
+    uint64 c = 0
+    uint64 p0 = list + i
+    unsafe { *(p0 as uint8) -> c }
+    while c != 0 {
+        uint64 start = i
+        while c != 0 && c != 44 {
+            i = i + 1
+            uint64 pn = list + i
+            unsafe { *(pn as uint8) -> c }
+        }
+        uint64 tok_start = list + start
+        uint64 tok_len = i - start
+        if tok_len > 0 {
+            if targets_name_eq(tok_start, tok_len, "all") != 0 {
+                mask = mask | 0xFF
+            } else {
+                uint64 bit = parse_target_name(tok_start, tok_len)
+                if bit != 0xFF {
+                    mask = mask | (1 << bit)
+                } else {
+                    write(2, "warning: unknown --targets name: ", 33)
+                    write(2, tok_start, tok_len)
+                    write(2, "\n", 1)
+                }
+            }
+        }
+        if c == 44 {
+            i = i + 1
+            uint64 pc = list + i
+            unsafe { *(pc as uint8) -> c }
+        }
+    }
+    target_mask = mask
+}
+
+fn slot_load_u64(uint64 p) -> uint64 {
+    uint64 v = 0
+    unsafe { *(p as uint64) -> v }
+    return v
+}
+
+fn emit_raw_bytes(uint64 buf, uint64 len) {
+    uint64 i = 0
+    while i < len {
+        uint64 p = buf + i
+        uint64 bv = 0
+        unsafe { *(p as uint8) -> bv }
+        uint8 bb = bv
+        emit_byte(bb)
+        i = i + 1
+    }
+}
+
+fn compress_pair_best(
+    uint64 a_buf, uint64 a_len, uint64 b_buf, uint64 b_len,
+    uint64 out_comp_ptr, uint64 out_comp_len_ptr,
+    uint64 out_a_off_ptr, uint64 out_b_off_ptr,
+    uint64 out_pair_len_ptr
+) {
+    uint64 pair_len = a_len + b_len
+    uint64 cap = lz4_compress_bound(pair_len)
+
+    uint64 pair_ab = alloc(pair_len)
+    memcpy(pair_ab, a_buf, a_len)
+    memcpy(pair_ab + a_len, b_buf, b_len)
+    uint64 comp_ab = alloc(cap)
+    uint64 len_ab = lz4_compress_frame(pair_ab, pair_len, comp_ab)
+
+    uint64 pair_ba = alloc(pair_len)
+    memcpy(pair_ba, b_buf, b_len)
+    memcpy(pair_ba + b_len, a_buf, a_len)
+    uint64 comp_ba = alloc(cap)
+    uint64 len_ba = lz4_compress_frame(pair_ba, pair_len, comp_ba)
+
+    dealloc(pair_ab)
+    dealloc(pair_ba)
+
+    if len_ab <= len_ba {
+        unsafe { *(out_comp_ptr as uint64) = comp_ab }
+        unsafe { *(out_comp_len_ptr as uint64) = len_ab }
+        unsafe { *(out_a_off_ptr as uint64) = 0 }
+        unsafe { *(out_b_off_ptr as uint64) = a_len }
+        dealloc(comp_ba)
+    } else {
+        unsafe { *(out_comp_ptr as uint64) = comp_ba }
+        unsafe { *(out_comp_len_ptr as uint64) = len_ba }
+        unsafe { *(out_a_off_ptr as uint64) = b_len }
+        unsafe { *(out_b_off_ptr as uint64) = 0 }
+        dealloc(comp_ab)
+    }
+
+    unsafe { *(out_pair_len_ptr as uint64) = pair_len }
+}
+
+fn compile_fat(uint64 input_path, uint64 output_path) {
+    uint64 t_start_fat = time_ns()
+    import_init()
+    import_check_file(input_path)
+    import_process(input_path)
+    uint64 source = import_buf
+    uint64 size = import_buf_len
+
+    uint64 max_tok = 262144
+    uint64 my_tokens = alloc(max_tok * 16)
+    lexer_init(source, size, my_tokens, max_tok)
+    uint64 tcount = lexer_run()
+
+    // Save token count for reuse
+    uint64 saved_tcount = tcount
+
+    // Snapshot source and tokens before the first parse.
+    // The parser MUTATES source and tokens (the for-loop parser in
+    // particular rewrites byte positions and token kinds). compile_fat
+    // re-parses once per platform slice, so we need to restore the
+    // pristine state between passes.
+    uint64 src_snapshot = alloc(size)
+    uint64 cpi = 0
+    while cpi < size {
+        uint64 sp_src = source + cpi
+        uint64 dp_src = src_snapshot + cpi
+        uint64 bv_src = 0
+        unsafe { *(sp_src as uint8) -> bv_src }
+        uint8 bb_src = bv_src
+        unsafe { *(dp_src as uint8) = bb_src }
+        cpi = cpi + 1
+    }
+    uint64 tok_bytes = saved_tcount * 16
+    uint64 tok_snapshot = alloc(tok_bytes)
+    uint64 cti = 0
+    while cti < tok_bytes {
+        uint64 sp_tk = my_tokens + cti
+        uint64 dp_tk = tok_snapshot + cti
+        uint64 bv_tk = 0
+        unsafe { *(sp_tk as uint8) -> bv_tk }
+        uint8 bb_tk = bv_tk
+        unsafe { *(dp_tk as uint8) = bb_tk }
+        cti = cti + 1
+    }
+
+    // === Compile x86_64 ELF (Linux) ===
+    target_os = 0
+    set_target_arch(0)
+    ast_init(262144)
+    codegen_init(4194304, source, my_tokens)
+    parser_init(my_tokens, saved_tcount)
+    uint64 root = parse_module()
+
+    // Semantic validation: check arg counts, missing returns, duplicate functions
+    uint64 sema_errs = run_semantic_checks(root, source, my_tokens)
+    diag_report_all()
+    if sema_errs != 0 {
+        uint8[24] ebuf2
+        uint64 elen2 = fmt_uint(ebuf2, sema_errs)
+        write(2, ebuf2, elen2)
+        write(2, " error(s) found\n", 16)
+        exit(1)
+    }
+
+    // Dead code elimination
+    dce_init()
+    dce_scan(root)
+
+    // Generate x86_64 ELF into temp buffer.
+    // The per-slice buffer is allocated AFTER codegen (same pattern as the
+    // arm64 / pe / macho / android slices below) because the 1 MB upfront
+    // allocation the code used to make silently overflowed once the slice
+    // grew past that size — harmlessly on Linux (the overflow lands in
+    // mapped heap pages) but as a SIGSEGV on Windows, where VirtualAlloc
+    // leaves guard pages between reservations.
+    uint64 x86_len = 0
+
+    emit_elf_header()
+    emit_program_header(0)
+    uint64 text_start = codegen_output_len()
+
+    uint32 child = ast_child(root)
+    uint64 wchild = child
+    while wchild != 0 {
+        uint32 ck = ast_kind(wchild)
+        if ck == 2 {
+            uint32 fn_name = ast_data1(wchild)
+            // IR is the default for every slice. `--legacy` (emit_ir_mode==0)
+            // opts a release build back onto the direct-walking codegen if a
+            // downstream issue is ever traced to the IR path; the old codegen
+            // is kept intact for that reason.
+            if dce_is_live(fn_name) != 0 {
+                if emit_ir_mode != 0 {
+                    fn_register(fn_name, out_len)
+                    ir_init()
+                    ir_emit_x86_function(wchild)
+                } else {
+                    gen_function(wchild)
+                }
+            }
+        }
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+    resolve_fixups()
+    resolve_fnaddr_fixups()
+    uint64 data_start = codegen_output_len()
+    emit_static_data()
+    resolve_static_fixups(data_start)
+    uint64 str_start = codegen_output_len()
+    emit_string_data()
+    resolve_string_fixups(str_start)
+    uint64 text_size = codegen_output_len() - text_start
+    uint64 entry_off = find_main_offset()
+    if entry_off == 0xFFFFFFFF {
+        write(2, "error: no 'main' function found\n", 32)
+        write(2, "Every KernRift program needs: fn main() { ... }\n", 49)
+        exit(1)
+    }
+    uint64 entry_va = 0x400000 + entry_off
+    patch_u32(24, entry_va & 0xFFFFFFFF)
+    patch_u32(28, (entry_va >> 32) & 0xFFFFFFFF)
+    uint64 total_size_x86 = 120 + text_size
+    patch_u32(96, total_size_x86 & 0xFFFFFFFF)
+    patch_u32(100, (total_size_x86 >> 32) & 0xFFFFFFFF)
+    patch_u32(104, total_size_x86 & 0xFFFFFFFF)
+    patch_u32(108, (total_size_x86 >> 32) & 0xFFFFFFFF)
+
+    // Copy x86_64 output to temp buffer
+    x86_len = codegen_output_len()
+    uint64 x86_buf = alloc(x86_len)
+    uint64 xi = 0
+    while xi < x86_len {
+        uint64 sp = out_buf + xi
+        uint64 dp = x86_buf + xi
+        uint64 bv = 0
+        unsafe { *(sp as uint8) -> bv }
+        uint8 bb = bv
+        unsafe { *(dp as uint8) = bb }
+        xi = xi + 1
+    }
+
+    // === Compile ARM64 ===
+    set_target_arch(1)
+    // Reset codegen for ARM64 pass
+    out_len = 0
+    fn_count = 0
+    fixup_count = 0
+    static_fixup_count = 0
+    str_fixup_count = 0
+    str_len = 0
+    extern_fn_count = 0
+    extern_call_count = 0
+    fnaddr_fixup_count = 0
+    static_count = 0
+    static_data_size = 0
+    struct_count = 0
+    struct_var_count = 0
+    enum_count = 0
+    type_alias_count = 0
+    arr_elem_count = 0
+    fn_ret_float_count = 0
+    fn_ret_struct_count = 0
+    line_table_count = 0
+    last_recorded_line = 0
+    debug_file_count = 0
+    diag_count = 0
+    diag_error_count = 0
+    diag_warn_count = 0
+    slice_len_count = 0
+    device_count = 0
+    device_field_count = 0
+    var_type_count = 0
+    win_iat_fixup_count = 0
+    a64_win_iat_fixup_count = 0
+
+    // Re-parse (need fresh AST; restore source+tokens to pristine state first)
+    restore_src_and_tokens(source, size, src_snapshot, my_tokens, tok_bytes, tok_snapshot)
+    ast_init(262144)
+    parser_init(my_tokens, saved_tcount)
+    uint64 root2 = parse_module()
+
+    // Re-run DCE for fresh AST
+    dce_init()
+    dce_scan(root2)
+
+    emit_elf_header_a64()
+    emit_program_header_a64(0)
+    uint64 text_start_a64 = codegen_output_len()
+
+    uint32 child2 = ast_child(root2)
+    uint64 wchild2 = child2
+    while wchild2 != 0 {
+        uint32 ck2 = ast_kind(wchild2)
+        if ck2 == 2 {
+            uint32 fn_name2 = ast_data1(wchild2)
+            if dce_is_live(fn_name2) != 0 {
+                // ARM64 slices go through IR by default (R1 is fixed — the
+                // IR ARM64 backend handles compile_fat itself correctly). The
+                // legacy path is retained behind `--legacy` as an explicit
+                // opt-out, not a silent fallback.
+                if emit_ir_mode != 0 {
+                    fn_register(fn_name2, out_len)
+                    ir_init()
+                    ir_emit_arm64_function(wchild2)
+                } else {
+                    gen_function_a64(wchild2)
+                }
+            }
+        }
+        uint32 nxt2 = ast_next(wchild2)
+        wchild2 = nxt2
+    }
+    resolve_fixups_a64()
+    resolve_fnaddr_fixups_a64()
+    uint64 data_start_a64 = codegen_output_len()
+    emit_static_data()
+    resolve_static_fixups_a64(data_start_a64)
+    uint64 str_start_a64 = codegen_output_len()
+    emit_string_data()
+    resolve_string_fixups_a64(str_start_a64)
+    uint64 text_size_a64 = codegen_output_len() - text_start_a64
+    uint64 entry_off_a64 = find_main_offset()
+    uint64 entry_va_a64 = 0x400000 + entry_off_a64
+    patch_u32(24, entry_va_a64 & 0xFFFFFFFF)
+    patch_u32(28, (entry_va_a64 >> 32) & 0xFFFFFFFF)
+    uint64 total_a64 = 120 + text_size_a64
+    patch_u32(96, total_a64 & 0xFFFFFFFF)
+    patch_u32(100, (total_a64 >> 32) & 0xFFFFFFFF)
+    patch_u32(104, total_a64 & 0xFFFFFFFF)
+    patch_u32(108, (total_a64 >> 32) & 0xFFFFFFFF)
+
+    uint64 a64_len = codegen_output_len()
+    uint64 a64_buf = alloc(a64_len)
+    uint64 ai = 0
+    while ai < a64_len {
+        uint64 sp = out_buf + ai
+        uint64 dp = a64_buf + ai
+        uint64 bv = 0
+        unsafe { *(sp as uint8) -> bv }
+        uint8 bb = bv
+        unsafe { *(dp as uint8) = bb }
+        ai = ai + 1
+    }
+
+    // === Compile x86_64 PE (Windows) ===
+    set_target_arch(0)
+    target_os = 2
+    out_len = 0
+    fn_count = 0
+    fixup_count = 0
+    static_fixup_count = 0
+    str_fixup_count = 0
+    str_len = 0
+    extern_fn_count = 0
+    extern_call_count = 0
+    win_iat_fixup_count = 0
+    fnaddr_fixup_count = 0
+    static_count = 0
+    static_data_size = 0
+    struct_count = 0
+    struct_var_count = 0
+    enum_count = 0
+    type_alias_count = 0
+    arr_elem_count = 0
+    fn_ret_float_count = 0
+    fn_ret_struct_count = 0
+    line_table_count = 0
+    last_recorded_line = 0
+    debug_file_count = 0
+    diag_count = 0
+    diag_error_count = 0
+    diag_warn_count = 0
+    slice_len_count = 0
+    device_count = 0
+    device_field_count = 0
+    var_type_count = 0
+    win_iat_fixup_count = 0
+    a64_win_iat_fixup_count = 0
+
+    restore_src_and_tokens(source, size, src_snapshot, my_tokens, tok_bytes, tok_snapshot)
+    ast_init(262144)
+    parser_init(my_tokens, saved_tcount)
+    uint64 root3 = parse_module()
+    dce_init()
+    dce_scan(root3)
+
+    uint64 header3 = emit_pe_headers_x64(0)
+    uint64 text_start3 = codegen_output_len()
+
+    uint32 child3 = ast_child(root3)
+    uint64 wchild3 = child3
+    while wchild3 != 0 {
+        uint32 ck3 = ast_kind(wchild3)
+        if ck3 == 2 {
+            uint32 fn_name3 = ast_data1(wchild3)
+            if dce_is_live(fn_name3) != 0 {
+                if emit_ir_mode != 0 {
+                    fn_register(fn_name3, out_len)
+                    ir_init()
+                    ir_emit_x86_function(wchild3)
+                } else {
+                    gen_function(wchild3)
+                }
+            }
+        }
+        uint32 nxt3 = ast_next(wchild3)
+        wchild3 = nxt3
+    }
+    resolve_fixups()
+    resolve_fnaddr_fixups()
+    uint64 data_start3 = codegen_output_len()
+    emit_static_data()
+    resolve_static_fixups(data_start3)
+    uint64 str_start3 = codegen_output_len()
+    emit_string_data()
+    resolve_string_fixups(str_start3)
+    uint64 text_size3 = codegen_output_len() - text_start3
+
+    uint64 main_off3 = find_main_offset()
+    uint64 pe_entry3 = 0x1000 + main_off3 - text_start3
+    patch_u32(0x68, pe_entry3)
+    uint64 text_aligned3 = (text_size3 + 0x1FF) & ~0x1FF
+    while codegen_output_len() < header3 + text_aligned3 { emit_byte(0) }
+    uint64 text_va_size3 = (text_size3 + 0xFFF) & ~0xFFF
+    uint64 idata_rva3 = 0x1000 + text_va_size3
+    uint64 iat_rva_val3 = emit_pe_idata(idata_rva3)
+    pe_iat_rva = iat_rva_val3
+    patch_u32(0x148 + 8, text_size3)
+    patch_u32(0x148 + 16, text_aligned3)
+    patch_u32(0x170 + 12, idata_rva3)
+    uint64 idata_file_off3 = header3 + text_aligned3
+    patch_u32(0x170 + 20, idata_file_off3)
+    patch_u32(0xD0, idata_rva3)
+    patch_u32(0x5C, text_aligned3)
+    uint64 image_size3 = 0x1000 + text_va_size3 + 0x1000
+    patch_u32(0x90, image_size3)
+    resolve_win_iat_fixups(text_start3, iat_rva_val3)
+
+    uint64 pe_x86_len = codegen_output_len()
+    uint64 pe_x86_buf = alloc(pe_x86_len)
+    uint64 pxi = 0
+    while pxi < pe_x86_len {
+        uint64 sp = out_buf + pxi
+        uint64 dp = pe_x86_buf + pxi
+        uint64 bv = 0
+        unsafe { *(sp as uint8) -> bv }
+        uint8 bb = bv
+        unsafe { *(dp as uint8) = bb }
+        pxi = pxi + 1
+    }
+
+    set_target_arch(1)
+    // === Compile ARM64 PE (Windows) ===
+    out_len = 0
+    fn_count = 0
+    fixup_count = 0
+    static_fixup_count = 0
+    str_fixup_count = 0
+    str_len = 0
+    extern_fn_count = 0
+    extern_call_count = 0
+    a64_win_iat_fixup_count = 0
+    fnaddr_fixup_count = 0
+    static_count = 0
+    static_data_size = 0
+    struct_count = 0
+    struct_var_count = 0
+    enum_count = 0
+    type_alias_count = 0
+    arr_elem_count = 0
+    fn_ret_float_count = 0
+    fn_ret_struct_count = 0
+    line_table_count = 0
+    last_recorded_line = 0
+    debug_file_count = 0
+    diag_count = 0
+    diag_error_count = 0
+    diag_warn_count = 0
+    slice_len_count = 0
+    device_count = 0
+    device_field_count = 0
+    var_type_count = 0
+    win_iat_fixup_count = 0
+    a64_win_iat_fixup_count = 0
+
+    restore_src_and_tokens(source, size, src_snapshot, my_tokens, tok_bytes, tok_snapshot)
+    ast_init(262144)
+    parser_init(my_tokens, saved_tcount)
+    uint64 root4 = parse_module()
+    dce_init()
+    dce_scan(root4)
+
+    uint64 header4 = emit_pe_headers_a64(0)
+    uint64 text_start4 = codegen_output_len()
+
+    uint32 child4 = ast_child(root4)
+    uint64 wchild4 = child4
+    while wchild4 != 0 {
+        uint32 ck4 = ast_kind(wchild4)
+        if ck4 == 2 {
+            uint32 fn_name4 = ast_data1(wchild4)
+            if dce_is_live(fn_name4) != 0 {
+                if emit_ir_mode != 0 {
+                    fn_register(fn_name4, out_len)
+                    ir_init()
+                    ir_emit_arm64_function(wchild4)
+                } else {
+                    gen_function_a64(wchild4)
+                }
+            }
+        }
+        uint32 nxt4 = ast_next(wchild4)
+        wchild4 = nxt4
+    }
+    resolve_fixups_a64()
+    resolve_fnaddr_fixups_a64()
+    uint64 data_start4 = codegen_output_len()
+    emit_static_data()
+    resolve_static_fixups_a64(data_start4)
+    uint64 str_start4 = codegen_output_len()
+    emit_string_data()
+    resolve_string_fixups_a64(str_start4)
+    uint64 text_size4 = codegen_output_len() - text_start4
+
+    uint64 main_off4 = find_main_offset()
+    uint64 pe_entry4 = 0x1000 + main_off4 - text_start4
+    patch_u32(0x68, pe_entry4)
+
+    // ARM64 PE: separate .data section (W^X)
+    uint64 text_aligned4 = (text_size4 + 0x1FF) & ~0x1FF
+    while codegen_output_len() < header4 + text_aligned4 { emit_byte(0) }
+    uint64 data_file_off4 = codegen_output_len()
+    emit_static_data()
+    uint64 data_raw_size4 = codegen_output_len() - data_file_off4
+    uint64 data_aligned4 = (data_raw_size4 + 0x1FF) & ~0x1FF
+    if data_aligned4 == 0 { data_aligned4 = 0x200 }
+    while codegen_output_len() < data_file_off4 + data_aligned4 { emit_byte(0) }
+    uint64 text_va_size4 = (text_size4 + 0xFFF) & ~0xFFF
+    uint64 data_rva4 = 0x1000 + text_va_size4
+    uint64 data_va_size4 = (data_raw_size4 + 0xFFF) & ~0xFFF
+    if data_va_size4 == 0 { data_va_size4 = 0x1000 }
+    uint64 data_va_base4 = data_rva4 - 0xE00
+    resolve_static_fixups_a64(data_va_base4)
+    uint64 idata_rva4 = 0x1000 + text_va_size4 + data_va_size4
+    uint64 iat_rva_val4 = emit_pe_idata(idata_rva4)
+    pe_iat_rva = iat_rva_val4
+    // Patch .text header at 0x148
+    patch_u32(0x148 + 8, text_size4)
+    patch_u32(0x148 + 16, text_aligned4)
+    // Patch .data header at 0x170
+    patch_u32(0x170 + 8, data_raw_size4)
+    patch_u32(0x170 + 12, data_rva4)
+    patch_u32(0x170 + 16, data_aligned4)
+    patch_u32(0x170 + 20, data_file_off4)
+    // Patch .idata header at 0x198
+    uint64 idata_file_off4 = data_file_off4 + data_aligned4
+    patch_u32(0x198 + 8, pe_idata_size())
+    patch_u32(0x198 + 12, idata_rva4)
+    patch_u32(0x198 + 16, pe_idata_size())
+    patch_u32(0x198 + 20, idata_file_off4)
+    patch_u32(0xD0, idata_rva4)
+    patch_u32(0x5C, text_aligned4)
+    uint64 image_size4 = 0x1000 + text_va_size4 + data_va_size4 + 0x1000
+    patch_u32(0x90, image_size4)
+    resolve_a64_win_iat_fixups(text_start4, iat_rva_val4)
+
+    uint64 pe_a64_len = codegen_output_len()
+    uint64 pe_a64_buf = alloc(pe_a64_len)
+    uint64 pai = 0
+    while pai < pe_a64_len {
+        uint64 sp = out_buf + pai
+        uint64 dp = pe_a64_buf + pai
+        uint64 bv = 0
+        unsafe { *(sp as uint8) -> bv }
+        uint8 bb = bv
+        unsafe { *(dp as uint8) = bb }
+        pai = pai + 1
+    }
+
+    set_target_arch(0)
+    // === Compile x86_64 Mach-O (macOS) ===
+    target_os = 1
+    out_len = 0
+    fn_count = 0
+    fixup_count = 0
+    static_fixup_count = 0
+    str_fixup_count = 0
+    str_len = 0
+    extern_fn_count = 0
+    extern_call_count = 0
+    fnaddr_fixup_count = 0
+    static_count = 0
+    static_data_size = 0
+    struct_count = 0
+    struct_var_count = 0
+    enum_count = 0
+    type_alias_count = 0
+    arr_elem_count = 0
+    fn_ret_float_count = 0
+    fn_ret_struct_count = 0
+    line_table_count = 0
+    last_recorded_line = 0
+    debug_file_count = 0
+    diag_count = 0
+    diag_error_count = 0
+    diag_warn_count = 0
+    slice_len_count = 0
+    device_count = 0
+    device_field_count = 0
+    var_type_count = 0
+    win_iat_fixup_count = 0
+    a64_win_iat_fixup_count = 0
+
+    restore_src_and_tokens(source, size, src_snapshot, my_tokens, tok_bytes, tok_snapshot)
+    ast_init(262144)
+    parser_init(my_tokens, saved_tcount)
+    uint64 root5 = parse_module()
+    dce_init()
+    dce_scan(root5)
+
+    uint64 header5 = emit_macho_headers_x64(0)
+    uint64 text_start5 = codegen_output_len()
+
+    uint32 child5 = ast_child(root5)
+    uint64 wchild5 = child5
+    while wchild5 != 0 {
+        uint32 ck5 = ast_kind(wchild5)
+        if ck5 == 2 {
+            uint32 fn_name5 = ast_data1(wchild5)
+            if dce_is_live(fn_name5) != 0 {
+                if emit_ir_mode != 0 {
+                    fn_register(fn_name5, out_len)
+                    ir_init()
+                    ir_emit_x86_function(wchild5)
+                } else {
+                    gen_function(wchild5)
+                }
+            }
+        }
+        uint32 nxt5 = ast_next(wchild5)
+        wchild5 = nxt5
+    }
+    resolve_fixups()
+    resolve_fnaddr_fixups()
+    uint64 data_start5 = codegen_output_len()
+    emit_static_data()
+    resolve_static_fixups(data_start5)
+    uint64 str_start5 = codegen_output_len()
+    emit_string_data()
+    resolve_string_fixups(str_start5)
+
+    // Mach-O patching: page-align, patch __TEXT vmsize/filesize and entry point
+    uint64 total_file5 = codegen_output_len()
+    uint64 total_aligned5 = (total_file5 + 4095) & ~4095
+    while codegen_output_len() < total_aligned5 { emit_byte(0) }
+    patch_u32(136, total_aligned5 & 0xFFFFFFFF)
+    patch_u32(140, (total_aligned5 >> 32) & 0xFFFFFFFF)
+    patch_u32(152, total_aligned5 & 0xFFFFFFFF)
+    patch_u32(156, (total_aligned5 >> 32) & 0xFFFFFFFF)
+    uint64 main_off5 = find_main_offset()
+    uint64 entry_va5 = 0x100000000 + main_off5
+    patch_u32(320, entry_va5 & 0xFFFFFFFF)
+    patch_u32(324, (entry_va5 >> 32) & 0xFFFFFFFF)
+
+    uint64 macho_x86_len = codegen_output_len()
+    uint64 macho_x86_buf = alloc(macho_x86_len)
+    uint64 mxi = 0
+    while mxi < macho_x86_len {
+        uint64 sp = out_buf + mxi
+        uint64 dp = macho_x86_buf + mxi
+        uint64 bv = 0
+        unsafe { *(sp as uint8) -> bv }
+        uint8 bb = bv
+        unsafe { *(dp as uint8) = bb }
+        mxi = mxi + 1
+    }
+    set_target_arch(1)
+
+    // === Compile ARM64 Mach-O (macOS) ===
+    out_len = 0
+    fn_count = 0
+    fixup_count = 0
+    static_fixup_count = 0
+    str_fixup_count = 0
+    str_len = 0
+    extern_fn_count = 0
+    extern_call_count = 0
+    fnaddr_fixup_count = 0
+    static_count = 0
+    static_data_size = 0
+    struct_count = 0
+    struct_var_count = 0
+    enum_count = 0
+    type_alias_count = 0
+    arr_elem_count = 0
+    fn_ret_float_count = 0
+    fn_ret_struct_count = 0
+    line_table_count = 0
+    last_recorded_line = 0
+    debug_file_count = 0
+    diag_count = 0
+    diag_error_count = 0
+    diag_warn_count = 0
+    slice_len_count = 0
+    device_count = 0
+    device_field_count = 0
+    var_type_count = 0
+    win_iat_fixup_count = 0
+    a64_win_iat_fixup_count = 0
+
+    restore_src_and_tokens(source, size, src_snapshot, my_tokens, tok_bytes, tok_snapshot)
+    ast_init(262144)
+    parser_init(my_tokens, saved_tcount)
+    uint64 root6 = parse_module()
+    dce_init()
+    dce_scan(root6)
+
+    uint64 header6 = emit_macho_headers_a64(0)
+    uint64 text_start6 = codegen_output_len()
+
+    uint32 child6 = ast_child(root6)
+    uint64 wchild6 = child6
+    while wchild6 != 0 {
+        uint32 ck6 = ast_kind(wchild6)
+        if ck6 == 2 {
+            uint32 fn_name6 = ast_data1(wchild6)
+            if dce_is_live(fn_name6) != 0 {
+                if emit_ir_mode != 0 {
+                    fn_register(fn_name6, out_len)
+                    ir_init()
+                    ir_emit_arm64_function(wchild6)
+                } else {
+                    gen_function_a64(wchild6)
+                }
+            }
+        }
+        uint32 nxt6 = ast_next(wchild6)
+        wchild6 = nxt6
+    }
+    resolve_fixups_a64()
+    resolve_fnaddr_fixups_a64()
+    uint64 data_start6 = codegen_output_len()
+    emit_static_data()
+    resolve_static_fixups_a64(data_start6)
+    uint64 str_start6 = codegen_output_len()
+    emit_string_data()
+    resolve_string_fixups_a64(str_start6)
+
+    // Mach-O ARM64: separate __TEXT (RX) + __DATA (RW)
+    uint64 total_file6 = codegen_output_len()
+    uint64 total_aligned6 = (total_file6 + 16383) & ~16383
+    while codegen_output_len() < total_aligned6 { emit_byte(0) }
+    // Emit __DATA segment
+    uint64 dfoff6 = codegen_output_len()
+    emit_static_data()
+    uint64 draw6 = codegen_output_len() - dfoff6
+    uint64 dal6 = (draw6 + 16383) & ~16383
+    if dal6 == 0 { dal6 = 16384 }
+    while codegen_output_len() < dfoff6 + dal6 { emit_byte(0) }
+    resolve_static_fixups_a64(dfoff6)
+    patch_u32(136, total_aligned6 & 0xFFFFFFFF)
+    patch_u32(140, (total_aligned6 >> 32) & 0xFFFFFFFF)
+    patch_u32(152, total_aligned6 & 0xFFFFFFFF)
+    patch_u32(156, (total_aligned6 >> 32) & 0xFFFFFFFF)
+    // __text section size at offset 216
+    uint64 textsz6 = total_aligned6 - 16384
+    patch_u32(216, textsz6 & 0xFFFFFFFF)
+    patch_u32(220, (textsz6 >> 32) & 0xFFFFFFFF)
+    uint64 dva6 = 0x100000000 + total_aligned6
+    patch_u32(280, dva6 & 0xFFFFFFFF)
+    patch_u32(284, (dva6 >> 32) & 0xFFFFFFFF)
+    patch_u32(288, dal6 & 0xFFFFFFFF)
+    patch_u32(292, (dal6 >> 32) & 0xFFFFFFFF)
+    patch_u32(296, total_aligned6 & 0xFFFFFFFF)
+    patch_u32(300, (total_aligned6 >> 32) & 0xFFFFFFFF)
+    patch_u32(304, dal6 & 0xFFFFFFFF)
+    patch_u32(308, (dal6 >> 32) & 0xFFFFFFFF)
+    // __LINKEDIT: chained fixups + symtab + strtab via helper
+    uint64 lva6 = dva6 + dal6
+    uint64 lfoff6 = dfoff6 + dal6
+    uint64 main_off6 = find_main_offset()
+    emit_macho_linkedit_a64(lfoff6, main_off6)
+    uint64 lraw6 = codegen_output_len() - lfoff6
+    uint64 lsize6 = (lraw6 + 16383) & ~16383
+    if lsize6 == 0 { lsize6 = 16384 }
+    while codegen_output_len() < lfoff6 + lsize6 { emit_byte(0) }
+    patch_u32(352, lva6 & 0xFFFFFFFF)
+    patch_u32(356, (lva6 >> 32) & 0xFFFFFFFF)
+    patch_u32(360, lsize6 & 0xFFFFFFFF)
+    patch_u32(364, (lsize6 >> 32) & 0xFFFFFFFF)
+    patch_u32(368, lfoff6 & 0xFFFFFFFF)
+    patch_u32(372, (lfoff6 >> 32) & 0xFFFFFFFF)
+    patch_u32(376, lraw6 & 0xFFFFFFFF)
+    patch_u32(380, (lraw6 >> 32) & 0xFFFFFFFF)
+
+    uint64 macho_a64_len = codegen_output_len()
+    uint64 macho_a64_buf = alloc(macho_a64_len)
+    uint64 mai = 0
+    while mai < macho_a64_len {
+        uint64 sp = out_buf + mai
+        uint64 dp = macho_a64_buf + mai
+        uint64 bv = 0
+        unsafe { *(sp as uint8) -> bv }
+        uint8 bb = bv
+        unsafe { *(dp as uint8) = bb }
+        mai = mai + 1
+    }
+    set_target_arch(0)
+
+    // === Compile x86_64 Android PIE ELF ===
+    target_os = 3
+    out_len = 0
+    fn_count = 0
+    fixup_count = 0
+    static_fixup_count = 0
+    str_fixup_count = 0
+    str_len = 0
+    extern_fn_count = 0
+    extern_call_count = 0
+    fnaddr_fixup_count = 0
+    static_count = 0
+    static_data_size = 0
+    struct_count = 0
+    struct_var_count = 0
+    enum_count = 0
+    type_alias_count = 0
+    arr_elem_count = 0
+    fn_ret_float_count = 0
+    fn_ret_struct_count = 0
+    line_table_count = 0
+    last_recorded_line = 0
+    debug_file_count = 0
+    diag_count = 0
+    diag_error_count = 0
+    diag_warn_count = 0
+    slice_len_count = 0
+    device_count = 0
+    device_field_count = 0
+    var_type_count = 0
+    win_iat_fixup_count = 0
+    a64_win_iat_fixup_count = 0
+
+    restore_src_and_tokens(source, size, src_snapshot, my_tokens, tok_bytes, tok_snapshot)
+    ast_init(262144)
+    parser_init(my_tokens, saved_tcount)
+    uint64 root8 = parse_module()
+    dce_init()
+    dce_scan(root8)
+
+    emit_elf_header_android_x86_64()
+    uint64 text_start8 = codegen_output_len()
+
+    uint32 child8 = ast_child(root8)
+    uint64 wchild8 = child8
+    while wchild8 != 0 {
+        uint32 ck8 = ast_kind(wchild8)
+        if ck8 == 2 {
+            uint32 fn_name8 = ast_data1(wchild8)
+            if dce_is_live(fn_name8) != 0 {
+                if emit_ir_mode != 0 {
+                    fn_register(fn_name8, out_len)
+                    ir_init()
+                    ir_emit_x86_function(wchild8)
+                } else {
+                    gen_function(wchild8)
+                }
+            }
+        }
+        uint32 nxt8 = ast_next(wchild8)
+        wchild8 = nxt8
+    }
+    resolve_fixups()
+    resolve_fnaddr_fixups()
+    uint64 data_start8 = codegen_output_len()
+    emit_static_data()
+    resolve_static_fixups(data_start8)
+    uint64 str_start8 = codegen_output_len()
+    emit_string_data()
+    resolve_string_fixups(str_start8)
+
+    // Android PIE ELF: separate RX code + RW data segments
+    uint64 androidx_entry = find_main_offset()
+    patch_u32(24, androidx_entry & 0xFFFFFFFF)
+    patch_u32(28, (androidx_entry >> 32) & 0xFFFFFFFF)
+    uint64 androidx_rx = codegen_output_len()
+    patch_u32(208, androidx_rx & 0xFFFFFFFF)
+    patch_u32(212, (androidx_rx >> 32) & 0xFFFFFFFF)
+    patch_u32(216, androidx_rx & 0xFFFFFFFF)
+    patch_u32(220, (androidx_rx >> 32) & 0xFFFFFFFF)
+    uint64 androidx_rx_aligned = (androidx_rx + 0xFFFF) & ~0xFFFF
+    while codegen_output_len() < androidx_rx_aligned { emit_byte(0) }
+    uint64 ax_dfoff = codegen_output_len()
+    emit_static_data()
+    uint64 ax_draw = codegen_output_len() - ax_dfoff
+    uint64 ax_dal = (ax_draw + 0xFFFF) & ~0xFFFF
+    if ax_dal == 0 { ax_dal = 0x10000 }
+    while codegen_output_len() < ax_dfoff + ax_dal { emit_byte(0) }
+    resolve_static_fixups(ax_dfoff)
+    patch_u32(296, ax_dfoff & 0xFFFFFFFF)
+    patch_u32(300, (ax_dfoff >> 32) & 0xFFFFFFFF)
+    patch_u32(304, androidx_rx_aligned & 0xFFFFFFFF)
+    patch_u32(308, (androidx_rx_aligned >> 32) & 0xFFFFFFFF)
+    patch_u32(312, androidx_rx_aligned & 0xFFFFFFFF)
+    patch_u32(316, (androidx_rx_aligned >> 32) & 0xFFFFFFFF)
+    patch_u32(320, ax_draw & 0xFFFFFFFF)
+    patch_u32(324, (ax_draw >> 32) & 0xFFFFFFFF)
+    // p_memsz = page-aligned size: bionic SIGBUSes on p_memsz=0.
+    patch_u32(328, ax_dal & 0xFFFFFFFF)
+    patch_u32(332, (ax_dal >> 32) & 0xFFFFFFFF)
+
+    uint64 androidx_len = codegen_output_len()
+    uint64 androidx_buf = alloc(androidx_len)
+    uint64 axi = 0
+    while axi < androidx_len {
+        uint64 sp = out_buf + axi
+        uint64 dp = androidx_buf + axi
+        uint64 bv = 0
+        unsafe { *(sp as uint8) -> bv }
+        uint8 bb = bv
+        unsafe { *(dp as uint8) = bb }
+        axi = axi + 1
+    set_target_arch(1)
+    }
+
+    // === Compile ARM64 Android PIE ELF ===
+    target_os = 3
+    out_len = 0
+    fn_count = 0
+    fixup_count = 0
+    static_fixup_count = 0
+    str_fixup_count = 0
+    str_len = 0
+    extern_fn_count = 0
+    extern_call_count = 0
+    fnaddr_fixup_count = 0
+    static_count = 0
+    static_data_size = 0
+    struct_count = 0
+    struct_var_count = 0
+    enum_count = 0
+    type_alias_count = 0
+    arr_elem_count = 0
+    fn_ret_float_count = 0
+    fn_ret_struct_count = 0
+    line_table_count = 0
+    last_recorded_line = 0
+    debug_file_count = 0
+    diag_count = 0
+    diag_error_count = 0
+    diag_warn_count = 0
+    slice_len_count = 0
+    device_count = 0
+    device_field_count = 0
+    var_type_count = 0
+    win_iat_fixup_count = 0
+    a64_win_iat_fixup_count = 0
+
+    restore_src_and_tokens(source, size, src_snapshot, my_tokens, tok_bytes, tok_snapshot)
+    ast_init(262144)
+    parser_init(my_tokens, saved_tcount)
+    uint64 root7 = parse_module()
+    dce_init()
+    dce_scan(root7)
+
+    emit_elf_header_android_a64()
+    uint64 text_start7 = codegen_output_len()
+
+    uint32 child7 = ast_child(root7)
+    uint64 wchild7 = child7
+    while wchild7 != 0 {
+        uint32 ck7 = ast_kind(wchild7)
+        if ck7 == 2 {
+            uint32 fn_name7 = ast_data1(wchild7)
+            if dce_is_live(fn_name7) != 0 {
+                if emit_ir_mode != 0 {
+                    fn_register(fn_name7, out_len)
+                    ir_init()
+                    ir_emit_arm64_function(wchild7)
+                } else {
+                    gen_function_a64(wchild7)
+                }
+            }
+        }
+        uint32 nxt7 = ast_next(wchild7)
+        wchild7 = nxt7
+    }
+    resolve_fixups_a64()
+    resolve_fnaddr_fixups_a64()
+    // Align to 8 bytes on arm64 (matches direct compile() path) so static
+    // data LDR (imm12 scaled by 8) can encode any slot offset exactly.
+    while (codegen_output_len() & 7) != 0 { emit_byte(0) }
+    uint64 data_start7 = codegen_output_len()
+    emit_static_data()
+    resolve_static_fixups_a64(data_start7)
+    uint64 str_start7 = codegen_output_len()
+    emit_string_data()
+    resolve_string_fixups_a64(str_start7)
+
+    // Android PIE ELF: separate RX code + RW data segments
+    uint64 android_entry = find_main_offset()
+    patch_u32(24, android_entry & 0xFFFFFFFF)
+    patch_u32(28, (android_entry >> 32) & 0xFFFFFFFF)
+    // PT_LOAD RX: code + strings only
+    uint64 android_rx = codegen_output_len()
+    patch_u32(208, android_rx & 0xFFFFFFFF)
+    patch_u32(212, (android_rx >> 32) & 0xFFFFFFFF)
+    patch_u32(216, android_rx & 0xFFFFFFFF)
+    patch_u32(220, (android_rx >> 32) & 0xFFFFFFFF)
+    // Pad to 64KB page boundary for PT_LOAD RW
+    uint64 android_rx_aligned = (android_rx + 0xFFFF) & ~0xFFFF
+    while codegen_output_len() < android_rx_aligned { emit_byte(0) }
+    // Emit data segment (statics)
+    uint64 a7_dfoff = codegen_output_len()
+    emit_static_data()
+    uint64 a7_draw = codegen_output_len() - a7_dfoff
+    uint64 a7_dal = (a7_draw + 0xFFFF) & ~0xFFFF
+    if a7_dal == 0 { a7_dal = 0x10000 }
+    while codegen_output_len() < a7_dfoff + a7_dal { emit_byte(0) }
+    // Re-resolve static fixups to point into RW segment
+    resolve_static_fixups_a64(a7_dfoff)
+    // Patch PT_LOAD RW @288
+    patch_u32(296, a7_dfoff & 0xFFFFFFFF)
+    patch_u32(300, (a7_dfoff >> 32) & 0xFFFFFFFF)
+    patch_u32(304, android_rx_aligned & 0xFFFFFFFF)
+    patch_u32(308, (android_rx_aligned >> 32) & 0xFFFFFFFF)
+    patch_u32(312, android_rx_aligned & 0xFFFFFFFF)
+    patch_u32(316, (android_rx_aligned >> 32) & 0xFFFFFFFF)
+    patch_u32(320, a7_draw & 0xFFFFFFFF)
+    patch_u32(324, (a7_draw >> 32) & 0xFFFFFFFF)
+    // p_memsz = page-aligned size: bionic SIGBUSes on p_memsz=0.
+    patch_u32(328, a7_dal & 0xFFFFFFFF)
+    patch_u32(332, (a7_dal >> 32) & 0xFFFFFFFF)
+
+    uint64 android_len = codegen_output_len()
+    uint64 android_buf = alloc(android_len)
+    uint64 adi = 0
+    while adi < android_len {
+        uint64 sp = out_buf + adi
+        uint64 dp = android_buf + adi
+        uint64 bv = 0
+        unsafe { *(sp as uint8) -> bv }
+        uint8 bb = bv
+        unsafe { *(dp as uint8) = bb }
+        adi = adi + 1
+    }
+
+    // Reset target_os for fat binary emission
+    target_os = 0
+
+    // === BCJ filter before compression ===
+    // x86_64 slices: filter E8/E9 CALL/JMP
+    filter_x86_64_bcj(x86_buf, x86_len, 1)
+    filter_x86_64_bcj(pe_x86_buf, pe_x86_len, 1)
+    filter_x86_64_bcj(macho_x86_buf, macho_x86_len, 1)
+    filter_x86_64_bcj(androidx_buf, androidx_len, 1)
+    // arm64 slices: filter B/BL instructions
+    filter_aarch64_bcj(a64_buf, a64_len, 1)
+    filter_aarch64_bcj(pe_a64_buf, pe_a64_len, 1)
+    filter_aarch64_bcj(macho_a64_buf, macho_a64_len, 1)
+    filter_aarch64_bcj(android_buf, android_len, 1)
+
+    // === Custom target subset: emit only the selected slices, each
+    // compressed as a standalone (non-paired) LZ4 blob. The runner treats
+    // an entry with pair_off == 0 and pair_uncomp_size == slice_uncomp_size
+    // as a single-slice blob. Full-set selection (all 8) drops into the
+    // default paired-compression path below for tighter compression.
+    if target_mask != 0 && target_mask != 0xFF {
+        uint64 comp_bufs = alloc(8 * 8)
+        uint64 comp_lens = alloc(8 * 8)
+        uint64 uncomp_lens = alloc(8 * 8)
+        uint64 zi = 0
+        while zi < 8 {
+            uint64 zp = comp_bufs + zi * 8
+            uint64 zl = comp_lens + zi * 8
+            uint64 zu = uncomp_lens + zi * 8
+            unsafe { *(zp as uint64) = 0 }
+            unsafe { *(zl as uint64) = 0 }
+            unsafe { *(zu as uint64) = 0 }
+            zi = zi + 1
+        }
+
+        uint64 sel_count = 0
+        uint64 aid = 1
+        while aid <= 8 {
+            uint64 bit = aid - 1
+            if ((target_mask >> bit) & 1) != 0 {
+                uint64 buf = 0
+                uint64 len = 0
+                if aid == 1 { buf = x86_buf; len = x86_len }
+                if aid == 2 { buf = a64_buf; len = a64_len }
+                if aid == 3 { buf = pe_x86_buf; len = pe_x86_len }
+                if aid == 4 { buf = pe_a64_buf; len = pe_a64_len }
+                if aid == 5 { buf = macho_x86_buf; len = macho_x86_len }
+                if aid == 6 { buf = macho_a64_buf; len = macho_a64_len }
+                if aid == 7 { buf = android_buf; len = android_len }
+                if aid == 8 { buf = androidx_buf; len = androidx_len }
+                uint64 cap = lz4_compress_bound(len)
+                uint64 cbuf = alloc(cap)
+                uint64 clen = lz4_compress_frame(buf, len, cbuf)
+                uint64 cp = comp_bufs + bit * 8
+                uint64 lp = comp_lens + bit * 8
+                uint64 ulp = uncomp_lens + bit * 8
+                unsafe { *(cp as uint64) = cbuf }
+                unsafe { *(lp as uint64) = clen }
+                unsafe { *(ulp as uint64) = len }
+                sel_count = sel_count + 1
+            }
+            aid = aid + 1
+        }
+
+        out_len = 0
+        emit_krbofat_v2_header(sel_count)
+        uint64 c_data_offset = 16 + sel_count * 48
+        uint64 c_pad = (16 - (c_data_offset & 15)) & 15
+        c_data_offset = c_data_offset + c_pad
+
+        uint64 cur_off = c_data_offset
+        uint64 aid2 = 1
+        while aid2 <= 8 {
+            uint64 bit2 = aid2 - 1
+            if ((target_mask >> bit2) & 1) != 0 {
+                uint64 lp2 = comp_lens + bit2 * 8
+                uint64 ulp2 = uncomp_lens + bit2 * 8
+                uint64 clen2 = 0
+                uint64 ulen2 = 0
+                unsafe { *(lp2 as uint64) -> clen2 }
+                unsafe { *(ulp2 as uint64) -> ulen2 }
+                emit_krbofat_v2_entry_hdr(aid2, 1, cur_off, clen2, ulen2)
+                emit_krbofat_v2_entry_rt(0, ulen2)
+                cur_off = cur_off + clen2
+            }
+            aid2 = aid2 + 1
+        }
+
+        uint64 cpi = 0
+        while cpi < c_pad { emit_byte(0); cpi = cpi + 1 }
+
+        uint64 aid3 = 1
+        while aid3 <= 8 {
+            uint64 bit3 = aid3 - 1
+            if ((target_mask >> bit3) & 1) != 0 {
+                uint64 cp3 = comp_bufs + bit3 * 8
+                uint64 lp3 = comp_lens + bit3 * 8
+                uint64 cbuf3 = 0
+                uint64 clen3 = 0
+                unsafe { *(cp3 as uint64) -> cbuf3 }
+                unsafe { *(lp3 as uint64) -> clen3 }
+                emit_raw_bytes(cbuf3, clen3)
+            }
+            aid3 = aid3 + 1
+        }
+
+        codegen_write_output(output_path)
+
+        uint8[64] nb3
+        uint64 msg3 = "custom fat binary: "
+        write(1, msg3, 19)
+        uint64 nl3 = fmt_uint(nb3, sel_count)
+        write(1, nb3, nl3)
+        msg3 = " slice"
+        write(1, msg3, 6)
+        if sel_count != 1 {
+            msg3 = "s"
+            write(1, msg3, 1)
+        }
+        msg3 = " -> "
+        write(1, msg3, 4)
+        uint64 olen3 = str_len(output_path)
+        write(1, output_path, olen3)
+        msg3 = "\n"
+        write(1, msg3, 1)
+        return
+    }
+
+    // === LZ4 compress 4 arch-paired blobs ===
+    // Best layout from experimental benchmarks (FAT_COMPRESSION_EXPERIMENTS.md):
+    //   x86_64: Linux + macOS,     Windows + Android
+    //   arm64:  Linux + Android,   Windows + macOS
+    uint64[1] x64_lm_comp_slot
+    uint64[1] x64_lm_comp_len_slot
+    uint64[1] x64_lm_linux_off_slot
+    uint64[1] x64_lm_mac_off_slot
+    uint64[1] x64_lm_pair_len_slot
+    compress_pair_best(
+        x86_buf, x86_len, macho_x86_buf, macho_x86_len,
+        x64_lm_comp_slot, x64_lm_comp_len_slot,
+        x64_lm_linux_off_slot, x64_lm_mac_off_slot,
+        x64_lm_pair_len_slot
+    )
+    uint64 x64_lm_comp = slot_load_u64(x64_lm_comp_slot)
+    uint64 x64_lm_comp_len = slot_load_u64(x64_lm_comp_len_slot)
+    uint64 x64_lm_linux_off = slot_load_u64(x64_lm_linux_off_slot)
+    uint64 x64_lm_mac_off = slot_load_u64(x64_lm_mac_off_slot)
+    uint64 x64_lm_pair_len = slot_load_u64(x64_lm_pair_len_slot)
+
+    uint64[1] x64_wa_comp_slot
+    uint64[1] x64_wa_comp_len_slot
+    uint64[1] x64_wa_win_off_slot
+    uint64[1] x64_wa_android_off_slot
+    uint64[1] x64_wa_pair_len_slot
+    compress_pair_best(
+        pe_x86_buf, pe_x86_len, androidx_buf, androidx_len,
+        x64_wa_comp_slot, x64_wa_comp_len_slot,
+        x64_wa_win_off_slot, x64_wa_android_off_slot,
+        x64_wa_pair_len_slot
+    )
+    uint64 x64_wa_comp = slot_load_u64(x64_wa_comp_slot)
+    uint64 x64_wa_comp_len = slot_load_u64(x64_wa_comp_len_slot)
+    uint64 x64_wa_win_off = slot_load_u64(x64_wa_win_off_slot)
+    uint64 x64_wa_android_off = slot_load_u64(x64_wa_android_off_slot)
+    uint64 x64_wa_pair_len = slot_load_u64(x64_wa_pair_len_slot)
+
+    uint64[1] arm_la_comp_slot
+    uint64[1] arm_la_comp_len_slot
+    uint64[1] arm_la_linux_off_slot
+    uint64[1] arm_la_android_off_slot
+    uint64[1] arm_la_pair_len_slot
+    compress_pair_best(
+        a64_buf, a64_len, android_buf, android_len,
+        arm_la_comp_slot, arm_la_comp_len_slot,
+        arm_la_linux_off_slot, arm_la_android_off_slot,
+        arm_la_pair_len_slot
+    )
+    uint64 arm_la_comp = slot_load_u64(arm_la_comp_slot)
+    uint64 arm_la_comp_len = slot_load_u64(arm_la_comp_len_slot)
+    uint64 arm_la_linux_off = slot_load_u64(arm_la_linux_off_slot)
+    uint64 arm_la_android_off = slot_load_u64(arm_la_android_off_slot)
+    uint64 arm_la_pair_len = slot_load_u64(arm_la_pair_len_slot)
+
+    uint64[1] arm_wm_comp_slot
+    uint64[1] arm_wm_comp_len_slot
+    uint64[1] arm_wm_win_off_slot
+    uint64[1] arm_wm_mac_off_slot
+    uint64[1] arm_wm_pair_len_slot
+    compress_pair_best(
+        pe_a64_buf, pe_a64_len, macho_a64_buf, macho_a64_len,
+        arm_wm_comp_slot, arm_wm_comp_len_slot,
+        arm_wm_win_off_slot, arm_wm_mac_off_slot,
+        arm_wm_pair_len_slot
+    )
+    uint64 arm_wm_comp = slot_load_u64(arm_wm_comp_slot)
+    uint64 arm_wm_comp_len = slot_load_u64(arm_wm_comp_len_slot)
+    uint64 arm_wm_win_off = slot_load_u64(arm_wm_win_off_slot)
+    uint64 arm_wm_mac_off = slot_load_u64(arm_wm_mac_off_slot)
+    uint64 arm_wm_pair_len = slot_load_u64(arm_wm_pair_len_slot)
+
+    // === Emit KrboFat v2 ===
+    out_len = 0
+    emit_krbofat_v2_header(8)
+    uint64 data_offset = 16 + 8 * 48
+    uint64 pad = (16 - (data_offset & 15)) & 15
+    data_offset = data_offset + pad
+    uint64 blob1_data_off = data_offset
+    uint64 blob2_data_off = blob1_data_off + x64_lm_comp_len
+    uint64 blob3_data_off = blob2_data_off + x64_wa_comp_len
+    uint64 blob4_data_off = blob3_data_off + arm_la_comp_len
+
+    // Entry fields: arch_id, compression, blob_offset, blob_comp_size,
+    // slice_uncomp_size, slice_offset_in_pair, pair_uncomp_size.
+    emit_krbofat_v2_entry_hdr(1, 1, blob1_data_off, x64_lm_comp_len, x86_len)
+    emit_krbofat_v2_entry_rt(x64_lm_linux_off, x64_lm_pair_len)
+    emit_krbofat_v2_entry_hdr(2, 1, blob3_data_off, arm_la_comp_len, a64_len)
+    emit_krbofat_v2_entry_rt(arm_la_linux_off, arm_la_pair_len)
+    emit_krbofat_v2_entry_hdr(3, 1, blob2_data_off, x64_wa_comp_len, pe_x86_len)
+    emit_krbofat_v2_entry_rt(x64_wa_win_off, x64_wa_pair_len)
+    emit_krbofat_v2_entry_hdr(4, 1, blob4_data_off, arm_wm_comp_len, pe_a64_len)
+    emit_krbofat_v2_entry_rt(arm_wm_win_off, arm_wm_pair_len)
+    emit_krbofat_v2_entry_hdr(5, 1, blob1_data_off, x64_lm_comp_len, macho_x86_len)
+    emit_krbofat_v2_entry_rt(x64_lm_mac_off, x64_lm_pair_len)
+    emit_krbofat_v2_entry_hdr(6, 1, blob4_data_off, arm_wm_comp_len, macho_a64_len)
+    emit_krbofat_v2_entry_rt(arm_wm_mac_off, arm_wm_pair_len)
+    emit_krbofat_v2_entry_hdr(7, 1, blob3_data_off, arm_la_comp_len, android_len)
+    emit_krbofat_v2_entry_rt(arm_la_android_off, arm_la_pair_len)
+    emit_krbofat_v2_entry_hdr(8, 1, blob2_data_off, x64_wa_comp_len, androidx_len)
+    emit_krbofat_v2_entry_rt(x64_wa_android_off, x64_wa_pair_len)
+
+    uint64 pi = 0
+    while pi < pad { emit_byte(0); pi = pi + 1 }
+
+    emit_raw_bytes(x64_lm_comp, x64_lm_comp_len)
+    emit_raw_bytes(x64_wa_comp, x64_wa_comp_len)
+    emit_raw_bytes(arm_la_comp, arm_la_comp_len)
+    emit_raw_bytes(arm_wm_comp, arm_wm_comp_len)
+
+    codegen_write_output(output_path)
+
+    uint8[64] nb
+    uint64 msg = "fat binary: x86_64("
+    write(1, msg, 19)
+    uint64 nl = fmt_uint(nb, x86_len)
+    write(1, nb, nl)
+    msg = ") + arm64("
+    write(1, msg, 10)
+    nl = fmt_uint(nb, a64_len)
+    write(1, nb, nl)
+    msg = ") + win-x64("
+    write(1, msg, 12)
+    nl = fmt_uint(nb, pe_x86_len)
+    write(1, nb, nl)
+    msg = ") + win-arm("
+    write(1, msg, 12)
+    nl = fmt_uint(nb, pe_a64_len)
+    write(1, nb, nl)
+    msg = ") + mac-x64("
+    write(1, msg, 12)
+    nl = fmt_uint(nb, macho_x86_len)
+    write(1, nb, nl)
+    msg = ") + mac-arm("
+    write(1, msg, 12)
+    nl = fmt_uint(nb, macho_a64_len)
+    write(1, nb, nl)
+    msg = ") + android-arm64("
+    write(1, msg, 18)
+    nl = fmt_uint(nb, android_len)
+    write(1, nb, nl)
+    msg = ") + android-x64("
+    write(1, msg, 16)
+    nl = fmt_uint(nb, androidx_len)
+    write(1, nb, nl)
+    msg = ") -> "
+    write(1, msg, 5)
+    uint64 olen = str_len(output_path)
+    write(1, output_path, olen)
+    // Same "(X.XX ms)" timer as single-file compile(). Gated on t_start_fat
+    // having landed as non-zero — older target_os paths that stub time_ns()
+    // to 0 just fall back to the plain newline.
+    uint64 t_end_fat = time_ns()
+    if t_start_fat != 0 {
+        uint64 elapsed_fat = t_end_fat - t_start_fat
+        uint64 ms_whole_f = elapsed_fat / 1000000
+        uint64 ms_hund_f  = (elapsed_fat / 10000) % 100
+        msg = "  ("
+        write(1, msg, 3)
+        uint64 w_len_f = fmt_uint(nb, ms_whole_f)
+        write(1, nb, w_len_f)
+        msg = "."
+        write(1, msg, 1)
+        uint8[2] hb_f
+        uint8 d0_f = 48 + (ms_hund_f / 10)
+        uint8 d1_f = 48 + (ms_hund_f % 10)
+        unsafe { *(hb_f as uint8) = d0_f }
+        uint64 hb_f1 = hb_f + 1
+        unsafe { *(hb_f1 as uint8) = d1_f }
+        write(1, hb_f, 2)
+        msg = " ms)\n"
+        write(1, msg, 5)
+    } else {
+        msg = "\n"
+        write(1, msg, 1)
+    }
+}
+
+// Statics set by _start trampoline
+static uint64 cli_argc = 0
+static uint64 cli_argv = 0
+
+// Living compiler CLI options
+static uint64 lc_ci_mode = 0
+static uint64 lc_min_fitness = 0
+static uint64 lc_fix_mode = 0
+static uint64 lc_dry_run = 0
+static uint64 lc_list_proposals = 0
+static uint64 lc_promote_name = 0
+static uint64 lc_deprecate_name = 0
+static uint64 lc_reject_name = 0
+static uint64 freestanding = 0
+
+fn parse_uint_arg(uint64 s) -> uint64 {
+    uint64 val = 0
+    uint64 i = 0
+    uint64 p = s + i
+    uint64 c = 0
+    unsafe { *(p as uint8) -> c }
+    while c >= 48 && c <= 57 {
+        val = val * 10 + (c - 48)
+        i = i + 1
+        p = s + i
+        unsafe { *(p as uint8) -> c }
+    }
+    return val
+}
+
+@export
+fn main() {
+    // Windows: parse raw GetCommandLineA result into argc/argv
+    if cli_argc == 0xFFFFFFFF {
+        win_init_args()
+    }
+
+    uint64 input_path = 0
+    uint64 output_path = "a.krbo"
+    uint64 mode = 0
+    uint64 arch = 0
+    uint64 emit_mode = 0
+    uint64 arch_set = 0
+    uint64 emit_set = 0
+
+    if cli_argc > 1 {
+        uint64 i = 1
+        while i < cli_argc {
+            uint64 arg_ptr = cli_argv + i * 8
+            uint64 arg = 0
+            unsafe { *(arg_ptr as uint64) -> arg }
+            if str_starts_with(arg, "-o", 2) != 0 {
+                uint64 arg_len = str_len(arg)
+                if arg_len == 2 {
+                    i = i + 1
+                    uint64 next_ptr = cli_argv + i * 8
+                    unsafe { *(next_ptr as uint64) -> output_path }
+                } else {
+                    output_path = arg + 2
+                }
+            } else if str_starts_with(arg, "--arch=", 7) != 0 {
+                arch_set = 1
+                uint64 arch_str = arg + 7
+                if str_starts_with(arch_str, "arm64", 5) != 0 {
+                    arch = 1
+                } else if str_starts_with(arch_str, "aarch64", 7) != 0 {
+                    arch = 1
+                } else {
+                    arch = 0
+                }
+            } else if str_starts_with(arg, "--emit=", 7) != 0 {
+                emit_set = 1
+                uint64 emit_str = arg + 7
+                if str_starts_with(emit_str, "elfexe", 6) != 0 {
+                    emit_mode = 0
+                } else if str_starts_with(emit_str, "elf", 3) != 0 {
+                    // "elf" / "elf-arm64" / "elf-x86_64" aliases for ELF
+                    emit_mode = 0
+                } else if str_starts_with(emit_str, "linux", 5) != 0 {
+                    // "linux", "linux-x86_64", "linux-arm64", "linux-x86-64" all alias to ELF
+                    emit_mode = 0
+                } else if str_starts_with(emit_str, "macho", 5) != 0 {
+                    emit_mode = 1
+                } else if str_starts_with(emit_str, "mac", 3) != 0 {
+                    // "macos", "mac-x64", "mac-arm64" alias to Mach-O
+                    emit_mode = 1
+                } else if str_starts_with(emit_str, "darwin", 6) != 0 {
+                    emit_mode = 1
+                } else if str_starts_with(emit_str, "windows", 7) != 0 {
+                    // "windows", "windows-x64", "windows-arm64" alias to PE
+                    emit_mode = 2
+                } else if str_starts_with(emit_str, "win", 3) != 0 {
+                    // "win", "win-x64", "win-arm64" alias to PE
+                    emit_mode = 2
+                } else if str_starts_with(emit_str, "pe", 2) != 0 {
+                    emit_mode = 2
+                } else if str_starts_with(emit_str, "obj", 3) != 0 {
+                    emit_mode = 3
+                } else if str_starts_with(emit_str, "android", 7) != 0 {
+                    emit_mode = 4
+                } else if str_starts_with(emit_str, "asm", 3) != 0 {
+                    emit_mode = 5
+                } else if str_starts_with(emit_str, "ir", 2) != 0 {
+                    emit_mode = 6
+                } else {
+                    write(2, "error: unknown emit format '", 28)
+                    uint64 esl = str_len(emit_str)
+                    write(2, emit_str, esl)
+                    write(2, "'\n", 2)
+                    write(2, "valid: elfexe, linux, macho, mac, pe, windows, win, obj, android, asm, ir\n", 74)
+                    exit(1)
+                }
+            } else if str_eq_full(arg, "-c") != 0 {
+                emit_set = 1
+                emit_mode = 3
+            } else if str_starts_with(arg, "--targets=", 10) != 0 {
+                parse_targets_arg(arg + 10)
+            } else if str_starts_with(arg, "--target=", 9) != 0 {
+                uint64 tgt_str = arg + 9
+                if str_starts_with(tgt_str, "macos", 5) != 0 {
+                    target_os = 1
+                } else if str_starts_with(tgt_str, "darwin", 6) != 0 {
+                    target_os = 1
+                } else if str_starts_with(tgt_str, "windows", 7) != 0 {
+                    target_os = 2
+                } else if str_starts_with(tgt_str, "win", 3) != 0 {
+                    target_os = 2
+                } else if str_starts_with(tgt_str, "linux", 5) != 0 {
+                    target_os = 0
+                } else if str_starts_with(tgt_str, "android", 7) != 0 {
+                    target_os = 3
+                    emit_mode = 4
+                }
+            } else if str_starts_with(arg, "--help", 6) != 0 || str_eq_full(arg, "-h") != 0 {
+                write(1, "usage: krc [options] <file.kr> [-o output]\n\n", 44)
+                write(1, "options:\n", 9)
+                write(1, "  --arch=x86_64|arm64\n", 22)
+                write(1, "  --emit=elfexe|macho|pe|obj|android|asm\n", 41)
+                write(1, "  -c                        emit relocatable .o\n", 48)
+                write(1, "  --target=linux|macos|windows\n", 31)
+                write(1, "  --targets=<list>          custom fat binary (e.g. linux-x64,macos-arm64)\n", 75)
+                write(1, "  --freestanding            no startup code\n", 44)
+                write(1, "  --debug                   runtime safety checks\n", 51)
+                write(1, "  -g                        emit DWARF debug info\n", 50)
+                write(1, "  --version                 show version\n", 41)
+                write(1, "  --help, -h                show this help\n\n", 44)
+                write(1, "commands:\n", 10)
+                write(1, "  check <file.kr>   safety analysis\n", 36)
+                write(1, "  lc <file.kr>      living compiler\n", 36)
+                write(1, "  fmt <file.kr>     auto-format source\n", 39)
+                exit(0)
+            } else if str_starts_with(arg, "--version", 9) != 0 {
+                uint64 msg = "krc 2.8.14 (KernRift self-hosted compiler)\n"
+                write(1, msg, 42)
+                exit(0)
+            } else if str_starts_with(arg, "--freestanding", 14) != 0 {
+                freestanding = 1
+            } else if str_starts_with(arg, "--legacy", 8) != 0 {
+                emit_ir_mode = 0
+            } else if str_starts_with(arg, "--ir", 4) != 0 {
+                emit_ir_mode = 2
+            } else if str_starts_with(arg, "--O0", 4) != 0 {
+                ir_opt_level = 0
+            } else if str_starts_with(arg, "--debug", 7) != 0 {
+                debug_mode = 1
+            } else if str_starts_with(arg, "-g", 2) != 0 {
+                debug_info_mode = 1
+            } else if str_starts_with(arg, "--ci", 4) != 0 {
+                lc_ci_mode = 1
+            } else if str_starts_with(arg, "--fix", 5) != 0 {
+                lc_fix_mode = 1
+            } else if str_starts_with(arg, "--dry-run", 9) != 0 {
+                lc_dry_run = 1
+            } else if str_starts_with(arg, "--list-proposals", 16) != 0 {
+                lc_list_proposals = 1
+                mode = 2
+            } else if str_starts_with(arg, "--promote=", 10) != 0 {
+                lc_promote_name = arg + 10
+                mode = 2
+            } else if str_starts_with(arg, "--promote", 9) != 0 {
+                i = i + 1
+                uint64 pnext_ptr = cli_argv + i * 8
+                uint64 pnext_arg = 0
+                unsafe { *(pnext_ptr as uint64) -> pnext_arg }
+                lc_promote_name = pnext_arg
+                mode = 2
+            } else if str_starts_with(arg, "--deprecate=", 12) != 0 {
+                lc_deprecate_name = arg + 12
+                mode = 2
+            } else if str_starts_with(arg, "--deprecate", 11) != 0 {
+                i = i + 1
+                uint64 dnext_ptr = cli_argv + i * 8
+                uint64 dnext_arg = 0
+                unsafe { *(dnext_ptr as uint64) -> dnext_arg }
+                lc_deprecate_name = dnext_arg
+                mode = 2
+            } else if str_starts_with(arg, "--reject=", 9) != 0 {
+                lc_reject_name = arg + 9
+                mode = 2
+            } else if str_starts_with(arg, "--reject", 8) != 0 {
+                i = i + 1
+                uint64 rnext_ptr = cli_argv + i * 8
+                uint64 rnext_arg = 0
+                unsafe { *(rnext_ptr as uint64) -> rnext_arg }
+                lc_reject_name = rnext_arg
+                mode = 2
+            } else if str_starts_with(arg, "--min-fitness=", 14) != 0 {
+                lc_min_fitness = parse_uint_arg(arg + 14)
+            } else if str_starts_with(arg, "--min-fitness", 13) != 0 {
+                // --min-fitness N (next arg)
+                i = i + 1
+                uint64 next_ptr = cli_argv + i * 8
+                uint64 next_arg = 0
+                unsafe { *(next_ptr as uint64) -> next_arg }
+                lc_min_fitness = parse_uint_arg(next_arg)
+            } else if str_starts_with(arg, "check", 5) != 0 {
+                mode = 1
+            } else if str_starts_with(arg, "lc", 2) != 0 {
+                mode = 2
+            } else if str_starts_with(arg, "fmt", 3) != 0 {
+                mode = 3
+            } else {
+                input_path = arg
+            }
+            i = i + 1
+        }
+    }
+
+
+
+    // Auto-set target_os from emit_mode if not explicitly set
+    if emit_mode == 1 && target_os == 0 { target_os = 1 }
+    if emit_mode == 2 && target_os == 0 { target_os = 2 }
+    if emit_mode == 4 && target_os == 0 { target_os = 3 }
+    // emit_mode=4 (android): default to arm64 unless --arch was explicitly set
+    if emit_mode == 4 && arch_set == 0 { arch = 1 }
+
+    // Derive output name from input if not specified with -o
+    if str_eq_full(output_path, "a.krbo") != 0 && input_path != 0 {
+        uint64 ilen = str_len(input_path)
+        // Strip .kr extension if present, then add appropriate extension
+        uint64 base_len = ilen
+        if ilen > 3 {
+            uint64 dp = input_path + ilen - 3
+            uint64 d0 = 0; uint64 d1 = 0; uint64 d2 = 0
+            unsafe { *(dp as uint8) -> d0 }
+            uint64 dp1 = dp + 1; unsafe { *(dp1 as uint8) -> d1 }
+            uint64 dp2 = dp + 2; unsafe { *(dp2 as uint8) -> d2 }
+            if d0 == 46 && d1 == 107 && d2 == 114 { base_len = ilen - 3 }
+        }
+        if emit_mode == 3 {
+            // Object file: input.kr → input.o
+            uint64 out = alloc(base_len + 3)
+            memcpy(out, input_path, base_len)
+            uint64 ep = out + base_len
+            uint8 e0 = 46; uint8 e1 = 111
+            unsafe { *(ep as uint8) = e0 }
+            uint64 ep1 = ep + 1; unsafe { *(ep1 as uint8) = e1 }
+            uint64 ep2 = ep + 2; uint8 z = 0
+            unsafe { *(ep2 as uint8) = z }
+            output_path = out
+        } else if emit_mode == 2 {
+            // PE: input.kr → input.exe
+            uint64 out = alloc(base_len + 5)
+            memcpy(out, input_path, base_len)
+            uint64 ep = out + base_len
+            uint8 e0 = 46; uint8 e1 = 101; uint8 e2 = 120; uint8 e3 = 101
+            unsafe { *(ep as uint8) = e0 }
+            uint64 ep1 = ep + 1; unsafe { *(ep1 as uint8) = e1 }
+            uint64 ep2 = ep + 2; unsafe { *(ep2 as uint8) = e2 }
+            uint64 ep3 = ep + 3; unsafe { *(ep3 as uint8) = e3 }
+            uint64 ep4 = ep + 4; uint8 z = 0
+            unsafe { *(ep4 as uint8) = z }
+            output_path = out
+        } else if arch_set != 0 || emit_set != 0 {
+            // Single arch: input.kr → input (no extension, native binary)
+            uint64 out = alloc(base_len + 1)
+            memcpy(out, input_path, base_len)
+            uint64 tp = out + base_len
+            uint8 z = 0
+            unsafe { *(tp as uint8) = z }
+            output_path = out
+        } else {
+            // Fat binary: input.kr → input.krbo
+            uint64 out = alloc(base_len + 6)
+            memcpy(out, input_path, base_len)
+            uint64 ep = out + base_len
+            uint8 e0 = 46; uint8 e1 = 107; uint8 e2 = 114; uint8 e3 = 98; uint8 e4 = 111
+            unsafe { *(ep as uint8) = e0 }
+            uint64 ep1 = ep + 1; unsafe { *(ep1 as uint8) = e1 }
+            uint64 ep2 = ep + 2; unsafe { *(ep2 as uint8) = e2 }
+            uint64 ep3 = ep + 3; unsafe { *(ep3 as uint8) = e3 }
+            uint64 ep4 = ep + 4; unsafe { *(ep4 as uint8) = e4 }
+            uint64 ep5 = ep + 5; uint8 z = 0
+            unsafe { *(ep5 as uint8) = z }
+            output_path = out
+        }
+    }
+
+    // --list-proposals doesn't need an input file
+    if lc_list_proposals != 0 && input_path == 0 {
+        init_proposals()
+        load_proposal_overrides()
+        list_proposals()
+        exit(0)
+    }
+
+    // --promote / --deprecate / --reject: governance commands, no input file
+    if lc_promote_name != 0 && input_path == 0 {
+        init_proposals()
+        load_proposal_overrides()
+        promote_proposal(lc_promote_name)
+        exit(0)
+    }
+    if lc_deprecate_name != 0 && input_path == 0 {
+        init_proposals()
+        load_proposal_overrides()
+        deprecate_proposal(lc_deprecate_name)
+        exit(0)
+    }
+    if lc_reject_name != 0 && input_path == 0 {
+        init_proposals()
+        load_proposal_overrides()
+        reject_proposal(lc_reject_name)
+        exit(0)
+    }
+
+    if input_path == 0 {
+        if cli_argc > 0 {
+            write(2, "krc: no input file\n\n", 20)
+            write(2, "usage: krc [options] <file.kr> [-o output]\n\n", 44)
+            write(2, "options:\n", 9)
+            write(2, "  --arch=x86_64|arm64\n", 22)
+            write(2, "  --emit=elfexe|macho|pe|obj|android|asm\n", 41)
+            write(2, "  -c                        emit relocatable .o\n", 48)
+            write(2, "  --target=linux|macos|windows\n", 31)
+            write(2, "  --version\n\n", 13)
+            write(2, "commands:\n", 10)
+            write(2, "  check <file.kr>   safety analysis\n", 36)
+            write(2, "  lc <file.kr>      living compiler\n", 36)
+            write(2, "  fmt <file.kr>     auto-format source\n", 39)
+            exit(0)
+        }
+        input_path = "test_input.kr"
+    }
+
+    if mode == 1 {
+        import_init()
+    import_check_file(input_path)
+        import_process(input_path)
+        uint64 source = import_buf
+        uint64 size = import_buf_len
+        uint64 max_tok = 262144
+        uint64 my_tokens = alloc(max_tok * 16)
+        lexer_init(source, size, my_tokens, max_tok)
+        uint64 tcount = lexer_run()
+        ast_init(262144)
+        codegen_init(1048576, source, my_tokens)
+        parser_init(my_tokens, tcount)
+        uint64 root = parse_module()
+        uint64 errors = run_analysis(root)
+        if errors > 0 {
+            uint8[32] nb
+            write(2, "\nkrc: ", 6)
+            uint64 nl = fmt_uint(nb, errors)
+            write(2, nb, nl)
+            write(2, " analysis error(s) found in ", 28)
+            write(2, input_path, str_len(input_path))
+            write(2, "\n", 1)
+            exit(1)
+        }
+        write(1, "krc check: ", 11)
+        write(1, input_path, str_len(input_path))
+        write(1, " — OK\n", 6)
+        exit(0)
+    }
+
+    if mode == 2 {
+        // --list-proposals: print the governance-layer proposal registry
+        if lc_list_proposals != 0 {
+            init_proposals()
+            load_proposal_overrides()
+            list_proposals()
+            exit(0)
+        }
+        // --fix mode: run the migration engine on the input file
+        if lc_fix_mode != 0 {
+            run_migration(input_path, lc_dry_run)
+            exit(0)
+        }
+        import_init()
+    import_check_file(input_path)
+        import_process(input_path)
+        uint64 source = import_buf
+        uint64 size = import_buf_len
+        uint64 max_tok = 262144
+        uint64 my_tokens = alloc(max_tok * 16)
+        lexer_init(source, size, my_tokens, max_tok)
+        uint64 tcount = lexer_run()
+        ast_init(262144)
+        codegen_init(1048576, source, my_tokens)
+        parser_init(my_tokens, tcount)
+        uint64 root = parse_module()
+        // Run analysis first to populate lock graph
+        analysis_init()
+        uint64 tel = collect_telemetry(root)
+        uint64 patterns = detect_patterns(root, tel)
+        uint64 cycles = check_lock_cycles()
+        uint64 fitness = compute_fitness(tel, patterns, cycles)
+        init_proposals()
+        load_proposal_overrides()
+        detect_proposals(tel)
+        if lc_min_fitness > 0 {
+            print_living_report_filtered(tel, patterns, fitness, lc_min_fitness)
+        } else {
+            print_living_report(tel, patterns, fitness)
+        }
+        print_firing_proposals()
+        if lc_ci_mode != 0 {
+            uint64 gate_threshold = lc_min_fitness
+            if gate_threshold == 0 { gate_threshold = 50 }
+            if lc_check_ci_gate(gate_threshold) != 0 {
+                exit(1)
+            }
+        }
+        exit(0)
+    }
+
+    if mode == 3 {
+        fmt_file(input_path)
+        exit(0)
+    }
+
+    // Default: produce fat binary unless --arch or --emit specified.
+    // On Windows / macOS: default to the host's native format so that
+    // `krc hello.kr` just works without flags. The user can still
+    // explicitly request a fat binary with `krc hello.kr -o hello.krbo`
+    // via --emit=... if they want cross-platform output.
+    // --targets=<list> always forces fat-binary emission (custom slice set).
+    if target_mask != 0 || (arch_set == 0 && emit_set == 0 && cli_argc > 0) {
+        compile_fat(input_path, output_path)
+    } else {
+        compile(input_path, output_path, arch, emit_mode)
+    }
+    exit(0)
+}

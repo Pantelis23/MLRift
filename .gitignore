@@ -1,0 +1,38 @@
+# Build artifacts
+/build/*
+!/build/krc2
+/dist/
+/target/
+
+# Compiled output
+*.krbo
+*.elf
+*.o
+*.a
+a.out
+
+# Test artifacts (root-level only — build/krc2 is the committed bootstrap)
+/test_input.kr
+/krc2
+/krc3
+/krc4
+
+# IDE
+/.idea
+/.vscode
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tools
+/.tools/
+.worktrees/
+
+# Website (deployed separately)
+/website/
+
+# Internal docs
+/docs/superpowers/
+/docs/reviews/

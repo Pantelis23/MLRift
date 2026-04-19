@@ -1,0 +1,378 @@
+// KernRift Standard Library — Allocators
+// Arena: bump allocator backed by mmap slab with optional guard page
+
+import "fmt.kr"
+
+fn arena_new(u64 capacity) -> u64 {
+    // Allocate slab: 40 (header) + capacity + 4096 (guard page)
+    u64 total = capacity + 40 + 4096
+    u64 base = alloc(total)
+    // base points to user region of alloc (after alloc's own 8-byte header)
+    // Store arena header
+    store64(base, capacity)       // [0]  capacity
+    store64(base + 8, 0)          // [8]  used = 0
+    store64(base + 16, 0)         // [16] alloc_count = 0
+    store64(base + 24, 0)         // [24] alloc_total = 0
+    store64(base + 32, 1)         // [32] guard = 1
+
+    // Set up guard page: mprotect the last 4096 bytes as PROT_NONE
+    // Only on Linux x86_64 for V1 (syscall_raw)
+    u64 guard_addr = base + 40 + capacity
+    // mprotect(addr, len, prot): Linux syscall 10
+    // prot = 0 (PROT_NONE)
+    syscall_raw(10, guard_addr, 4096, 0, 0, 0, 0)
+
+    return base
+}
+
+fn arena_alloc(u64 arena, u64 size) -> u64 {
+    // 8-byte align size
+    u64 aligned = (size + 7) & ~7
+    u64 capacity = load64(arena)
+    u64 used = load64(arena + 8)
+    if used + aligned > capacity {
+        write(2, "arena: out of memory\n", 21)
+        exit(1)
+    }
+    u64 ptr = arena + 40 + used
+    store64(arena + 8, used + aligned)       // update used
+    u64 count = load64(arena + 16)
+    store64(arena + 16, count + 1)           // update alloc_count
+    u64 total = load64(arena + 24)
+    store64(arena + 24, total + size)        // update alloc_total (original size)
+    return ptr
+}
+
+fn arena_reset(u64 arena) {
+    store64(arena + 8, 0)   // used = 0
+    // Don't reset alloc_count/alloc_total — they're cumulative stats
+}
+
+fn arena_destroy(u64 arena) {
+    u64 used = load64(arena + 8)
+    if used > 0 {
+        u64 count = load64(arena + 16)
+        write(2, "arena: ", 7)
+        u64 s1 = fmt_dec(used)
+        write(2, s1, str_len(s1))
+        write(2, " bytes still live at destroy (", 30)
+        u64 s2 = fmt_dec(count)
+        write(2, s2, str_len(s2))
+        write(2, " allocations)\n", 14)
+    }
+    dealloc(arena)
+}
+
+fn arena_stats(u64 arena) -> u64 {
+    u64 total = load64(arena + 24)
+    u64 live = load64(arena + 8)
+    return (total, live)
+}
+
+// Pool: fixed-size slot allocator with free list, double-free detection, poison
+
+fn pool_new(u64 obj_size, u64 count) -> u64 {
+    // Round obj_size to 8-byte alignment, minimum 16 (need 8 for next-ptr + 8 for canary)
+    u64 aligned = (obj_size + 7) & 0xFFFFFFFFFFFFFFF8
+    if aligned < 16 { aligned = 16 }
+    u64 data_size = aligned * count
+    u64 total = 56 + data_size + 4096
+    u64 base = alloc(total)
+    // Header
+    store64(base, aligned)            // obj_size
+    store64(base + 8, count)          // capacity
+    store64(base + 24, 0)             // used_count
+    store64(base + 32, 0)             // alloc_count
+    store64(base + 40, 0)             // free_count
+    store64(base + 48, 1)             // guard
+
+    // Guard page
+    u64 guard_addr = base + 56 + data_size
+    syscall_raw(10, guard_addr, 4096, 0, 0, 0, 0)
+
+    // Initialize free list: chain all slots
+    u64 slot_base = base + 56
+    u64 i = 0
+    while i < count {
+        u64 slot = slot_base + i * aligned
+        if i + 1 < count {
+            u64 next_slot = slot_base + (i + 1) * aligned
+            store64(slot, next_slot)        // next pointer
+        } else {
+            store64(slot, 0)                // last slot: next = NULL
+        }
+        store64(slot + 8, 0)               // canary = 0 (clean)
+        i = i + 1
+    }
+    store64(base + 16, slot_base)     // free_head = first slot
+
+    return base
+}
+
+fn pool_alloc(u64 pool) -> u64 {
+    u64 head = load64(pool + 16)
+    if head == 0 {
+        write(2, "pool: out of slots\n", 19)
+        exit(1)
+    }
+    // Pop from free list
+    u64 next = load64(head)
+    store64(pool + 16, next)           // free_head = next
+
+    // Clear poison/canary (zero the slot)
+    u64 obj_size = load64(pool)
+    u64 j = 0
+    while j < obj_size {
+        store8(head + j, 0)
+        j = j + 1
+    }
+
+    // Update stats
+    u64 used = load64(pool + 24)
+    store64(pool + 24, used + 1)
+    u64 ac = load64(pool + 32)
+    store64(pool + 32, ac + 1)
+
+    return head
+}
+
+fn pool_free(u64 pool, u64 ptr) {
+    // Double-free detection: check canary at [ptr+8]
+    u64 canary = load64(ptr + 8)
+    if canary == 0xDEADBEEFDEADBEEF {
+        write(2, "pool: double-free detected\n", 27)
+        exit(1)
+    }
+
+    // Poison the slot (except first 8 bytes used for free-list next pointer)
+    u64 obj_size = load64(pool)
+    u64 j = 8
+    while j < obj_size {
+        store8(ptr + j, 0xEF)   // Fill with 0xEF pattern (part of 0xDEADBEEF)
+        j = j + 1
+    }
+    // Write poison canary at [ptr+8]
+    store64(ptr + 8, 0xDEADBEEFDEADBEEF)
+
+    // Push to free list head
+    u64 old_head = load64(pool + 16)
+    store64(ptr, old_head)
+    store64(pool + 16, ptr)
+
+    // Update stats
+    u64 used = load64(pool + 24)
+    store64(pool + 24, used - 1)
+    u64 fc = load64(pool + 40)
+    store64(pool + 40, fc + 1)
+}
+
+fn pool_destroy(u64 pool) {
+    u64 used = load64(pool + 24)
+    if used > 0 {
+        u64 obj_size = load64(pool)
+        u64 leaked = used * obj_size
+        write(2, "pool: ", 6)
+        u64 s1 = fmt_dec(used)
+        write(2, s1, str_len(s1))
+        write(2, " slots leaked (", 15)
+        u64 s2 = fmt_dec(leaked)
+        write(2, s2, str_len(s2))
+        write(2, " bytes)\n", 8)
+    }
+    dealloc(pool)
+}
+
+fn pool_stats(u64 pool) -> u64 {
+    u64 total = load64(pool + 8)    // capacity
+    u64 used = load64(pool + 24)    // used_count
+    return (total, used)
+}
+
+// Heap: general-purpose variable-size allocator with free list, coalescing, leak detection
+
+fn heap_new(u64 capacity) -> u64 {
+    u64 total = 56 + capacity + 4096
+    u64 base = alloc(total)
+    // Heap header
+    store64(base, capacity)
+    store64(base + 16, 0)   // alloc_count
+    store64(base + 24, 0)   // free_count
+    store64(base + 32, 0)   // alloc_total
+    store64(base + 40, 0)   // free_total
+    store64(base + 48, 1)   // guard
+
+    // Guard page
+    u64 guard_addr = base + 56 + capacity
+    syscall_raw(10, guard_addr, 4096, 0, 0, 0, 0)
+
+    // Initialize one big free block covering the entire capacity
+    u64 block = base + 56
+    u64 block_size = capacity - 40  // usable size = capacity minus block header
+    store64(block, block_size)      // size
+    store64(block + 8, 0)           // flags = free
+    store64(block + 16, 0)          // prev_free = NULL
+    store64(block + 24, 0)          // next_free = NULL
+    store64(block + 32, 0)          // canary = 0 (unset for free)
+
+    store64(base + 8, block)        // free_head = this block
+    return base
+}
+
+fn heap_alloc(u64 heap, u64 size) -> u64 {
+    // 8-byte align requested size
+    u64 aligned = (size + 7) & 0xFFFFFFFFFFFFFFF8
+    if aligned < 8 { aligned = 8 }
+
+    // First-fit: walk free list
+    u64 block = load64(heap + 8)    // free_head
+    u64 found = 0
+    while block != 0 && found == 0 {
+        u64 bsize = load64(block)
+        if bsize >= aligned {
+            found = block
+        } else {
+            block = load64(block + 24)  // next_free
+        }
+    }
+
+    if found == 0 {
+        write(2, "heap: out of memory\n", 20)
+        exit(1)
+    }
+
+    u64 bsize = load64(found)
+
+    // Split if large enough (remaining > 80 = 40 header + 40 min usable)
+    if bsize >= aligned + 80 {
+        u64 new_block = found + 40 + aligned
+        u64 new_size = bsize - aligned - 40
+        store64(new_block, new_size)        // size
+        store64(new_block + 8, 0)           // flags = free
+        store64(new_block + 32, 0)          // canary
+
+        // Link new_block into free list in place of found
+        u64 prev = load64(found + 16)
+        u64 next = load64(found + 24)
+        store64(new_block + 16, prev)
+        store64(new_block + 24, next)
+        if prev != 0 { store64(prev + 24, new_block) }
+        if next != 0 { store64(next + 16, new_block) }
+        if load64(heap + 8) == found { store64(heap + 8, new_block) }
+
+        store64(found, aligned)             // shrink found to exact size
+    } else {
+        // Don't split — remove found from free list entirely
+        u64 prev = load64(found + 16)
+        u64 next = load64(found + 24)
+        if prev != 0 { store64(prev + 24, next) }
+        if next != 0 { store64(next + 16, prev) }
+        if load64(heap + 8) == found { store64(heap + 8, next) }
+    }
+
+    // Mark allocated
+    store64(found + 8, 1)                   // flags = allocated
+    store64(found + 16, 0)                  // clear prev_free
+    store64(found + 24, 0)                  // clear next_free
+    store64(found + 32, 0xCAFEBABECAFEBABE) // canary = allocated
+
+    // Update stats
+    u64 ac = load64(heap + 16)
+    store64(heap + 16, ac + 1)
+    u64 atot = load64(heap + 32)
+    store64(heap + 32, atot + size)         // original size, not aligned
+
+    return found + 40
+}
+
+fn heap_free(u64 heap, u64 ptr) {
+    u64 block = ptr - 40
+
+    // Double-free detection
+    u64 canary = load64(block + 32)
+    if canary == 0xDEADBEEFDEADBEEF {
+        write(2, "heap: double-free detected\n", 27)
+        exit(1)
+    }
+
+    u64 bsize = load64(block)
+
+    // Forward coalescing: check next adjacent block
+    u64 next_block = block + 40 + bsize
+    // Check if next_block is within the heap slab
+    u64 capacity = load64(heap)
+    u64 slab_end = heap + 56 + capacity
+    if next_block + 40 <= slab_end {
+        u64 next_flags = load64(next_block + 8)
+        if next_flags == 0 {
+            // Next block is free — merge
+            u64 next_size = load64(next_block)
+            store64(block, bsize + 40 + next_size)  // grow block
+
+            // Remove next_block from free list
+            u64 np = load64(next_block + 16)
+            u64 nn = load64(next_block + 24)
+            if np != 0 { store64(np + 24, nn) }
+            if nn != 0 { store64(nn + 16, np) }
+            if load64(heap + 8) == next_block { store64(heap + 8, nn) }
+
+            bsize = load64(block)  // updated size after merge
+        }
+    }
+
+    // Mark free
+    store64(block + 8, 0)                       // flags = free
+    store64(block + 32, 0xDEADBEEFDEADBEEF)    // canary = freed
+
+    // Poison first 8 bytes of user data
+    store64(ptr, 0xDEADBEEFDEADBEEF)
+
+    // Insert at head of free list
+    u64 old_head = load64(heap + 8)
+    store64(block + 16, 0)                      // prev = NULL
+    store64(block + 24, old_head)               // next = old head
+    if old_head != 0 { store64(old_head + 16, block) }
+    store64(heap + 8, block)                    // free_head = block
+
+    // Update stats
+    u64 fc = load64(heap + 24)
+    store64(heap + 24, fc + 1)
+    u64 ft = load64(heap + 40)
+    // Use original size from the block (bsize is aligned, but we stored aligned)
+    // For simplicity, track aligned bytes freed
+    store64(heap + 40, ft + bsize)
+}
+
+fn heap_destroy(u64 heap) {
+    // Linear walk all blocks to find leaks
+    u64 capacity = load64(heap)
+    u64 pos = heap + 56
+    u64 end = heap + 56 + capacity
+    u64 leak_count = 0
+    u64 leak_bytes = 0
+    while pos + 40 <= end {
+        u64 bsize = load64(pos)
+        u64 flags = load64(pos + 8)
+        if flags == 1 {
+            leak_count = leak_count + 1
+            leak_bytes = leak_bytes + bsize
+        }
+        pos = pos + 40 + bsize
+    }
+    if leak_count > 0 {
+        write(2, "heap: ", 6)
+        u64 s1 = fmt_dec(leak_count)
+        write(2, s1, str_len(s1))
+        write(2, " blocks leaked (", 16)
+        u64 s2 = fmt_dec(leak_bytes)
+        write(2, s2, str_len(s2))
+        write(2, " bytes)\n", 8)
+    }
+    dealloc(heap)
+}
+
+fn heap_stats(u64 heap) -> u64 {
+    u64 atot = load64(heap + 32)    // alloc_total
+    u64 ftot = load64(heap + 40)    // free_total
+    u64 live = atot - ftot
+    return (atot, ftot, live)
+}
