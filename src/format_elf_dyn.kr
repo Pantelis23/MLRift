@@ -635,6 +635,71 @@ fn edyn_write_gotplt() {
 }
 
 // ---------------------------------------------------------------------------
+// Layout computation hook (M2a.3.c)
+// ---------------------------------------------------------------------------
+// Sets the emitter's input state and runs edyn_compute_layout without
+// writing anything. Drivers call this before edyn_patch_dyn_calls so
+// the per-symbol PLT vaddr is available to the patcher.
+
+@export
+fn edyn_compute_dyn_layout_for(uint64 lib_ptr, uint64 lib_len,
+                               uint64 sym_list_ptr, uint64 sym_count,
+                               uint64 text_len) {
+    edyn_in_lib_ptr   = lib_ptr
+    edyn_in_lib_len   = lib_len
+    edyn_in_sym_list  = sym_list_ptr
+    edyn_in_sym_count = sym_count
+    edyn_in_text_len  = text_len
+    edyn_in_entry_off = 0
+    edyn_compute_layout()
+}
+
+// Patch every recorded @dynamic call site in `text_ptr` with the rel32
+// that reaches the corresponding PLT entry. Assumes edyn_compute_layout
+// has been run so edyn_va_text and edyn_sym_plt_va(i) are valid.
+//
+// code_off in dyn_call_sites is the offset into the *codegen* buffer
+// where the rel32 lives (codegen writes its output into out_buf, which
+// may carry ELF headers ahead of .text). `code_off_base` is the offset
+// of .text's first byte inside that same codegen buffer — passing 0
+// means "code_off values are already text-relative".
+@export
+fn edyn_patch_dyn_calls(uint64 text_ptr, uint64 code_off_base) {
+    uint64 n = dyn_call_count_get()
+    if n == 0 { return }
+
+    uint64 i = 0
+    while i < n {
+        uint64 code_off = dyn_call_off_at(i)
+        uint64 sym_idx  = dyn_call_sym_at(i)
+        if code_off < code_off_base {
+            write(2, "format_elf_dyn: @dynamic call site before text start\n", 53)
+            exit(1)
+        }
+        uint64 text_off = code_off - code_off_base
+        if text_off + 4 > edyn_in_text_len {
+            write(2, "format_elf_dyn: @dynamic call site past text end\n", 49)
+            exit(1)
+        }
+        uint64 rip_after = edyn_va_text + text_off + 4
+        uint64 plt_va = edyn_sym_plt_va(sym_idx)
+        uint64 rel32 = (plt_va - rip_after) & 0xFFFFFFFF
+
+        uint64 p = text_ptr + text_off
+        uint8 b0 = rel32 & 0xFF
+        uint8 b1 = (rel32 >> 8) & 0xFF
+        uint8 b2 = (rel32 >> 16) & 0xFF
+        uint8 b3 = (rel32 >> 24) & 0xFF
+        unsafe { *(p as uint8) = b0 }
+        uint64 p1 = p + 1; unsafe { *(p1 as uint8) = b1 }
+        uint64 p2 = p + 2; unsafe { *(p2 as uint8) = b2 }
+        uint64 p3 = p + 3; unsafe { *(p3 as uint8) = b3 }
+
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Top-level generic entry
 // ---------------------------------------------------------------------------
 
