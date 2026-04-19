@@ -1,0 +1,172 @@
+// MLRift — stage 7.
+//
+// 100 LIF neurons with a biologically-shaped 80% excitatory / 20%
+// inhibitory split. cell_type[i] = 0 for E (i < 80), 1 for I (i >= 80).
+//
+// Each target tracks two conductances with different taus:
+//   s_exc  (AMPA-like)  τ = 10 ms
+//   s_inh  (GABA-like)  τ =  5 ms
+// Drive into the voltage equation:
+//   (V_rest - V + RI + s_exc * J_E − s_inh * J_I) / τ_m
+//
+// J_I is 4× J_E, following the typical cortical E/I-balance pattern:
+// inhibitory interneurons are rarer (20%) but individually stronger
+// per unit conductance, so average fan-in drives cancel at steady state.
+//
+// Same xorshift32 / p=0.1 connectivity as stage 5; synapses carry an
+// extra syn_is_inh flag set from the source's cell type. The delivery
+// loop dispatches to s_exc or s_inh accordingly.
+//
+// Matches examples/ei_100_reference.py byte-for-byte.
+
+static f64 dt = 0.1
+static f64 V_rest = -70.0
+static f64 V_reset = -75.0
+static f64 V_thresh = -55.0
+static f64 tau_m = 20.0
+static f64 tau_e = 10.0
+static f64 tau_i = 5.0
+static f64 J_E = 2.0
+static f64 J_I = 8.0
+static f64 syn_weight = 0.1
+
+static uint64[100] cell_type      // 0 = E, 1 = I
+static f64[100] V
+static uint64[100] ref_count
+static f64[100] RI
+static f64[100] s_exc
+static f64[100] s_inh
+static uint64[100] fired_this_step
+
+static uint64[2000] syn_src
+static uint64[2000] syn_tgt
+static f64[2000]    syn_w
+static uint64[2000] syn_is_inh
+
+static uint32 rng_state = 0
+
+fn rng_next() -> uint64 {
+    uint32 s = rng_state
+    uint64 s64 = s
+    uint64 t1 = (s64 << 13) & 0xFFFFFFFF
+    s64 = s64 ^ t1
+    s64 = s64 ^ (s64 >> 17)
+    uint64 t2 = (s64 << 5) & 0xFFFFFFFF
+    s64 = s64 ^ t2
+    s64 = s64 & 0xFFFFFFFF
+    uint32 s2 = s64
+    rng_state = s2
+    return s64
+}
+
+fn main() {
+    uint64 N = 100
+    uint64 n_E = 80
+    uint64 n_steps = 10000
+    uint64 ref_steps = 20
+    uint64 connect_prob_denom = 10
+
+    rng_state = 305419896
+
+    uint64 j = 0
+    while j < N {
+        V[j] = V_rest
+        ref_count[j] = 0
+        s_exc[j] = 0.0
+        s_inh[j] = 0.0
+        RI[j] = 10.0 + int_to_f64(j) * 0.2
+        if j < n_E { cell_type[j] = 0 } else { cell_type[j] = 1 }
+        j = j + 1
+    }
+
+    uint64 n_syn = 0
+    uint64 i_s = 0
+    while i_s < N {
+        uint64 j_s = 0
+        while j_s < N {
+            if i_s != j_s {
+                uint64 r = rng_next()
+                if (r % connect_prob_denom) == 0 {
+                    syn_src[n_syn] = i_s
+                    syn_tgt[n_syn] = j_s
+                    syn_w[n_syn] = syn_weight
+                    syn_is_inh[n_syn] = cell_type[i_s]
+                    n_syn = n_syn + 1
+                }
+            }
+            j_s = j_s + 1
+        }
+        i_s = i_s + 1
+    }
+
+    // count E and I synapses for the info header
+    uint64 n_i_syn = 0
+    uint64 cs = 0
+    while cs < n_syn {
+        if syn_is_inh[cs] > 0 { n_i_syn = n_i_syn + 1 }
+        cs = cs + 1
+    }
+    print("# n_syn=")
+    print(n_syn)
+    print(" n_i=")
+    println(n_i_syn)
+
+    uint64 step = 0
+    while step < n_steps {
+        uint64 k = 0
+        while k < N {
+            f64 se = s_exc[k]
+            f64 si = s_inh[k]
+            s_exc[k] = se - se * dt / tau_e
+            s_inh[k] = si - si * dt / tau_i
+            fired_this_step[k] = 0
+            k = k + 1
+        }
+
+        uint64 i = 0
+        while i < N {
+            if ref_count[i] > 0 {
+                ref_count[i] = ref_count[i] - 1
+                V[i] = V_reset
+            } else {
+                f64 v = V[i]
+                f64 ri = RI[i]
+                f64 se = s_exc[i]
+                f64 si = s_inh[i]
+                f64 drive = ri + se * J_E - si * J_I
+                f64 dv = dt * (V_rest - v + drive) / tau_m
+                f64 v_new = v + dv
+                V[i] = v_new
+                if v_new >= V_thresh {
+                    print(i)
+                    print(" ")
+                    println(step)
+                    V[i] = V_reset
+                    ref_count[i] = ref_steps
+                    fired_this_step[i] = 1
+                }
+            }
+            i = i + 1
+        }
+
+        uint64 syn = 0
+        while syn < n_syn {
+            uint64 s_src = syn_src[syn]
+            if fired_this_step[s_src] > 0 {
+                uint64 s_tgt = syn_tgt[syn]
+                f64 w = syn_w[syn]
+                if syn_is_inh[syn] > 0 {
+                    f64 cur = s_inh[s_tgt]
+                    s_inh[s_tgt] = cur + w
+                } else {
+                    f64 cur = s_exc[s_tgt]
+                    s_exc[s_tgt] = cur + w
+                }
+            }
+            syn = syn + 1
+        }
+
+        step = step + 1
+    }
+    exit(0)
+}
