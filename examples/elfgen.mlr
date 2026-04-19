@@ -1,0 +1,478 @@
+// MLRift — M2a.0.std: standalone dynamic-ELF prototype.
+//
+// Hand-rolls an x86_64 Linux dynamic-ELF that calls `puts("hello")`
+// and `exit(0)` via PLT/GOT, with `libc.so.6` declared as DT_NEEDED.
+// The `ld-linux-x86-64.so.2` interpreter resolves the symbols at
+// load time.
+//
+// This lives as a standalone example (not in src/) so it can be
+// verified independently before its layout gets ported into the
+// compiler's codegen path (M2a.1). When executed, writes the
+// output file to argv[1] (or /tmp/elfgen_hello by default).
+//
+// Verification:
+//   mlrc examples/elfgen.mlr -o /tmp/elfgen
+//   /tmp/elfgen /tmp/hello_dyn
+//   /tmp/hello_dyn                        # -> prints "hello"
+//   readelf -l /tmp/hello_dyn             # 6 phdrs incl. INTERP, DYNAMIC
+//   readelf -d /tmp/hello_dyn             # NEEDED libc.so.6 + 10 other DT entries
+//
+// Layout (total file size 0x2028):
+//
+//   PT_LOAD R     0x0000..0x0308   ELF hdr + phdrs + .interp + .dynstr +
+//                                  .dynsym + .hash + .rela.plt + .dynamic
+//   PT_LOAD RX    0x1000..0x1049   .plt + .text + "hello\0"
+//   PT_LOAD RW    0x2000..0x2028   .got.plt
+//
+// Entry point: 0x401030 (_start in .text).
+
+// Opt in to the compiler's argc/argv plumbing: if `main()` sees these
+// statics declared, it populates them from the Linux process stack
+// (argc at [rsp], argv at rsp+8) during its prologue.
+static uint64 cli_argc = 0
+static uint64 cli_argv = 0
+
+// ---------------------------------------------------------------------------
+// Layout constants (offsets + virtual addresses). Kept as `static` so
+// cross-references in the various writers stay in one place.
+// ---------------------------------------------------------------------------
+
+static uint64 BASE_VADDR   = 0x400000
+
+static uint64 OFF_ELF_HDR  = 0
+static uint64 OFF_PHDR     = 0x40
+static uint64 OFF_INTERP   = 0x190
+static uint64 OFF_DYNSTR   = 0x1AC
+static uint64 OFF_DYNSYM   = 0x1C8
+static uint64 OFF_HASH     = 0x210
+static uint64 OFF_RELAPLT  = 0x228
+static uint64 OFF_DYNAMIC  = 0x258
+static uint64 OFF_PLT      = 0x1000
+static uint64 OFF_TEXT     = 0x1030
+static uint64 OFF_HELLO    = 0x1047
+static uint64 OFF_GOTPLT   = 0x2000
+static uint64 FILE_END     = 0x2028
+
+static uint64 VA_INTERP    = 0x400190
+static uint64 VA_DYNSTR    = 0x4001AC
+static uint64 VA_DYNSYM    = 0x4001C8
+static uint64 VA_HASH      = 0x400210
+static uint64 VA_RELAPLT   = 0x400228
+static uint64 VA_DYNAMIC   = 0x400258
+static uint64 VA_PLT       = 0x401000
+static uint64 VA_PLT_PUTS  = 0x401010
+static uint64 VA_PLT_EXIT  = 0x401020
+static uint64 VA_TEXT      = 0x401030
+static uint64 VA_HELLO     = 0x401047
+static uint64 VA_GOTPLT    = 0x402000
+
+// GOT slot virtual addresses — 8 bytes each, 5 slots total:
+//   [0] _DYNAMIC  [1] link_map  [2] resolver  [3] puts  [4] exit
+static uint64 VA_GOT0      = 0x402000
+static uint64 VA_GOT1      = 0x402008
+static uint64 VA_GOT2      = 0x402010
+static uint64 VA_GOT_PUTS  = 0x402018
+static uint64 VA_GOT_EXIT  = 0x402020
+
+// .dynstr layout. 21 bytes: "\0libc.so.6\0puts\0exit\0"
+static uint64 DYNSTR_LEN      = 21
+static uint64 DSTR_OFF_LIBC   = 1    // "libc.so.6"
+static uint64 DSTR_OFF_PUTS   = 11   // "puts"
+static uint64 DSTR_OFF_EXIT   = 16   // "exit"
+
+// ---------------------------------------------------------------------------
+// Little-endian emit helpers (write absolute offset into buf).
+// ---------------------------------------------------------------------------
+
+fn emit_u8(uint64 buf, uint64 off, uint64 val) {
+    uint64 p = buf + off
+    uint8 b = val & 0xFF
+    unsafe { *(p as uint8) = b }
+}
+
+fn emit_u16(uint64 buf, uint64 off, uint64 val) {
+    emit_u8(buf, off, val & 0xFF)
+    emit_u8(buf, off + 1, (val >> 8) & 0xFF)
+}
+
+fn emit_u32(uint64 buf, uint64 off, uint64 val) {
+    emit_u16(buf, off, val & 0xFFFF)
+    emit_u16(buf, off + 2, (val >> 16) & 0xFFFF)
+}
+
+fn emit_u64(uint64 buf, uint64 off, uint64 val) {
+    emit_u32(buf, off, val & 0xFFFFFFFF)
+    emit_u32(buf, off + 4, (val >> 32) & 0xFFFFFFFF)
+}
+
+fn emit_str(uint64 buf, uint64 off, uint64 src, uint64 len) {
+    uint64 i = 0
+    while i < len {
+        uint64 sp = src + i
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        emit_u8(buf, off + i, b)
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ELF64 header (64 bytes @ file offset 0).
+// ---------------------------------------------------------------------------
+
+fn write_elf_header(uint64 buf) {
+    // e_ident[16]
+    emit_u8(buf, 0, 0x7F)
+    emit_u8(buf, 1, 69)     // 'E'
+    emit_u8(buf, 2, 76)     // 'L'
+    emit_u8(buf, 3, 70)     // 'F'
+    emit_u8(buf, 4, 2)      // ELFCLASS64
+    emit_u8(buf, 5, 1)      // ELFDATA2LSB (little-endian)
+    emit_u8(buf, 6, 1)      // EV_CURRENT
+    emit_u8(buf, 7, 0)      // ELFOSABI_NONE (SysV)
+    // 8..15 padding (already zero)
+
+    emit_u16(buf, 16, 2)          // e_type = ET_EXEC
+    emit_u16(buf, 18, 0x3E)       // e_machine = EM_X86_64
+    emit_u32(buf, 20, 1)          // e_version = EV_CURRENT
+    emit_u64(buf, 24, VA_TEXT)    // e_entry
+    emit_u64(buf, 32, OFF_PHDR)   // e_phoff
+    emit_u64(buf, 40, 0)          // e_shoff (no section headers)
+    emit_u32(buf, 48, 0)          // e_flags
+    emit_u16(buf, 52, 64)         // e_ehsize
+    emit_u16(buf, 54, 56)         // e_phentsize
+    emit_u16(buf, 56, 6)          // e_phnum
+    emit_u16(buf, 58, 0)          // e_shentsize
+    emit_u16(buf, 60, 0)          // e_shnum
+    emit_u16(buf, 62, 0)          // e_shstrndx
+}
+
+// ---------------------------------------------------------------------------
+// Program headers (6 × 56 bytes @ file offset 0x40).
+// Each Elf64_Phdr:
+//   u32 p_type, u32 p_flags, u64 p_offset, u64 p_vaddr, u64 p_paddr,
+//   u64 p_filesz, u64 p_memsz, u64 p_align
+// ---------------------------------------------------------------------------
+
+fn write_phdr(uint64 buf, uint64 idx,
+              uint64 p_type, uint64 p_flags,
+              uint64 p_offset, uint64 p_vaddr,
+              uint64 p_filesz, uint64 p_memsz,
+              uint64 p_align) {
+    uint64 base = OFF_PHDR + idx * 56
+    emit_u32(buf, base + 0,  p_type)
+    emit_u32(buf, base + 4,  p_flags)
+    emit_u64(buf, base + 8,  p_offset)
+    emit_u64(buf, base + 16, p_vaddr)
+    emit_u64(buf, base + 24, p_vaddr)     // p_paddr = p_vaddr
+    emit_u64(buf, base + 32, p_filesz)
+    emit_u64(buf, base + 40, p_memsz)
+    emit_u64(buf, base + 48, p_align)
+}
+
+fn write_phdrs(uint64 buf) {
+    // 0: PT_PHDR self-reference (loader convention)
+    write_phdr(buf, 0, 6, 4, OFF_PHDR, BASE_VADDR + OFF_PHDR, 336, 336, 8)
+    // 1: PT_INTERP -> "/lib64/ld-linux-x86-64.so.2"
+    write_phdr(buf, 1, 3, 4, OFF_INTERP, VA_INTERP, 28, 28, 1)
+    // 2: PT_LOAD R — ELF hdr, phdrs, .interp, dyn tables, .dynamic
+    write_phdr(buf, 2, 1, 4, 0, BASE_VADDR, 0x308, 0x308, 0x1000)
+    // 3: PT_LOAD RX — .plt, .text, "hello"
+    write_phdr(buf, 3, 1, 5, OFF_PLT, VA_PLT, 0x49, 0x49, 0x1000)
+    // 4: PT_LOAD RW — .got.plt
+    write_phdr(buf, 4, 1, 6, OFF_GOTPLT, VA_GOTPLT, 0x28, 0x28, 0x1000)
+    // 5: PT_DYNAMIC — pointer to .dynamic table
+    write_phdr(buf, 5, 2, 4, OFF_DYNAMIC, VA_DYNAMIC, 176, 176, 8)
+}
+
+// ---------------------------------------------------------------------------
+// .interp — "/lib64/ld-linux-x86-64.so.2\0" (28 bytes).
+// ---------------------------------------------------------------------------
+
+fn write_interp(uint64 buf) {
+    uint64 s = "/lib64/ld-linux-x86-64.so.2"
+    emit_str(buf, OFF_INTERP, s, 27)
+    emit_u8(buf, OFF_INTERP + 27, 0)
+}
+
+// ---------------------------------------------------------------------------
+// .dynstr — flat concatenation of null-terminated symbol + library names.
+// Layout (21 bytes):
+//   off 0:  '\0'
+//   off 1:  "libc.so.6\0"   (10 bytes, ends at off 10)
+//   off 11: "puts\0"        (5 bytes, ends at off 15)
+//   off 16: "exit\0"        (5 bytes, ends at off 20)
+// ---------------------------------------------------------------------------
+
+fn write_dynstr(uint64 buf) {
+    emit_u8(buf, OFF_DYNSTR + 0, 0)
+    uint64 s_libc = "libc.so.6"
+    emit_str(buf, OFF_DYNSTR + 1, s_libc, 9)
+    emit_u8(buf, OFF_DYNSTR + 10, 0)
+    uint64 s_puts = "puts"
+    emit_str(buf, OFF_DYNSTR + 11, s_puts, 4)
+    emit_u8(buf, OFF_DYNSTR + 15, 0)
+    uint64 s_exit = "exit"
+    emit_str(buf, OFF_DYNSTR + 16, s_exit, 4)
+    emit_u8(buf, OFF_DYNSTR + 20, 0)
+}
+
+// ---------------------------------------------------------------------------
+// .dynsym — 3 Elf64_Sym entries (24 bytes each):
+//   u32 st_name, u8 st_info, u8 st_other, u16 st_shndx,
+//   u64 st_value, u64 st_size
+// sym 0 is the null sentinel; puts and exit are GLOBAL FUNC UND.
+// st_info = (STB_GLOBAL << 4) | STT_FUNC = 0x12
+// ---------------------------------------------------------------------------
+
+fn write_dynsym_entry(uint64 buf, uint64 idx, uint64 name_off, uint64 info) {
+    uint64 base = OFF_DYNSYM + idx * 24
+    emit_u32(buf, base + 0,  name_off)
+    emit_u8 (buf, base + 4,  info)
+    emit_u8 (buf, base + 5,  0)           // st_other
+    emit_u16(buf, base + 6,  0)           // st_shndx = SHN_UNDEF
+    emit_u64(buf, base + 8,  0)           // st_value
+    emit_u64(buf, base + 16, 0)           // st_size
+}
+
+fn write_dynsym(uint64 buf) {
+    write_dynsym_entry(buf, 0, 0, 0)                      // null sentinel
+    write_dynsym_entry(buf, 1, DSTR_OFF_PUTS, 0x12)       // puts
+    write_dynsym_entry(buf, 2, DSTR_OFF_EXIT, 0x12)       // exit
+}
+
+// ---------------------------------------------------------------------------
+// .hash — SysV hash table (24 bytes).
+//   nbucket (4) = 1
+//   nchain  (4) = 3 (matches DYNSYM count)
+//   bucket[0] (4) = 1  (lookup starts at sym 1)
+//   chain[0..2] (12) = { 0, 2, 0 }  — after sym 1 try sym 2, end after sym 2
+// Single-bucket walks every chained sym, which is fine for our handful
+// of imports; proper nbucket sizing is a future optimisation.
+// ---------------------------------------------------------------------------
+
+fn write_hash(uint64 buf) {
+    emit_u32(buf, OFF_HASH + 0,  1)   // nbucket
+    emit_u32(buf, OFF_HASH + 4,  3)   // nchain
+    emit_u32(buf, OFF_HASH + 8,  1)   // bucket[0]
+    emit_u32(buf, OFF_HASH + 12, 0)   // chain[0]
+    emit_u32(buf, OFF_HASH + 16, 2)   // chain[1] -> 2
+    emit_u32(buf, OFF_HASH + 20, 0)   // chain[2] -> end
+}
+
+// ---------------------------------------------------------------------------
+// .rela.plt — Elf64_Rela entries (24 bytes each) for PLT lazy resolution:
+//   u64 r_offset  = GOT slot vaddr
+//   u64 r_info    = (sym_idx << 32) | R_X86_64_JUMP_SLOT (7)
+//   i64 r_addend  = 0
+// ---------------------------------------------------------------------------
+
+fn write_rela(uint64 buf, uint64 idx, uint64 got_vaddr, uint64 sym_idx) {
+    uint64 base = OFF_RELAPLT + idx * 24
+    emit_u64(buf, base + 0,  got_vaddr)
+    uint64 r_info = (sym_idx << 32) | 7     // R_X86_64_JUMP_SLOT
+    emit_u64(buf, base + 8,  r_info)
+    emit_u64(buf, base + 16, 0)
+}
+
+fn write_relaplt(uint64 buf) {
+    write_rela(buf, 0, VA_GOT_PUTS, 1)
+    write_rela(buf, 1, VA_GOT_EXIT, 2)
+}
+
+// ---------------------------------------------------------------------------
+// .dynamic — 11 Elf64_Dyn entries (16 bytes each):
+//   u64 d_tag, u64 d_val_or_ptr
+// Loader walks until DT_NULL.
+// ---------------------------------------------------------------------------
+
+fn write_dyn(uint64 buf, uint64 idx, uint64 tag, uint64 val) {
+    uint64 base = OFF_DYNAMIC + idx * 16
+    emit_u64(buf, base + 0, tag)
+    emit_u64(buf, base + 8, val)
+}
+
+fn write_dynamic(uint64 buf) {
+    write_dyn(buf,  0, 1,  DSTR_OFF_LIBC)   // DT_NEEDED -> "libc.so.6"
+    write_dyn(buf,  1, 5,  VA_DYNSTR)       // DT_STRTAB
+    write_dyn(buf,  2, 10, DYNSTR_LEN)      // DT_STRSZ
+    write_dyn(buf,  3, 6,  VA_DYNSYM)       // DT_SYMTAB
+    write_dyn(buf,  4, 11, 24)              // DT_SYMENT (sizeof Elf64_Sym)
+    write_dyn(buf,  5, 4,  VA_HASH)         // DT_HASH
+    write_dyn(buf,  6, 3,  VA_GOTPLT)       // DT_PLTGOT
+    write_dyn(buf,  7, 2,  48)              // DT_PLTRELSZ (2 relas * 24)
+    write_dyn(buf,  8, 20, 7)               // DT_PLTREL = DT_RELA
+    write_dyn(buf,  9, 23, VA_RELAPLT)      // DT_JMPREL
+    write_dyn(buf, 10, 0,  0)               // DT_NULL
+}
+
+// ---------------------------------------------------------------------------
+// .plt — PLT0 (16 bytes) + 2 entries (16 bytes each). Standard x86_64
+// lazy-binding ABI:
+//
+//   PLT0:           ff 35 <disp32>      push [rip+disp]   ; GOT[1] link_map
+//                   ff 25 <disp32>      jmp  [rip+disp]   ; GOT[2] resolver
+//                   0f 1f 40 00         nopl 0x0(%rax)    ; pad to 16
+//
+//   PLT[n]:         ff 25 <disp32>      jmp  [rip+disp]   ; GOT[3+n]
+//                   68 <imm32>          push n            ; rela index
+//                   e9 <rel32>          jmp  PLT0
+// ---------------------------------------------------------------------------
+
+fn write_plt0(uint64 buf) {
+    // push [rip + disp] where disp reaches GOT[1] (VA_GOT1)
+    // Instruction at VA_PLT, 6 bytes; rip after = VA_PLT+6
+    emit_u8(buf, OFF_PLT + 0, 0xFF)
+    emit_u8(buf, OFF_PLT + 1, 0x35)
+    uint64 disp1 = VA_GOT1 - (VA_PLT + 6)
+    emit_u32(buf, OFF_PLT + 2, disp1)
+
+    // jmp [rip + disp] to GOT[2] (VA_GOT2)
+    // Instruction at VA_PLT+6, 6 bytes; rip after = VA_PLT+12
+    emit_u8(buf, OFF_PLT + 6, 0xFF)
+    emit_u8(buf, OFF_PLT + 7, 0x25)
+    uint64 disp2 = VA_GOT2 - (VA_PLT + 12)
+    emit_u32(buf, OFF_PLT + 8, disp2)
+
+    // nopl 0x0(%rax) — 4-byte NOP pad
+    emit_u8(buf, OFF_PLT + 12, 0x0F)
+    emit_u8(buf, OFF_PLT + 13, 0x1F)
+    emit_u8(buf, OFF_PLT + 14, 0x40)
+    emit_u8(buf, OFF_PLT + 15, 0x00)
+}
+
+fn write_plt_entry(uint64 buf, uint64 idx,
+                   uint64 entry_va, uint64 got_slot_va,
+                   uint64 rela_idx) {
+    uint64 off = OFF_PLT + 16 + idx * 16
+
+    // jmp [rip + disp] to GOT slot (6 bytes; rip after = entry_va+6)
+    emit_u8(buf, off + 0, 0xFF)
+    emit_u8(buf, off + 1, 0x25)
+    uint64 disp = got_slot_va - (entry_va + 6)
+    emit_u32(buf, off + 2, disp)
+
+    // push rela_idx (5 bytes; at entry_va+6, rip after = entry_va+11)
+    emit_u8(buf, off + 6, 0x68)
+    emit_u32(buf, off + 7, rela_idx)
+
+    // jmp rel32 to PLT0 (5 bytes; at entry_va+11, rip after = entry_va+16)
+    emit_u8(buf, off + 11, 0xE9)
+    uint64 rel = VA_PLT - (entry_va + 16)
+    emit_u32(buf, off + 12, rel & 0xFFFFFFFF)
+}
+
+fn write_plt(uint64 buf) {
+    write_plt0(buf)
+    write_plt_entry(buf, 0, VA_PLT_PUTS, VA_GOT_PUTS, 0)
+    write_plt_entry(buf, 1, VA_PLT_EXIT, VA_GOT_EXIT, 1)
+}
+
+// ---------------------------------------------------------------------------
+// .text — minimal _start (23 bytes):
+//
+//   sub rsp, 8                     ; realign stack (16-align before call)
+//   lea rdi, [rip+disp_to_hello]
+//   call puts@plt
+//   xor edi, edi                   ; status = 0
+//   call exit@plt
+// ---------------------------------------------------------------------------
+
+fn write_text(uint64 buf) {
+    // sub rsp, 8 — 4 bytes at text+0
+    emit_u8(buf, OFF_TEXT + 0, 0x48)
+    emit_u8(buf, OFF_TEXT + 1, 0x83)
+    emit_u8(buf, OFF_TEXT + 2, 0xEC)
+    emit_u8(buf, OFF_TEXT + 3, 0x08)
+
+    // lea rdi, [rip+disp_to_hello] — 7 bytes at text+4
+    // Instruction rip after = VA_TEXT+11; target = VA_HELLO
+    emit_u8(buf, OFF_TEXT + 4, 0x48)
+    emit_u8(buf, OFF_TEXT + 5, 0x8D)
+    emit_u8(buf, OFF_TEXT + 6, 0x3D)
+    uint64 lea_disp = VA_HELLO - (VA_TEXT + 11)
+    emit_u32(buf, OFF_TEXT + 7, lea_disp)
+
+    // call puts_plt — 5 bytes at text+11; rip after = VA_TEXT+16
+    emit_u8(buf, OFF_TEXT + 11, 0xE8)
+    uint64 puts_rel = VA_PLT_PUTS - (VA_TEXT + 16)
+    emit_u32(buf, OFF_TEXT + 12, puts_rel & 0xFFFFFFFF)
+
+    // xor edi, edi — 2 bytes at text+16
+    emit_u8(buf, OFF_TEXT + 16, 0x31)
+    emit_u8(buf, OFF_TEXT + 17, 0xFF)
+
+    // call exit_plt — 5 bytes at text+18; rip after = VA_TEXT+23
+    emit_u8(buf, OFF_TEXT + 18, 0xE8)
+    uint64 exit_rel = VA_PLT_EXIT - (VA_TEXT + 23)
+    emit_u32(buf, OFF_TEXT + 19, exit_rel & 0xFFFFFFFF)
+}
+
+fn write_hello(uint64 buf) {
+    uint64 s = "hello"
+    emit_str(buf, OFF_HELLO, s, 5)
+    emit_u8(buf, OFF_HELLO + 5, 0)
+}
+
+// ---------------------------------------------------------------------------
+// .got.plt — 5 slots (40 bytes):
+//   [0] = VA_DYNAMIC          (loader reads this)
+//   [1] = 0                   (link_map, filled at load time)
+//   [2] = 0                   (resolver, filled at load time)
+//   [3] = VA_PLT_PUTS + 6     (points at `push 0` in puts PLT entry)
+//   [4] = VA_PLT_EXIT + 6
+// ---------------------------------------------------------------------------
+
+fn write_gotplt(uint64 buf) {
+    emit_u64(buf, OFF_GOTPLT + 0,  VA_DYNAMIC)
+    emit_u64(buf, OFF_GOTPLT + 8,  0)
+    emit_u64(buf, OFF_GOTPLT + 16, 0)
+    emit_u64(buf, OFF_GOTPLT + 24, VA_PLT_PUTS + 6)
+    emit_u64(buf, OFF_GOTPLT + 32, VA_PLT_EXIT + 6)
+}
+
+// ---------------------------------------------------------------------------
+// Driver.
+// ---------------------------------------------------------------------------
+
+fn main() {
+    // Output path: argv[1] if given, else fixed default.
+    uint64 out_path = "/tmp/elfgen_hello"
+    if cli_argc >= 2 {
+        uint64 slot = cli_argv + 8
+        uint64 v = 0
+        unsafe { *(slot as uint64) -> v }
+        out_path = v
+    }
+
+    // alloc() zeroes memory — pad regions stay 0 automatically.
+    uint64 buf = alloc(16384)
+
+    write_elf_header(buf)
+    write_phdrs(buf)
+    write_interp(buf)
+    write_dynstr(buf)
+    write_dynsym(buf)
+    write_hash(buf)
+    write_relaplt(buf)
+    write_dynamic(buf)
+    write_plt(buf)
+    write_text(buf)
+    write_hello(buf)
+    write_gotplt(buf)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "elfgen: failed to open output\n", 30)
+        exit(1)
+    }
+    file_write(fd, buf, FILE_END)
+    file_close(fd)
+    set_executable(out_path)
+
+    write(1, "wrote dynamic ELF: ", 19)
+    uint64 n = str_len(out_path)
+    write(1, out_path, n)
+    write(1, "\n", 1)
+    exit(0)
+}
