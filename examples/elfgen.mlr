@@ -178,7 +178,11 @@ fn write_phdrs(uint64 buf) {
     // 2: PT_LOAD R — ELF hdr, phdrs, .interp, dyn tables, .dynamic
     write_phdr(buf, 2, 1, 4, 0, BASE_VADDR, 0x308, 0x308, 0x1000)
     // 3: PT_LOAD RX — .plt, .text, "hello"
-    write_phdr(buf, 3, 1, 5, OFF_PLT, VA_PLT, 0x49, 0x49, 0x1000)
+    //   filesz/memsz = PLT (0x30) + _start (23) + "hello\0" (6) = 0x4D
+    //   (an earlier version of this prototype wrote 0x49, which
+    //   under-reported by 4 bytes — Linux still ran it since mmap
+    //   rounds to a full page, but readelf/valgrind would complain.)
+    write_phdr(buf, 3, 1, 5, OFF_PLT, VA_PLT, 0x4D, 0x4D, 0x1000)
     // 4: PT_LOAD RW — .got.plt
     write_phdr(buf, 4, 1, 6, OFF_GOTPLT, VA_GOTPLT, 0x28, 0x28, 0x1000)
     // 5: PT_DYNAMIC — pointer to .dynamic table

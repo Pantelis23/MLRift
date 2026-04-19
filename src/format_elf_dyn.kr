@@ -1,76 +1,30 @@
 // MLRift -- built on KernRift -- Linux x86_64 dynamic-ELF emitter
 //
 // Emits a self-contained dynamically-linked executable that resolves
-// external symbols through libdl's loader (ld-linux-x86-64.so.2).
-// Currently hardcoded to the "hello puts/exit" layout validated by
-// `examples/elfgen.mlr` (M2a.0.std). Subsequent landings generalise
-// on top:
+// external symbols through the ld-linux-x86-64.so.2 loader. Layout is
+// computed from the callers's inputs (symbol list + text bytes + entry
+// offset) rather than being hardcoded, so any combination of imports
+// and code size fits as long as each PT_LOAD stays under a 4K page.
 //
-//   M2a.2 — frontend `@dynamic extern fn` → registers a symbol
-//   M2a.3 — codegen call-through-PLT for dynamic symbols
-//   M2a.4 — driver: pick this path when any @dynamic extern is seen
+// Milestones landed:
+//   M2a.0.std — standalone prototype (examples/elfgen.mlr)
+//   M2a.1     — byte-identical port behind emit_dynamic_elf_hello()
+//   M2a.2     — @dynamic extern fn frontend + symbol registry
+//   M2a.3.a   — generalise emission: sym_list + text_bytes inputs,
+//               dynamic offset/vaddr computation (this file)
 //
-// Internally uses a dedicated `edyn_buf` buffer (not codegen.kr's
-// `out_buf`) so the dynamic-ELF emission doesn't collide with the
-// main CPU codegen path during the transition.
+// Pending:
+//   M2a.3.b — codegen: call-through-PLT lowering for @dynamic calls
+//   M2a.3.c — relocation patching after layout is fixed
+//   M2a.4   — driver: route exe output through here when registry
+//             is non-empty
 
 // ---------------------------------------------------------------------------
-// Layout constants
-// ---------------------------------------------------------------------------
-// Mirrors examples/elfgen.mlr exactly so the two emitters produce
-// byte-identical output during M2a.1. Once frontend/codegen hooks land
-// the offsets become functions of symbol count + text size.
-
-static uint64 EDYN_BASE_VADDR   = 0x400000
-
-static uint64 EDYN_OFF_ELF_HDR  = 0
-static uint64 EDYN_OFF_PHDR     = 0x40
-static uint64 EDYN_OFF_INTERP   = 0x190
-static uint64 EDYN_OFF_DYNSTR   = 0x1AC
-static uint64 EDYN_OFF_DYNSYM   = 0x1C8
-static uint64 EDYN_OFF_HASH     = 0x210
-static uint64 EDYN_OFF_RELAPLT  = 0x228
-static uint64 EDYN_OFF_DYNAMIC  = 0x258
-static uint64 EDYN_OFF_PLT      = 0x1000
-static uint64 EDYN_OFF_TEXT     = 0x1030
-static uint64 EDYN_OFF_HELLO    = 0x1047
-static uint64 EDYN_OFF_GOTPLT   = 0x2000
-static uint64 EDYN_FILE_END     = 0x2028
-
-static uint64 EDYN_VA_INTERP    = 0x400190
-static uint64 EDYN_VA_DYNSTR    = 0x4001AC
-static uint64 EDYN_VA_DYNSYM    = 0x4001C8
-static uint64 EDYN_VA_HASH      = 0x400210
-static uint64 EDYN_VA_RELAPLT   = 0x400228
-static uint64 EDYN_VA_DYNAMIC   = 0x400258
-static uint64 EDYN_VA_PLT       = 0x401000
-static uint64 EDYN_VA_PLT_PUTS  = 0x401010
-static uint64 EDYN_VA_PLT_EXIT  = 0x401020
-static uint64 EDYN_VA_TEXT      = 0x401030
-static uint64 EDYN_VA_HELLO     = 0x401047
-static uint64 EDYN_VA_GOTPLT    = 0x402000
-
-static uint64 EDYN_VA_GOT0      = 0x402000
-static uint64 EDYN_VA_GOT1      = 0x402008
-static uint64 EDYN_VA_GOT2      = 0x402010
-static uint64 EDYN_VA_GOT_PUTS  = 0x402018
-static uint64 EDYN_VA_GOT_EXIT  = 0x402020
-
-static uint64 EDYN_DYNSTR_LEN     = 21
-static uint64 EDYN_DSTR_OFF_LIBC  = 1
-static uint64 EDYN_DSTR_OFF_PUTS  = 11
-static uint64 EDYN_DSTR_OFF_EXIT  = 16
-
-// ---------------------------------------------------------------------------
-// Dynamic-symbol registry (M2a.2)
+// Dynamic-symbol registry
 // ---------------------------------------------------------------------------
 // Populated from parser.kr whenever an `@dynamic extern fn` declaration
-// is seen. Each entry is a name-token index, stored in a flat uint32
-// array so codegen can look up the symbol text at PLT-call emission
-// time. The slot index returned by dyn_sym_register is also the
-// position in .dynsym/.rela.plt/.got.plt for the generated binary —
-// keeping the numbering implicit here means format_elf_dyn's emitter
-// can walk this table in order when building those sections.
+// is seen. Storage is the raw name-token index so codegen can resolve
+// the symbol's source text at call-site emission time.
 
 static uint64 DYN_SYM_MAX     = 64
 static uint64 dyn_sym_tokens  = 0
@@ -114,11 +68,6 @@ fn dyn_sym_tok_at(uint64 idx) -> uint32 {
 // ---------------------------------------------------------------------------
 // Buffer state
 // ---------------------------------------------------------------------------
-// Position-advancing emit: callers push bytes sequentially and use
-// `edyn_pad_to(offset)` to jump forward between sections. Absolute
-// patching is available via `edyn_patch_u32` for fields computed after
-// their slot is already emitted (unused in M2a.1 but will matter once
-// text size becomes variable).
 
 static uint64 edyn_buf = 0
 static uint64 edyn_cap = 0
@@ -130,8 +79,6 @@ fn edyn_init(uint64 capacity) {
         edyn_buf = alloc(capacity)
         edyn_cap = capacity
     } else {
-        // Zero any bytes we might reuse; alloc() zeros on first use
-        // but callers might re-invoke emit_dynamic_elf_hello().
         uint64 i = 0
         while i < edyn_cap {
             uint64 p = edyn_buf + i
@@ -184,16 +131,10 @@ fn edyn_bytes(uint64 src, uint64 len) {
     }
 }
 
-// Zero-fill the buffer up to the requested offset, leaving pos=offset.
-// Used to skip over unused regions between sections (pad-to-page).
 fn edyn_pad_to(uint64 offset) {
     while edyn_pos < offset { edyn_byte(0) }
 }
 
-// Absolute-offset patch, for fields whose value isn't known at the
-// moment we pass their slot. Not needed for M2a.1's fully-static
-// layout but kept so M2a.3's variable-text-size case has a primitive
-// to reach for.
 @export
 fn edyn_patch_u32(uint64 off, uint64 val) {
     uint64 p0 = edyn_buf + off
@@ -211,39 +152,192 @@ fn edyn_patch_u32(uint64 off, uint64 val) {
 }
 
 // ---------------------------------------------------------------------------
-// ELF64 header (64 bytes)
+// Fixed layout constants
+// ---------------------------------------------------------------------------
+// Everything at/before .dynstr has a fixed size, so the offsets up to
+// and including .dynstr's start are constant. The R-segment sections
+// after .dynstr (.dynsym/.hash/.rela.plt/.dynamic) move around based
+// on the number of imported symbols.
+//
+// Page-alignment of the three PT_LOADs fixes the remaining offsets:
+//   R  starts at file 0x0000  vaddr 0x400000
+//   RX starts at file 0x1000  vaddr 0x401000
+//   RW starts at file 0x2000  vaddr 0x402000
+// Each PT_LOAD must stay under 0x1000 bytes (single 4K page) for the
+// current simple layout — a future session can grow this if any
+// imported-symbol table busts the ceiling.
+
+static uint64 EDYN_BASE_VADDR  = 0x400000
+static uint64 EDYN_OFF_ELF_HDR = 0
+static uint64 EDYN_OFF_PHDR    = 0x40
+static uint64 EDYN_OFF_INTERP  = 0x190
+static uint64 EDYN_OFF_DYNSTR  = 0x1AC
+static uint64 EDYN_INTERP_SIZE = 28            // "/lib64/ld-linux-x86-64.so.2\0"
+static uint64 EDYN_OFF_PLT     = 0x1000
+static uint64 EDYN_OFF_GOTPLT  = 0x2000
+static uint64 EDYN_VA_PLT      = 0x401000
+static uint64 EDYN_VA_GOTPLT   = 0x402000
+static uint64 EDYN_N_DYN       = 11            // DT entries incl. NULL
+
+// ---------------------------------------------------------------------------
+// Emission state (inputs + derived layout)
 // ---------------------------------------------------------------------------
 
-fn edyn_write_elf_header() {
-    // e_ident
-    edyn_byte(0x7F)
-    edyn_byte(69)     // 'E'
-    edyn_byte(76)     // 'L'
-    edyn_byte(70)     // 'F'
-    edyn_byte(2)      // ELFCLASS64
-    edyn_byte(1)      // ELFDATA2LSB
-    edyn_byte(1)      // EV_CURRENT
-    edyn_byte(0)      // ELFOSABI_NONE
-    uint64 i = 0
-    while i < 8 { edyn_byte(0); i = i + 1 }
+// Inputs (set by emit_dynamic_elf at entry)
+static uint64 edyn_in_lib_ptr     = 0
+static uint64 edyn_in_lib_len     = 0
+static uint64 edyn_in_sym_list    = 0    // (name_ptr(u64), name_len(u64)) × count
+static uint64 edyn_in_sym_count   = 0
+static uint64 edyn_in_text_ptr    = 0
+static uint64 edyn_in_text_len    = 0
+static uint64 edyn_in_entry_off   = 0
 
-    edyn_u16(2)                      // e_type = ET_EXEC
-    edyn_u16(0x3E)                   // e_machine = EM_X86_64
-    edyn_u32(1)                      // e_version
-    edyn_u64(EDYN_VA_TEXT)           // e_entry
-    edyn_u64(EDYN_OFF_PHDR)          // e_phoff
-    edyn_u64(0)                      // e_shoff (none)
-    edyn_u32(0)                      // e_flags
-    edyn_u16(64)                     // e_ehsize
-    edyn_u16(56)                     // e_phentsize
-    edyn_u16(6)                      // e_phnum
-    edyn_u16(0)                      // e_shentsize
-    edyn_u16(0)                      // e_shnum
-    edyn_u16(0)                      // e_shstrndx
+// Derived offsets (filled by edyn_compute_layout)
+static uint64 edyn_off_dynsym     = 0
+static uint64 edyn_off_hash       = 0
+static uint64 edyn_off_relaplt    = 0
+static uint64 edyn_off_dynamic    = 0
+static uint64 edyn_size_r         = 0    // end of R segment
+static uint64 edyn_off_text       = 0
+static uint64 edyn_size_rx        = 0    // length of RX segment from file 0x1000
+static uint64 edyn_size_rw        = 0
+static uint64 edyn_file_end       = 0
+
+// Derived sizes
+static uint64 edyn_dynstr_size    = 0
+static uint64 edyn_plt_size       = 0    // 16 (PLT0) + 16 × sym_count
+static uint64 edyn_dynsym_size    = 0    // 24 × (sym_count + 1)
+static uint64 edyn_hash_size      = 0    // 12 + 4 × (sym_count + 1)
+static uint64 edyn_relaplt_size   = 0    // 24 × sym_count
+static uint64 edyn_dynamic_size   = 0    // 16 × N_DYN
+static uint64 edyn_gotplt_size    = 0    // 8 × (3 + sym_count)
+
+// Derived virtual addresses
+static uint64 edyn_va_dynstr      = 0
+static uint64 edyn_va_dynsym      = 0
+static uint64 edyn_va_hash        = 0
+static uint64 edyn_va_relaplt     = 0
+static uint64 edyn_va_dynamic     = 0
+static uint64 edyn_va_text        = 0
+
+// ---------------------------------------------------------------------------
+// Symbol-list accessors (sym_list layout: 16 bytes per entry)
+// ---------------------------------------------------------------------------
+
+fn edyn_sym_name(uint64 i) -> uint64 {
+    uint64 p = edyn_in_sym_list + i * 16
+    uint64 v = 0
+    unsafe { *(p as uint64) -> v }
+    return v
+}
+
+fn edyn_sym_len(uint64 i) -> uint64 {
+    uint64 p = edyn_in_sym_list + i * 16 + 8
+    uint64 v = 0
+    unsafe { *(p as uint64) -> v }
+    return v
+}
+
+// Offset of symbol i's name within the emitted .dynstr section.
+// Layout: sentinel (1) + lib_name+null + sym[0]+null + ... + sym[i-1]+null.
+fn edyn_sym_dynstr_off(uint64 i) -> uint64 {
+    uint64 off = 1 + edyn_in_lib_len + 1
+    uint64 k = 0
+    while k < i {
+        off = off + edyn_sym_len(k) + 1
+        k = k + 1
+    }
+    return off
+}
+
+fn edyn_sym_plt_va(uint64 i) -> uint64 {
+    return EDYN_VA_PLT + 16 + i * 16
+}
+
+fn edyn_sym_got_va(uint64 i) -> uint64 {
+    return EDYN_VA_GOTPLT + (3 + i) * 8
 }
 
 // ---------------------------------------------------------------------------
-// Program headers — 6 × 56 bytes
+// Layout computation
+// ---------------------------------------------------------------------------
+
+fn edyn_compute_layout() {
+    uint64 n = edyn_in_sym_count
+
+    // .dynstr: sentinel + lib + syms (each + null)
+    uint64 dss = 1 + edyn_in_lib_len + 1
+    uint64 i = 0
+    while i < n {
+        dss = dss + edyn_sym_len(i) + 1
+        i = i + 1
+    }
+    edyn_dynstr_size = dss
+
+    // 8-align .dynsym after .dynstr
+    uint64 ds_end = EDYN_OFF_DYNSTR + dss
+    edyn_off_dynsym = (ds_end + 7) & 0xFFFFFFFFFFFFFFF8
+
+    edyn_dynsym_size  = 24 * (n + 1)
+    edyn_off_hash     = edyn_off_dynsym + edyn_dynsym_size
+    edyn_hash_size    = 12 + 4 * (n + 1)
+    edyn_off_relaplt  = edyn_off_hash + edyn_hash_size
+    edyn_relaplt_size = 24 * n
+    edyn_off_dynamic  = edyn_off_relaplt + edyn_relaplt_size
+    edyn_dynamic_size = 16 * EDYN_N_DYN
+    edyn_size_r       = edyn_off_dynamic + edyn_dynamic_size
+
+    edyn_plt_size  = 16 + 16 * n
+    edyn_off_text  = EDYN_OFF_PLT + edyn_plt_size
+    edyn_size_rx   = edyn_plt_size + edyn_in_text_len
+
+    edyn_gotplt_size = 8 * (3 + n)
+    edyn_size_rw     = edyn_gotplt_size
+    edyn_file_end    = EDYN_OFF_GOTPLT + edyn_size_rw
+
+    edyn_va_dynstr  = EDYN_BASE_VADDR + EDYN_OFF_DYNSTR
+    edyn_va_dynsym  = EDYN_BASE_VADDR + edyn_off_dynsym
+    edyn_va_hash    = EDYN_BASE_VADDR + edyn_off_hash
+    edyn_va_relaplt = EDYN_BASE_VADDR + edyn_off_relaplt
+    edyn_va_dynamic = EDYN_BASE_VADDR + edyn_off_dynamic
+    edyn_va_text    = EDYN_VA_PLT + edyn_plt_size
+
+    // Page-overflow guards (< 0x1000 per PT_LOAD under current layout)
+    if edyn_size_r > 0x1000 {
+        write(2, "format_elf_dyn: R segment exceeds one page\n", 43)
+        exit(1)
+    }
+    if edyn_size_rx > 0x1000 {
+        write(2, "format_elf_dyn: RX segment exceeds one page\n", 44)
+        exit(1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ELF64 header
+// ---------------------------------------------------------------------------
+
+fn edyn_write_elf_header() {
+    edyn_byte(0x7F); edyn_byte(69); edyn_byte(76); edyn_byte(70)
+    edyn_byte(2); edyn_byte(1); edyn_byte(1); edyn_byte(0)
+    uint64 i = 0
+    while i < 8 { edyn_byte(0); i = i + 1 }
+
+    edyn_u16(2)                                              // e_type
+    edyn_u16(0x3E)                                           // e_machine
+    edyn_u32(1)                                              // e_version
+    edyn_u64(edyn_va_text + edyn_in_entry_off)               // e_entry
+    edyn_u64(EDYN_OFF_PHDR)                                  // e_phoff
+    edyn_u64(0)                                              // e_shoff
+    edyn_u32(0)                                              // e_flags
+    edyn_u16(64)                                             // e_ehsize
+    edyn_u16(56)                                             // e_phentsize
+    edyn_u16(6)                                              // e_phnum
+    edyn_u16(0); edyn_u16(0); edyn_u16(0)
+}
+
+// ---------------------------------------------------------------------------
+// Program headers
 // ---------------------------------------------------------------------------
 
 fn edyn_write_phdr(uint64 p_type, uint64 p_flags,
@@ -254,41 +348,35 @@ fn edyn_write_phdr(uint64 p_type, uint64 p_flags,
     edyn_u32(p_flags)
     edyn_u64(p_offset)
     edyn_u64(p_vaddr)
-    edyn_u64(p_vaddr)              // p_paddr = p_vaddr
+    edyn_u64(p_vaddr)
     edyn_u64(p_filesz)
     edyn_u64(p_memsz)
     edyn_u64(p_align)
 }
 
 fn edyn_write_phdrs() {
-    // PT_PHDR self-reference
     edyn_write_phdr(6, 4,
                     EDYN_OFF_PHDR, EDYN_BASE_VADDR + EDYN_OFF_PHDR,
                     336, 336, 8)
-    // PT_INTERP
     edyn_write_phdr(3, 4,
-                    EDYN_OFF_INTERP, EDYN_VA_INTERP,
-                    28, 28, 1)
-    // PT_LOAD R — hdr, phdrs, dyn tables, .dynamic
+                    EDYN_OFF_INTERP, EDYN_BASE_VADDR + EDYN_OFF_INTERP,
+                    EDYN_INTERP_SIZE, EDYN_INTERP_SIZE, 1)
     edyn_write_phdr(1, 4,
                     0, EDYN_BASE_VADDR,
-                    0x308, 0x308, 0x1000)
-    // PT_LOAD RX — .plt + .text + "hello"
+                    edyn_size_r, edyn_size_r, 0x1000)
     edyn_write_phdr(1, 5,
                     EDYN_OFF_PLT, EDYN_VA_PLT,
-                    0x49, 0x49, 0x1000)
-    // PT_LOAD RW — .got.plt
+                    edyn_size_rx, edyn_size_rx, 0x1000)
     edyn_write_phdr(1, 6,
                     EDYN_OFF_GOTPLT, EDYN_VA_GOTPLT,
-                    0x28, 0x28, 0x1000)
-    // PT_DYNAMIC
+                    edyn_size_rw, edyn_size_rw, 0x1000)
     edyn_write_phdr(2, 4,
-                    EDYN_OFF_DYNAMIC, EDYN_VA_DYNAMIC,
-                    176, 176, 8)
+                    edyn_off_dynamic, edyn_va_dynamic,
+                    edyn_dynamic_size, edyn_dynamic_size, 8)
 }
 
 // ---------------------------------------------------------------------------
-// .interp — null-terminated path to ld.so
+// .interp
 // ---------------------------------------------------------------------------
 
 fn edyn_write_interp() {
@@ -298,69 +386,83 @@ fn edyn_write_interp() {
 }
 
 // ---------------------------------------------------------------------------
-// .dynstr — flat null-terminated strings
+// .dynstr
 // ---------------------------------------------------------------------------
 
 fn edyn_write_dynstr() {
-    edyn_byte(0)                      // sentinel
-    uint64 s_libc = "libc.so.6"
-    edyn_bytes(s_libc, 9); edyn_byte(0)
-    uint64 s_puts = "puts"
-    edyn_bytes(s_puts, 4); edyn_byte(0)
-    uint64 s_exit = "exit"
-    edyn_bytes(s_exit, 4); edyn_byte(0)
+    edyn_byte(0)
+    edyn_bytes(edyn_in_lib_ptr, edyn_in_lib_len)
+    edyn_byte(0)
+    uint64 i = 0
+    while i < edyn_in_sym_count {
+        edyn_bytes(edyn_sym_name(i), edyn_sym_len(i))
+        edyn_byte(0)
+        i = i + 1
+    }
 }
 
 // ---------------------------------------------------------------------------
-// .dynsym — 3 Elf64_Sym (24 bytes each)
+// .dynsym
 // ---------------------------------------------------------------------------
 
 fn edyn_write_dynsym_entry(uint64 name_off, uint64 info) {
     edyn_u32(name_off)
-    edyn_byte(info)                   // st_info
-    edyn_byte(0)                      // st_other
-    edyn_u16(0)                       // st_shndx = SHN_UNDEF
-    edyn_u64(0)                       // st_value
-    edyn_u64(0)                       // st_size
+    edyn_byte(info)
+    edyn_byte(0)
+    edyn_u16(0)
+    edyn_u64(0)
+    edyn_u64(0)
 }
 
 fn edyn_write_dynsym() {
-    edyn_write_dynsym_entry(0, 0)                          // null sentinel
-    edyn_write_dynsym_entry(EDYN_DSTR_OFF_PUTS, 0x12)      // GLOBAL FUNC puts
-    edyn_write_dynsym_entry(EDYN_DSTR_OFF_EXIT, 0x12)      // GLOBAL FUNC exit
+    edyn_write_dynsym_entry(0, 0)
+    uint64 i = 0
+    while i < edyn_in_sym_count {
+        edyn_write_dynsym_entry(edyn_sym_dynstr_off(i), 0x12)
+        i = i + 1
+    }
 }
 
 // ---------------------------------------------------------------------------
-// .hash — single-bucket SysV hash (24 bytes)
+// .hash — single-bucket SysV chain
 // ---------------------------------------------------------------------------
 
 fn edyn_write_hash() {
-    edyn_u32(1)    // nbucket
-    edyn_u32(3)    // nchain (= sym count)
-    edyn_u32(1)    // bucket[0] — start lookup at sym 1
-    edyn_u32(0)    // chain[0]   (sentinel chain, never followed)
-    edyn_u32(2)    // chain[1] -> sym 2
-    edyn_u32(0)    // chain[2] -> end
+    uint64 n = edyn_in_sym_count + 1    // +1 for null sentinel sym
+    edyn_u32(1)                         // nbucket
+    edyn_u32(n)                         // nchain
+    edyn_u32(1)                         // bucket[0]
+    edyn_u32(0)                         // chain[0] sentinel
+    uint64 i = 1
+    while i < n {
+        uint64 nxt = i + 1
+        if nxt >= n { nxt = 0 }
+        edyn_u32(nxt)
+        i = i + 1
+    }
 }
 
 // ---------------------------------------------------------------------------
-// .rela.plt — Elf64_Rela (24 bytes each)
+// .rela.plt
 // ---------------------------------------------------------------------------
 
-fn edyn_write_rela(uint64 got_vaddr, uint64 sym_idx) {
-    edyn_u64(got_vaddr)
-    uint64 r_info = (sym_idx << 32) | 7      // R_X86_64_JUMP_SLOT
+fn edyn_write_rela(uint64 got_va, uint64 sym_idx) {
+    edyn_u64(got_va)
+    uint64 r_info = (sym_idx << 32) | 7     // R_X86_64_JUMP_SLOT
     edyn_u64(r_info)
-    edyn_u64(0)                              // r_addend
+    edyn_u64(0)
 }
 
 fn edyn_write_relaplt() {
-    edyn_write_rela(EDYN_VA_GOT_PUTS, 1)
-    edyn_write_rela(EDYN_VA_GOT_EXIT, 2)
+    uint64 i = 0
+    while i < edyn_in_sym_count {
+        edyn_write_rela(edyn_sym_got_va(i), i + 1)
+        i = i + 1
+    }
 }
 
 // ---------------------------------------------------------------------------
-// .dynamic — Elf64_Dyn entries (16 bytes each), terminated by DT_NULL
+// .dynamic
 // ---------------------------------------------------------------------------
 
 fn edyn_write_dyn(uint64 tag, uint64 val) {
@@ -369,17 +471,17 @@ fn edyn_write_dyn(uint64 tag, uint64 val) {
 }
 
 fn edyn_write_dynamic() {
-    edyn_write_dyn(1,  EDYN_DSTR_OFF_LIBC)   // DT_NEEDED
-    edyn_write_dyn(5,  EDYN_VA_DYNSTR)       // DT_STRTAB
-    edyn_write_dyn(10, EDYN_DYNSTR_LEN)      // DT_STRSZ
-    edyn_write_dyn(6,  EDYN_VA_DYNSYM)       // DT_SYMTAB
-    edyn_write_dyn(11, 24)                   // DT_SYMENT
-    edyn_write_dyn(4,  EDYN_VA_HASH)         // DT_HASH
-    edyn_write_dyn(3,  EDYN_VA_GOTPLT)       // DT_PLTGOT
-    edyn_write_dyn(2,  48)                   // DT_PLTRELSZ
-    edyn_write_dyn(20, 7)                    // DT_PLTREL = DT_RELA
-    edyn_write_dyn(23, EDYN_VA_RELAPLT)      // DT_JMPREL
-    edyn_write_dyn(0,  0)                    // DT_NULL
+    edyn_write_dyn(1,  1)                        // DT_NEEDED (lib at dynstr+1)
+    edyn_write_dyn(5,  edyn_va_dynstr)           // DT_STRTAB
+    edyn_write_dyn(10, edyn_dynstr_size)         // DT_STRSZ
+    edyn_write_dyn(6,  edyn_va_dynsym)           // DT_SYMTAB
+    edyn_write_dyn(11, 24)                       // DT_SYMENT
+    edyn_write_dyn(4,  edyn_va_hash)             // DT_HASH
+    edyn_write_dyn(3,  EDYN_VA_GOTPLT)           // DT_PLTGOT
+    edyn_write_dyn(2,  edyn_relaplt_size)        // DT_PLTRELSZ
+    edyn_write_dyn(20, 7)                        // DT_PLTREL = DT_RELA
+    edyn_write_dyn(23, edyn_va_relaplt)          // DT_JMPREL
+    edyn_write_dyn(0,  0)                        // DT_NULL
 }
 
 // ---------------------------------------------------------------------------
@@ -387,26 +489,22 @@ fn edyn_write_dynamic() {
 // ---------------------------------------------------------------------------
 
 fn edyn_write_plt0() {
-    // push [rip + disp_to_GOT[1]]  (6 bytes; rip after = VA_PLT+6)
-    edyn_byte(0xFF)
-    edyn_byte(0x35)
-    uint64 disp1 = EDYN_VA_GOT1 - (EDYN_VA_PLT + 6)
+    // push [rip + disp_to_GOT[1]] (6 bytes; rip after = VA_PLT+6)
+    edyn_byte(0xFF); edyn_byte(0x35)
+    uint64 disp1 = (EDYN_VA_GOTPLT + 8) - (EDYN_VA_PLT + 6)
     edyn_u32(disp1)
 
     // jmp [rip + disp_to_GOT[2]] (6 bytes; rip after = VA_PLT+12)
-    edyn_byte(0xFF)
-    edyn_byte(0x25)
-    uint64 disp2 = EDYN_VA_GOT2 - (EDYN_VA_PLT + 12)
+    edyn_byte(0xFF); edyn_byte(0x25)
+    uint64 disp2 = (EDYN_VA_GOTPLT + 16) - (EDYN_VA_PLT + 12)
     edyn_u32(disp2)
 
-    // nopl 0x0(%rax) — 4-byte pad
     edyn_byte(0x0F); edyn_byte(0x1F); edyn_byte(0x40); edyn_byte(0x00)
 }
 
 fn edyn_write_plt_entry(uint64 entry_va, uint64 got_slot_va, uint64 rela_idx) {
     // jmp [rip + disp] (6 bytes; rip after = entry_va+6)
-    edyn_byte(0xFF)
-    edyn_byte(0x25)
+    edyn_byte(0xFF); edyn_byte(0x25)
     uint64 disp = got_slot_va - (entry_va + 6)
     edyn_u32(disp)
 
@@ -422,66 +520,76 @@ fn edyn_write_plt_entry(uint64 entry_va, uint64 got_slot_va, uint64 rela_idx) {
 
 fn edyn_write_plt() {
     edyn_write_plt0()
-    edyn_write_plt_entry(EDYN_VA_PLT_PUTS, EDYN_VA_GOT_PUTS, 0)
-    edyn_write_plt_entry(EDYN_VA_PLT_EXIT, EDYN_VA_GOT_EXIT, 1)
+    uint64 i = 0
+    while i < edyn_in_sym_count {
+        edyn_write_plt_entry(edyn_sym_plt_va(i),
+                             edyn_sym_got_va(i),
+                             i)
+        i = i + 1
+    }
 }
 
 // ---------------------------------------------------------------------------
-// .text — 23-byte _start
+// .text — caller-provided bytes
 // ---------------------------------------------------------------------------
 
 fn edyn_write_text() {
-    // sub rsp, 8
-    edyn_byte(0x48); edyn_byte(0x83); edyn_byte(0xEC); edyn_byte(0x08)
-
-    // lea rdi, [rip+disp_to_hello] (7 bytes; rip after = VA_TEXT+11)
-    edyn_byte(0x48); edyn_byte(0x8D); edyn_byte(0x3D)
-    uint64 lea_disp = EDYN_VA_HELLO - (EDYN_VA_TEXT + 11)
-    edyn_u32(lea_disp)
-
-    // call puts_plt (5 bytes; rip after = VA_TEXT+16)
-    edyn_byte(0xE8)
-    uint64 puts_rel = EDYN_VA_PLT_PUTS - (EDYN_VA_TEXT + 16)
-    edyn_u32(puts_rel & 0xFFFFFFFF)
-
-    // xor edi, edi
-    edyn_byte(0x31); edyn_byte(0xFF)
-
-    // call exit_plt (5 bytes; rip after = VA_TEXT+23)
-    edyn_byte(0xE8)
-    uint64 exit_rel = EDYN_VA_PLT_EXIT - (EDYN_VA_TEXT + 23)
-    edyn_u32(exit_rel & 0xFFFFFFFF)
+    edyn_bytes(edyn_in_text_ptr, edyn_in_text_len)
 }
 
 // ---------------------------------------------------------------------------
-// "hello\0"
-// ---------------------------------------------------------------------------
-
-fn edyn_write_hello() {
-    uint64 s = "hello"
-    edyn_bytes(s, 5)
-    edyn_byte(0)
-}
-
-// ---------------------------------------------------------------------------
-// .got.plt — 5 × 8-byte slots
+// .got.plt — 3 reserved slots + one per imported symbol
 // ---------------------------------------------------------------------------
 
 fn edyn_write_gotplt() {
-    edyn_u64(EDYN_VA_DYNAMIC)         // [0] _DYNAMIC pointer
-    edyn_u64(0)                        // [1] link_map — filled by loader
-    edyn_u64(0)                        // [2] resolver — filled by loader
-    edyn_u64(EDYN_VA_PLT_PUTS + 6)     // [3] initial target = push imm in puts_plt
-    edyn_u64(EDYN_VA_PLT_EXIT + 6)     // [4] same for exit_plt
+    edyn_u64(edyn_va_dynamic)             // [0] _DYNAMIC
+    edyn_u64(0)                            // [1] link_map
+    edyn_u64(0)                            // [2] resolver
+    uint64 i = 0
+    while i < edyn_in_sym_count {
+        // initial target = (PLT entry's push-imm insn, at entry_va+6)
+        edyn_u64(edyn_sym_plt_va(i) + 6)
+        i = i + 1
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Top-level entry — fills the buffer with a hello-puts dynamic ELF,
-// returns total byte count ready to flush.
+// Top-level generic entry
 // ---------------------------------------------------------------------------
 
+// Fill edyn_buf with a complete dynamic-ELF image.
+//
+// Parameters:
+//   lib_name_ptr / lib_name_len — DT_NEEDED library name (e.g. "libc.so.6")
+//   sym_list_ptr / sym_count    — packed array: 16 bytes per entry, each
+//                                 (name_ptr: u64, name_len: u64). Order is
+//                                 preserved into .dynsym / .rela.plt / PLT.
+//   text_ptr / text_len         — .text section bytes (caller is responsible
+//                                 for PLT-relative rel32s; they must be
+//                                 pre-patched against the PLT layout
+//                                 described by edyn_sym_plt_va(i))
+//   entry_off                   — byte offset within `text` where _start begins
+//
+// Returns: total byte count written (EDYN_FILE_END equivalent).
 @export
-fn emit_dynamic_elf_hello() -> uint64 {
+fn emit_dynamic_elf(uint64 lib_name_ptr, uint64 lib_name_len,
+                    uint64 sym_list_ptr,  uint64 sym_count,
+                    uint64 text_ptr,      uint64 text_len,
+                    uint64 entry_off) -> uint64 {
+    if sym_count == 0 {
+        write(2, "format_elf_dyn: no dynamic symbols\n", 35)
+        exit(1)
+    }
+
+    edyn_in_lib_ptr   = lib_name_ptr
+    edyn_in_lib_len   = lib_name_len
+    edyn_in_sym_list  = sym_list_ptr
+    edyn_in_sym_count = sym_count
+    edyn_in_text_ptr  = text_ptr
+    edyn_in_text_len  = text_len
+    edyn_in_entry_off = entry_off
+
+    edyn_compute_layout()
     edyn_init(16384)
 
     edyn_write_elf_header()
@@ -491,29 +599,120 @@ fn emit_dynamic_elf_hello() -> uint64 {
     edyn_write_interp()
     edyn_pad_to(EDYN_OFF_DYNSTR)
     edyn_write_dynstr()
-    edyn_pad_to(EDYN_OFF_DYNSYM)
+    edyn_pad_to(edyn_off_dynsym)
     edyn_write_dynsym()
-    edyn_pad_to(EDYN_OFF_HASH)
+    edyn_pad_to(edyn_off_hash)
     edyn_write_hash()
-    edyn_pad_to(EDYN_OFF_RELAPLT)
+    edyn_pad_to(edyn_off_relaplt)
     edyn_write_relaplt()
-    edyn_pad_to(EDYN_OFF_DYNAMIC)
+    edyn_pad_to(edyn_off_dynamic)
     edyn_write_dynamic()
     edyn_pad_to(EDYN_OFF_PLT)
     edyn_write_plt()
-    edyn_pad_to(EDYN_OFF_TEXT)
+    edyn_pad_to(edyn_off_text)
     edyn_write_text()
-    edyn_pad_to(EDYN_OFF_HELLO)
-    edyn_write_hello()
     edyn_pad_to(EDYN_OFF_GOTPLT)
     edyn_write_gotplt()
-    edyn_pad_to(EDYN_FILE_END)
+    edyn_pad_to(edyn_file_end)
 
-    return EDYN_FILE_END
+    return edyn_file_end
 }
 
-// Convenience: fill buffer, open path, write, close, chmod +x.
-// Returns 0 on success, 1 on I/O error.
+// ---------------------------------------------------------------------------
+// Backcompat wrappers for the hello-puts configuration
+// ---------------------------------------------------------------------------
+// Still driven by the M2a.1 API (fmtelf_test.mlr calls into this path).
+// These build the same 2-symbol + 29-byte text payload as
+// examples/elfgen.mlr and then call emit_dynamic_elf.
+
+fn edyn_build_hello_text(uint64 text_buf) {
+    uint64 va_text = EDYN_VA_PLT + 16 + 2 * 16        // PLT0 + 2 entries
+    uint64 va_plt_puts = EDYN_VA_PLT + 16
+    uint64 va_plt_exit = EDYN_VA_PLT + 32
+    uint64 va_hello = va_text + 23
+
+    // sub rsp, 8
+    uint8 b0 = 0x48; unsafe { *((text_buf + 0) as uint8) = b0 }
+    uint8 b1 = 0x83; unsafe { *((text_buf + 1) as uint8) = b1 }
+    uint8 b2 = 0xEC; unsafe { *((text_buf + 2) as uint8) = b2 }
+    uint8 b3 = 0x08; unsafe { *((text_buf + 3) as uint8) = b3 }
+
+    // lea rdi, [rip+disp_to_hello] — rip after at text+11
+    uint8 b4 = 0x48; unsafe { *((text_buf + 4) as uint8) = b4 }
+    uint8 b5 = 0x8D; unsafe { *((text_buf + 5) as uint8) = b5 }
+    uint8 b6 = 0x3D; unsafe { *((text_buf + 6) as uint8) = b6 }
+    uint64 lea_disp = va_hello - (va_text + 11)
+    uint8 l0 = lea_disp & 0xFF
+    uint8 l1 = (lea_disp >> 8) & 0xFF
+    uint8 l2 = (lea_disp >> 16) & 0xFF
+    uint8 l3 = (lea_disp >> 24) & 0xFF
+    unsafe { *((text_buf + 7)  as uint8) = l0 }
+    unsafe { *((text_buf + 8)  as uint8) = l1 }
+    unsafe { *((text_buf + 9)  as uint8) = l2 }
+    unsafe { *((text_buf + 10) as uint8) = l3 }
+
+    // call puts_plt — rip after at text+16
+    uint8 b11 = 0xE8; unsafe { *((text_buf + 11) as uint8) = b11 }
+    uint64 puts_rel = va_plt_puts - (va_text + 16)
+    uint8 p0 = puts_rel & 0xFF
+    uint8 p1 = (puts_rel >> 8) & 0xFF
+    uint8 p2 = (puts_rel >> 16) & 0xFF
+    uint8 p3 = (puts_rel >> 24) & 0xFF
+    unsafe { *((text_buf + 12) as uint8) = p0 }
+    unsafe { *((text_buf + 13) as uint8) = p1 }
+    unsafe { *((text_buf + 14) as uint8) = p2 }
+    unsafe { *((text_buf + 15) as uint8) = p3 }
+
+    // xor edi, edi
+    uint8 b16 = 0x31; unsafe { *((text_buf + 16) as uint8) = b16 }
+    uint8 b17 = 0xFF; unsafe { *((text_buf + 17) as uint8) = b17 }
+
+    // call exit_plt — rip after at text+23
+    uint8 b18 = 0xE8; unsafe { *((text_buf + 18) as uint8) = b18 }
+    uint64 exit_rel = va_plt_exit - (va_text + 23)
+    uint8 e0 = exit_rel & 0xFF
+    uint8 e1 = (exit_rel >> 8) & 0xFF
+    uint8 e2 = (exit_rel >> 16) & 0xFF
+    uint8 e3 = (exit_rel >> 24) & 0xFF
+    unsafe { *((text_buf + 19) as uint8) = e0 }
+    unsafe { *((text_buf + 20) as uint8) = e1 }
+    unsafe { *((text_buf + 21) as uint8) = e2 }
+    unsafe { *((text_buf + 22) as uint8) = e3 }
+
+    // "hello\0"
+    uint8 h0 = 104; unsafe { *((text_buf + 23) as uint8) = h0 }
+    uint8 h1 = 101; unsafe { *((text_buf + 24) as uint8) = h1 }
+    uint8 h2 = 108; unsafe { *((text_buf + 25) as uint8) = h2 }
+    uint8 h3 = 108; unsafe { *((text_buf + 26) as uint8) = h3 }
+    uint8 h4 = 111; unsafe { *((text_buf + 27) as uint8) = h4 }
+    uint8 h5 = 0;   unsafe { *((text_buf + 28) as uint8) = h5 }
+}
+
+@export
+fn emit_dynamic_elf_hello() -> uint64 {
+    uint64 lib = "libc.so.6"
+    uint64 puts_s = "puts"
+    uint64 exit_s = "exit"
+
+    // sym_list[2]: (ptr, len) pairs
+    uint64 sym_list = alloc(2 * 16)
+    unsafe { *((sym_list +  0) as uint64) = puts_s }
+    uint64 vpl = 4
+    unsafe { *((sym_list +  8) as uint64) = vpl }
+    unsafe { *((sym_list + 16) as uint64) = exit_s }
+    uint64 vel = 4
+    unsafe { *((sym_list + 24) as uint64) = vel }
+
+    // Text: 29 bytes (23-byte _start + "hello\0")
+    uint64 text_buf = alloc(64)
+    edyn_build_hello_text(text_buf)
+
+    return emit_dynamic_elf(lib, 9,
+                            sym_list, 2,
+                            text_buf, 29,
+                            0)
+}
+
 @export
 fn emit_dynamic_elf_to_file(uint64 out_path) -> uint64 {
     uint64 size = emit_dynamic_elf_hello()
