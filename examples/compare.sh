@@ -14,11 +14,11 @@ REPO="$(cd "$DIR/.." && pwd)"
 MLRC="${MLRC:-$REPO/build/mlrc}"
 
 if [ $# -ne 1 ]; then
-    echo "usage: $0 <base>   (expects $DIR/<base>.kr + $DIR/<base>_reference.py)" >&2
+    echo "usage: $0 <base>   (expects $DIR/<base>.mlr + $DIR/<base>_reference.py)" >&2
     exit 2
 fi
 BASE="$1"
-KR_SRC="$DIR/${BASE}.kr"
+KR_SRC="$DIR/${BASE}.mlr"
 PY_SRC="$DIR/${BASE}_reference.py"
 [ -r "$KR_SRC" ] || { echo "compare: missing $KR_SRC" >&2; exit 2; }
 [ -r "$PY_SRC" ] || { echo "compare: missing $PY_SRC" >&2; exit 2; }

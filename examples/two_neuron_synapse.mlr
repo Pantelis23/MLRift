@@ -1,7 +1,7 @@
 // MLRift — stage 1.
 //
 // Two LIF neurons connected by one excitatory synapse. Pre has constant
-// drive (same as examples/lif_neuron.kr); post has no drive of its own
+// drive (same as examples/lif_neuron.mlr); post has no drive of its own
 // and only fires when EPSPs push it above threshold.
 //
 // Synaptic dynamics:
@@ -21,9 +21,9 @@ fn main() {
     uint64 n_steps = 10000
 
     // --- presynaptic neuron ---
-    f64 V_pre_rest = 0.0 - 70.0
-    f64 V_pre_reset = 0.0 - 75.0
-    f64 V_pre_thresh = 0.0 - 55.0
+    f64 V_pre_rest = -70.0
+    f64 V_pre_reset = -75.0
+    f64 V_pre_thresh = -55.0
     f64 tau_pre = 20.0
     f64 RI_pre = 20.0
     uint64 ref_pre_steps = 20
@@ -31,9 +31,9 @@ fn main() {
     uint64 ref_pre = 0
 
     // --- postsynaptic neuron ---
-    f64 V_post_rest = 0.0 - 70.0
-    f64 V_post_reset = 0.0 - 75.0
-    f64 V_post_thresh = 0.0 - 55.0
+    f64 V_post_rest = -70.0
+    f64 V_post_reset = -75.0
+    f64 V_post_thresh = -55.0
     f64 tau_post = 20.0
     uint64 ref_post_steps = 20
     f64 V_post = V_post_rest

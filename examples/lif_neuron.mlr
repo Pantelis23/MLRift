@@ -4,24 +4,21 @@
 // integration, constant current injection, and a discrete refractory
 // period. Prints the integer step index at every spike.
 //
-// This uses only existing KernRift primitives — no new IR ops, no
-// language extensions. The point is to prove the existing stack can
-// express biological dynamics end-to-end, so that subsequent
-// MLRift-specific work has a concrete workload to justify it.
+// Built from primitives inherited from KernRift — the fork exists so
+// MLRift-specific features land later with a concrete workload driving
+// them, not as speculative vision-doc line items.
 //
 // Matches examples/lif_neuron_reference.py exactly (same parameters,
-// same update rule, both IEEE-754 f64). examples/lif_compare.sh
-// diffs the two outputs — if they disagree, either the MLRift
-// codegen lost precision or the two implementations drifted.
+// same update rule, both IEEE-754 f64). Verified by examples/compare.sh.
 
 fn main() {
     // --- parameters ---
     f64 dt = 0.1           // ms per step
     f64 tau_m = 20.0       // membrane time constant (ms)
-    f64 V_rest = 0.0 - 70.0
-    f64 V_reset = 0.0 - 75.0
-    f64 V_thresh = 0.0 - 55.0
-    f64 RI = 20.0          // effective drive (brings V_ss to -50)
+    f64 V_rest = -70.0
+    f64 V_reset = -75.0
+    f64 V_thresh = -55.0
+    f64 RI = 20.0          // effective drive (brings V_ss to -50 mV)
     uint64 n_steps = 10000 // 1000 ms
     uint64 ref_steps = 20  // 2.0 ms / dt
 
@@ -33,11 +30,9 @@ fn main() {
     // --- integration loop ---
     while step < n_steps {
         if ref_count > 0 {
-            // refractory: hold at reset potential
             ref_count = ref_count - 1
             V = V_reset
         } else {
-            // leaky integration: dV/dt = (V_rest - V + RI) / tau_m
             f64 dv = dt * (V_rest - V + RI) / tau_m
             V = V + dv
             if V >= V_thresh {

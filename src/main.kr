@@ -4200,7 +4200,7 @@ fn main() {
                     emit_mode = 4
                 }
             } else if str_starts_with(arg, "--help", 6) != 0 || str_eq_full(arg, "-h") != 0 {
-                write(1, "usage: krc [options] <file.kr> [-o output]\n\n", 44)
+                write(1, "usage: mlrc [options] <file.mlr> [-o output]\n\n", 46)
                 write(1, "options:\n", 9)
                 write(1, "  --arch=x86_64|arm64\n", 22)
                 write(1, "  --emit=elfexe|macho|pe|obj|android|asm\n", 41)
@@ -4213,9 +4213,9 @@ fn main() {
                 write(1, "  --version                 show version\n", 41)
                 write(1, "  --help, -h                show this help\n\n", 44)
                 write(1, "commands:\n", 10)
-                write(1, "  check <file.kr>   safety analysis\n", 36)
-                write(1, "  lc <file.kr>      living compiler\n", 36)
-                write(1, "  fmt <file.kr>     auto-format source\n", 39)
+                write(1, "  check <file.mlr>  safety analysis\n", 36)
+                write(1, "  lc <file.mlr>     living compiler\n", 36)
+                write(1, "  fmt <file.mlr>    auto-format source\n", 39)
                 exit(0)
             } else if str_starts_with(arg, "--version", 9) != 0 {
                 uint64 msg = "mlrc 0.1.0 (MLRift — built on KernRift v2.8.15)\n"
@@ -4396,7 +4396,7 @@ fn main() {
     if input_path == 0 {
         if cli_argc > 0 {
             write(2, "mlrc: no input file\n\n", 21)
-            write(2, "usage: mlrc [options] <file.kr> [-o output]\n\n", 45)
+            write(2, "usage: mlrc [options] <file.mlr> [-o output]\n\n", 46)
             write(2, "options:\n", 9)
             write(2, "  --arch=x86_64|arm64\n", 22)
             write(2, "  --emit=elfexe|macho|pe|obj|android|asm\n", 41)
@@ -4404,9 +4404,9 @@ fn main() {
             write(2, "  --target=linux|macos|windows\n", 31)
             write(2, "  --version\n\n", 13)
             write(2, "commands:\n", 10)
-            write(2, "  check <file.kr>   safety analysis\n", 36)
-            write(2, "  lc <file.kr>      living compiler\n", 36)
-            write(2, "  fmt <file.kr>     auto-format source\n", 39)
+            write(2, "  check <file.mlr>  safety analysis\n", 36)
+            write(2, "  lc <file.mlr>     living compiler\n", 36)
+            write(2, "  fmt <file.mlr>    auto-format source\n", 39)
             exit(0)
         }
         input_path = "test_input.kr"
