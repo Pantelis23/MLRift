@@ -1,0 +1,69 @@
+// MLRift — stage 2.
+//
+// 100 uncoupled LIF neurons with heterogeneous drive.
+// Neuron i gets RI = 10.0 + 0.2 * i, so the population spans:
+//   i =   0 → RI=10.0 (subthreshold, never fires)
+//   i =  25 → RI=15.0 (borderline — V_ss ≈ V_thresh)
+//   i =  50 → RI=20.0 (same as stage 0, ~29 spikes/s)
+//   i =  99 → RI=29.8 (fast firing, ~53 spikes/s)
+//
+// Per-neuron state lives in static f64[100] / uint64[100] arrays.
+// The array-read type-flow quirk in the current language (inline
+// `V[i] + x` loses f64 typing but `f64 v = V[i]` preserves it) is
+// worked around by pulling each element into a named local before
+// use. Paper cut worth fixing in a later language pass.
+//
+// Output: one 'i step' line per spike, in the order they happen.
+// Matches examples/population_100_reference.py byte-for-byte.
+
+static f64[100] V
+static uint64[100] ref_count
+static f64[100] RI
+
+fn main() {
+    f64 dt = 0.1
+    f64 V_rest = 0.0 - 70.0
+    f64 V_reset = 0.0 - 75.0
+    f64 V_thresh = 0.0 - 55.0
+    f64 tau_m = 20.0
+    uint64 ref_steps = 20
+    uint64 N = 100
+    uint64 n_steps = 10000
+
+    // initialize state
+    uint64 j = 0
+    while j < N {
+        V[j] = V_rest
+        ref_count[j] = 0
+        f64 jf = int_to_f64(j)
+        RI[j] = 10.0 + jf * 0.2
+        j = j + 1
+    }
+
+    uint64 step = 0
+    while step < n_steps {
+        uint64 i = 0
+        while i < N {
+            if ref_count[i] > 0 {
+                ref_count[i] = ref_count[i] - 1
+                V[i] = V_reset
+            } else {
+                f64 v = V[i]
+                f64 ri = RI[i]
+                f64 dv = dt * (V_rest - v + ri) / tau_m
+                f64 v_new = v + dv
+                V[i] = v_new
+                if v_new >= V_thresh {
+                    print(i)
+                    print(" ")
+                    println(step)
+                    V[i] = V_reset
+                    ref_count[i] = ref_steps
+                }
+            }
+            i = i + 1
+        }
+        step = step + 1
+    }
+    exit(0)
+}
