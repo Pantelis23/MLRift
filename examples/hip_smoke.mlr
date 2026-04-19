@@ -1,39 +1,79 @@
-// MLRift — M2b.2 HIP-binding load test.
+// MLRift — M2b.3 end-to-end: HIP runtime call through PLT/libc_start_main.
 //
-// Exercises the dynamic-linking infrastructure for HIP:
+// Calls hipGetDeviceCount(&count) via libamdhip64.so.7 and prints the
+// number of HIP-capable devices. Works because mlrc now prepends a
+// glibc-style _start stub that calls __libc_start_main, so libc's
+// startup (TLS, environ, pthread_self) + libamdhip64's constructors
+// all fire before user main() runs.
 //
-//   1. Importing std/hip.kr registers the hip* bindings as @dynamic
-//      extern fns.
-//   2. The mlrc driver sees a "hip" prefix in the registry and auto-
-//      includes libamdhip64.so.7 in the ELF's DT_NEEDED list.
-//   3. The loader resolves libamdhip64 at load time (chains into
-//      librocprofiler, libhsa-runtime64, libstdc++, libm, ...).
-//
-// What this test does NOT verify: actually calling into libamdhip64.
-// Any hip* call currently segfaults because the HIP runtime's lazy
-// first-call initialisation assumes a full glibc startup chain
-// (pthread_self, TLS, environ, getenv, etc.) — MLRift's entry stub
-// goes straight to main without running __libc_start_main, so parts
-// of libc's threadlocal state are uninitialised. Fixing this needs a
-// proper crt-style entry or a switch to __libc_start_main; tracked as
-// M2b.3+ in docs/GPU_BACKEND.md.
-//
-// Verification:
 //   mlrc examples/hip_smoke.mlr -o /tmp/hip_smoke
-//   readelf -d /tmp/hip_smoke | grep NEEDED
-//     → libc.so.6 + libamdhip64.so.7
-//   ldd /tmp/hip_smoke | grep libamdhip64
-//     → resolves (~/opt/rocm-.../libamdhip64.so.7)
 //   /tmp/hip_smoke
-//     → prints "hip-smoke: linked" and exits 0
+//     → "hip devices: N"    (2 on the 7800XT host: discrete + iGPU)
+//     → exit 0
 
 import "../std/hip.kr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)
 
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 {
+        uint8 zero = 48
+        unsafe { *(buf as uint8) = zero }
+        return 1
+    }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 {
+        n = n + 1
+        tmp = tmp / 10
+    }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
 fn main() {
-    uint64 msg = "hip-smoke: linked"
+    // HIP's `int *count` — we pass an 8-byte slot; the first 4 bytes
+    // receive the device count.
+    uint64 count_slot = alloc(8)
+    uint32 err = hipGetDeviceCount(count_slot)
+    if err != 0 {
+        uint64 errmsg = "hip error: hipGetDeviceCount failed"
+        puts(errmsg)
+        exit(1)
+    }
+
+    uint64 count = 0
+    unsafe { *(count_slot as uint32) -> count }
+
+    // Format "hip devices: N\0" into a heap buffer.
+    uint64 msg = alloc(64)
+    uint64 prefix = "hip devices: "
+    uint64 pi = 0
+    while pi < 13 {
+        uint64 sp = prefix + pi
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = msg + pi
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        pi = pi + 1
+    }
+    uint64 num_buf = msg + 13
+    uint64 dlen = u64_to_ascii_decimal(count, num_buf)
+    uint64 nul_p = msg + 13 + dlen
+    uint8 nul = 0
+    unsafe { *(nul_p as uint8) = nul }
+
     puts(msg)
     exit(0)
 }

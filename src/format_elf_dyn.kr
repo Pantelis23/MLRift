@@ -778,6 +778,96 @@ fn emit_dynamic_elf(uint64 lib_list_ptr, uint64 lib_count,
 }
 
 // ---------------------------------------------------------------------------
+// glibc-style _start stub (M2b.3)
+// ---------------------------------------------------------------------------
+// When a dynamic ELF pulls in complex C++ runtimes like libamdhip64 +
+// libstdc++, the loader expects MLRift's entry to set up argc/argv +
+// __libc_start_main the same way gcc-emitted binaries do. The stub
+// below mirrors the glibc _start sequence: fill registers per the
+// System V AMD64 ABI, then call __libc_start_main@plt with the user's
+// main() address in %rdi. __libc_start_main runs libc ctors, TLS, and
+// .init_array for every loaded library, then invokes main.
+//
+// Layout (33 bytes):
+//   off  bytes              asm
+//    0   31 ed              xor ebp, ebp
+//    2   49 89 d1           mov r9, rdx            ; rtld_fini
+//    5   5e                 pop rsi                ; argc
+//    6   48 89 e2           mov rdx, rsp           ; argv
+//    9   48 83 e4 f0        and rsp, -16
+//   13   50                 push rax               ; align to 16
+//   14   54                 push rsp               ; stack_end
+//   15   45 31 c0           xor r8d, r8d           ; fini = NULL
+//   18   31 c9              xor ecx, ecx           ; init = NULL
+//   20   48 8d 3d <disp>    lea rdi, [rip + disp]  ; main address
+//   27   e8 <rel32>         call __libc_start_main@plt
+//   32   f4                 hlt                    ; unreached
+
+static uint64 EDYN_START_STUB_SIZE         = 33
+static uint64 EDYN_START_STUB_LEA_DISP_OFF = 23   // 4-byte disp starts here
+static uint64 EDYN_START_STUB_CALL_REL_OFF = 28   // 4-byte rel32 starts here
+
+@export fn edyn_start_stub_size() -> uint64 { return EDYN_START_STUB_SIZE }
+@export fn edyn_start_stub_call_rel32_off() -> uint64 { return EDYN_START_STUB_CALL_REL_OFF }
+
+fn edyn_stub_emit_u8(uint64 buf, uint64 off, uint64 val) {
+    uint64 p = buf + off
+    uint8 b = val & 0xFF
+    unsafe { *(p as uint8) = b }
+}
+
+fn edyn_stub_emit_u32(uint64 buf, uint64 off, uint64 val) {
+    edyn_stub_emit_u8(buf, off,     val & 0xFF)
+    edyn_stub_emit_u8(buf, off + 1, (val >> 8)  & 0xFF)
+    edyn_stub_emit_u8(buf, off + 2, (val >> 16) & 0xFF)
+    edyn_stub_emit_u8(buf, off + 3, (val >> 24) & 0xFF)
+}
+
+// Write the 33-byte _start stub into `buf`.
+//   main_off_in_text — byte offset of user `main()` within the .text
+//                      section being assembled (i.e., stub occupies
+//                      [0..33), main lives at main_off_in_text; for
+//                      a single-fn source where main is first, that's
+//                      just STUB_SIZE).
+// The call rel32 at offset 28 is left as zero — caller must patch it
+// after edyn_compute_layout knows the PLT vaddr for __libc_start_main.
+@export
+fn edyn_write_start_stub(uint64 buf, uint64 main_off_in_text) {
+    // xor ebp, ebp
+    edyn_stub_emit_u8(buf, 0, 0x31); edyn_stub_emit_u8(buf, 1, 0xED)
+    // mov r9, rdx
+    edyn_stub_emit_u8(buf, 2, 0x49); edyn_stub_emit_u8(buf, 3, 0x89)
+    edyn_stub_emit_u8(buf, 4, 0xD1)
+    // pop rsi
+    edyn_stub_emit_u8(buf, 5, 0x5E)
+    // mov rdx, rsp
+    edyn_stub_emit_u8(buf, 6, 0x48); edyn_stub_emit_u8(buf, 7, 0x89)
+    edyn_stub_emit_u8(buf, 8, 0xE2)
+    // and rsp, -16
+    edyn_stub_emit_u8(buf,  9, 0x48); edyn_stub_emit_u8(buf, 10, 0x83)
+    edyn_stub_emit_u8(buf, 11, 0xE4); edyn_stub_emit_u8(buf, 12, 0xF0)
+    // push rax
+    edyn_stub_emit_u8(buf, 13, 0x50)
+    // push rsp
+    edyn_stub_emit_u8(buf, 14, 0x54)
+    // xor r8d, r8d
+    edyn_stub_emit_u8(buf, 15, 0x45); edyn_stub_emit_u8(buf, 16, 0x31)
+    edyn_stub_emit_u8(buf, 17, 0xC0)
+    // xor ecx, ecx
+    edyn_stub_emit_u8(buf, 18, 0x31); edyn_stub_emit_u8(buf, 19, 0xC9)
+    // lea rdi, [rip + disp]   rip_after_lea = stub+27
+    edyn_stub_emit_u8(buf, 20, 0x48); edyn_stub_emit_u8(buf, 21, 0x8D)
+    edyn_stub_emit_u8(buf, 22, 0x3D)
+    uint64 lea_disp = main_off_in_text - 27
+    edyn_stub_emit_u32(buf, EDYN_START_STUB_LEA_DISP_OFF, lea_disp)
+    // call rel32 (placeholder)
+    edyn_stub_emit_u8(buf, 27, 0xE8)
+    edyn_stub_emit_u32(buf, EDYN_START_STUB_CALL_REL_OFF, 0)
+    // hlt
+    edyn_stub_emit_u8(buf, 32, 0xF4)
+}
+
+// ---------------------------------------------------------------------------
 // Backcompat wrappers for the hello-puts configuration
 // ---------------------------------------------------------------------------
 // Still driven by the M2a.1 API (fmtelf_test.mlr calls into this path).

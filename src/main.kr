@@ -2456,22 +2456,32 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
         exit(1)
     }
 
-    // Dynamic-linked ELF path (M2a.4): when the module declares one or
-    // more `@dynamic extern fn`, hand the output off to format_elf_dyn
-    // instead of the static-ELF header-patching path below. format_elf_dyn
-    // builds a fresh binary with PT_INTERP + PT_DYNAMIC + PLT/GOT; call
-    // sites recorded by dyn_call_record get their rel32s patched to the
-    // corresponding PLT entry.
+    // Dynamic-linked ELF path (M2a.4, refined by M2b.3): when the module
+    // declares one or more `@dynamic extern fn`, hand the output off to
+    // format_elf_dyn instead of the static-ELF header-patching path. We
+    // prepend a glibc-compatible _start stub that calls __libc_start_main
+    // (see edyn_write_start_stub) so libstdc++/libamdhip64's .init_array
+    // constructors fire and TLS/stdio end up fully initialised before
+    // user main() runs.
     if dyn_sym_count_get() > 0 && emit_mode == 0 {
-        uint64 text_start_dyn = header_size           // 120 for elfexe
-        uint64 text_len_dyn = codegen_output_len() - text_start_dyn
-        uint64 entry_off_dyn = entry_off - text_start_dyn
+        uint64 text_start_dyn = header_size            // 120 for elfexe
+        uint64 text_len_orig = codegen_output_len() - text_start_dyn
+        uint64 main_off_orig = entry_off - text_start_dyn
 
-        // Build sym_list[count] — each entry is (name_ptr: u64, name_len: u64)
-        uint64 nsym = dyn_sym_count_get()
-        uint64 sym_list = alloc(nsym * 16)
+        // Combined .text layout: [stub_size bytes of _start] + [original
+        // codegen output]. main() ends up at stub_size + main_off_orig.
+        uint64 stub_size = edyn_start_stub_size()
+        uint64 text_len_dyn = stub_size + text_len_orig
+        uint64 main_off_in_text = stub_size + main_off_orig
+
+        // Build extended sym_list: existing @dynamic syms then the
+        // synthesised __libc_start_main entry that the stub needs.
+        uint64 nsym_user = dyn_sym_count_get()
+        uint64 nsym_ext = nsym_user + 1
+        uint64 lsm_idx = nsym_user                     // slot for libc_start_main
+        uint64 sym_list = alloc(nsym_ext * 16)
         uint64 si_dyn = 0
-        while si_dyn < nsym {
+        while si_dyn < nsym_user {
             uint32 nt_dyn = dyn_sym_tok_at(si_dyn)
             uint64 wnt = nt_dyn
             uint64 ts = tok_text_start(wnt)
@@ -2483,11 +2493,15 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
             unsafe { *(slot_b as uint64) = tl }
             si_dyn = si_dyn + 1
         }
+        uint64 lsm_name = "__libc_start_main"
+        uint64 lsm_slot = sym_list + lsm_idx * 16
+        unsafe { *(lsm_slot as uint64) = lsm_name }
+        uint64 lsm_slot_len = lsm_slot + 8
+        uint64 lsm_len = 17
+        unsafe { *(lsm_slot_len as uint64) = lsm_len }
 
-        // Build the lib list. libc.so.6 is always there; libamdhip64.so.7
-        // joins it when any registered @dynamic symbol starts with "hip"
-        // (i.e. the program imported std/hip.kr bindings). M2c-era work
-        // can replace this heuristic with a per-symbol library annotation.
+        // Library list: libc.so.6 always, libamdhip64.so.7 if any
+        // registered @dynamic symbol starts with "hip".
         uint64 add_hip = dyn_sym_any_hip_prefix()
         uint64 lib_count = 1
         if add_hip != 0 { lib_count = 2 }
@@ -2503,23 +2517,47 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
             unsafe { *((lib_list + 24) as uint64) = libhip_l }
         }
 
-        // Pass 1: compute layout so va_text + plt_va(i) are known.
-        edyn_compute_dyn_layout_for(lib_list, lib_count, sym_list, nsym, text_len_dyn)
-
-        // Pass 2: patch recorded @dynamic call sites. text_ptr must
-        // point at the start of .text (not at out_buf[0]) so the
-        // patcher's `text_ptr + text_off` arithmetic resolves to the
-        // real byte address of each rel32 slot.
+        // Build the combined text: stub bytes ahead of codegen's text.
+        uint64 combined_text = alloc(text_len_dyn + 64)
+        edyn_write_start_stub(combined_text, main_off_in_text)
         uint64 cg_buf = codegen_buf_ptr()
-        uint64 text_ptr_patch = cg_buf + text_start_dyn
-        edyn_patch_dyn_calls(text_ptr_patch, text_start_dyn)
+        memcpy(combined_text + stub_size, cg_buf + text_start_dyn, text_len_orig)
 
-        // Pass 3: emit the dynamic ELF into edyn_buf.
-        uint64 text_ptr_dyn = cg_buf + text_start_dyn
+        // Pass 1: compute layout so va_text + plt_va(i) are known.
+        edyn_compute_dyn_layout_for(lib_list, lib_count, sym_list, nsym_ext, text_len_dyn)
+
+        // Pass 2: patch the original recorded @dynamic call sites. Each
+        // code_off in dyn_call_sites is an out_buf absolute offset; in
+        // combined_text the same call lives at (code_off - text_start +
+        // stub_size), which means passing text_start - stub_size as the
+        // patcher's code_off_base.
+        uint64 base = text_start_dyn - stub_size
+        edyn_patch_dyn_calls(combined_text, base)
+
+        // Pass 3: patch the stub's own `call __libc_start_main@plt`
+        // rel32 now that edyn_sym_plt_va() is valid.
+        uint64 stub_call_off = edyn_start_stub_call_rel32_off()
+        uint64 stub_call_rip_after = edyn_va_text + stub_call_off + 4
+        uint64 lsm_plt_va = edyn_sym_plt_va(lsm_idx)
+        uint64 lsm_rel32 = (lsm_plt_va - stub_call_rip_after) & 0xFFFFFFFF
+        uint64 rb0 = combined_text + stub_call_off
+        uint8 rlsm0 = lsm_rel32 & 0xFF
+        unsafe { *(rb0 as uint8) = rlsm0 }
+        uint64 rb1 = rb0 + 1
+        uint8 rlsm1 = (lsm_rel32 >> 8) & 0xFF
+        unsafe { *(rb1 as uint8) = rlsm1 }
+        uint64 rb2 = rb0 + 2
+        uint8 rlsm2 = (lsm_rel32 >> 16) & 0xFF
+        unsafe { *(rb2 as uint8) = rlsm2 }
+        uint64 rb3 = rb0 + 3
+        uint8 rlsm3 = (lsm_rel32 >> 24) & 0xFF
+        unsafe { *(rb3 as uint8) = rlsm3 }
+
+        // Pass 4: emit the dynamic ELF into edyn_buf.
         uint64 elf_size = emit_dynamic_elf(lib_list, lib_count,
-                                            sym_list, nsym,
-                                            text_ptr_dyn, text_len_dyn,
-                                            entry_off_dyn)
+                                            sym_list, nsym_ext,
+                                            combined_text, text_len_dyn,
+                                            0)
 
         // Flush edyn_buf to output_path, bypassing the normal
         // codegen_write_output (which would write the static-ELF
