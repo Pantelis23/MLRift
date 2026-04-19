@@ -1,0 +1,92 @@
+// MLRift — stage 1.
+//
+// Two LIF neurons connected by one excitatory synapse. Pre has constant
+// drive (same as examples/lif_neuron.kr); post has no drive of its own
+// and only fires when EPSPs push it above threshold.
+//
+// Synaptic dynamics:
+//   s_exc decays each step via Euler: s_exc -= s_exc * dt / tau_s
+//     (first-order approx of s_exc *= exp(-dt/tau_s), exact match
+//      to the Python reference which does the same thing bit-for-bit)
+//   on pre spike: s_exc += 1.0
+//   post drive term: s_exc * J
+//     plugged into dV/dt = (V_rest - V + s_exc*J) / tau_m
+//
+// Prints "pre <step>" and "post <step>" on each spike so the harness
+// can count and diff each population independently.
+
+fn main() {
+    // --- shared ---
+    f64 dt = 0.1
+    uint64 n_steps = 10000
+
+    // --- presynaptic neuron ---
+    f64 V_pre_rest = 0.0 - 70.0
+    f64 V_pre_reset = 0.0 - 75.0
+    f64 V_pre_thresh = 0.0 - 55.0
+    f64 tau_pre = 20.0
+    f64 RI_pre = 20.0
+    uint64 ref_pre_steps = 20
+    f64 V_pre = V_pre_rest
+    uint64 ref_pre = 0
+
+    // --- postsynaptic neuron ---
+    f64 V_post_rest = 0.0 - 70.0
+    f64 V_post_reset = 0.0 - 75.0
+    f64 V_post_thresh = 0.0 - 55.0
+    f64 tau_post = 20.0
+    uint64 ref_post_steps = 20
+    f64 V_post = V_post_rest
+    uint64 ref_post = 0
+
+    // --- synapse ---
+    f64 tau_s = 10.0
+    f64 J = 100.0
+    f64 s_exc = 0.0
+
+    uint64 step = 0
+    while step < n_steps {
+        // synaptic decay (Euler)
+        s_exc = s_exc - s_exc * dt / tau_s
+
+        // pre neuron
+        uint64 pre_fired = 0
+        if ref_pre > 0 {
+            ref_pre = ref_pre - 1
+            V_pre = V_pre_reset
+        } else {
+            f64 dv_pre = dt * (V_pre_rest - V_pre + RI_pre) / tau_pre
+            V_pre = V_pre + dv_pre
+            if V_pre >= V_pre_thresh {
+                pre_fired = 1
+                V_pre = V_pre_reset
+                ref_pre = ref_pre_steps
+                print("pre ")
+                println(step)
+            }
+        }
+
+        // synaptic event
+        if pre_fired > 0 {
+            s_exc = s_exc + 1.0
+        }
+
+        // post neuron (driven by s_exc * J)
+        if ref_post > 0 {
+            ref_post = ref_post - 1
+            V_post = V_post_reset
+        } else {
+            f64 dv_post = dt * (V_post_rest - V_post + s_exc * J) / tau_post
+            V_post = V_post + dv_post
+            if V_post >= V_post_thresh {
+                V_post = V_post_reset
+                ref_post = ref_post_steps
+                print("post ")
+                println(step)
+            }
+        }
+
+        step = step + 1
+    }
+    exit(0)
+}
