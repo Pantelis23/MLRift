@@ -1,0 +1,43 @@
+// MLRift — M2a.1 byte-equivalence test for src/format_elf_dyn.kr.
+//
+// Calls the @export'd `emit_dynamic_elf_to_file` and writes a hello-
+// puts dynamic ELF to argv[1] (or /tmp/fmtelf_hello by default). Used
+// alongside `examples/elfgen.mlr` to prove the buffer-based port
+// produces bytes identical to the standalone prototype:
+//
+//   mlrc examples/elfgen.mlr      -o /tmp/elfgen
+//   mlrc examples/fmtelf_test.mlr -o /tmp/fmtelf_test
+//   /tmp/elfgen      /tmp/ref_hello
+//   /tmp/fmtelf_test /tmp/port_hello
+//   cmp /tmp/ref_hello /tmp/port_hello   # must be byte-identical
+//   /tmp/port_hello                      # must print "hello"
+//
+// `format_elf_dyn.kr` will be wired into the compiler's own SRCS in
+// M2a.3 (once codegen uses it). For now it lives in src/ but the only
+// caller is this test program, which inlines it via `import`.
+
+import "../src/format_elf_dyn.kr"
+
+static uint64 cli_argc = 0
+static uint64 cli_argv = 0
+
+fn main() {
+    uint64 out_path = "/tmp/fmtelf_hello"
+    if cli_argc >= 2 {
+        uint64 slot = cli_argv + 8
+        uint64 v = 0
+        unsafe { *(slot as uint64) -> v }
+        out_path = v
+    }
+
+    uint64 rc = emit_dynamic_elf_to_file(out_path)
+    if rc != 0 {
+        write(2, "fmtelf_test: emit failed\n", 25)
+        exit(1)
+    }
+    write(1, "wrote ", 6)
+    uint64 n = str_len(out_path)
+    write(1, out_path, n)
+    write(1, "\n", 1)
+    exit(0)
+}
