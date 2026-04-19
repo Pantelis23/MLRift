@@ -1,0 +1,298 @@
+// MLRift — stage 11: Mongillo-style working memory.
+//
+// Everything from stage 9 (E/I, STDP, TM-STP on every neuron) plus a
+// stimulus injection that briefly drives a specific subset of neurons
+// above their baseline. The test: after stimulus ends, can you tell
+// which subset was stimulated by looking at synaptic state (u_stp)
+// alone — i.e., without any persistent firing?
+//
+// If u_stp on the stimulated neurons stays measurably elevated above
+// baseline after the stimulus, Mongillo-2008 synaptic-facilitation-
+// based working memory is active, and the network has a "memory" of
+// the stimulus that outlasts the evoked spiking.
+//
+// Experiment:
+//   steps 0–999    (0–100 ms): baseline, no stimulus
+//   steps 1000–1999 (100–200 ms): +50 pA injected into neurons 0..19
+//   steps 2000–9999 (200–1000 ms): no stimulus, observe
+//
+// Checkpoints report mean u_stp for two subpopulations:
+//   stim group:    neurons 0..19  (got the +50 pA)
+//   baseline group: neurons 20..39 (matched E neurons, no extra drive)
+// Both groups are in the same RI range — the only difference is the
+// stimulus. Readings at:
+//   step 1999 (end of stim)
+//   step 4999 (+300 ms after stim ends)
+//   step 7999 (+600 ms after)
+//   step 9999 (+800 ms after)
+//
+// Matches examples/mongillo_wm_reference.py byte-for-byte.
+
+static f64 dt = 0.1
+static f64 V_rest = -70.0
+static f64 V_reset = -75.0
+static f64 V_thresh = -55.0
+static f64 tau_m = 20.0
+static f64 tau_e = 10.0
+static f64 tau_i = 5.0
+static f64 tau_pre = 20.0
+static f64 tau_post = 20.0
+static f64 tau_f = 1000.0
+static f64 tau_d = 200.0
+static f64 U_baseline = 0.2
+static f64 J_E = 2.0
+static f64 J_I = 8.0
+static f64 syn_weight_init = 0.1
+static f64 A_plus = 0.01
+static f64 A_minus = -0.012
+static f64 w_max = 0.3
+
+static f64 stim_amp = 50.0
+static uint64 stim_start = 1000
+static uint64 stim_end = 2000
+static uint64 stim_lo = 0
+static uint64 stim_hi = 20
+static uint64 base_lo = 20
+static uint64 base_hi = 40
+
+static uint64[100] cell_type
+static f64[100] V
+static uint64[100] ref_count
+static f64[100] RI
+static f64[100] s_exc
+static f64[100] s_inh
+static f64[100] x_pre
+static f64[100] x_post
+static f64[100] u_stp
+static f64[100] x_stp
+static f64[100] release_factor
+static uint64[100] fired_this_step
+
+static uint64[2000] syn_src
+static uint64[2000] syn_tgt
+static f64[2000]    syn_w
+static uint64[2000] syn_is_inh
+
+static uint32 rng_state = 0
+
+fn rng_next() -> uint64 {
+    uint32 s = rng_state
+    uint64 s64 = s
+    uint64 t1 = (s64 << 13) & 0xFFFFFFFF
+    s64 = s64 ^ t1
+    s64 = s64 ^ (s64 >> 17)
+    uint64 t2 = (s64 << 5) & 0xFFFFFFFF
+    s64 = s64 ^ t2
+    s64 = s64 & 0xFFFFFFFF
+    uint32 s2 = s64
+    rng_state = s2
+    return s64
+}
+
+fn report_u_stp(uint64 step, uint64 lo, uint64 hi, uint64 label) {
+    f64 sum = 0.0
+    uint64 k = lo
+    while k < hi {
+        sum = sum + u_stp[k]
+        k = k + 1
+    }
+    uint64 mean_ppm = f64_to_int(sum / int_to_f64(hi - lo) * 1000000.0)
+    print("# u_at_step=")
+    print(step)
+    if label == 0 {
+        print(" group=stim mean_ppm=")
+    } else {
+        print(" group=base mean_ppm=")
+    }
+    println(mean_ppm)
+}
+
+fn main() {
+    uint64 N = 100
+    uint64 n_E = 80
+    uint64 n_steps = 10000
+    uint64 ref_steps = 20
+    uint64 connect_prob_denom = 10
+
+    rng_state = 305419896
+
+    uint64 j = 0
+    while j < N {
+        V[j] = V_rest
+        ref_count[j] = 0
+        s_exc[j] = 0.0
+        s_inh[j] = 0.0
+        x_pre[j] = 0.0
+        x_post[j] = 0.0
+        u_stp[j] = U_baseline
+        x_stp[j] = 1.0
+        release_factor[j] = 0.0
+        RI[j] = 10.0 + int_to_f64(j) * 0.2
+        if j < n_E { cell_type[j] = 0 } else { cell_type[j] = 1 }
+        j = j + 1
+    }
+
+    uint64 n_syn = 0
+    uint64 i_s = 0
+    while i_s < N {
+        uint64 j_s = 0
+        while j_s < N {
+            if i_s != j_s {
+                uint64 r = rng_next()
+                if (r % connect_prob_denom) == 0 {
+                    syn_src[n_syn] = i_s
+                    syn_tgt[n_syn] = j_s
+                    syn_w[n_syn] = syn_weight_init
+                    syn_is_inh[n_syn] = cell_type[i_s]
+                    n_syn = n_syn + 1
+                }
+            }
+            j_s = j_s + 1
+        }
+        i_s = i_s + 1
+    }
+
+    print("# n_syn=")
+    println(n_syn)
+
+    uint64 ltp_events = 0
+    uint64 ltd_events = 0
+
+    uint64 step = 0
+    while step < n_steps {
+        // Decay all per-neuron dynamics + clear flags
+        uint64 k = 0
+        while k < N {
+            f64 se = s_exc[k]
+            f64 si = s_inh[k]
+            f64 xp = x_pre[k]
+            f64 xq = x_post[k]
+            f64 uv = u_stp[k]
+            f64 xv = x_stp[k]
+            s_exc[k] = se - se * dt / tau_e
+            s_inh[k] = si - si * dt / tau_i
+            x_pre[k] = xp - xp * dt / tau_pre
+            x_post[k] = xq - xq * dt / tau_post
+            u_stp[k] = uv + (U_baseline - uv) * dt / tau_f
+            x_stp[k] = xv + (1.0 - xv) * dt / tau_d
+            fired_this_step[k] = 0
+            release_factor[k] = 0.0
+            k = k + 1
+        }
+
+        // Determine this-step stimulus offset for neurons in [stim_lo, stim_hi)
+        f64 stim_now = 0.0
+        if step >= stim_start {
+            if step < stim_end {
+                stim_now = stim_amp
+            }
+        }
+
+        // Integrate voltages; on spike, TM update + trace bumps
+        uint64 i = 0
+        while i < N {
+            if ref_count[i] > 0 {
+                ref_count[i] = ref_count[i] - 1
+                V[i] = V_reset
+            } else {
+                f64 v = V[i]
+                f64 ri = RI[i]
+                // External stimulus into [stim_lo, stim_hi)
+                if i >= stim_lo {
+                    if i < stim_hi {
+                        ri = ri + stim_now
+                    }
+                }
+                f64 se = s_exc[i]
+                f64 si = s_inh[i]
+                f64 drive = ri + se * J_E - si * J_I
+                f64 dv = dt * (V_rest - v + drive) / tau_m
+                f64 v_new = v + dv
+                V[i] = v_new
+                if v_new >= V_thresh {
+                    print(i)
+                    print(" ")
+                    println(step)
+                    V[i] = V_reset
+                    ref_count[i] = ref_steps
+                    fired_this_step[i] = 1
+                    x_pre[i] = x_pre[i] + 1.0
+                    x_post[i] = x_post[i] + 1.0
+                    f64 uv = u_stp[i]
+                    f64 xv = x_stp[i]
+                    f64 rel = uv * xv
+                    release_factor[i] = rel
+                    x_stp[i] = xv - rel
+                    u_stp[i] = uv + U_baseline * (1.0 - uv)
+                }
+            }
+            i = i + 1
+        }
+
+        // Delivery + STDP
+        uint64 syn = 0
+        while syn < n_syn {
+            uint64 src = syn_src[syn]
+            uint64 tgt = syn_tgt[syn]
+            f64 w = syn_w[syn]
+            uint64 is_inh = syn_is_inh[syn]
+
+            if fired_this_step[src] > 0 {
+                f64 rel = release_factor[src]
+                f64 effective = w * rel
+                if is_inh > 0 {
+                    f64 cur = s_inh[tgt]
+                    s_inh[tgt] = cur + effective
+                } else {
+                    f64 cur = s_exc[tgt]
+                    s_exc[tgt] = cur + effective
+                }
+            }
+
+            if is_inh == 0 {
+                f64 w_new = w
+                if fired_this_step[src] > 0 {
+                    f64 xq = x_post[tgt]
+                    w_new = w_new + A_minus * xq
+                    ltd_events = ltd_events + 1
+                }
+                if fired_this_step[tgt] > 0 {
+                    f64 xp = x_pre[src]
+                    w_new = w_new + A_plus * xp
+                    ltp_events = ltp_events + 1
+                }
+                if w_new < 0.0 { w_new = 0.0 }
+                if w_new > w_max { w_new = w_max }
+                syn_w[syn] = w_new
+            }
+
+            syn = syn + 1
+        }
+
+        // Report u_stp checkpoints AFTER the full step update.
+        if step == 1999 {
+            report_u_stp(step, stim_lo, stim_hi, 0)
+            report_u_stp(step, base_lo, base_hi, 1)
+        }
+        if step == 4999 {
+            report_u_stp(step, stim_lo, stim_hi, 0)
+            report_u_stp(step, base_lo, base_hi, 1)
+        }
+        if step == 7999 {
+            report_u_stp(step, stim_lo, stim_hi, 0)
+            report_u_stp(step, base_lo, base_hi, 1)
+        }
+        if step == 9999 {
+            report_u_stp(step, stim_lo, stim_hi, 0)
+            report_u_stp(step, base_lo, base_hi, 1)
+        }
+
+        step = step + 1
+    }
+
+    print("# ltp_events=")
+    println(ltp_events)
+    print("# ltd_events=")
+    println(ltd_events)
+    exit(0)
+}
