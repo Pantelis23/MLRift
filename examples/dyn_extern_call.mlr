@@ -1,0 +1,25 @@
+// MLRift — M2a.3.b codegen test for @dynamic extern calls.
+//
+// Declares `my_dyn_puts` as a @dynamic extern and calls it. The
+// codegen dispatch for Call sees the callee is in the dyn_sym
+// registry and routes through `dyn_call_record`, leaving the rel32
+// as placeholder zeros. M2a.3.c will patch those rel32s to point
+// at the PLT stubs once format_elf_dyn computes the layout.
+//
+// Until M2a.4 wires the driver to emit a dynamic ELF, the CPU binary
+// produced by this test is NOT runnable — the `call rel32 0` would
+// jump to vaddr 0. Treat this as a compile-only test: verify mlrc
+// reports "recorded N @dynamic call site(s)" on stderr.
+//
+//   mlrc examples/dyn_extern_call.mlr -o /tmp/dyn_extern_call
+//   # stderr should include:
+//   #   mlrc: registered 1 @dynamic symbol(s)
+//   #   mlrc: recorded  1 @dynamic call site(s)
+
+@dynamic extern fn my_dyn_puts(uint64 s) -> uint32
+
+fn main() {
+    uint64 greeting = "hello"
+    my_dyn_puts(greeting)
+    exit(0)
+}

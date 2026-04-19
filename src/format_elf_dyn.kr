@@ -65,6 +65,87 @@ fn dyn_sym_tok_at(uint64 idx) -> uint32 {
     return v
 }
 
+// Look up a token-named symbol in the registry.
+// Returns slot_idx (0..count-1) if found, 0xFFFFFFFF if not. Called from
+// codegen at call-site lowering to detect whether a callee is a
+// @dynamic extern (→ route through PLT) or an ordinary extern/local fn.
+@export
+fn dyn_sym_lookup(uint64 name_tok) -> uint64 {
+    uint64 i = 0
+    while i < dyn_sym_count {
+        uint64 slot = dyn_sym_tokens + i * 4
+        uint32 stored = 0
+        unsafe { *(slot as uint32) -> stored }
+        uint64 ws = stored
+        if tok_text_eq(ws, name_tok) != 0 { return i }
+        i = i + 1
+    }
+    return 0xFFFFFFFF
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic-call-site table (M2a.3.b)
+// ---------------------------------------------------------------------------
+// Populated by codegen when it lowers a call to a @dynamic extern. Each
+// entry is (code_off: u32, sym_idx: u32) packed in 8 bytes. M2a.3.c
+// iterates this list after format_elf_dyn computes the PLT layout and
+// patches the 4-byte rel32 at each code_off to point at the appropriate
+// PLT entry.
+//
+// code_off is the byte position of the 4-byte rel32 disp inside
+// codegen.kr's `out_buf`. Converting to a text-relative offset happens
+// at patch time using the text_start supplied by the driver.
+
+static uint64 DYN_CALL_MAX    = 1024
+static uint64 dyn_call_sites  = 0
+static uint64 dyn_call_count  = 0
+
+fn dyn_call_init() {
+    if dyn_call_sites == 0 {
+        dyn_call_sites = alloc(DYN_CALL_MAX * 8)
+    }
+    dyn_call_count = 0
+}
+
+@export
+fn dyn_call_record(uint64 code_off, uint64 sym_idx) {
+    if dyn_call_sites == 0 { dyn_call_init() }
+    if dyn_call_count >= DYN_CALL_MAX {
+        write(2, "format_elf_dyn: too many @dynamic call sites (>1024)\n", 53)
+        exit(1)
+    }
+    uint64 entry = dyn_call_sites + dyn_call_count * 8
+    uint32 co = code_off
+    unsafe { *(entry as uint32) = co }
+    uint64 e4 = entry + 4
+    uint32 si = sym_idx
+    unsafe { *(e4 as uint32) = si }
+    dyn_call_count = dyn_call_count + 1
+}
+
+@export
+fn dyn_call_count_get() -> uint64 {
+    return dyn_call_count
+}
+
+@export
+fn dyn_call_off_at(uint64 i) -> uint64 {
+    uint64 entry = dyn_call_sites + i * 8
+    uint32 v = 0
+    unsafe { *(entry as uint32) -> v }
+    uint64 wv = v
+    return wv
+}
+
+@export
+fn dyn_call_sym_at(uint64 i) -> uint64 {
+    uint64 entry = dyn_call_sites + i * 8 + 4
+    uint32 v = 0
+    unsafe { *(entry as uint32) -> v }
+    uint64 wv = v
+    return wv
+}
+
 // ---------------------------------------------------------------------------
 // Buffer state
 // ---------------------------------------------------------------------------

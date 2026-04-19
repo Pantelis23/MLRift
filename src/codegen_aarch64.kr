@@ -4071,6 +4071,19 @@ fn gen_expr_a64(uint64 node) {
             }
         }
 
+        // @dynamic extern → record in the dyn-call table (M2a.3.b).
+        // Note: aarch64 PLT lowering will need ADRP+LDR+BLR sequences,
+        // not the simple BL used for local/extern calls. M2a.3.c /
+        // M2a.4 will emit that when (and if) aarch64 becomes a dyn-link
+        // target; for now we record the call-site offset so no arch-
+        // specific emit bug goes unnoticed once the patcher lands.
+        uint64 wct_dyn_a = callee_tok
+        uint64 dyn_idx_a = dyn_sym_lookup(wct_dyn_a)
+        if dyn_idx_a != 0xFFFFFFFF {
+            dyn_call_record(fixup_off, dyn_idx_a)
+            return
+        }
+
         // If the callee is an extern fn, record a call site for a linker
         // relocation and skip the internal fixup (the BL's imm26 stays zero
         // until the linker patches it with R_AARCH64_CALL26).

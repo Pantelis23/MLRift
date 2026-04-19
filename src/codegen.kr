@@ -7442,6 +7442,17 @@ fn gen_expr(uint64 node) {
             }
         }
 
+        // Legacy (non-IR) codegen: @dynamic extern takes priority over the
+        // ordinary extern relocation path. Matches the equivalent check in
+        // ir.kr's IR_CALL emission; the IR path is the default and this
+        // mirror exists for --legacy consistency.
+        uint64 wct_dyn = callee_tok
+        uint64 dyn_idx = dyn_sym_lookup(wct_dyn)
+        if dyn_idx != 0xFFFFFFFF {
+            dyn_call_record(fixup_off, dyn_idx)
+            return
+        }
+
         // If the callee is an extern fn, record a call site for the linker
         // relocation and skip the internal fixup table — the linker fills the
         // disp32 at .o emit time with R_X86_64_PLT32.

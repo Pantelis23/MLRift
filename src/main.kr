@@ -2707,6 +2707,20 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
     // No-op on Windows; safe on Linux/macOS/Android.
     set_executable(output_path)
 
+    // Dynamic-call-site count: reports on how many @dynamic extern
+    // call sites codegen recorded. M2a.3.c consumes this table to
+    // patch rel32s once format_elf_dyn computes the PLT layout. Until
+    // then, the call-site rel32s are placeholder zeros in the emitted
+    // binary — do NOT invoke any @dynamic extern in a CPU target yet.
+    uint64 dcall_n = dyn_call_count_get()
+    if dcall_n > 0 {
+        uint8[24] dc_buf
+        uint64 dc_len = fmt_uint(dc_buf, dcall_n)
+        write(2, "mlrc: recorded ", 15)
+        write(2, dc_buf, dc_len)
+        write(2, " @dynamic call site(s)\n", 23)
+    }
+
     uint64 t_end = time_ns()
     uint64 elapsed_ns = t_end - t_start
 

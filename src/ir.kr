@@ -6288,14 +6288,24 @@ fn ir_emit_x86_insn(uint64 ii) {
         emit_byte(0xE8)
         uint64 call_patch = out_len
         emit_u32_le(0)
-        // Record fixup: imm holds the callee token
-        uint64 fentry = fixup_table + fixup_count * 8
-        uint32 fo = call_patch
-        unsafe { *(fentry as uint32) = fo }
-        uint64 fe4 = fentry + 4
-        uint32 ct = imm
-        unsafe { *(fe4 as uint32) = ct }
-        fixup_count = fixup_count + 1
+        // @dynamic extern: route through the PLT call-site table instead
+        // of the fixup_table + fn_lookup resolution path. imm here is the
+        // callee token (same as IR_CALL's imm arg). M2a.3.c patches the
+        // rel32 at call_patch after format_elf_dyn computes the PLT
+        // layout; until then the rel32 stays 0.
+        uint64 ir_dyn_idx = dyn_sym_lookup(imm)
+        if ir_dyn_idx != 0xFFFFFFFF {
+            dyn_call_record(call_patch, ir_dyn_idx)
+        } else {
+            // Record fixup: imm holds the callee token
+            uint64 fentry = fixup_table + fixup_count * 8
+            uint32 fo = call_patch
+            unsafe { *(fentry as uint32) = fo }
+            uint64 fe4 = fentry + 4
+            uint32 ct = imm
+            unsafe { *(fe4 as uint32) = ct }
+            fixup_count = fixup_count + 1
+        }
         // Clean up overflow args from stack
         if stack_args > 0 {
             uint64 aligned_stack = stack_args
