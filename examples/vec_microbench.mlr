@@ -1,0 +1,85 @@
+// Micro-benchmark for std/vec_f64.kr decay helper.
+//
+// Compares two implementations of the same math on two alloc'd f64
+// buffers:
+//   (A) inline scalar loop — what stages 3-15 write by hand
+//   (B) vec_f64_decay_inplace — manual unroll-by-4 in std/vec_f64.kr
+//
+// Same input bytes, different compute path. Output compares final
+// sums (should be within f64 precision — not bit-identical because
+// the unrolled version may reorder add-operations subtly).
+
+import "../std/vec_f64.kr"
+
+fn main() {
+    uint64 N = 65536
+    uint64 ROUNDS = 1000
+    f64 factor = 0.005
+
+    uint64 buf_a = alloc(N * 8)
+    uint64 buf_b = alloc(N * 8)
+
+    // Fill both with the same pattern.
+    uint64 i = 0
+    while i < N {
+        uint64 p = i * 8
+        f64 v = int_to_f64(i) * 0.001 + 1.0
+        uint64 pa = buf_a + p
+        uint64 pb = buf_b + p
+        unsafe { *(pa as f64) = v }
+        unsafe { *(pb as f64) = v }
+        i = i + 1
+    }
+
+    // (A) inline scalar — identical loop to what stage 13 writes.
+    uint64 t0 = time_ns()
+    uint64 r = 0
+    while r < ROUNDS {
+        uint64 k = 0
+        while k < N {
+            uint64 pk = buf_a + k * 8
+            f64 x = 0.0
+            unsafe { *(pk as f64) -> x }
+            x = x - x * factor
+            unsafe { *(pk as f64) = x }
+            k = k + 1
+        }
+        r = r + 1
+    }
+    uint64 t1 = time_ns()
+    uint64 inline_ns = t1 - t0
+
+    // (B) helper — same math via unrolled vec_f64_decay_inplace.
+    uint64 t2 = time_ns()
+    uint64 r2 = 0
+    while r2 < ROUNDS {
+        vec_f64_decay_inplace(buf_b, N, factor)
+        r2 = r2 + 1
+    }
+    uint64 t3 = time_ns()
+    uint64 helper_ns = t3 - t2
+
+    f64 sum_a = vec_f64_sum(buf_a, N)
+    f64 sum_b = vec_f64_sum(buf_b, N)
+
+    print("# inline_us=")
+    println(inline_ns / 1000)
+    print("# helper_us=")
+    println(helper_ns / 1000)
+    // Pull into explicit locals to sidestep the nested-expr f64
+    // type-flow quirk the older examples hit.
+    f64 sa_scaled = sum_a * 1000.0
+    f64 sb_scaled = sum_b * 1000.0
+    uint64 sa_out = f64_to_int(sa_scaled)
+    uint64 sb_out = f64_to_int(sb_scaled)
+    print("# sum_a_milli=")
+    println(sa_out)
+    print("# sum_b_milli=")
+    println(sb_out)
+    // Speedup ratio, × 100 so we can print integer — expect ~160
+    // (i.e., helper is ~1.60× faster than inline).
+    uint64 ratio_x100 = (inline_ns * 100) / helper_ns
+    print("# helper_vs_inline_x100=")
+    println(ratio_x100)
+    exit(0)
+}

@@ -1,0 +1,147 @@
+// MLRift std/vec_f64.kr — vector helpers over raw f64 buffers.
+//
+// Each function takes a raw byte pointer (as returned by alloc or
+// taken from a static array's address) and treats it as a contiguous
+// f64 array. The body is currently manual 4-way scalar unroll; future
+// work will swap these bodies for AVX2/NEON kernels, and callers
+// don't change.
+
+// buf[i] = buf[i] - buf[i] * factor    for i in 0..n
+//   (aka Euler exponential decay body: x -= x * (dt/tau))
+fn vec_f64_decay_inplace(uint64 buf, uint64 n, f64 factor) {
+    uint64 i = 0
+    uint64 n4 = n & 0xFFFFFFFFFFFFFFFC
+    while i < n4 {
+        uint64 p0 = buf + i * 8
+        uint64 p1 = p0 + 8
+        uint64 p2 = p0 + 16
+        uint64 p3 = p0 + 24
+        f64 a = 0.0
+        f64 b = 0.0
+        f64 c = 0.0
+        f64 d = 0.0
+        unsafe { *(p0 as f64) -> a }
+        unsafe { *(p1 as f64) -> b }
+        unsafe { *(p2 as f64) -> c }
+        unsafe { *(p3 as f64) -> d }
+        a = a - a * factor
+        b = b - b * factor
+        c = c - c * factor
+        d = d - d * factor
+        unsafe { *(p0 as f64) = a }
+        unsafe { *(p1 as f64) = b }
+        unsafe { *(p2 as f64) = c }
+        unsafe { *(p3 as f64) = d }
+        i = i + 4
+    }
+    while i < n {
+        uint64 p = buf + i * 8
+        f64 v = 0.0
+        unsafe { *(p as f64) -> v }
+        v = v - v * factor
+        unsafe { *(p as f64) = v }
+        i = i + 1
+    }
+}
+
+// buf[i] = buf[i] + (target - buf[i]) * factor    for i in 0..n
+//   (Euler relax-toward-target: used for u_stp, x_stp recovery)
+fn vec_f64_relax_inplace(uint64 buf, uint64 n, f64 target, f64 factor) {
+    uint64 i = 0
+    uint64 n4 = n & 0xFFFFFFFFFFFFFFFC
+    while i < n4 {
+        uint64 p0 = buf + i * 8
+        uint64 p1 = p0 + 8
+        uint64 p2 = p0 + 16
+        uint64 p3 = p0 + 24
+        f64 a = 0.0
+        f64 b = 0.0
+        f64 c = 0.0
+        f64 d = 0.0
+        unsafe { *(p0 as f64) -> a }
+        unsafe { *(p1 as f64) -> b }
+        unsafe { *(p2 as f64) -> c }
+        unsafe { *(p3 as f64) -> d }
+        a = a + (target - a) * factor
+        b = b + (target - b) * factor
+        c = c + (target - c) * factor
+        d = d + (target - d) * factor
+        unsafe { *(p0 as f64) = a }
+        unsafe { *(p1 as f64) = b }
+        unsafe { *(p2 as f64) = c }
+        unsafe { *(p3 as f64) = d }
+        i = i + 4
+    }
+    while i < n {
+        uint64 p = buf + i * 8
+        f64 v = 0.0
+        unsafe { *(p as f64) -> v }
+        v = v + (target - v) * factor
+        unsafe { *(p as f64) = v }
+        i = i + 1
+    }
+}
+
+// Fill n f64 slots with `value`. Mainly useful for bulk-reset at
+// episode boundaries (ring buffers, per-step fired_flag arrays).
+fn vec_f64_fill(uint64 buf, uint64 n, f64 value) {
+    uint64 i = 0
+    uint64 n4 = n & 0xFFFFFFFFFFFFFFFC
+    while i < n4 {
+        uint64 p0 = buf + i * 8
+        uint64 p1 = p0 + 8
+        uint64 p2 = p0 + 16
+        uint64 p3 = p0 + 24
+        unsafe { *(p0 as f64) = value }
+        unsafe { *(p1 as f64) = value }
+        unsafe { *(p2 as f64) = value }
+        unsafe { *(p3 as f64) = value }
+        i = i + 4
+    }
+    while i < n {
+        uint64 p = buf + i * 8
+        unsafe { *(p as f64) = value }
+        i = i + 1
+    }
+}
+
+// Sum of n f64 slots in `buf`. 4-way parallel accumulator so the CPU
+// can pipeline the adds. NOT byte-identical to a straight-line sum
+// when n is not a multiple of 4 — downstream tolerance tests should
+// allow ~1e-12 × n × max|x| of drift.
+fn vec_f64_sum(uint64 buf, uint64 n) -> f64 {
+    f64 s0 = 0.0
+    f64 s1 = 0.0
+    f64 s2 = 0.0
+    f64 s3 = 0.0
+    uint64 i = 0
+    uint64 n4 = n & 0xFFFFFFFFFFFFFFFC
+    while i < n4 {
+        uint64 p0 = buf + i * 8
+        uint64 p1 = p0 + 8
+        uint64 p2 = p0 + 16
+        uint64 p3 = p0 + 24
+        f64 a = 0.0
+        f64 b = 0.0
+        f64 c = 0.0
+        f64 d = 0.0
+        unsafe { *(p0 as f64) -> a }
+        unsafe { *(p1 as f64) -> b }
+        unsafe { *(p2 as f64) -> c }
+        unsafe { *(p3 as f64) -> d }
+        s0 = s0 + a
+        s1 = s1 + b
+        s2 = s2 + c
+        s3 = s3 + d
+        i = i + 4
+    }
+    f64 s = s0 + s1 + s2 + s3
+    while i < n {
+        uint64 p = buf + i * 8
+        f64 v = 0.0
+        unsafe { *(p as f64) -> v }
+        s = s + v
+        i = i + 1
+    }
+    return s
+}
