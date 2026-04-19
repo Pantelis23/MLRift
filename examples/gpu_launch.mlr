@@ -1,0 +1,167 @@
+// MLRift — M2c end-to-end: MLRift host launches an MLRift kernel.
+//
+// Closes the whole GPU kickoff loop:
+//
+//   1. `mlrc --target=hip-amd examples/gpu_hello.mlr -o /tmp/gpu_hello`
+//      emits /tmp/gpu_hello.hip + /tmp/gpu_hello.co (compiled via hipcc)
+//      plus a CPU-side ELF.
+//   2. `mlrc examples/gpu_launch.mlr -o /tmp/gpu_launch` builds this
+//      host program — a dynamic ELF that links against libc + libamdhip64.
+//   3. `/tmp/gpu_launch` reads /tmp/gpu_hello.co, loads it as a HIP
+//      module, grabs `kernel_accumulate`, sets up a device buffer +
+//      scalar args, launches with grid=(1,1,1)/block=(1,1,1), copies
+//      the result back, and prints it. Expected output: 42.
+//
+// The kernel is single-thread: sum = base (36) + 0+1+2+3 = 42, written
+// into *out_ptr. Parallel workloads (threadIdx-parameterised) will land
+// alongside M3's decay-loop port.
+
+import "../std/hip.kr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 {
+        uint8 zero = 48
+        unsafe { *(buf as uint8) = zero }
+        return 1
+    }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 {
+        n = n + 1
+        tmp = tmp / 10
+    }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+// Print "<label>: <val>\0" via puts.
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 colon_p = buf + label_len
+    uint8 colon = 58
+    unsafe { *(colon_p as uint8) = colon }
+    uint64 space_p = buf + label_len + 1
+    uint8 space = 32
+    unsafe { *(space_p as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0
+    unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 {
+        die("hipSetDevice failed", err)
+    }
+
+    // --- 1. Read /tmp/gpu_hello.co into memory ---
+    uint64 co_path = "/tmp/gpu_hello.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/gpu_hello.co — build the kernel first:")
+        puts("  mlrc --target=hip-amd examples/gpu_hello.mlr -o /tmp/gpu_hello")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    // --- 2. Load module ---
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData failed", err) }
+    uint64 mod = 0
+    unsafe { *(mod_slot as uint64) -> mod }
+
+    // --- 3. Get kernel fn handle ---
+    uint64 fn_slot = alloc(8)
+    uint64 kname = "kernel_accumulate"
+    err = hipModuleGetFunction(fn_slot, mod, kname)
+    if err != 0 { die("hipModuleGetFunction failed", err) }
+    uint64 fn_handle = 0
+    unsafe { *(fn_slot as uint64) -> fn_handle }
+
+    // --- 4. Allocate one uint64 on the device ---
+    uint64 dev_buf_slot = alloc(8)
+    err = hipMalloc(dev_buf_slot, 8)
+    if err != 0 { die("hipMalloc failed", err) }
+    uint64 dev_buf = 0
+    unsafe { *(dev_buf_slot as uint64) -> dev_buf }
+
+    // --- 5. Build kernel arg storage + params array ---
+    // Kernel signature: kernel_accumulate(uint64 out_ptr, uint64 base, uint64 count)
+    uint64 arg_out = alloc(8)
+    unsafe { *(arg_out as uint64) = dev_buf }
+    uint64 arg_base = alloc(8)
+    uint64 base_val = 36
+    unsafe { *(arg_base as uint64) = base_val }
+    uint64 arg_count = alloc(8)
+    uint64 count_val = 4
+    unsafe { *(arg_count as uint64) = count_val }
+
+    uint64 kernel_params = alloc(3 * 8)
+    unsafe { *(kernel_params as uint64) = arg_out }
+    uint64 kp1 = kernel_params + 8
+    unsafe { *(kp1 as uint64) = arg_base }
+    uint64 kp2 = kernel_params + 16
+    unsafe { *(kp2 as uint64) = arg_count }
+
+    // --- 6. Launch kernel (single thread) ---
+    err = hipModuleLaunchKernel(fn_handle,
+                                 1, 1, 1,
+                                 1, 1, 1,
+                                 0, 0,
+                                 kernel_params, 0)
+    if err != 0 { die("hipModuleLaunchKernel failed", err) }
+
+    err = hipDeviceSynchronize()
+    if err != 0 { die("hipDeviceSynchronize failed", err) }
+
+    // --- 7. Copy result back to host (D2H = 2) ---
+    uint64 host_buf = alloc(8)
+    err = hipMemcpy(host_buf, dev_buf, 8, 2)
+    if err != 0 { die("hipMemcpy D2H failed", err) }
+
+    uint64 result = 0
+    unsafe { *(host_buf as uint64) -> result }
+
+    // --- 8. Report ---
+    print_label_val("kernel_accumulate result", 24, result)
+
+    // --- 9. Cleanup ---
+    hipFree(dev_buf)
+
+    exit(0)
+}

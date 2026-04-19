@@ -57,3 +57,26 @@
 // --- Synchronisation --------------------------------------------------------
 
 @dynamic extern fn hipDeviceSynchronize() -> uint32
+
+// --- Module loading + kernel launch (M2c) -----------------------------------
+
+// Load a HIP code object from a memory blob. On success `*mod_out`
+// receives a hipModule_t handle.
+@dynamic extern fn hipModuleLoadData(uint64 mod_out, uint64 blob_ptr) -> uint32
+
+// Look up a kernel by name inside a loaded module.
+// `name_cstr` is a null-terminated C string (e.g. "kernel_accumulate").
+@dynamic extern fn hipModuleGetFunction(uint64 fn_out, uint64 mod, uint64 name_cstr) -> uint32
+
+// Launch a kernel. `kernel_params` is a void** — an array of pointers,
+// each pointing at the storage for one kernel argument. `extra` is an
+// alternative packed-struct interface we don't use here (pass 0).
+@dynamic extern fn hipModuleLaunchKernel(
+    uint64 fn_handle,
+    uint32 grid_x, uint32 grid_y, uint32 grid_z,
+    uint32 block_x, uint32 block_y, uint32 block_z,
+    uint32 shared_bytes,
+    uint64 stream,
+    uint64 kernel_params,
+    uint64 extra
+) -> uint32
