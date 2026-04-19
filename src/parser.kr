@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler — Parser
+// MLRift — built on KernRift — Parser
 //
 // Recursive descent parser. Reads tokens produced by the lexer
 // and builds a flat AST using the arena in ast.kr.

@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler — Archive and distribution formats
+// MLRift — built on KernRift — Archive and distribution formats
 //
 // Implements: ar archive (staticlib), hostexe (runtime blob + user code),
 // KRBO (portable object), and KrboFat v2 (LZ4-compressed multi-arch fat binary)

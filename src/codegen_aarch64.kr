@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler — AArch64 Code Generator
+// MLRift — built on KernRift — AArch64 Code Generator
 //
 // AArch64 instruction encoding: all instructions are 4 bytes, little-endian.
 // Calling convention (AAPCS64):

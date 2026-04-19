@@ -14,7 +14,7 @@ import "runtime.kr"
 import "formatter.kr"
 // formatter.kr is included via cat command, not import
 
-// KernRift self-hosted compiler — main
+// MLRift — built on KernRift — main
 
 // Windows command line parser: called from main() when cli_argc == 0xFFFFFFFF
 // cli_argv contains the raw GetCommandLineA pointer; parse it into proper argc/argv
@@ -4218,8 +4218,8 @@ fn main() {
                 write(1, "  fmt <file.kr>     auto-format source\n", 39)
                 exit(0)
             } else if str_starts_with(arg, "--version", 9) != 0 {
-                uint64 msg = "krc 2.8.14 (KernRift self-hosted compiler)\n"
-                write(1, msg, 42)
+                uint64 msg = "mlrc 0.1.0 (MLRift — built on KernRift v2.8.15)\n"
+                write(1, msg, 50)
                 exit(0)
             } else if str_starts_with(arg, "--freestanding", 14) != 0 {
                 freestanding = 1
@@ -4395,8 +4395,8 @@ fn main() {
 
     if input_path == 0 {
         if cli_argc > 0 {
-            write(2, "krc: no input file\n\n", 20)
-            write(2, "usage: krc [options] <file.kr> [-o output]\n\n", 44)
+            write(2, "mlrc: no input file\n\n", 21)
+            write(2, "usage: mlrc [options] <file.kr> [-o output]\n\n", 45)
             write(2, "options:\n", 9)
             write(2, "  --arch=x86_64|arm64\n", 22)
             write(2, "  --emit=elfexe|macho|pe|obj|android|asm\n", 41)

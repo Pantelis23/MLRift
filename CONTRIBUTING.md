@@ -1,68 +1,59 @@
-# Contributing to KernRift
+# Contributing to MLRift
+
+MLRift is a systems language for machine learning and artificial biology, built
+on top of KernRift. The compiler's own source is written in KernRift (`.kr`
+files in `src/`), reuses KernRift's backend, and extends its IR with
+ML-specific primitives. MLRift user programs (when the frontend lands) will
+use the `.mlr` extension.
 
 ## Prerequisites
 
-- **Bootstrap compiler** — needed only once: `cargo install --git https://github.com/Pantelis23/KernRift-bootstrap kernriftc`
-- After first build, `krc` compiles itself — no Rust needed
+The repo ships a committed `build/mlrc` as the bootstrap binary, so there is
+no external toolchain required — a clean clone self-hosts on Linux x86_64.
 
 ## Build
 
 ```sh
-make build       # bootstrap → krc → krc2 (self-compiled)
+make build       # build/mlrc compiles build/mlrc.kr → build/mlrc (in place)
 ```
 
 ## Test
 
 ```sh
-make test        # 125 tests (arithmetic, control flow, functions, structs, imports, match, stdlib, etc.)
-make bootstrap   # verify krc3 == krc4 (fixed point)
+make test        # full suite
+make bootstrap   # verify stage3 == stage4 (fixed point)
 ```
 
 ## Install
 
 ```sh
-make install     # installs to ~/.local/bin/krc
+make install     # installs to ~/.local/bin/mlrc
 ```
 
 ## Source Structure
 
-All compiler source is in `src/`:
+All compiler source is in `src/` (written in KernRift):
 
 | File | Purpose |
 |------|---------|
 | `lexer.kr` | Tokenizer |
 | `parser.kr` | Parser (recursive descent + Pratt) |
-| `codegen.kr` | x86_64 code generation |
-| `codegen_aarch64.kr` | AArch64 code generation |
+| `ast.kr` | AST node definitions |
 | `analysis.kr` | Safety passes |
-| `living.kr` | Living compiler (7 patterns, CI gating) |
+| `ir.kr` | SSA IR + x86_64 codegen |
+| `ir_aarch64.kr` | AArch64 IR codegen |
+| `codegen.kr` | x86_64 legacy code generation |
+| `codegen_aarch64.kr` | AArch64 legacy code generation |
 | `format_*.kr` | Output formats (ELF, Mach-O, PE, AR, KRBO) |
+| `runtime.kr`, `living.kr`, `formatter.kr` | Supporting infrastructure |
 | `main.kr` | CLI and compilation driver |
 
-Standard library modules are in `std/` (16 modules, 2500+ lines):
-
-| Module | Purpose |
-|--------|---------|
-| `std/string.kr` | String manipulation (cat, copy, find, sub, trim, int conversion) |
-| `std/io.kr` | File I/O helpers (read_file, write_file, read_line) |
-| `std/math.kr` | Math utilities (min, max, clamp, pow, sqrt, gcd, primes) |
-| `std/fmt.kr` | Formatting (hex, binary, padding) |
-| `std/mem.kr` | Memory management (realloc, memcmp, arena allocator) |
-| `std/vec.kr` | Dynamic array |
-| `std/map.kr` | Hash map |
-| `std/color.kr` | Color utilities (rgb, rgba, blend, lerp, darken, lighten) |
-| `std/fb.kr` | Framebuffer primitives (pixel, rect, line, fill, blit) |
-| `std/fixedpoint.kr` | 16.16 fixed-point math (add, sub, mul, div, sqrt, lerp) |
-| `std/font.kr` | 8x16 bitmap font renderer (fb_char, fb_text) |
-| `std/memfast.kr` | Fast block memory operations (memcpy32, memcpy64, memset32, memset64) |
-| `std/widget.kr` | UI widget system (panel, label, button, progress, textfield) |
-| `std/time.kr` | Clock access (clock_gettime, nanosleep) |
-| `std/log.kr` | Structured logging with levels |
-| `std/net.kr` | Raw socket operations |
+Standard library modules in `std/` are inherited from KernRift.
 
 ## Guidelines
 
-- The compiler must always self-compile to a fixed point
-- Run `make bootstrap` before submitting changes
-- All tests must pass (`make test`)
+- The compiler must always self-compile to a fixed point (`make bootstrap`)
+- Run `make test` before submitting changes
 - No external dependencies — the compiler is fully self-contained
+- When porting bug fixes from upstream KernRift, reference the KernRift
+  commit hash in the commit message so the lineage stays traceable

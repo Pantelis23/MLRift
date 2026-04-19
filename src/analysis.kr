@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler — Analysis Passes
+// MLRift — built on KernRift — Analysis Passes
 //
 // Implements kernel safety checks:
 //   1. Context check (ctx): verify caller/callee context compatibility

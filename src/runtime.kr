@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler — Runtime helpers
+// MLRift — built on KernRift — Runtime helpers
 
 fn fmt_uint(uint64 buf, uint64 val) -> uint64 {
     if val == 0 {

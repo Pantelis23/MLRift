@@ -2059,10 +2059,10 @@ rm -f /tmp/krc_lc_$$.kr /tmp/krc_lc_out_$$.txt
 TOTAL=$((TOTAL + 1))
 GOV_DIR=/tmp/krc_gov_$$
 # Use the raw compiler binary (not the wrapper script) so we can cd elsewhere
-if [ -f "$DIR/../build/krc2" ]; then
-    GOV_KRC=$(cd "$DIR/../build" && pwd)/krc2
-elif [ -f "$DIR/../build/krc3" ]; then
-    GOV_KRC=$(cd "$DIR/../build" && pwd)/krc3
+if [ -f "$DIR/../build/mlrc" ]; then
+    GOV_KRC=$(cd "$DIR/../build" && pwd)/mlrc
+elif [ -f "$DIR/../build/mlrc3" ]; then
+    GOV_KRC=$(cd "$DIR/../build" && pwd)/mlrc3
 else
     GOV_KRC=""
 fi
@@ -2289,7 +2289,7 @@ rm -f /tmp/krc_noext_$$.kr /tmp/krc_noext_$$.o
 echo ""
 echo "--- fat binary real LZ4 compression (regression) ---"
 TOTAL=$((TOTAL + 1))
-KRCBIN="$DIR/../build/krc2"
+KRCBIN="$DIR/../build/mlrc"
 cat > /tmp/krc_lz4_$$.kr <<'KREOF'
 fn main() {
     u64 i = 0
@@ -2356,7 +2356,7 @@ fn main() {
     exit(123)
 }
 KREOF
-KRCBIN="$DIR/../build/krc2"
+KRCBIN="$DIR/../build/mlrc"
 cat "$DIR/../src/bcj.kr" "$DIR/../src/runner.kr" > /tmp/krc_rt_kr_$$.kr
 if "$KRCBIN" /tmp/krc_rt_$$.kr -o /tmp/krc_rt_$$.krbo > /dev/null 2>&1 \
    && "$KRCBIN" --arch=$ARCH /tmp/krc_rt_kr_$$.kr -o /tmp/krc_rt_kr_$$ > /dev/null 2>&1; then

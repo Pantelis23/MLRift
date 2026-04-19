@@ -20,21 +20,21 @@ jobs:
         run: |
           mkdir -p build
           curl -sL -o build/krc-bootstrap \
-            https://github.com/Pantelis23/KernRift/releases/download/v2.8.4/krc-linux-x86_64
+            https://github.com/Pantelis23/MLRift/releases/download/v2.8.4/mlrc-linux-x86_64
           chmod +x build/krc-bootstrap
 
       - name: Build (self-compile)
         run: |
           cat src/lexer.kr src/ast.kr src/parser.kr src/codegen.kr src/codegen_aarch64.kr \
               src/ir.kr src/ir_aarch64.kr src/format_macho.kr src/format_pe.kr src/format_archive.kr src/format_android.kr \
-              src/bcj.kr src/analysis.kr src/living.kr src/runtime.kr src/formatter.kr src/main.kr > build/krc.kr
+              src/bcj.kr src/analysis.kr src/living.kr src/runtime.kr src/formatter.kr src/main.kr > build/mlrc.kr
           # Bootstrap: compile source with released krc (use --legacy for speed),
           # then re-compile with itself (which uses IR by default)
-          ./build/krc-bootstrap --legacy --arch=x86_64 build/krc.kr -o build/krc2
-          chmod +x build/krc2
-          ./build/krc2 --arch=x86_64 build/krc.kr -o build/krc2.stable
-          mv build/krc2.stable build/krc2
-          chmod +x build/krc2
+          ./build/krc-bootstrap --legacy --arch=x86_64 build/mlrc.kr -o build/mlrc
+          chmod +x build/mlrc
+          ./build/mlrc --arch=x86_64 build/mlrc.kr -o build/mlrc.stable
+          mv build/mlrc.stable build/mlrc
+          chmod +x build/mlrc
 
       - name: Compile test programs for all platforms
         run: |
@@ -42,7 +42,7 @@ jobs:
 
           # Test programs
           echo 'fn main() { exit(42) }' > /tmp/exit42.kr
-          echo 'fn main() { uint64 msg = "Hello from KernRift!\n"; write(1, msg, 21); exit(0) }' > /tmp/hello.kr
+          echo 'fn main() { uint64 msg = "Hello from MLRift!\n"; write(1, msg, 21); exit(0) }' > /tmp/hello.kr
           echo 'fn fib(uint64 n) -> uint64 { if n <= 1 { return n }; return fib(n - 1) + fib(n - 2) }
           fn main() { exit(fib(10)) }' > /tmp/fib.kr
           echo 'fn add(uint64 a, uint64 b) -> uint64 { return a + b }
@@ -62,39 +62,39 @@ jobs:
 
           # macOS x86_64
           for t in exit42 hello fib add static alloc_test; do
-            ./build/krc2 --arch=x86_64 --emit=macho /tmp/$t.kr -o /tmp/test-bins/macos-x64-$t
+            ./build/mlrc --arch=x86_64 --emit=macho /tmp/$t.kr -o /tmp/test-bins/macos-x64-$t
           done
 
           # macOS ARM64
           for t in exit42 hello fib add static alloc_test; do
-            ./build/krc2 --arch=arm64 --emit=macho /tmp/$t.kr -o /tmp/test-bins/macos-arm-$t
+            ./build/mlrc --arch=arm64 --emit=macho /tmp/$t.kr -o /tmp/test-bins/macos-arm-$t
           done
 
           # Windows x86_64
           for t in exit42 hello fib add static; do
-            ./build/krc2 --arch=x86_64 --emit=pe /tmp/$t.kr -o /tmp/test-bins/win-x64-$t.exe
+            ./build/mlrc --arch=x86_64 --emit=pe /tmp/$t.kr -o /tmp/test-bins/win-x64-$t.exe
           done
 
           # Windows ARM64
           for t in exit42 hello fib add static; do
-            ./build/krc2 --arch=arm64 --emit=pe /tmp/$t.kr -o /tmp/test-bins/win-arm-$t.exe
+            ./build/mlrc --arch=arm64 --emit=pe /tmp/$t.kr -o /tmp/test-bins/win-arm-$t.exe
           done
 
           # File I/O test (write + read back) with diagnostics
           cat > /tmp/fileio.kr << 'KEOF'
           fn main() {
               println("1:open-write")
-              uint64 wfd = file_open("krc_test_io.tmp", 1)
+              uint64 wfd = file_open("mlrc_test_io.tmp", 1)
               print("2:wfd=")
               println(wfd)
-              uint64 msg = "KernRift"
+              uint64 msg = "MLRift"
               file_write(wfd, msg, 8)
               println("3:wrote")
               file_close(wfd)
               println("4:closed")
               uint64 buf = alloc(64)
               println("5:alloc")
-              uint64 rfd = file_open("krc_test_io.tmp", 0)
+              uint64 rfd = file_open("mlrc_test_io.tmp", 0)
               print("6:rfd=")
               println(rfd)
               uint64 n = file_read(rfd, buf, 64)
@@ -104,33 +104,33 @@ jobs:
               exit(n)
           }
           KEOF
-          ./build/krc2 --arch=x86_64 --emit=pe /tmp/fileio.kr -o /tmp/test-bins/win-x64-fileio.exe
-          ./build/krc2 --arch=arm64 --emit=pe /tmp/fileio.kr -o /tmp/test-bins/win-arm-fileio.exe
+          ./build/mlrc --arch=x86_64 --emit=pe /tmp/fileio.kr -o /tmp/test-bins/win-x64-fileio.exe
+          ./build/mlrc --arch=arm64 --emit=pe /tmp/fileio.kr -o /tmp/test-bins/win-arm-fileio.exe
 
           # macOS file I/O tests
-          ./build/krc2 --arch=x86_64 --emit=macho /tmp/fileio.kr -o /tmp/test-bins/macos-x64-fileio
-          ./build/krc2 --arch=arm64 --emit=macho /tmp/fileio.kr -o /tmp/test-bins/macos-arm-fileio
+          ./build/mlrc --arch=x86_64 --emit=macho /tmp/fileio.kr -o /tmp/test-bins/macos-x64-fileio
+          ./build/mlrc --arch=arm64 --emit=macho /tmp/fileio.kr -o /tmp/test-bins/macos-arm-fileio
 
           # Cross-compile full compiler for self-compilation tests
-          ./build/krc2 --arch=x86_64 --emit=pe build/krc.kr -o /tmp/test-bins/krc-win-x64.exe
-          ./build/krc2 --arch=arm64 --emit=pe build/krc.kr -o /tmp/test-bins/krc-win-arm64.exe
-          ./build/krc2 --arch=x86_64 --emit=macho build/krc.kr -o /tmp/test-bins/krc-macos-x64
-          cp build/krc.kr /tmp/test-bins/krc-source.kr
+          ./build/mlrc --arch=x86_64 --emit=pe build/mlrc.kr -o /tmp/test-bins/mlrc-win-x64.exe
+          ./build/mlrc --arch=arm64 --emit=pe build/mlrc.kr -o /tmp/test-bins/mlrc-win-arm64.exe
+          ./build/mlrc --arch=x86_64 --emit=macho build/mlrc.kr -o /tmp/test-bins/mlrc-macos-x64
+          cp build/mlrc.kr /tmp/test-bins/mlrc-source.kr
 
           # Build kr runners for each platform
-          cat src/bcj.kr src/runner.kr > /tmp/kr_src.kr
-          ./build/krc2 --arch=x86_64 --emit=pe    /tmp/kr_src.kr -o /tmp/test-bins/kr-win-x64.exe
-          ./build/krc2 --arch=arm64  --emit=pe    /tmp/kr_src.kr -o /tmp/test-bins/kr-win-arm64.exe
-          ./build/krc2 --arch=x86_64 --emit=macho /tmp/kr_src.kr -o /tmp/test-bins/kr-macos-x64
-          ./build/krc2 --arch=arm64  --emit=macho /tmp/kr_src.kr -o /tmp/test-bins/kr-macos-arm64
+          cat src/bcj.kr src/runner.kr > /tmp/mlr_src.kr
+          ./build/mlrc --arch=x86_64 --emit=pe    /tmp/mlr_src.kr -o /tmp/test-bins/mlr-win-x64.exe
+          ./build/mlrc --arch=arm64  --emit=pe    /tmp/mlr_src.kr -o /tmp/test-bins/mlr-win-arm64.exe
+          ./build/mlrc --arch=x86_64 --emit=macho /tmp/mlr_src.kr -o /tmp/test-bins/mlr-macos-x64
+          ./build/mlrc --arch=arm64  --emit=macho /tmp/mlr_src.kr -o /tmp/test-bins/mlr-macos-arm64
 
           # Build a fat binary test program + ship the compiler's own
           # fat binary so the native-OS jobs can exercise fat-compile
           # determinism (Tier 1 #3 extended to the .krbo container).
-          echo 'fn main() { exit(42) }' > /tmp/kr_fat_test.kr
-          ./build/krc2 /tmp/kr_fat_test.kr -o /tmp/test-bins/kr-test.krbo
-          ./build/krc2 build/krc.kr -o /tmp/test-bins/krc.krbo
-          ls -la /tmp/test-bins/krc.krbo
+          echo 'fn main() { exit(42) }' > /tmp/mlr_fat_test.kr
+          ./build/mlrc /tmp/mlr_fat_test.kr -o /tmp/test-bins/mlr-test.krbo
+          ./build/mlrc build/mlrc.kr -o /tmp/test-bins/mlrc.krbo
+          ls -la /tmp/test-bins/mlrc.krbo
 
           # Cross-compile the smoke corpus for every non-Linux target. The
           # native-OS jobs below consume these to make sure primitives like
@@ -143,10 +143,10 @@ jobs:
             expected="$(grep -oE '// expected:[[:space:]]*[0-9]+' "$src" | head -1 | grep -oE '[0-9]+$')"
             expected="${expected:-0}"
             echo "$t $expected" >> /tmp/test-bins/smoke/manifest.txt
-            ./build/krc2 --arch=x86_64 --emit=pe    "$src" -o "/tmp/test-bins/smoke/win-x64-$t.exe"
-            ./build/krc2 --arch=arm64  --emit=pe    "$src" -o "/tmp/test-bins/smoke/win-arm-$t.exe"
-            ./build/krc2 --arch=x86_64 --emit=macho "$src" -o "/tmp/test-bins/smoke/mac-x64-$t"
-            ./build/krc2 --arch=arm64  --emit=macho "$src" -o "/tmp/test-bins/smoke/mac-arm-$t"
+            ./build/mlrc --arch=x86_64 --emit=pe    "$src" -o "/tmp/test-bins/smoke/win-x64-$t.exe"
+            ./build/mlrc --arch=arm64  --emit=pe    "$src" -o "/tmp/test-bins/smoke/win-arm-$t.exe"
+            ./build/mlrc --arch=x86_64 --emit=macho "$src" -o "/tmp/test-bins/smoke/mac-x64-$t"
+            ./build/mlrc --arch=arm64  --emit=macho "$src" -o "/tmp/test-bins/smoke/mac-arm-$t"
           done
           cat /tmp/test-bins/smoke/manifest.txt
 
@@ -247,8 +247,8 @@ jobs:
 
       - name: Fat binary runner (kr) on macOS
         run: |
-          chmod +x bins/kr-macos-x64
-          set +e; bins/kr-macos-x64 bins/kr-test.krbo; CODE=$?; set -e
+          chmod +x bins/mlr-macos-x64
+          set +e; bins/mlr-macos-x64 bins/mlr-test.krbo; CODE=$?; set -e
           if [ "$CODE" -eq 42 ]; then
             echo "PASS: kr runner (fat binary exit=42)"
           else
@@ -259,9 +259,9 @@ jobs:
       - name: Self-compilation on macOS (Rosetta)
         run: |
           set +e
-          chmod +x bins/krc-macos-x64
+          chmod +x bins/mlrc-macos-x64
           echo 'fn main() { println("macOS self-compiled!"); exit(42) }' > test.kr
-          ./bins/krc-macos-x64 --arch=x86_64 --emit=macho test.kr -o test_out 2>&1
+          ./bins/mlrc-macos-x64 --arch=x86_64 --emit=macho test.kr -o test_out 2>&1
           COMP=$?
           if [ "$COMP" -ne 0 ]; then echo "FAIL: compile (exit=$COMP)"; exit 1; fi
           chmod +x test_out
@@ -273,44 +273,44 @@ jobs:
             exit 1
           fi
 
-      - name: Full krc self-host fixed point (macOS x86_64 via Rosetta)
+      - name: Full mlrc self-host fixed point (macOS x86_64 via Rosetta)
         run: |
-          # krc3 → krc4 → krc5 on actual macOS hardware. krc4 == krc5
+          # mlrc3 → mlrc4 → mlrc5 on actual macOS hardware. mlrc4 == mlrc5
           # byte-equality is the real test; a 1-line exit(42) program
           # stresses almost none of the compiler's codegen surface.
           set +e
-          chmod +x bins/krc-macos-x64
-          ./bins/krc-macos-x64 --arch=x86_64 --emit=macho bins/krc-source.kr -o krc4
-          if [ $? -ne 0 ]; then echo "FAIL: krc4 compile"; exit 1; fi
-          chmod +x krc4
-          ./krc4 --arch=x86_64 --emit=macho bins/krc-source.kr -o krc5
-          if [ $? -ne 0 ]; then echo "FAIL: krc5 compile"; exit 1; fi
-          chmod +x krc5
-          if cmp -s krc4 krc5; then
-            echo "PASS: macOS x86_64 fixed point ($(wc -c < krc4) bytes)"
+          chmod +x bins/mlrc-macos-x64
+          ./bins/mlrc-macos-x64 --arch=x86_64 --emit=macho bins/mlrc-source.kr -o mlrc4
+          if [ $? -ne 0 ]; then echo "FAIL: mlrc4 compile"; exit 1; fi
+          chmod +x mlrc4
+          ./mlrc4 --arch=x86_64 --emit=macho bins/mlrc-source.kr -o mlrc5
+          if [ $? -ne 0 ]; then echo "FAIL: mlrc5 compile"; exit 1; fi
+          chmod +x mlrc5
+          if cmp -s mlrc4 mlrc5; then
+            echo "PASS: macOS x86_64 fixed point ($(wc -c < mlrc4) bytes)"
           else
-            echo "FAIL: macOS x86_64 fixed point — krc4 ($(wc -c < krc4)) != krc5 ($(wc -c < krc5))"
+            echo "FAIL: macOS x86_64 fixed point — mlrc4 ($(wc -c < mlrc4)) != mlrc5 ($(wc -c < mlrc5))"
             exit 1
           fi
 
       - name: Fat-binary self-host determinism (macOS x86_64 via Rosetta)
         run: |
-          # kr-macos-x64 extracts the macOS x86_64 slice from krc.krbo
+          # mlr-macos-x64 extracts the macOS x86_64 slice from mlrc.krbo
           # and runs it as a compile_fat driver. Two runs with the same
           # input must produce byte-identical output; drift here is
           # non-deterministic compression / BCJ filtering / fixup
           # ordering that only surfaces in the fat container.
           set +e
-          chmod +x bins/kr-macos-x64
-          ./bins/kr-macos-x64 bins/krc.krbo bins/krc-source.kr -o /tmp/krc2.krbo
-          if [ $? -ne 0 ]; then echo "FAIL: krc2.krbo compile"; exit 1; fi
-          ./bins/kr-macos-x64 /tmp/krc2.krbo bins/krc-source.kr -o /tmp/krc3.krbo
-          if [ $? -ne 0 ]; then echo "FAIL: krc3.krbo compile"; exit 1; fi
-          s2=$(wc -c < /tmp/krc2.krbo); s3=$(wc -c < /tmp/krc3.krbo)
-          if cmp -s /tmp/krc2.krbo /tmp/krc3.krbo; then
+          chmod +x bins/mlr-macos-x64
+          ./bins/mlr-macos-x64 bins/mlrc.krbo bins/mlrc-source.kr -o /tmp/mlrc2.krbo
+          if [ $? -ne 0 ]; then echo "FAIL: mlrc2.krbo compile"; exit 1; fi
+          ./bins/mlr-macos-x64 /tmp/mlrc2.krbo bins/mlrc-source.kr -o /tmp/mlrc3.krbo
+          if [ $? -ne 0 ]; then echo "FAIL: mlrc3.krbo compile"; exit 1; fi
+          s2=$(wc -c < /tmp/mlrc2.krbo); s3=$(wc -c < /tmp/mlrc3.krbo)
+          if cmp -s /tmp/mlrc2.krbo /tmp/mlrc3.krbo; then
             echo "PASS: macOS x86_64 fat self-host determinism ($s2 bytes)"
           else
-            echo "FAIL: macOS x86_64 fat self-host — krc2.krbo ($s2) != krc3.krbo ($s3)"
+            echo "FAIL: macOS x86_64 fat self-host — mlrc2.krbo ($s2) != mlrc3.krbo ($s3)"
             exit 1
           fi
 
@@ -491,7 +491,7 @@ jobs:
         shell: pwsh
         run: |
           $output = & bins\win-x64-hello.exe 2>&1
-          if ($output -match "Hello from KernRift") {
+          if ($output -match "Hello from MLRift") {
             Write-Host "PASS: hello world output"
           } else {
             Write-Host "FAIL: hello world output: $output"
@@ -531,7 +531,7 @@ jobs:
       - name: Fat binary runner (kr) on Windows
         shell: pwsh
         run: |
-          $r = Start-Process -FilePath bins\kr-win-x64.exe -ArgumentList 'bins\kr-test.krbo' -Wait -PassThru -NoNewWindow
+          $r = Start-Process -FilePath bins\mlr-win-x64.exe -ArgumentList 'bins\mlr-test.krbo' -Wait -PassThru -NoNewWindow
           if ($r.ExitCode -eq 42) {
             Write-Host "PASS: kr runner (fat binary exit=42)"
           } else {
@@ -542,12 +542,12 @@ jobs:
       - name: Self-compilation on Windows
         shell: pwsh
         run: |
-          $r1 = Start-Process -FilePath bins\krc-win-x64.exe -ArgumentList '--emit=pe','bins\krc-source.kr','-o','krc-self1.exe' -Wait -PassThru -NoNewWindow
+          $r1 = Start-Process -FilePath bins\mlrc-win-x64.exe -ArgumentList '--emit=pe','bins\mlrc-source.kr','-o','mlrc-self1.exe' -Wait -PassThru -NoNewWindow
           if ($r1.ExitCode -ne 0) { Write-Host "FAIL: self-compile stage 1 (exit=$($r1.ExitCode))"; exit 1 }
           Write-Host "Stage 1: OK (compiled on Windows)"
 
           Set-Content -Path test.kr -Value 'fn main() { println("self-compiled!"); exit(42) }'
-          $r2 = Start-Process -FilePath .\krc-self1.exe -ArgumentList '--emit=pe','test.kr','-o','test-self.exe' -Wait -PassThru -NoNewWindow
+          $r2 = Start-Process -FilePath .\mlrc-self1.exe -ArgumentList '--emit=pe','test.kr','-o','test-self.exe' -Wait -PassThru -NoNewWindow
           if ($r2.ExitCode -ne 0) { Write-Host "FAIL: self-compile stage 2 (exit=$($r2.ExitCode))"; exit 1 }
 
           $r3 = Start-Process -FilePath .\test-self.exe -Wait -PassThru -NoNewWindow
@@ -561,45 +561,45 @@ jobs:
       - name: Bootstrap fixed point on Windows x86_64
         shell: pwsh
         run: |
-          # krc-self1 was built on Windows by the cross-compiled krc3.
-          # Now have krc-self1 compile the source again → krc-self2.
-          # If the Windows-native codegen is deterministic, krc-self1
-          # and krc-self2 must be byte-identical. Drift here would
+          # mlrc-self1 was built on Windows by the cross-compiled mlrc3.
+          # Now have mlrc-self1 compile the source again → mlrc-self2.
+          # If the Windows-native codegen is deterministic, mlrc-self1
+          # and mlrc-self2 must be byte-identical. Drift here would
           # point at non-deterministic PE emission (timestamp-like
           # fields, uninitialised header bytes).
-          $r = Start-Process -FilePath .\krc-self1.exe -ArgumentList '--emit=pe','bins\krc-source.kr','-o','krc-self2.exe' -Wait -PassThru -NoNewWindow
+          $r = Start-Process -FilePath .\mlrc-self1.exe -ArgumentList '--emit=pe','bins\mlrc-source.kr','-o','mlrc-self2.exe' -Wait -PassThru -NoNewWindow
           if ($r.ExitCode -ne 0) { Write-Host "FAIL: self-compile stage 2 (exit=$($r.ExitCode))"; exit 1 }
-          $h1 = (Get-FileHash -Algorithm MD5 krc-self1.exe).Hash
-          $h2 = (Get-FileHash -Algorithm MD5 krc-self2.exe).Hash
-          $s1 = (Get-Item krc-self1.exe).Length
-          $s2 = (Get-Item krc-self2.exe).Length
+          $h1 = (Get-FileHash -Algorithm MD5 mlrc-self1.exe).Hash
+          $h2 = (Get-FileHash -Algorithm MD5 mlrc-self2.exe).Hash
+          $s1 = (Get-Item mlrc-self1.exe).Length
+          $s2 = (Get-Item mlrc-self2.exe).Length
           if ($h1 -eq $h2) {
             Write-Host "PASS: Windows x86_64 fixed point ($s1 bytes, md5=$h1)"
           } else {
-            Write-Host "FAIL: Windows x86_64 fixed point — krc-self1 ($s1, $h1) != krc-self2 ($s2, $h2)"
+            Write-Host "FAIL: Windows x86_64 fixed point — mlrc-self1 ($s1, $h1) != mlrc-self2 ($s2, $h2)"
             exit 1
           }
 
       - name: Fat-binary self-host determinism (Windows x86_64)
         shell: pwsh
         run: |
-          # kr-win-x64.exe extracts the Windows x86_64 slice from
-          # krc.krbo and execs it with the caller's argv forwarded as
+          # mlr-win-x64.exe extracts the Windows x86_64 slice from
+          # mlrc.krbo and execs it with the caller's argv forwarded as
           # a quoted cmdline (see exec_process_argv Windows branch).
           # Two compile_fat runs with identical input must produce
           # byte-identical .krbo output.
-          $r = Start-Process -FilePath bins\kr-win-x64.exe -ArgumentList 'bins\krc.krbo','bins\krc-source.kr','-o','krc2.krbo' -Wait -PassThru -NoNewWindow
-          if ($r.ExitCode -ne 0) { Write-Host "FAIL: krc2.krbo compile (exit=$($r.ExitCode))"; exit 1 }
-          $r = Start-Process -FilePath bins\kr-win-x64.exe -ArgumentList 'bins\krc.krbo','bins\krc-source.kr','-o','krc3.krbo' -Wait -PassThru -NoNewWindow
-          if ($r.ExitCode -ne 0) { Write-Host "FAIL: krc3.krbo compile (exit=$($r.ExitCode))"; exit 1 }
-          $h2 = (Get-FileHash -Algorithm MD5 krc2.krbo).Hash
-          $h3 = (Get-FileHash -Algorithm MD5 krc3.krbo).Hash
-          $s2 = (Get-Item krc2.krbo).Length
-          $s3 = (Get-Item krc3.krbo).Length
+          $r = Start-Process -FilePath bins\mlr-win-x64.exe -ArgumentList 'bins\mlrc.krbo','bins\mlrc-source.kr','-o','mlrc2.krbo' -Wait -PassThru -NoNewWindow
+          if ($r.ExitCode -ne 0) { Write-Host "FAIL: mlrc2.krbo compile (exit=$($r.ExitCode))"; exit 1 }
+          $r = Start-Process -FilePath bins\mlr-win-x64.exe -ArgumentList 'bins\mlrc.krbo','bins\mlrc-source.kr','-o','mlrc3.krbo' -Wait -PassThru -NoNewWindow
+          if ($r.ExitCode -ne 0) { Write-Host "FAIL: mlrc3.krbo compile (exit=$($r.ExitCode))"; exit 1 }
+          $h2 = (Get-FileHash -Algorithm MD5 mlrc2.krbo).Hash
+          $h3 = (Get-FileHash -Algorithm MD5 mlrc3.krbo).Hash
+          $s2 = (Get-Item mlrc2.krbo).Length
+          $s3 = (Get-Item mlrc3.krbo).Length
           if ($h2 -eq $h3) {
             Write-Host "PASS: Windows x86_64 fat self-host determinism ($s2 bytes, md5=$h2)"
           } else {
-            Write-Host "FAIL: Windows x86_64 fat self-host — krc2.krbo ($s2, $h2) != krc3.krbo ($s3, $h3)"
+            Write-Host "FAIL: Windows x86_64 fat self-host — mlrc2.krbo ($s2, $h2) != mlrc3.krbo ($s3, $h3)"
             exit 1
           }
 
@@ -640,7 +640,7 @@ jobs:
         shell: pwsh
         run: |
           $output = & bins\win-arm-hello.exe 2>&1
-          if ($output -match "Hello from KernRift") {
+          if ($output -match "Hello from MLRift") {
             Write-Host "PASS: hello world output"
           } else {
             Write-Host "FAIL: hello world output: $output"
@@ -685,74 +685,74 @@ jobs:
           $ErrorActionPreference = 'Continue'
           Set-Content -Path test.kr -Encoding ascii -Value 'fn main() { println("ARM64 self-compiled!"); exit(42) }'
 
-          # Stage 1: cross-compiled compiler (krc3) compiles test program
-          $r1 = Start-Process -FilePath bins\krc-win-arm64.exe -ArgumentList '--emit=pe','test.kr','-o','test-s1.exe' -Wait -PassThru -NoNewWindow
+          # Stage 1: cross-compiled compiler (mlrc3) compiles test program
+          $r1 = Start-Process -FilePath bins\mlrc-win-arm64.exe -ArgumentList '--emit=pe','test.kr','-o','test-s1.exe' -Wait -PassThru -NoNewWindow
           if ($r1.ExitCode -ne 0) { Write-Host "FAIL: stage 1 compile (exit=$($r1.ExitCode))"; exit 1 }
           $r1r = Start-Process -FilePath .\test-s1.exe -Wait -PassThru -NoNewWindow
           if ($r1r.ExitCode -ne 42) { Write-Host "FAIL: stage 1 run (exit=$($r1r.ExitCode))"; exit 1 }
-          Write-Host "Stage 1: PASS (krc3 compiles test, runs with exit 42)"
+          Write-Host "Stage 1: PASS (mlrc3 compiles test, runs with exit 42)"
 
-          # Stage 2: krc3 self-compiles to krc4
-          $r2 = Start-Process -FilePath bins\krc-win-arm64.exe -ArgumentList '--emit=pe','bins\krc-source.kr','-o','krc4.exe' -Wait -PassThru -NoNewWindow
+          # Stage 2: mlrc3 self-compiles to mlrc4
+          $r2 = Start-Process -FilePath bins\mlrc-win-arm64.exe -ArgumentList '--emit=pe','bins\mlrc-source.kr','-o','mlrc4.exe' -Wait -PassThru -NoNewWindow
           if ($r2.ExitCode -ne 0) { Write-Host "FAIL: stage 2 self-compile (exit=$($r2.ExitCode))"; exit 1 }
-          Write-Host "Stage 2: PASS (krc3 self-compiled to krc4, $((Get-Item krc4.exe).Length) bytes)"
+          Write-Host "Stage 2: PASS (mlrc3 self-compiled to mlrc4, $((Get-Item mlrc4.exe).Length) bytes)"
 
-          # Stage 3: krc4 compiles the same test program
-          $r3 = Start-Process -FilePath .\krc4.exe -ArgumentList '--emit=pe','test.kr','-o','test-s3.exe' -Wait -PassThru -NoNewWindow
+          # Stage 3: mlrc4 compiles the same test program
+          $r3 = Start-Process -FilePath .\mlrc4.exe -ArgumentList '--emit=pe','test.kr','-o','test-s3.exe' -Wait -PassThru -NoNewWindow
           if ($r3.ExitCode -ne 0) { Write-Host "FAIL: stage 3 compile (exit=$($r3.ExitCode))"; exit 1 }
           $r3r = Start-Process -FilePath .\test-s3.exe -Wait -PassThru -NoNewWindow
           if ($r3r.ExitCode -ne 42) { Write-Host "FAIL: stage 3 run (exit=$($r3r.ExitCode))"; exit 1 }
-          Write-Host "Stage 3: PASS (krc4 compiles test, runs with exit 42)"
+          Write-Host "Stage 3: PASS (mlrc4 compiles test, runs with exit 42)"
 
           # Stage 4: compare test-s1 and test-s3 output (the tiny test program
-          # compiled by krc3 vs krc4). Won't always match because krc3 was
-          # cross-compiled on Linux and krc4 was self-compiled on Windows, but
+          # compiled by mlrc3 vs mlrc4). Won't always match because mlrc3 was
+          # cross-compiled on Linux and mlrc4 was self-compiled on Windows, but
           # if they DO match that's a nice confirmation.
           $h1 = (Get-FileHash test-s1.exe).Hash
           $h3 = (Get-FileHash test-s3.exe).Hash
           if ($h1 -eq $h3) {
-            Write-Host "PASS: krc3 and krc4 produce identical output (bootstrap verified)"
+            Write-Host "PASS: mlrc3 and mlrc4 produce identical output (bootstrap verified)"
           } else {
-            Write-Host "INFO: krc3 and krc4 output differs (expected — different compiler binaries)"
+            Write-Host "INFO: mlrc3 and mlrc4 output differs (expected — different compiler binaries)"
           }
 
-          # Stage 5: true fixed point. krc4 self-compiles → krc5.
+          # Stage 5: true fixed point. mlrc4 self-compiles → mlrc5.
           # Both were built on this Windows-arm64 host with arm64-PE
-          # codegen, so krc4 and krc5 must be byte-identical if the
+          # codegen, so mlrc4 and mlrc5 must be byte-identical if the
           # emitter is deterministic. This is the check that catches
           # any PE-header non-determinism (timestamps, padding, etc.)
           # specific to the arm64 path.
-          $r5 = Start-Process -FilePath .\krc4.exe -ArgumentList '--emit=pe','bins\krc-source.kr','-o','krc5.exe' -Wait -PassThru -NoNewWindow
+          $r5 = Start-Process -FilePath .\mlrc4.exe -ArgumentList '--emit=pe','bins\mlrc-source.kr','-o','mlrc5.exe' -Wait -PassThru -NoNewWindow
           if ($r5.ExitCode -ne 0) { Write-Host "FAIL: stage 5 self-compile (exit=$($r5.ExitCode))"; exit 1 }
-          $h4 = (Get-FileHash -Algorithm MD5 krc4.exe).Hash
-          $h5 = (Get-FileHash -Algorithm MD5 krc5.exe).Hash
-          $s4 = (Get-Item krc4.exe).Length
-          $s5 = (Get-Item krc5.exe).Length
+          $h4 = (Get-FileHash -Algorithm MD5 mlrc4.exe).Hash
+          $h5 = (Get-FileHash -Algorithm MD5 mlrc5.exe).Hash
+          $s4 = (Get-Item mlrc4.exe).Length
+          $s5 = (Get-Item mlrc5.exe).Length
           if ($h4 -eq $h5) {
             Write-Host "PASS: Windows ARM64 fixed point ($s4 bytes, md5=$h4)"
           } else {
-            Write-Host "FAIL: Windows ARM64 fixed point — krc4 ($s4, $h4) != krc5 ($s5, $h5)"
+            Write-Host "FAIL: Windows ARM64 fixed point — mlrc4 ($s4, $h4) != mlrc5 ($s5, $h5)"
             exit 1
           }
 
       - name: Fat-binary self-host determinism (Windows ARM64)
         shell: pwsh
         run: |
-          # kr-win-arm64.exe extracts the Windows ARM64 slice from
-          # krc.krbo and execs it with the caller's argv forwarded as
+          # mlr-win-arm64.exe extracts the Windows ARM64 slice from
+          # mlrc.krbo and execs it with the caller's argv forwarded as
           # a quoted cmdline. Two compile_fat runs with identical
           # input must produce byte-identical .krbo output.
-          $r = Start-Process -FilePath bins\kr-win-arm64.exe -ArgumentList 'bins\krc.krbo','bins\krc-source.kr','-o','krc2.krbo' -Wait -PassThru -NoNewWindow
-          if ($r.ExitCode -ne 0) { Write-Host "FAIL: krc2.krbo compile (exit=$($r.ExitCode))"; exit 1 }
-          $r = Start-Process -FilePath bins\kr-win-arm64.exe -ArgumentList 'bins\krc.krbo','bins\krc-source.kr','-o','krc3.krbo' -Wait -PassThru -NoNewWindow
-          if ($r.ExitCode -ne 0) { Write-Host "FAIL: krc3.krbo compile (exit=$($r.ExitCode))"; exit 1 }
-          $h2 = (Get-FileHash -Algorithm MD5 krc2.krbo).Hash
-          $h3 = (Get-FileHash -Algorithm MD5 krc3.krbo).Hash
-          $s2 = (Get-Item krc2.krbo).Length
-          $s3 = (Get-Item krc3.krbo).Length
+          $r = Start-Process -FilePath bins\mlr-win-arm64.exe -ArgumentList 'bins\mlrc.krbo','bins\mlrc-source.kr','-o','mlrc2.krbo' -Wait -PassThru -NoNewWindow
+          if ($r.ExitCode -ne 0) { Write-Host "FAIL: mlrc2.krbo compile (exit=$($r.ExitCode))"; exit 1 }
+          $r = Start-Process -FilePath bins\mlr-win-arm64.exe -ArgumentList 'bins\mlrc.krbo','bins\mlrc-source.kr','-o','mlrc3.krbo' -Wait -PassThru -NoNewWindow
+          if ($r.ExitCode -ne 0) { Write-Host "FAIL: mlrc3.krbo compile (exit=$($r.ExitCode))"; exit 1 }
+          $h2 = (Get-FileHash -Algorithm MD5 mlrc2.krbo).Hash
+          $h3 = (Get-FileHash -Algorithm MD5 mlrc3.krbo).Hash
+          $s2 = (Get-Item mlrc2.krbo).Length
+          $s3 = (Get-Item mlrc3.krbo).Length
           if ($h2 -eq $h3) {
             Write-Host "PASS: Windows ARM64 fat self-host determinism ($s2 bytes, md5=$h2)"
           } else {
-            Write-Host "FAIL: Windows ARM64 fat self-host — krc2.krbo ($s2, $h2) != krc3.krbo ($s3, $h3)"
+            Write-Host "FAIL: Windows ARM64 fat self-host — mlrc2.krbo ($s2, $h2) != mlrc3.krbo ($s3, $h3)"
             exit 1
           }

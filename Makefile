@@ -1,13 +1,12 @@
-# KernRift Self-Hosted Compiler
+# MLRift compiler (built on KernRift)
 # Usage:
-#   make              - build the compiler
+#   make              - build the compiler (self-hosts from build/mlrc)
 #   make test         - run test suite
-#   make install      - install to ~/.local/bin
+#   make install      - install to ~/.local/bin/mlrc
 #   make dist         - create distribution binaries for all platforms
 #   make clean        - remove build artifacts
-#   make bootstrap    - verify bootstrap (krc3 == krc4)
+#   make bootstrap    - verify self-host fixed point
 
-KERNRIFTC ?= kernriftc
 INSTALL_DIR ?= $(HOME)/.local/bin
 DIST_DIR = dist
 
@@ -20,98 +19,75 @@ SRCS = src/lexer.kr src/ast.kr src/parser.kr src/codegen.kr \
 
 all: build
 
-# Build from the self-hosted compiler (no Rust needed)
-build: build/krc2
+build: build/mlrc
 
-build/krc.kr: $(SRCS)
+build/mlrc.kr: $(SRCS)
 	@mkdir -p build
-	cat $(SRCS) > build/krc.kr
+	cat $(SRCS) > build/mlrc.kr
 
-# Use the pre-built self-hosted compiler to self-compile
-build/krc2: build/krc.kr
-	@if [ -f build/krc2 ]; then \
-		./build/krc2 --arch=x86_64 build/krc.kr -o build/krc2.new && \
-		mv build/krc2.new build/krc2 && chmod +x build/krc2; \
-	elif [ -f $(DIST_DIR)/krc-linux-x86_64 ]; then \
-		cp $(DIST_DIR)/krc-linux-x86_64 build/krc2 && chmod +x build/krc2 && \
-		./build/krc2 --arch=x86_64 build/krc.kr -o build/krc2.new && \
-		mv build/krc2.new build/krc2; \
-	else \
-		echo "No self-hosted compiler found. Bootstrap from Rust:"; \
-		echo "  cargo install --git https://github.com/Pantelis23/KernRift-bootstrap kernriftc"; \
-		echo "  $(KERNRIFTC) --emit=hostexe build/krc.kr -o build/krc"; \
-		echo "  cp build/krc.kr test_input.kr && ./build/krc && mv a.out build/krc2"; \
+# Self-compile. build/mlrc is committed as the bootstrap.
+build/mlrc: build/mlrc.kr
+	@if [ ! -x build/mlrc ]; then \
+		echo "build/mlrc not found — clone must include the committed bootstrap."; \
 		exit 1; \
 	fi
-
-# Build using the import system (no cat needed)
-build-import: build/krc2
-	./build/krc2 --arch=x86_64 src/main.kr -o build/krc-import
-	chmod +x build/krc-import
+	./build/mlrc --arch=x86_64 build/mlrc.kr -o build/mlrc.new
+	mv build/mlrc.new build/mlrc
+	chmod +x build/mlrc
 
 # Run test suite
-test: build/krc2
-	@echo "=== Running test suite ==="
-	@echo '#!/bin/bash' > /tmp/krc-test && echo 'exec ./build/krc2 --arch=x86_64 "$$@"' >> /tmp/krc-test && chmod +x /tmp/krc-test
-	@KRC=/tmp/krc-test bash tests/run_tests.sh || true
+test: build/mlrc
+	@echo "=== Running MLRift test suite ==="
+	@echo '#!/bin/bash' > /tmp/mlrc-test && echo 'exec ./build/mlrc --arch=x86_64 "$$@"' >> /tmp/mlrc-test && chmod +x /tmp/mlrc-test
+	@KRC=/tmp/mlrc-test bash tests/run_tests.sh || true
 
-# Verify bootstrap convergence
-bootstrap: build/krc2
+# Verify self-host fixed point (stage3 == stage4)
+bootstrap: build/mlrc
 	@echo "=== Bootstrap verification ==="
-	@cp build/krc.kr /tmp/krc_bs_src.kr
-	@./build/krc2 --arch=x86_64 /tmp/krc_bs_src.kr -o /tmp/krc3_bs 2>/dev/null
-	@chmod +x /tmp/krc3_bs
-	@/tmp/krc3_bs --arch=x86_64 /tmp/krc_bs_src.kr -o /tmp/krc4_bs 2>/dev/null
-	@if diff /tmp/krc3_bs /tmp/krc4_bs >/dev/null 2>&1; then \
-		echo "PASS: fixed point at $$(wc -c < /tmp/krc3_bs) bytes"; \
+	@cp build/mlrc.kr /tmp/mlrc_bs_src.kr
+	@./build/mlrc --arch=x86_64 /tmp/mlrc_bs_src.kr -o /tmp/mlrc3_bs 2>/dev/null
+	@chmod +x /tmp/mlrc3_bs
+	@/tmp/mlrc3_bs --arch=x86_64 /tmp/mlrc_bs_src.kr -o /tmp/mlrc4_bs 2>/dev/null
+	@if diff /tmp/mlrc3_bs /tmp/mlrc4_bs >/dev/null 2>&1; then \
+		echo "PASS: fixed point at $$(wc -c < /tmp/mlrc3_bs) bytes"; \
 	else \
-		echo "FAIL: krc3 != krc4"; exit 1; \
+		echo "FAIL: stage3 != stage4"; exit 1; \
 	fi
-	@rm -f /tmp/krc_bs_src.kr /tmp/krc3_bs /tmp/krc4_bs
+	@rm -f /tmp/mlrc_bs_src.kr /tmp/mlrc3_bs /tmp/mlrc4_bs
 
-# Install to INSTALL_DIR
-install: build/krc2
+# Install as "mlrc" in INSTALL_DIR
+install: build/mlrc
 	@mkdir -p $(INSTALL_DIR)
-	cp build/krc2 $(INSTALL_DIR)/krc
-	chmod +x $(INSTALL_DIR)/krc
-	@echo "Installed: $(INSTALL_DIR)/krc"
+	cp build/mlrc $(INSTALL_DIR)/mlrc
+	chmod +x $(INSTALL_DIR)/mlrc
+	@echo "Installed: $(INSTALL_DIR)/mlrc"
 	@echo "Ensure $(INSTALL_DIR) is in your PATH"
 
-# Create distribution binaries
-dist: build/krc2
+# Distribution binaries
+dist: build/mlrc
 	@mkdir -p $(DIST_DIR)
 	@echo "=== Building distribution ==="
-	@# x86_64 Linux ELF
-	cp build/krc2 $(DIST_DIR)/krc-linux-x86_64
-	chmod +x $(DIST_DIR)/krc-linux-x86_64
-	@echo "  krc-linux-x86_64"
-	@# ARM64 Linux ELF (cross-compiled). R1 fix landed — IR ARM64 now
-	@# handles 9+ arg calls correctly so the previous --legacy override
-	@# is no longer needed. Validated natively on Redmi Note 8 Pro.
-	./build/krc2 --arch=arm64 build/krc.kr -o $(DIST_DIR)/krc-linux-arm64 2>/dev/null
-	chmod +x $(DIST_DIR)/krc-linux-arm64
-	@echo "  krc-linux-arm64"
-	@# Windows PE (cross-compiled)
-	./build/krc2 --arch=x86_64 --emit=pe build/krc.kr -o $(DIST_DIR)/krc-windows-x86_64.exe 2>/dev/null
-	@echo "  krc-windows-x86_64.exe"
-	./build/krc2 --arch=arm64 --emit=pe build/krc.kr -o $(DIST_DIR)/krc-windows-arm64.exe 2>/dev/null
-	@echo "  krc-windows-arm64.exe"
-	@# Fat binary (default)
-	./build/krc2 build/krc.kr -o $(DIST_DIR)/krc.krbo 2>/dev/null
-	@echo "  krc.krbo (x86_64 + arm64)"
-	@# Source distribution
-	cp build/krc.kr $(DIST_DIR)/krc-source.kr
-	@echo "  krc-source.kr"
+	cp build/mlrc $(DIST_DIR)/mlrc-linux-x86_64
+	chmod +x $(DIST_DIR)/mlrc-linux-x86_64
+	@echo "  mlrc-linux-x86_64"
+	./build/mlrc --arch=arm64 build/mlrc.kr -o $(DIST_DIR)/mlrc-linux-arm64 2>/dev/null
+	chmod +x $(DIST_DIR)/mlrc-linux-arm64
+	@echo "  mlrc-linux-arm64"
+	./build/mlrc --arch=x86_64 --emit=pe build/mlrc.kr -o $(DIST_DIR)/mlrc-windows-x86_64.exe 2>/dev/null
+	@echo "  mlrc-windows-x86_64.exe"
+	./build/mlrc --arch=arm64 --emit=pe build/mlrc.kr -o $(DIST_DIR)/mlrc-windows-arm64.exe 2>/dev/null
+	@echo "  mlrc-windows-arm64.exe"
+	./build/mlrc build/mlrc.kr -o $(DIST_DIR)/mlrc.krbo 2>/dev/null
+	@echo "  mlrc.krbo (fat binary, 8 slices)"
+	cp build/mlrc.kr $(DIST_DIR)/mlrc-source.kr
+	@echo "  mlrc-source.kr"
 	@echo ""
 	@ls -la $(DIST_DIR)/
-	@echo ""
 	@echo "=== Distribution complete ==="
 
-# Clean all build artifacts
 clean:
-	rm -rf build/krc build/krc2 build/krc.kr
+	rm -f build/mlrc.new build/mlrc.kr
 	rm -rf $(DIST_DIR)
 	rm -f a.out output.elf test_input.kr
-	rm -f krc2 krc3 krc4 krc_arm64
 	rm -f *.elf *.out
-	@echo "Cleaned."
+	@echo "Cleaned (build/mlrc preserved — committed bootstrap)."

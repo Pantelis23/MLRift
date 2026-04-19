@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler — Lexer (Tokenizer)
+// MLRift — built on KernRift — Lexer (Tokenizer)
 //
 // Converts source text (uint8 bytes) into a flat token array.
 // Each token is 16 bytes:

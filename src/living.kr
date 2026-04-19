@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler — Living Compiler
+// MLRift — built on KernRift — Living Compiler
 //
 // Implements the blueprint vision (see docs/LIVING_COMPILER.md) at its
 // current maturity stage: a governed, two-layer analysis that separates

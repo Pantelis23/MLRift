@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler — PE/COFF output format (Windows)
+// MLRift — built on KernRift — PE/COFF output format (Windows)
 //
 // PE32+ with .text + .idata sections for Windows x86_64 and AArch64
 // Import table provides: ExitProcess, GetStdHandle, WriteFile,

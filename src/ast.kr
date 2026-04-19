@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler — AST node definitions
+// MLRift — built on KernRift — AST node definitions
 //
 // Arena-based flat AST. Each node is 32 bytes:
 //   [0..4)   node_kind (uint32)

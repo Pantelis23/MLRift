@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler — Code Generator (x86_64 ELF)
+// MLRift — built on KernRift — Code Generator (x86_64 ELF)
 //
 // Strategy: register-based codegen. Expressions evaluate into %rax.
 // Variables live on the stack. Function calls use SysV ABI.

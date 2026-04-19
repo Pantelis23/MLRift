@@ -21,63 +21,63 @@ jobs:
           mkdir -p build
           # Download krc from pinned release — avoids CDN caching issues with /latest
           curl -sL -o build/krc-bootstrap \
-            https://github.com/Pantelis23/KernRift/releases/download/v2.8.4/krc-linux-x86_64
+            https://github.com/Pantelis23/MLRift/releases/download/v2.8.4/mlrc-linux-x86_64
           chmod +x build/krc-bootstrap
 
       - name: Build (self-compile)
         run: |
           cat src/lexer.kr src/ast.kr src/parser.kr src/codegen.kr src/codegen_aarch64.kr \
               src/ir.kr src/ir_aarch64.kr src/format_macho.kr src/format_pe.kr src/format_archive.kr src/format_android.kr \
-              src/bcj.kr src/analysis.kr src/living.kr src/runtime.kr src/formatter.kr src/main.kr > build/krc.kr
+              src/bcj.kr src/analysis.kr src/living.kr src/runtime.kr src/formatter.kr src/main.kr > build/mlrc.kr
           # Bootstrap: compile source with released krc (use --legacy for speed),
           # then re-compile with itself (which uses IR by default)
-          ./build/krc-bootstrap --legacy --arch=x86_64 build/krc.kr -o build/krc2
-          chmod +x build/krc2
-          ./build/krc2 --arch=x86_64 build/krc.kr -o build/krc2.stable
-          mv build/krc2.stable build/krc2
-          chmod +x build/krc2
+          ./build/krc-bootstrap --legacy --arch=x86_64 build/mlrc.kr -o build/mlrc
+          chmod +x build/mlrc
+          ./build/mlrc --arch=x86_64 build/mlrc.kr -o build/mlrc.stable
+          mv build/mlrc.stable build/mlrc
+          chmod +x build/mlrc
 
       - name: Test suite
         run: |
-          echo '#!/bin/bash' > /tmp/krc-test
-          echo 'exec ./build/krc2 --arch=x86_64 "$@"' >> /tmp/krc-test
-          chmod +x /tmp/krc-test
-          KRC=/tmp/krc-test bash tests/run_tests.sh
+          echo '#!/bin/bash' > /tmp/mlrc-test
+          echo 'exec ./build/mlrc --arch=x86_64 "$@"' >> /tmp/mlrc-test
+          chmod +x /tmp/mlrc-test
+          KRC=/tmp/mlrc-test bash tests/run_tests.sh
 
       - name: Smoke suite (Linux x86_64 IR)
-        run: KRC=./build/krc2 bash tests/smoke/run.sh
+        run: KRC=./build/mlrc bash tests/smoke/run.sh
 
       - name: Smoke suite (Linux x86_64 legacy)
-        run: KRC=./build/krc2 KRC_FLAGS="--legacy --arch=x86_64" bash tests/smoke/run.sh
+        run: KRC=./build/mlrc KRC_FLAGS="--legacy --arch=x86_64" bash tests/smoke/run.sh
 
       - name: Smoke suite (Linux ARM64 via qemu)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-user-static
-          KRC=./build/krc2 KRC_FLAGS="--arch=arm64" SMOKE_RUNNER=qemu-aarch64-static bash tests/smoke/run.sh
+          KRC=./build/mlrc KRC_FLAGS="--arch=arm64" SMOKE_RUNNER=qemu-aarch64-static bash tests/smoke/run.sh
 
       - name: Differential harness (legacy vs IR, Linux x86_64)
-        run: KRC=./build/krc2 bash tests/diff/run.sh
+        run: KRC=./build/mlrc bash tests/diff/run.sh
 
       - name: Differential harness (IR x86_64 vs IR arm64 via qemu)
-        run: DIFF_MODE=crossarch KRC=./build/krc2 bash tests/diff/run.sh
+        run: DIFF_MODE=crossarch KRC=./build/mlrc bash tests/diff/run.sh
 
       - name: Fuzz harness (Tier 2 — random programs, Python oracle)
-        run: KRC=./build/krc2 FUZZ_COUNT=50 FUZZ_SEED=3735928559 bash tests/fuzz/run.sh
+        run: KRC=./build/mlrc FUZZ_COUNT=50 FUZZ_SEED=3735928559 bash tests/fuzz/run.sh
 
-      - name: Bootstrap verification (krc3 == krc4)
+      - name: Bootstrap verification (mlrc3 == mlrc4)
         run: make bootstrap
 
       - name: Cross-compile ARM64
         run: |
-          ./build/krc2 --arch=arm64 build/krc.kr -o /tmp/krc-arm64
-          file /tmp/krc-arm64 | grep -q "ARM aarch64"
+          ./build/mlrc --arch=arm64 build/mlrc.kr -o /tmp/mlrc-arm64
+          file /tmp/mlrc-arm64 | grep -q "ARM aarch64"
           echo "ARM64 cross-compile: OK"
 
       - name: Fat binary verification
         run: |
           echo 'fn main() { exit(42) }' > /tmp/test.kr
-          ./build/krc2 /tmp/test.kr -o /tmp/test.krbo
+          ./build/mlrc /tmp/test.kr -o /tmp/test.krbo
           python3 -c "
           d = open('/tmp/test.krbo','rb').read()
           assert d[:8] == b'KRBOFAT\x00', 'not a fat binary'
@@ -87,33 +87,33 @@ jobs:
           print(f'Fat binary OK: {count} architectures, {len(d)} bytes')
           "
 
-      - name: Build krc.krbo (the compiler itself as a fat binary) + kr runners
+      - name: Build mlrc.krbo (the compiler itself as a fat binary) + kr runners
         run: |
-          # krc.krbo — 8-slice fat binary of the compiler
-          ./build/krc2 build/krc.kr -o /tmp/krc.krbo
-          ls -la /tmp/krc.krbo
+          # mlrc.krbo — 8-slice fat binary of the compiler
+          ./build/mlrc build/mlrc.kr -o /tmp/mlrc.krbo
+          ls -la /tmp/mlrc.krbo
           # Ship the concatenated source alongside so the Tier-1 #3
           # self-host fixed-point tests on macOS/Windows/Android have
-          # something to feed back into krc4.
-          cp build/krc.kr /tmp/krc-source.kr
+          # something to feed back into mlrc4.
+          cp build/mlrc.kr /tmp/mlrc-source.kr
           # kr runner for every platform (one source, seven slices)
           cat src/bcj.kr src/runner.kr > /tmp/kr.kr
-          mkdir -p /tmp/kr-runners
-          ./build/krc2 --arch=x86_64 /tmp/kr.kr -o /tmp/kr-runners/kr-linux-x86_64
-          ./build/krc2 --arch=arm64  /tmp/kr.kr -o /tmp/kr-runners/kr-linux-arm64
-          ./build/krc2 --arch=x86_64 --emit=macho /tmp/kr.kr -o /tmp/kr-runners/kr-macos-x86_64
-          ./build/krc2 --arch=arm64  --emit=macho /tmp/kr.kr -o /tmp/kr-runners/kr-macos-arm64
-          ./build/krc2 --arch=x86_64 --emit=pe    /tmp/kr.kr -o /tmp/kr-runners/kr-windows-x86_64.exe
-          ./build/krc2 --arch=arm64  --emit=pe    /tmp/kr.kr -o /tmp/kr-runners/kr-windows-arm64.exe
-          ls -la /tmp/kr-runners/
+          mkdir -p /tmp/mlr-runners
+          ./build/mlrc --arch=x86_64 /tmp/kr.kr -o /tmp/mlr-runners/mlr-linux-x86_64
+          ./build/mlrc --arch=arm64  /tmp/kr.kr -o /tmp/mlr-runners/mlr-linux-arm64
+          ./build/mlrc --arch=x86_64 --emit=macho /tmp/kr.kr -o /tmp/mlr-runners/mlr-macos-x86_64
+          ./build/mlrc --arch=arm64  --emit=macho /tmp/kr.kr -o /tmp/mlr-runners/mlr-macos-arm64
+          ./build/mlrc --arch=x86_64 --emit=pe    /tmp/kr.kr -o /tmp/mlr-runners/mlr-windows-x86_64.exe
+          ./build/mlrc --arch=arm64  --emit=pe    /tmp/kr.kr -o /tmp/mlr-runners/mlr-windows-arm64.exe
+          ls -la /tmp/mlr-runners/
 
-      - name: Fat-binary krc self-test (Linux x86_64 host)
+      - name: Fat-binary mlrc self-test (Linux x86_64 host)
         run: |
           # Prove the end-to-end stack works on THIS host:
-          #   kr -> krc.krbo -> native krc slice -> compile test.kr -> run test
-          /tmp/kr-runners/kr-linux-x86_64 /tmp/krc.krbo --version
+          #   kr -> mlrc.krbo -> native krc slice -> compile test.kr -> run test
+          /tmp/mlr-runners/mlr-linux-x86_64 /tmp/mlrc.krbo --version
           echo 'fn main() { println("krbo-via-kr OK"); exit(42) }' > /tmp/fb_test.kr
-          /tmp/kr-runners/kr-linux-x86_64 /tmp/krc.krbo --arch=x86_64 /tmp/fb_test.kr -o /tmp/fb_test
+          /tmp/mlr-runners/mlr-linux-x86_64 /tmp/mlrc.krbo --arch=x86_64 /tmp/fb_test.kr -o /tmp/fb_test
           set +e
           OUT=$(/tmp/fb_test)
           CODE=$?
@@ -129,55 +129,55 @@ jobs:
       - name: Fat-binary self-host determinism (Linux x86_64)
         run: |
           # Pure fat-container determinism check: kr → compile_fat →
-          # krc2.krbo → repeat → krc3.krbo, byte-compare. Extracts and
-          # runs the Linux x86_64 slice from krc.krbo to drive the
+          # mlrc2.krbo → repeat → mlrc3.krbo, byte-compare. Extracts and
+          # runs the Linux x86_64 slice from mlrc.krbo to drive the
           # compile; output is a new fat bundle with all 8 slices.
           # Byte-equality proves compile_fat itself (BCJ + LZ-Rift +
           # fixup ordering + slice concatenation) is deterministic on
           # this host.
-          /tmp/kr-runners/kr-linux-x86_64 /tmp/krc.krbo /tmp/krc-source.kr -o /tmp/krc2.krbo
-          /tmp/kr-runners/kr-linux-x86_64 /tmp/krc.krbo /tmp/krc-source.kr -o /tmp/krc3.krbo
-          s2=$(wc -c < /tmp/krc2.krbo); s3=$(wc -c < /tmp/krc3.krbo)
-          if cmp -s /tmp/krc2.krbo /tmp/krc3.krbo; then
+          /tmp/mlr-runners/mlr-linux-x86_64 /tmp/mlrc.krbo /tmp/mlrc-source.kr -o /tmp/mlrc2.krbo
+          /tmp/mlr-runners/mlr-linux-x86_64 /tmp/mlrc.krbo /tmp/mlrc-source.kr -o /tmp/mlrc3.krbo
+          s2=$(wc -c < /tmp/mlrc2.krbo); s3=$(wc -c < /tmp/mlrc3.krbo)
+          if cmp -s /tmp/mlrc2.krbo /tmp/mlrc3.krbo; then
             echo "PASS: Linux x86_64 fat self-host determinism ($s2 bytes)"
           else
-            echo "FAIL: Linux x86_64 fat self-host — krc2.krbo ($s2) != krc3.krbo ($s3)"
+            echo "FAIL: Linux x86_64 fat self-host — mlrc2.krbo ($s2) != mlrc3.krbo ($s3)"
             exit 1
           fi
 
-      - name: Upload krc.krbo + kr runners
+      - name: Upload mlrc.krbo + kr runners
         uses: actions/upload-artifact@v4
         with:
-          name: krc-fatbinary
+          name: mlrift-fatbinary
           path: |
-            /tmp/krc.krbo
-            /tmp/kr-runners/
-            /tmp/krc-source.kr
+            /tmp/mlrc.krbo
+            /tmp/mlr-runners/
+            /tmp/mlrc-source.kr
 
       - name: Cross-compile macOS and Windows
         run: |
           echo 'fn main() { exit(42) }' > /tmp/cross.kr
-          ./build/krc2 --arch=x86_64 --emit=macho /tmp/cross.kr -o /tmp/cross-macos-x64
+          ./build/mlrc --arch=x86_64 --emit=macho /tmp/cross.kr -o /tmp/cross-macos-x64
           file /tmp/cross-macos-x64 | grep -q "Mach-O 64-bit x86_64"
           echo "macOS x86_64 Mach-O: OK"
 
-          ./build/krc2 --arch=arm64 --emit=macho /tmp/cross.kr -o /tmp/cross-macos-arm
+          ./build/mlrc --arch=arm64 --emit=macho /tmp/cross.kr -o /tmp/cross-macos-arm
           file /tmp/cross-macos-arm | grep -q "Mach-O 64-bit arm64"
           echo "macOS ARM64 Mach-O: OK"
 
-          ./build/krc2 --arch=x86_64 --emit=pe /tmp/cross.kr -o /tmp/cross-win-x64.exe
+          ./build/mlrc --arch=x86_64 --emit=pe /tmp/cross.kr -o /tmp/cross-win-x64.exe
           file /tmp/cross-win-x64.exe | grep -q "PE32+"
           echo "Windows x86_64 PE: OK"
 
-          ./build/krc2 --arch=arm64 --emit=pe /tmp/cross.kr -o /tmp/cross-win-arm.exe
+          ./build/mlrc --arch=arm64 --emit=pe /tmp/cross.kr -o /tmp/cross-win-arm.exe
           file /tmp/cross-win-arm.exe | grep -q "PE32+"
           echo "Windows ARM64 PE: OK"
 
-          ./build/krc2 --emit=android /tmp/cross.kr -o /tmp/cross-android-arm
+          ./build/mlrc --emit=android /tmp/cross.kr -o /tmp/cross-android-arm
           file /tmp/cross-android-arm | grep -q "ARM aarch64"
           echo "Android ARM64 PIE: OK"
 
-          ./build/krc2 --arch=x86_64 --emit=android /tmp/cross.kr -o /tmp/cross-android-x86
+          ./build/mlrc --arch=x86_64 --emit=android /tmp/cross.kr -o /tmp/cross-android-x86
           file /tmp/cross-android-x86 | grep -q "x86-64"
           file /tmp/cross-android-x86 | grep -qi "shared object\|DYN"
           echo "Android x86_64 PIE: OK"
@@ -186,7 +186,7 @@ jobs:
         run: |
           # Run PIE ELF directly via glibc loader (bypasses PT_INTERP=/system/bin/linker64)
           echo 'fn main() { exit(42) }' > /tmp/androidx.kr
-          ./build/krc2 --arch=x86_64 --emit=android /tmp/androidx.kr -o /tmp/androidx-exit42
+          ./build/mlrc --arch=x86_64 --emit=android /tmp/androidx.kr -o /tmp/androidx-exit42
           chmod +x /tmp/androidx-exit42
           set +e; /lib64/ld-linux-x86-64.so.2 /tmp/androidx-exit42; CODE=$?; set -e
           [ "$CODE" -eq 42 ] && echo "PASS: Android x86_64 exit(42)" || { echo "FAIL: expected 42, got $CODE"; exit 1; }
@@ -194,27 +194,27 @@ jobs:
           echo 'static uint64 c = 0
           fn inc() { c = c + 1 }
           fn main() { println("Android x86_64!"); inc(); inc(); inc(); exit(c) }' > /tmp/androidx.kr
-          ./build/krc2 --arch=x86_64 --emit=android /tmp/androidx.kr -o /tmp/androidx-static
+          ./build/mlrc --arch=x86_64 --emit=android /tmp/androidx.kr -o /tmp/androidx-static
           chmod +x /tmp/androidx-static
           set +e; /lib64/ld-linux-x86-64.so.2 /tmp/androidx-static; CODE=$?; set -e
           [ "$CODE" -eq 3 ] && echo "PASS: Android x86_64 statics (exit=3)" || { echo "FAIL: expected 3, got $CODE"; exit 1; }
 
           # Full Android x86_64 self-compile + fixed point. Uses the
           # glibc loader directly since we don't have bionic on the CI
-          # box. krc-androidx compiles the full source → krc-androidx-2;
+          # box. mlrc-androidx compiles the full source → mlrc-androidx-2;
           # byte-equality is the deterministic-codegen test.
-          ./build/krc2 --arch=x86_64 --emit=android build/krc.kr -o /tmp/krc-androidx
-          chmod +x /tmp/krc-androidx
+          ./build/mlrc --arch=x86_64 --emit=android build/mlrc.kr -o /tmp/mlrc-androidx
+          chmod +x /tmp/mlrc-androidx
           set +e
-          /lib64/ld-linux-x86-64.so.2 /tmp/krc-androidx --arch=x86_64 --emit=android build/krc.kr -o /tmp/krc-androidx-2
+          /lib64/ld-linux-x86-64.so.2 /tmp/mlrc-androidx --arch=x86_64 --emit=android build/mlrc.kr -o /tmp/mlrc-androidx-2
           COMP=$?
           set -e
           [ "$COMP" -eq 0 ] && echo "PASS: Android x86_64 full self-compile" || { echo "FAIL: Android x86_64 self-compile (exit=$COMP)"; exit 1; }
-          chmod +x /tmp/krc-androidx-2
-          if cmp -s /tmp/krc-androidx /tmp/krc-androidx-2; then
-            echo "PASS: Android x86_64 fixed point ($(wc -c < /tmp/krc-androidx) bytes)"
+          chmod +x /tmp/mlrc-androidx-2
+          if cmp -s /tmp/mlrc-androidx /tmp/mlrc-androidx-2; then
+            echo "PASS: Android x86_64 fixed point ($(wc -c < /tmp/mlrc-androidx) bytes)"
           else
-            echo "FAIL: Android x86_64 fixed point — krc-androidx ($(wc -c < /tmp/krc-androidx)) != krc-androidx-2 ($(wc -c < /tmp/krc-androidx-2))"
+            echo "FAIL: Android x86_64 fixed point — mlrc-androidx ($(wc -c < /tmp/mlrc-androidx)) != mlrc-androidx-2 ($(wc -c < /tmp/mlrc-androidx-2))"
             exit 1
           fi
 
@@ -228,7 +228,7 @@ jobs:
 
           # Test 1: exit(42)
           echo 'fn main() { exit(42) }' > /tmp/android.kr
-          ./build/krc2 --emit=android /tmp/android.kr -o /tmp/android-exit42
+          ./build/mlrc --emit=android /tmp/android.kr -o /tmp/android-exit42
           chmod +x /tmp/android-exit42
           set +e; qemu-aarch64-static /tmp/android-exit42; CODE=$?; set -e
           [ "$CODE" -eq 42 ] && echo "PASS: Android exit(42)" || { echo "FAIL: expected 42, got $CODE"; exit 1; }
@@ -237,54 +237,54 @@ jobs:
           echo 'static uint64 c = 0
           fn inc() { c = c + 1 }
           fn main() { println("Android QEMU!"); inc(); inc(); inc(); exit(c) }' > /tmp/android.kr
-          ./build/krc2 --emit=android /tmp/android.kr -o /tmp/android-static
+          ./build/mlrc --emit=android /tmp/android.kr -o /tmp/android-static
           chmod +x /tmp/android-static
           set +e; qemu-aarch64-static /tmp/android-static; CODE=$?; set -e
           [ "$CODE" -eq 3 ] && echo "PASS: Android statics (exit=3)" || { echo "FAIL: expected 3, got $CODE"; exit 1; }
 
           # Test 3: self-compile on QEMU
-          ./build/krc2 --emit=android build/krc.kr -o /tmp/krc-android
-          chmod +x /tmp/krc-android
+          ./build/mlrc --emit=android build/mlrc.kr -o /tmp/mlrc-android
+          chmod +x /tmp/mlrc-android
           echo 'fn main() { exit(99) }' > /tmp/android-selftest.kr
-          set +e; qemu-aarch64-static /tmp/krc-android --emit=android /tmp/android-selftest.kr -o /tmp/android-selfout; COMP=$?; set -e
+          set +e; qemu-aarch64-static /tmp/mlrc-android --emit=android /tmp/android-selftest.kr -o /tmp/android-selfout; COMP=$?; set -e
           [ "$COMP" -eq 0 ] && echo "PASS: Android self-compile" || { echo "FAIL: compile exit=$COMP"; exit 1; }
           chmod +x /tmp/android-selfout
           set +e; qemu-aarch64-static /tmp/android-selfout; CODE=$?; set -e
           [ "$CODE" -eq 99 ] && echo "PASS: Android self-compiled binary runs (exit=99)" || { echo "FAIL: expected 99, got $CODE"; exit 1; }
 
           # Test 4: Android ARM64 bootstrap fixed point under qemu. Have
-          # krc-android compile the full krc source → krc-android-2, then
+          # mlrc-android compile the full krc source → mlrc-android-2, then
           # diff bytes. This catches Android-specific codegen non-
           # determinism that a trivial exit(99) test can't see. Slow
           # (~25s on qemu emulation) but covers the scenario the Redmi
           # Note 8 Pro phone runs in production.
           set +e
-          qemu-aarch64-static /tmp/krc-android --emit=android build/krc.kr -o /tmp/krc-android-2
+          qemu-aarch64-static /tmp/mlrc-android --emit=android build/mlrc.kr -o /tmp/mlrc-android-2
           COMP=$?
           set -e
           [ "$COMP" -eq 0 ] && echo "PASS: Android full self-compile" || { echo "FAIL: Android self-compile (exit=$COMP)"; exit 1; }
-          chmod +x /tmp/krc-android-2
-          if cmp -s /tmp/krc-android /tmp/krc-android-2; then
-            echo "PASS: Android ARM64 fixed point ($(wc -c < /tmp/krc-android) bytes)"
+          chmod +x /tmp/mlrc-android-2
+          if cmp -s /tmp/mlrc-android /tmp/mlrc-android-2; then
+            echo "PASS: Android ARM64 fixed point ($(wc -c < /tmp/mlrc-android) bytes)"
           else
-            echo "FAIL: Android ARM64 fixed point — krc-android ($(wc -c < /tmp/krc-android)) != krc-android-2 ($(wc -c < /tmp/krc-android-2))"
+            echo "FAIL: Android ARM64 fixed point — mlrc-android ($(wc -c < /tmp/mlrc-android)) != mlrc-android-2 ($(wc -c < /tmp/mlrc-android-2))"
             exit 1
           fi
 
       - name: Fat binary runner (kr) test
         run: |
           # Build kr runner
-          cat src/bcj.kr src/runner.kr > /tmp/kr_src.kr
-          ./build/krc2 --arch=x86_64 /tmp/kr_src.kr -o /tmp/kr
+          cat src/bcj.kr src/runner.kr > /tmp/mlr_src.kr
+          ./build/mlrc --arch=x86_64 /tmp/mlr_src.kr -o /tmp/kr
           chmod +x /tmp/kr
 
           # Compile a test program to fat binary
-          echo 'fn main() { println("kr runner works!"); exit(42) }' > /tmp/kr_test.kr
-          ./build/krc2 /tmp/kr_test.kr -o /tmp/kr_test.krbo
+          echo 'fn main() { println("kr runner works!"); exit(42) }' > /tmp/mlr_test.kr
+          ./build/mlrc /tmp/mlr_test.kr -o /tmp/mlr_test.krbo
 
           # Run via kr runner — should extract x86_64 slice and execute
           set +e
-          OUTPUT=$(/tmp/kr /tmp/kr_test.krbo 2>&1)
+          OUTPUT=$(/tmp/kr /tmp/mlr_test.krbo 2>&1)
           CODE=$?
           set -e
           echo "kr output: $OUTPUT"
@@ -299,14 +299,14 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: krc-linux-x86_64
-          path: build/krc2
+          name: mlrc-linux-x86_64
+          path: build/mlrc
 
       - name: Upload Linux ARM64 krc (for native job)
         uses: actions/upload-artifact@v4
         with:
-          name: krc-linux-arm64
-          path: /tmp/krc-arm64
+          name: mlrc-linux-arm64
+          path: /tmp/mlrc-arm64
 
       - name: Upload cross-compiled binaries
         uses: actions/upload-artifact@v4
@@ -327,16 +327,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download freshly built krc-linux-arm64
+      - name: Download freshly built mlrc-linux-arm64
         uses: actions/download-artifact@v4
         with:
-          name: krc-linux-arm64
+          name: mlrc-linux-arm64
           path: build/
 
-      - name: Download krc.krbo + kr runners
+      - name: Download mlrc.krbo + kr runners
         uses: actions/download-artifact@v4
         with:
-          name: krc-fatbinary
+          name: mlrift-fatbinary
           path: /tmp/fatbin
 
       - name: Self-compile + tests (everything to debug-kit)
@@ -353,8 +353,8 @@ jobs:
           cat /proc/cpuinfo | head -20 || true
           echo
 
-          echo "=== bootstrap krc-linux-arm64 (just cross-compiled by build-test) ==="
-          mv build/krc-arm64 build/krc-bootstrap
+          echo "=== bootstrap mlrc-linux-arm64 (just cross-compiled by build-test) ==="
+          mv build/mlrc-arm64 build/krc-bootstrap
           chmod +x build/krc-bootstrap
           ls -la build/krc-bootstrap
           file build/krc-bootstrap
@@ -364,34 +364,34 @@ jobs:
           echo "=== concatenate source ==="
           cat src/lexer.kr src/ast.kr src/parser.kr src/codegen.kr src/codegen_aarch64.kr \
               src/ir.kr src/ir_aarch64.kr src/format_macho.kr src/format_pe.kr src/format_archive.kr src/format_android.kr \
-              src/bcj.kr src/analysis.kr src/living.kr src/runtime.kr src/formatter.kr src/main.kr > build/krc.kr
-          wc -l build/krc.kr
+              src/bcj.kr src/analysis.kr src/living.kr src/runtime.kr src/formatter.kr src/main.kr > build/mlrc.kr
+          wc -l build/mlrc.kr
           echo
 
           echo "=== self-compile pass 1 ==="
-          timeout 120 ./build/krc-bootstrap --arch=arm64 build/krc.kr -o build/krc2
+          timeout 120 ./build/krc-bootstrap --arch=arm64 build/mlrc.kr -o build/mlrc
           SC1=$?
-          chmod +x build/krc2 2>/dev/null
-          ls -la build/krc2 2>/dev/null
+          chmod +x build/mlrc 2>/dev/null
+          ls -la build/mlrc 2>/dev/null
           echo "pass 1 exit=$SC1"
           echo
 
-          echo "=== self-compile pass 2 (krc2 compiles itself → krc3) ==="
-          timeout 120 ./build/krc2 --arch=arm64 build/krc.kr -o build/krc3
+          echo "=== self-compile pass 2 (krc2 compiles itself → mlrc3) ==="
+          timeout 120 ./build/mlrc --arch=arm64 build/mlrc.kr -o build/mlrc3
           SC2=$?
-          chmod +x build/krc3 2>/dev/null
+          chmod +x build/mlrc3 2>/dev/null
           echo "pass 2 exit=$SC2"
           echo
 
-          echo "=== self-compile pass 3 (krc3 compiles itself → krc4) ==="
-          timeout 120 ./build/krc3 --arch=arm64 build/krc.kr -o build/krc4
+          echo "=== self-compile pass 3 (mlrc3 compiles itself → mlrc4) ==="
+          timeout 120 ./build/mlrc3 --arch=arm64 build/mlrc.kr -o build/mlrc4
           SC3=$?
-          chmod +x build/krc4 2>/dev/null
+          chmod +x build/mlrc4 2>/dev/null
           echo "pass 3 exit=$SC3"
           echo
 
-          echo "=== bootstrap fixed-point check (krc3 ?= krc4) ==="
-          if cmp build/krc3 build/krc4 2>/dev/null; then
+          echo "=== bootstrap fixed-point check (mlrc3 ?= mlrc4) ==="
+          if cmp build/mlrc3 build/mlrc4 2>/dev/null; then
             echo "FIXED POINT OK"
             BSEXIT=0
           else
@@ -401,10 +401,10 @@ jobs:
           echo
 
           echo "=== test suite ==="
-          echo '#!/bin/bash' > /tmp/krc-test
-          echo 'exec ./build/krc3 --arch=arm64 "$@"' >> /tmp/krc-test
-          chmod +x /tmp/krc-test
-          KRC=/tmp/krc-test bash tests/run_tests.sh
+          echo '#!/bin/bash' > /tmp/mlrc-test
+          echo 'exec ./build/mlrc3 --arch=arm64 "$@"' >> /tmp/mlrc-test
+          chmod +x /tmp/mlrc-test
+          KRC=/tmp/mlrc-test bash tests/run_tests.sh
           TESTEXIT=$?
           echo
           echo "=== SUMMARY ==="
@@ -423,11 +423,11 @@ jobs:
 
           echo
           echo "=== fat-binary krc via kr runner (native arm64) ==="
-          chmod +x /tmp/fatbin/kr-runners/kr-linux-arm64
-          /tmp/fatbin/kr-runners/kr-linux-arm64 /tmp/fatbin/krc.krbo --version
+          chmod +x /tmp/fatbin/mlr-runners/mlr-linux-arm64
+          /tmp/fatbin/mlr-runners/mlr-linux-arm64 /tmp/fatbin/mlrc.krbo --version
           FB_VER=$?
           echo 'fn main() { println("fb-arm64-ok"); exit(42) }' > /tmp/fb_test.kr
-          /tmp/fatbin/kr-runners/kr-linux-arm64 /tmp/fatbin/krc.krbo --arch=arm64 /tmp/fb_test.kr -o /tmp/fb_test
+          /tmp/fatbin/mlr-runners/mlr-linux-arm64 /tmp/fatbin/mlrc.krbo --arch=arm64 /tmp/fb_test.kr -o /tmp/fb_test
           FB_CC=$?
           /tmp/fb_test 2>&1
           FB_RUN=$?
@@ -472,38 +472,38 @@ jobs:
           name: cross-compiled
           path: /tmp/bins
 
-      - name: Download krc.krbo + kr runners
+      - name: Download mlrc.krbo + kr runners
         uses: actions/download-artifact@v4
         with:
-          name: krc-fatbinary
+          name: mlrift-fatbinary
           path: /tmp/fatbin
 
-      - name: Fat-binary krc via kr runner (macOS ARM64 native + x86_64 Rosetta)
+      - name: Fat-binary mlrc via kr runner (macOS ARM64 native + x86_64 Rosetta)
         continue-on-error: true
         run: |
           set +e
-          KRBO=/tmp/fatbin/krc.krbo
-          chmod +x /tmp/fatbin/kr-runners/kr-macos-arm64 /tmp/fatbin/kr-runners/kr-macos-x86_64
+          KRBO=/tmp/fatbin/mlrc.krbo
+          chmod +x /tmp/fatbin/mlr-runners/mlr-macos-arm64 /tmp/fatbin/mlr-runners/mlr-macos-x86_64
 
           # macOS arm64 host native path
-          echo "=== macOS arm64 native: kr -> krc.krbo -> arm64 krc slice ==="
-          /tmp/fatbin/kr-runners/kr-macos-arm64 "$KRBO" --version
+          echo "=== macOS arm64 native: kr -> mlrc.krbo -> arm64 krc slice ==="
+          /tmp/fatbin/mlr-runners/mlr-macos-arm64 "$KRBO" --version
           V_ARM_EXIT=$?
           echo "exit: $V_ARM_EXIT"
 
           echo 'fn main() { exit(42) }' > /tmp/fbtest.kr
-          /tmp/fatbin/kr-runners/kr-macos-arm64 "$KRBO" --target=macos --arch=arm64 /tmp/fatbin/../fbtest.kr -o /tmp/fbtest_out 2>&1 || true
+          /tmp/fatbin/mlr-runners/mlr-macos-arm64 "$KRBO" --target=macos --arch=arm64 /tmp/fatbin/../fbtest.kr -o /tmp/fbtest_out 2>&1 || true
           # Some runners fall back via tmp dir relative to cwd
           ls -la /tmp/fbtest_out 2>/dev/null || true
 
           # macOS x86_64 via Rosetta
-          echo "=== macOS x86_64 (Rosetta): kr -> krc.krbo -> x86_64 krc slice ==="
-          arch -x86_64 /tmp/fatbin/kr-runners/kr-macos-x86_64 "$KRBO" --version
+          echo "=== macOS x86_64 (Rosetta): kr -> mlrc.krbo -> x86_64 krc slice ==="
+          arch -x86_64 /tmp/fatbin/mlr-runners/mlr-macos-x86_64 "$KRBO" --version
           V_X64_EXIT=$?
           echo "exit: $V_X64_EXIT"
 
           if [ "$V_ARM_EXIT" = "0" ] || [ "$V_X64_EXIT" = "0" ]; then
-            echo "PASS: at least one macOS slice accepts kr -> krc.krbo --version"
+            echo "PASS: at least one macOS slice accepts kr -> mlrc.krbo --version"
           else
             echo "FAIL: neither macOS slice printed version"
           fi
@@ -526,14 +526,14 @@ jobs:
           set +e; /tmp/ref_arm64; REF_EXIT=$?; set -e
           echo "Reference (with libSystem): exit=$REF_EXIT"
 
-          # Test KernRift binary (disable set -e to capture exit codes)
+          # Test MLRift binary (disable set -e to capture exit codes)
           chmod +x /tmp/bins/cross-macos-arm
           # LC_UNIXTHREAD binaries don't need codesign (kernel handles directly)
           set +e
           /tmp/bins/cross-macos-arm
           KR_EXIT=$?
           set -e
-          echo "KernRift ARM64: exit=$KR_EXIT"
+          echo "MLRift ARM64: exit=$KR_EXIT"
 
           # Test x86_64 via Rosetta
           chmod +x /tmp/bins/cross-macos-x64
@@ -541,7 +541,7 @@ jobs:
           arch -x86_64 /tmp/bins/cross-macos-x64
           X64_EXIT=$?
           set -e
-          echo "KernRift x86_64 Rosetta: exit=$X64_EXIT"
+          echo "MLRift x86_64 Rosetta: exit=$X64_EXIT"
 
           # Verdict
           FAIL=0
@@ -551,12 +551,12 @@ jobs:
 
       - name: Self-compile on macOS (ARM64 native)
         run: |
-          chmod +x /tmp/fatbin/kr-runners/kr-macos-arm64
+          chmod +x /tmp/fatbin/mlr-runners/mlr-macos-arm64
           # Verify kr runner works
-          /tmp/fatbin/kr-runners/kr-macos-arm64 --version
+          /tmp/fatbin/mlr-runners/mlr-macos-arm64 --version
           # krc via fat binary: compile a test program
           echo 'fn main() { exit(42) }' > /tmp/sc_test.kr
-          /tmp/fatbin/kr-runners/kr-macos-arm64 /tmp/fatbin/krc.krbo --arch=arm64 --emit=macho /tmp/sc_test.kr -o /tmp/sc_test_mac
+          /tmp/fatbin/mlr-runners/mlr-macos-arm64 /tmp/fatbin/mlrc.krbo --arch=arm64 --emit=macho /tmp/sc_test.kr -o /tmp/sc_test_mac
           chmod +x /tmp/sc_test_mac
           # Run the self-compiled binary
           set +e; /tmp/sc_test_mac; CODE=$?; set -e
@@ -566,53 +566,53 @@ jobs:
       - name: Full krc self-host fixed point on macOS ARM64 (native)
         run: |
           # Extract the macOS arm64 slice and compile the full compiler
-          # source with it — the real self-host test. krc3 is the fat-
-          # extracted binary; krc4 is krc3 compiling krc-source.kr; krc5
-          # is krc4 doing the same. krc4 must equal krc5 byte-for-byte
+          # source with it — the real self-host test. mlrc3 is the fat-
+          # extracted binary; mlrc4 is mlrc3 compiling mlrc-source.kr; mlrc5
+          # is mlrc4 doing the same. mlrc4 must equal mlrc5 byte-for-byte
           # (the fixed point). Catches arm64-native codegen divergence
           # that a 10-line exit(42) test can't see.
-          chmod +x /tmp/fatbin/kr-runners/kr-macos-arm64
-          cp /tmp/fatbin/krc-source.kr /tmp/krc-source.kr
-          /tmp/fatbin/kr-runners/kr-macos-arm64 /tmp/fatbin/krc.krbo --arch=arm64 --emit=macho /tmp/krc-source.kr -o /tmp/krc4
-          chmod +x /tmp/krc4
-          /tmp/krc4 --arch=arm64 --emit=macho /tmp/krc-source.kr -o /tmp/krc5
-          chmod +x /tmp/krc5
-          if cmp -s /tmp/krc4 /tmp/krc5; then
-            echo "PASS: macOS ARM64 fixed point ($(wc -c < /tmp/krc4) bytes)"
+          chmod +x /tmp/fatbin/mlr-runners/mlr-macos-arm64
+          cp /tmp/fatbin/mlrc-source.kr /tmp/mlrc-source.kr
+          /tmp/fatbin/mlr-runners/mlr-macos-arm64 /tmp/fatbin/mlrc.krbo --arch=arm64 --emit=macho /tmp/mlrc-source.kr -o /tmp/mlrc4
+          chmod +x /tmp/mlrc4
+          /tmp/mlrc4 --arch=arm64 --emit=macho /tmp/mlrc-source.kr -o /tmp/mlrc5
+          chmod +x /tmp/mlrc5
+          if cmp -s /tmp/mlrc4 /tmp/mlrc5; then
+            echo "PASS: macOS ARM64 fixed point ($(wc -c < /tmp/mlrc4) bytes)"
           else
-            echo "FAIL: macOS ARM64 fixed point — krc4 ($(wc -c < /tmp/krc4)) != krc5 ($(wc -c < /tmp/krc5))"
+            echo "FAIL: macOS ARM64 fixed point — mlrc4 ($(wc -c < /tmp/mlrc4)) != mlrc5 ($(wc -c < /tmp/mlrc5))"
             exit 1
           fi
-          # Sanity: krc5 should compile a trivial program the same way as krc4
+          # Sanity: mlrc5 should compile a trivial program the same way as mlrc4
           echo 'fn main() { exit(77) }' > /tmp/fp_test.kr
-          /tmp/krc5 --arch=arm64 --emit=macho /tmp/fp_test.kr -o /tmp/fp_out
+          /tmp/mlrc5 --arch=arm64 --emit=macho /tmp/fp_test.kr -o /tmp/fp_out
           chmod +x /tmp/fp_out
           set +e; /tmp/fp_out; CODE=$?; set -e
-          [ "$CODE" -eq 77 ] && echo "PASS: macOS ARM64 krc5 runs" || { echo "FAIL: krc5 run (got $CODE)"; exit 1; }
+          [ "$CODE" -eq 77 ] && echo "PASS: macOS ARM64 mlrc5 runs" || { echo "FAIL: mlrc5 run (got $CODE)"; exit 1; }
 
       - name: Fat-binary self-host determinism on macOS ARM64
         run: |
-          # kr runner extracts the macOS arm64 slice from krc.krbo,
-          # which then compiles krc-source.kr into a NEW fat bundle
-          # (krc2.krbo — 8 slices compressed together). A second pass
-          # with krc2.krbo must produce krc3.krbo byte-equal to
-          # krc2.krbo. This catches compile_fat non-determinism
+          # kr runner extracts the macOS arm64 slice from mlrc.krbo,
+          # which then compiles mlrc-source.kr into a NEW fat bundle
+          # (mlrc2.krbo — 8 slices compressed together). A second pass
+          # with mlrc2.krbo must produce mlrc3.krbo byte-equal to
+          # mlrc2.krbo. This catches compile_fat non-determinism
           # specific to the macOS arm64 compiler slice: BCJ filter
           # state leakage, LZ-Rift hash-table drift, ordering of
           # static-fixup resolution, etc. Slice-level fixed point
           # (above) already covers the native-emitter deterministic
           # output; this covers the fat container around it.
-          chmod +x /tmp/fatbin/kr-runners/kr-macos-arm64
-          /tmp/fatbin/kr-runners/kr-macos-arm64 /tmp/fatbin/krc.krbo /tmp/fatbin/krc-source.kr -o /tmp/krc2.krbo
-          /tmp/fatbin/kr-runners/kr-macos-arm64 /tmp/krc2.krbo /tmp/fatbin/krc-source.kr -o /tmp/krc3.krbo
-          s2=$(wc -c < /tmp/krc2.krbo)
-          s3=$(wc -c < /tmp/krc3.krbo)
-          if cmp -s /tmp/krc2.krbo /tmp/krc3.krbo; then
+          chmod +x /tmp/fatbin/mlr-runners/mlr-macos-arm64
+          /tmp/fatbin/mlr-runners/mlr-macos-arm64 /tmp/fatbin/mlrc.krbo /tmp/fatbin/mlrc-source.kr -o /tmp/mlrc2.krbo
+          /tmp/fatbin/mlr-runners/mlr-macos-arm64 /tmp/mlrc2.krbo /tmp/fatbin/mlrc-source.kr -o /tmp/mlrc3.krbo
+          s2=$(wc -c < /tmp/mlrc2.krbo)
+          s3=$(wc -c < /tmp/mlrc3.krbo)
+          if cmp -s /tmp/mlrc2.krbo /tmp/mlrc3.krbo; then
             echo "PASS: macOS ARM64 fat self-host determinism ($s2 bytes)"
           else
-            echo "FAIL: macOS ARM64 fat self-host — krc2.krbo ($s2) != krc3.krbo ($s3)"
+            echo "FAIL: macOS ARM64 fat self-host — mlrc2.krbo ($s2) != mlrc3.krbo ($s3)"
             # Show which byte first diverges for diagnosis
-            cmp /tmp/krc2.krbo /tmp/krc3.krbo || true
+            cmp /tmp/mlrc2.krbo /tmp/mlrc3.krbo || true
             exit 1
           fi
 
@@ -630,10 +630,10 @@ jobs:
           name: cross-compiled
           path: C:\tmp\bins
 
-      - name: Download krc.krbo + kr runners
+      - name: Download mlrc.krbo + kr runners
         uses: actions/download-artifact@v4
         with:
-          name: krc-fatbinary
+          name: mlrift-fatbinary
           path: C:\tmp\fatbin
 
       - name: Run Windows x86_64 binary
@@ -646,12 +646,12 @@ jobs:
           Write-Host "PASS: Windows x86_64 exit(42)"
           exit 0
 
-      - name: Fat-binary krc via kr runner (Windows x86_64)
+      - name: Fat-binary mlrc via kr runner (Windows x86_64)
         shell: pwsh
         continue-on-error: true
         run: |
-          $kr  = "C:\tmp\fatbin\kr-runners\kr-windows-x86_64.exe"
-          $krbo = "C:\tmp\fatbin\krc.krbo"
+          $kr  = "C:\tmp\fatbin\mlr-runners\mlr-windows-x86_64.exe"
+          $krbo = "C:\tmp\fatbin\mlrc.krbo"
           Write-Host "=== kr --version ==="
           & $kr $krbo --version
           $exit1 = $LASTEXITCODE
@@ -676,18 +676,18 @@ jobs:
           name: cross-compiled
           path: C:\tmp\bins
 
-      - name: Download krc.krbo + kr runners
+      - name: Download mlrc.krbo + kr runners
         uses: actions/download-artifact@v4
         with:
-          name: krc-fatbinary
+          name: mlrift-fatbinary
           path: C:\tmp\fatbin
 
-      - name: Fat-binary krc via kr runner (Windows ARM64)
+      - name: Fat-binary mlrc via kr runner (Windows ARM64)
         shell: pwsh
         continue-on-error: true
         run: |
-          $kr  = "C:\tmp\fatbin\kr-runners\kr-windows-arm64.exe"
-          $krbo = "C:\tmp\fatbin\krc.krbo"
+          $kr  = "C:\tmp\fatbin\mlr-runners\mlr-windows-arm64.exe"
+          $krbo = "C:\tmp\fatbin\mlrc.krbo"
           Write-Host "=== kr --version ==="
           & $kr $krbo --version
           $exit1 = $LASTEXITCODE
@@ -726,7 +726,7 @@ jobs:
 
       - name: Source stats
         run: |
-          echo "=== KernRift Self-Hosted Compiler ==="
+          echo "=== MLRift Self-Hosted Compiler ==="
           wc -l src/*.kr
           echo "---"
           echo "Total: $(cat src/*.kr | wc -l) lines"

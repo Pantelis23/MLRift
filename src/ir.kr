@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler — SSA IR infrastructure
+// MLRift — built on KernRift — SSA IR infrastructure
 //
 // Arena-based intermediate representation for SSA-form optimisation passes.
 //

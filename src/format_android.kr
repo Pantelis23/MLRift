@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler — Android PIE ELF output format
+// MLRift — built on KernRift — Android PIE ELF output format
 //
 // PIE ELF for Android (ARM64 and x86_64). Minimal dynamic linking structures.
 // Both arches share the same layout — only e_machine differs.

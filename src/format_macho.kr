@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler — Mach-O output format
+// MLRift — built on KernRift — Mach-O output format
 //
 // x86_64: Uses LC_UNIXTHREAD for direct kernel entry (no dyld dependency).
 // ARM64:  Uses LC_UNIXTHREAD for direct kernel entry (no dyld dependency).

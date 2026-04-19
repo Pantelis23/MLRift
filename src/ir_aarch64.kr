@@ -1,4 +1,4 @@
-// KernRift self-hosted compiler -- AArch64 IR backend
+// MLRift -- built on KernRift -- AArch64 IR backend
 //
 // Emits ARM64 machine code from the shared SSA IR infrastructure (ir.kr).
 // Uses the graph-colouring register allocator with 10 callee-saved registers
