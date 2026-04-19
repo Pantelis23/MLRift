@@ -2484,13 +2484,17 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
             si_dyn = si_dyn + 1
         }
 
-        // libc is the only DT_NEEDED lib for now — later GPU bindings
-        // (libamdhip64.so.7) will need a multi-lib flow.
-        uint64 lib_dyn = "libc.so.6"
-        uint64 lib_len_dyn = 9
+        // Build a lib list (for now: just libc.so.6). M2b.2+ will add
+        // more entries as other `@dynamic` sources land (libamdhip64,
+        // etc.); the API already accepts a packed list.
+        uint64 lib_list = alloc(1 * 16)
+        uint64 libc_s = "libc.so.6"
+        unsafe { *((lib_list + 0) as uint64) = libc_s }
+        uint64 libc_l = 9
+        unsafe { *((lib_list + 8) as uint64) = libc_l }
 
         // Pass 1: compute layout so va_text + plt_va(i) are known.
-        edyn_compute_dyn_layout_for(lib_dyn, lib_len_dyn, sym_list, nsym, text_len_dyn)
+        edyn_compute_dyn_layout_for(lib_list, 1, sym_list, nsym, text_len_dyn)
 
         // Pass 2: patch recorded @dynamic call sites. text_ptr must
         // point at the start of .text (not at out_buf[0]) so the
@@ -2502,7 +2506,7 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
 
         // Pass 3: emit the dynamic ELF into edyn_buf.
         uint64 text_ptr_dyn = cg_buf + text_start_dyn
-        uint64 elf_size = emit_dynamic_elf(lib_dyn, lib_len_dyn,
+        uint64 elf_size = emit_dynamic_elf(lib_list, 1,
                                             sym_list, nsym,
                                             text_ptr_dyn, text_len_dyn,
                                             entry_off_dyn)

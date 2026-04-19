@@ -1,0 +1,68 @@
+// MLRift -- built on KernRift -- @dynamic symbol registry (compiler-only)
+//
+// Holds the token-keyed name table populated by parser.kr whenever a
+// `@dynamic extern fn` declaration is seen, plus the lookup helper
+// codegen uses to detect @dynamic calls at Call-emission time.
+//
+// This lives in its own file (and not in src/format_elf_dyn.kr) because
+// dyn_sym_lookup calls into codegen's `tok_text_eq`, which depends on
+// the compiler-wide source/tokens globals. format_elf_dyn is reusable
+// from user programs via `import`; it can't reach those globals. By
+// splitting the registry out, user programs importing format_elf_dyn
+// don't accidentally drag in unresolved compiler-internal references.
+
+static uint64 DYN_SYM_MAX     = 64
+static uint64 dyn_sym_tokens  = 0
+static uint64 dyn_sym_count   = 0
+
+fn dyn_sym_init() {
+    if dyn_sym_tokens == 0 {
+        dyn_sym_tokens = alloc(DYN_SYM_MAX * 4)
+    }
+    dyn_sym_count = 0
+}
+
+@export
+fn dyn_sym_register(uint64 name_tok) -> uint64 {
+    if dyn_sym_tokens == 0 { dyn_sym_init() }
+    if dyn_sym_count >= DYN_SYM_MAX {
+        write(2, "dyn_sym_registry: too many @dynamic symbols (>64)\n", 50)
+        exit(1)
+    }
+    uint64 slot = dyn_sym_tokens + dyn_sym_count * 4
+    uint32 nt32 = name_tok
+    unsafe { *(slot as uint32) = nt32 }
+    uint64 idx = dyn_sym_count
+    dyn_sym_count = dyn_sym_count + 1
+    return idx
+}
+
+@export
+fn dyn_sym_count_get() -> uint64 {
+    return dyn_sym_count
+}
+
+@export
+fn dyn_sym_tok_at(uint64 idx) -> uint32 {
+    uint64 p = dyn_sym_tokens + idx * 4
+    uint32 v = 0
+    unsafe { *(p as uint32) -> v }
+    return v
+}
+
+// Search for a token by text equivalence (not by numeric token idx).
+// Returns slot_idx if found, 0xFFFFFFFF otherwise. Codegen calls this
+// at Call lowering to detect @dynamic-shadowed callees.
+@export
+fn dyn_sym_lookup(uint64 name_tok) -> uint64 {
+    uint64 i = 0
+    while i < dyn_sym_count {
+        uint64 slot = dyn_sym_tokens + i * 4
+        uint32 stored = 0
+        unsafe { *(slot as uint32) -> stored }
+        uint64 ws = stored
+        if tok_text_eq(ws, name_tok) != 0 { return i }
+        i = i + 1
+    }
+    return 0xFFFFFFFF
+}

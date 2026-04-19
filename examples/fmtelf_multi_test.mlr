@@ -1,0 +1,75 @@
+// MLRift — M2b.1 multi-lib DT_NEEDED test for format_elf_dyn.
+//
+// Drives emit_dynamic_elf with two libraries (libc.so.6 + libdl.so.2)
+// while keeping the hello-puts symbol + text payload unchanged.
+// Output should still print "hello" — the second NEEDED lib is just
+// loaded alongside and its symbols aren't resolved because nothing
+// calls them.
+//
+// Verification:
+//   mlrc examples/fmtelf_multi_test.mlr -o /tmp/fmtelf_multi
+//   /tmp/fmtelf_multi /tmp/multi_out
+//   readelf -d /tmp/multi_out | grep NEEDED
+//     → two entries: libc.so.6 and libdl.so.2
+//   /tmp/multi_out   # still prints "hello" (via libc's puts)
+
+import "../src/format_elf_dyn.kr"
+
+static uint64 cli_argc = 0
+static uint64 cli_argv = 0
+
+fn main() {
+    uint64 out_path = "/tmp/fmtelf_multi"
+    if cli_argc >= 2 {
+        uint64 slot = cli_argv + 8
+        uint64 v = 0
+        unsafe { *(slot as uint64) -> v }
+        out_path = v
+    }
+
+    // lib_list[2]: libc.so.6 + libdl.so.2
+    uint64 lib_list = alloc(2 * 16)
+    uint64 libc_s = "libc.so.6"
+    unsafe { *((lib_list +  0) as uint64) = libc_s }
+    uint64 libc_l = 9
+    unsafe { *((lib_list +  8) as uint64) = libc_l }
+    uint64 libdl_s = "libdl.so.2"
+    unsafe { *((lib_list + 16) as uint64) = libdl_s }
+    uint64 libdl_l = 10
+    unsafe { *((lib_list + 24) as uint64) = libdl_l }
+
+    // sym_list[2]: puts + exit (both resolved from libc)
+    uint64 sym_list = alloc(2 * 16)
+    uint64 puts_s = "puts"
+    unsafe { *((sym_list +  0) as uint64) = puts_s }
+    uint64 psl = 4
+    unsafe { *((sym_list +  8) as uint64) = psl }
+    uint64 exit_s = "exit"
+    unsafe { *((sym_list + 16) as uint64) = exit_s }
+    uint64 esl = 4
+    unsafe { *((sym_list + 24) as uint64) = esl }
+
+    // Reuse the hello-puts text builder from format_elf_dyn.
+    uint64 text_buf = alloc(64)
+    edyn_build_hello_text(text_buf)
+
+    uint64 size = emit_dynamic_elf(lib_list, 2,
+                                    sym_list, 2,
+                                    text_buf, 29,
+                                    0)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "fmtelf_multi: open failed\n", 26)
+        exit(1)
+    }
+    file_write(fd, edyn_buf_ptr(), size)
+    file_close(fd)
+    set_executable(out_path)
+
+    write(1, "wrote ", 6)
+    uint64 n = str_len(out_path)
+    write(1, out_path, n)
+    write(1, "\n", 1)
+    exit(0)
+}

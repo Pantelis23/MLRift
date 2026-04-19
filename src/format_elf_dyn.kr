@@ -19,69 +19,10 @@
 //   M2a.4   — driver: route exe output through here when registry
 //             is non-empty
 
-// ---------------------------------------------------------------------------
-// Dynamic-symbol registry
-// ---------------------------------------------------------------------------
-// Populated from parser.kr whenever an `@dynamic extern fn` declaration
-// is seen. Storage is the raw name-token index so codegen can resolve
-// the symbol's source text at call-site emission time.
-
-static uint64 DYN_SYM_MAX     = 64
-static uint64 dyn_sym_tokens  = 0
-static uint64 dyn_sym_count   = 0
-
-fn dyn_sym_init() {
-    if dyn_sym_tokens == 0 {
-        dyn_sym_tokens = alloc(DYN_SYM_MAX * 4)
-    }
-    dyn_sym_count = 0
-}
-
-@export
-fn dyn_sym_register(uint64 name_tok) -> uint64 {
-    if dyn_sym_tokens == 0 { dyn_sym_init() }
-    if dyn_sym_count >= DYN_SYM_MAX {
-        write(2, "format_elf_dyn: too many @dynamic symbols (>64)\n", 48)
-        exit(1)
-    }
-    uint64 slot = dyn_sym_tokens + dyn_sym_count * 4
-    uint32 nt32 = name_tok
-    unsafe { *(slot as uint32) = nt32 }
-    uint64 idx = dyn_sym_count
-    dyn_sym_count = dyn_sym_count + 1
-    return idx
-}
-
-@export
-fn dyn_sym_count_get() -> uint64 {
-    return dyn_sym_count
-}
-
-@export
-fn dyn_sym_tok_at(uint64 idx) -> uint32 {
-    uint64 p = dyn_sym_tokens + idx * 4
-    uint32 v = 0
-    unsafe { *(p as uint32) -> v }
-    return v
-}
-
-// Look up a token-named symbol in the registry.
-// Returns slot_idx (0..count-1) if found, 0xFFFFFFFF if not. Called from
-// codegen at call-site lowering to detect whether a callee is a
-// @dynamic extern (→ route through PLT) or an ordinary extern/local fn.
-@export
-fn dyn_sym_lookup(uint64 name_tok) -> uint64 {
-    uint64 i = 0
-    while i < dyn_sym_count {
-        uint64 slot = dyn_sym_tokens + i * 4
-        uint32 stored = 0
-        unsafe { *(slot as uint32) -> stored }
-        uint64 ws = stored
-        if tok_text_eq(ws, name_tok) != 0 { return i }
-        i = i + 1
-    }
-    return 0xFFFFFFFF
-}
+// The @dynamic symbol registry (dyn_sym_register / dyn_sym_lookup /
+// dyn_sym_count_get / dyn_sym_tok_at) lives in src/dyn_sym_registry.kr
+// because it needs codegen's tok_text_eq. This file stays importable
+// by user programs that want to call emit_dynamic_elf directly.
 
 // ---------------------------------------------------------------------------
 // Dynamic-call-site table (M2a.3.b)
@@ -265,15 +206,19 @@ static uint64 EDYN_OFF_PLT     = 0x1000
 static uint64 EDYN_OFF_GOTPLT  = 0x2000
 static uint64 EDYN_VA_PLT      = 0x401000
 static uint64 EDYN_VA_GOTPLT   = 0x402000
-static uint64 EDYN_N_DYN       = 11            // DT entries incl. NULL
+
+// .dynamic carries 10 fixed entries (STRTAB, STRSZ, SYMTAB, SYMENT,
+// HASH, PLTGOT, PLTRELSZ, PLTREL, JMPREL, NULL) plus one DT_NEEDED
+// per linked library. Total = 10 + lib_count.
+static uint64 EDYN_N_DYN_FIXED = 10
 
 // ---------------------------------------------------------------------------
 // Emission state (inputs + derived layout)
 // ---------------------------------------------------------------------------
 
 // Inputs (set by emit_dynamic_elf at entry)
-static uint64 edyn_in_lib_ptr     = 0
-static uint64 edyn_in_lib_len     = 0
+static uint64 edyn_in_lib_list    = 0    // (name_ptr(u64), name_len(u64)) × count
+static uint64 edyn_in_lib_count   = 0
 static uint64 edyn_in_sym_list    = 0    // (name_ptr(u64), name_len(u64)) × count
 static uint64 edyn_in_sym_count   = 0
 static uint64 edyn_in_text_ptr    = 0
@@ -309,6 +254,48 @@ static uint64 edyn_va_dynamic     = 0
 static uint64 edyn_va_text        = 0
 
 // ---------------------------------------------------------------------------
+// Library-list accessors (16 bytes per entry: name_ptr + name_len)
+// ---------------------------------------------------------------------------
+
+fn edyn_lib_name(uint64 i) -> uint64 {
+    uint64 p = edyn_in_lib_list + i * 16
+    uint64 v = 0
+    unsafe { *(p as uint64) -> v }
+    return v
+}
+
+fn edyn_lib_len(uint64 i) -> uint64 {
+    uint64 p = edyn_in_lib_list + i * 16 + 8
+    uint64 v = 0
+    unsafe { *(p as uint64) -> v }
+    return v
+}
+
+// Dynstr offset where library i's null-terminated name starts.
+// Layout: sentinel (1) + lib[0]+null + lib[1]+null + ... + lib[i-1]+null.
+fn edyn_lib_dynstr_off(uint64 i) -> uint64 {
+    uint64 off = 1
+    uint64 k = 0
+    while k < i {
+        off = off + edyn_lib_len(k) + 1
+        k = k + 1
+    }
+    return off
+}
+
+// Sum of lib name sizes (incl. trailing nulls) — used to skip past the
+// library region when computing symbol dynstr offsets.
+fn edyn_libs_total_len() -> uint64 {
+    uint64 total = 0
+    uint64 k = 0
+    while k < edyn_in_lib_count {
+        total = total + edyn_lib_len(k) + 1
+        k = k + 1
+    }
+    return total
+}
+
+// ---------------------------------------------------------------------------
 // Symbol-list accessors (sym_list layout: 16 bytes per entry)
 // ---------------------------------------------------------------------------
 
@@ -327,9 +314,9 @@ fn edyn_sym_len(uint64 i) -> uint64 {
 }
 
 // Offset of symbol i's name within the emitted .dynstr section.
-// Layout: sentinel (1) + lib_name+null + sym[0]+null + ... + sym[i-1]+null.
+// Layout: sentinel (1) + libs + sym[0]+null + ... + sym[i-1]+null.
 fn edyn_sym_dynstr_off(uint64 i) -> uint64 {
-    uint64 off = 1 + edyn_in_lib_len + 1
+    uint64 off = 1 + edyn_libs_total_len()
     uint64 k = 0
     while k < i {
         off = off + edyn_sym_len(k) + 1
@@ -352,9 +339,10 @@ fn edyn_sym_got_va(uint64 i) -> uint64 {
 
 fn edyn_compute_layout() {
     uint64 n = edyn_in_sym_count
+    uint64 nl = edyn_in_lib_count
 
-    // .dynstr: sentinel + lib + syms (each + null)
-    uint64 dss = 1 + edyn_in_lib_len + 1
+    // .dynstr: sentinel + libs (each + null) + syms (each + null)
+    uint64 dss = 1 + edyn_libs_total_len()
     uint64 i = 0
     while i < n {
         dss = dss + edyn_sym_len(i) + 1
@@ -372,7 +360,7 @@ fn edyn_compute_layout() {
     edyn_off_relaplt  = edyn_off_hash + edyn_hash_size
     edyn_relaplt_size = 24 * n
     edyn_off_dynamic  = edyn_off_relaplt + edyn_relaplt_size
-    edyn_dynamic_size = 16 * EDYN_N_DYN
+    edyn_dynamic_size = 16 * (EDYN_N_DYN_FIXED + nl)
     edyn_size_r       = edyn_off_dynamic + edyn_dynamic_size
 
     edyn_plt_size  = 16 + 16 * n
@@ -479,8 +467,12 @@ fn edyn_write_interp() {
 
 fn edyn_write_dynstr() {
     edyn_byte(0)
-    edyn_bytes(edyn_in_lib_ptr, edyn_in_lib_len)
-    edyn_byte(0)
+    uint64 li = 0
+    while li < edyn_in_lib_count {
+        edyn_bytes(edyn_lib_name(li), edyn_lib_len(li))
+        edyn_byte(0)
+        li = li + 1
+    }
     uint64 i = 0
     while i < edyn_in_sym_count {
         edyn_bytes(edyn_sym_name(i), edyn_sym_len(i))
@@ -559,7 +551,13 @@ fn edyn_write_dyn(uint64 tag, uint64 val) {
 }
 
 fn edyn_write_dynamic() {
-    edyn_write_dyn(1,  1)                        // DT_NEEDED (lib at dynstr+1)
+    // One DT_NEEDED per library, each pointing at that library's
+    // dynstr offset.
+    uint64 li = 0
+    while li < edyn_in_lib_count {
+        edyn_write_dyn(1, edyn_lib_dynstr_off(li))   // DT_NEEDED
+        li = li + 1
+    }
     edyn_write_dyn(5,  edyn_va_dynstr)           // DT_STRTAB
     edyn_write_dyn(10, edyn_dynstr_size)         // DT_STRSZ
     edyn_write_dyn(6,  edyn_va_dynsym)           // DT_SYMTAB
@@ -649,11 +647,11 @@ fn edyn_write_gotplt() {
 // the per-symbol PLT vaddr is available to the patcher.
 
 @export
-fn edyn_compute_dyn_layout_for(uint64 lib_ptr, uint64 lib_len,
+fn edyn_compute_dyn_layout_for(uint64 lib_list_ptr, uint64 lib_count,
                                uint64 sym_list_ptr, uint64 sym_count,
                                uint64 text_len) {
-    edyn_in_lib_ptr   = lib_ptr
-    edyn_in_lib_len   = lib_len
+    edyn_in_lib_list  = lib_list_ptr
+    edyn_in_lib_count = lib_count
     edyn_in_sym_list  = sym_list_ptr
     edyn_in_sym_count = sym_count
     edyn_in_text_len  = text_len
@@ -713,7 +711,11 @@ fn edyn_patch_dyn_calls(uint64 text_ptr, uint64 code_off_base) {
 // Fill edyn_buf with a complete dynamic-ELF image.
 //
 // Parameters:
-//   lib_name_ptr / lib_name_len — DT_NEEDED library name (e.g. "libc.so.6")
+//   lib_list_ptr / lib_count    — packed (name_ptr, name_len) × N, 16 bytes
+//                                 per entry. Each becomes a DT_NEEDED entry.
+//                                 Loader searches all NEEDED libs for each
+//                                 symbol, so per-symbol library binding is
+//                                 implicit.
 //   sym_list_ptr / sym_count    — packed array: 16 bytes per entry, each
 //                                 (name_ptr: u64, name_len: u64). Order is
 //                                 preserved into .dynsym / .rela.plt / PLT.
@@ -725,7 +727,7 @@ fn edyn_patch_dyn_calls(uint64 text_ptr, uint64 code_off_base) {
 //
 // Returns: total byte count written (EDYN_FILE_END equivalent).
 @export
-fn emit_dynamic_elf(uint64 lib_name_ptr, uint64 lib_name_len,
+fn emit_dynamic_elf(uint64 lib_list_ptr, uint64 lib_count,
                     uint64 sym_list_ptr,  uint64 sym_count,
                     uint64 text_ptr,      uint64 text_len,
                     uint64 entry_off) -> uint64 {
@@ -733,9 +735,13 @@ fn emit_dynamic_elf(uint64 lib_name_ptr, uint64 lib_name_len,
         write(2, "format_elf_dyn: no dynamic symbols\n", 35)
         exit(1)
     }
+    if lib_count == 0 {
+        write(2, "format_elf_dyn: no DT_NEEDED libraries\n", 39)
+        exit(1)
+    }
 
-    edyn_in_lib_ptr   = lib_name_ptr
-    edyn_in_lib_len   = lib_name_len
+    edyn_in_lib_list  = lib_list_ptr
+    edyn_in_lib_count = lib_count
     edyn_in_sym_list  = sym_list_ptr
     edyn_in_sym_count = sym_count
     edyn_in_text_ptr  = text_ptr
@@ -778,6 +784,7 @@ fn emit_dynamic_elf(uint64 lib_name_ptr, uint64 lib_name_len,
 // These build the same 2-symbol + 29-byte text payload as
 // examples/elfgen.mlr and then call emit_dynamic_elf.
 
+@export
 fn edyn_build_hello_text(uint64 text_buf) {
     uint64 va_text = EDYN_VA_PLT + 16 + 2 * 16        // PLT0 + 2 entries
     uint64 va_plt_puts = EDYN_VA_PLT + 16
@@ -843,11 +850,16 @@ fn edyn_build_hello_text(uint64 text_buf) {
 
 @export
 fn emit_dynamic_elf_hello() -> uint64 {
-    uint64 lib = "libc.so.6"
-    uint64 puts_s = "puts"
-    uint64 exit_s = "exit"
+    // lib_list[1]: just libc.so.6
+    uint64 lib_list = alloc(1 * 16)
+    uint64 libc_s = "libc.so.6"
+    unsafe { *((lib_list + 0) as uint64) = libc_s }
+    uint64 libc_l = 9
+    unsafe { *((lib_list + 8) as uint64) = libc_l }
 
     // sym_list[2]: (ptr, len) pairs
+    uint64 puts_s = "puts"
+    uint64 exit_s = "exit"
     uint64 sym_list = alloc(2 * 16)
     unsafe { *((sym_list +  0) as uint64) = puts_s }
     uint64 vpl = 4
@@ -860,7 +872,7 @@ fn emit_dynamic_elf_hello() -> uint64 {
     uint64 text_buf = alloc(64)
     edyn_build_hello_text(text_buf)
 
-    return emit_dynamic_elf(lib, 9,
+    return emit_dynamic_elf(lib_list, 1,
                             sym_list, 2,
                             text_buf, 29,
                             0)
