@@ -139,6 +139,10 @@ static uint64 IR_DSB = 129          // data-sync barrier (ARM64 DSB SY; x86 MFEN
 static uint64 IR_DMB = 130          // data-memory barrier (ARM64 DMB ISH; x86 MFENCE)
 static uint64 IR_ARR_CHECK = 131    // bounds check: trap if s1_v (idx) >= imm (count)
 
+// GPU opcodes (140-147) live in `ir_hip.kr` — see docs/GPU_BACKEND.md.
+// The 132-139 gap is intentional: keeps the GPU family visually distinct
+// from CPU-side barrier/bounds ops.
+
 // ---------------------------------------------------------------------------
 // Instruction arena
 // ---------------------------------------------------------------------------
