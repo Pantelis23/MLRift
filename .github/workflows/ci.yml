@@ -16,23 +16,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download self-hosted compiler
+      - name: Build (self-compile from committed build/mlrc)
         run: |
-          mkdir -p build
-          # Download krc from pinned release — avoids CDN caching issues with /latest
-          curl -sL -o build/krc-bootstrap \
-            https://github.com/Pantelis23/MLRift/releases/download/v2.8.4/mlrc-linux-x86_64
-          chmod +x build/krc-bootstrap
-
-      - name: Build (self-compile)
-        run: |
+          chmod +x build/mlrc
           cat src/lexer.kr src/ast.kr src/parser.kr src/codegen.kr src/codegen_aarch64.kr \
               src/ir.kr src/ir_aarch64.kr src/format_macho.kr src/format_pe.kr src/format_archive.kr src/format_android.kr \
               src/bcj.kr src/analysis.kr src/living.kr src/runtime.kr src/formatter.kr src/main.kr > build/mlrc.kr
-          # Bootstrap: compile source with released krc (use --legacy for speed),
-          # then re-compile with itself (which uses IR by default)
-          ./build/krc-bootstrap --legacy --arch=x86_64 build/mlrc.kr -o build/mlrc
-          chmod +x build/mlrc
+          # MLRift ships the bootstrap binary in-tree (build/mlrc). Use it
+          # to self-compile, then overwrite with the freshly-compiled one
+          # so every CI run exercises an up-to-date binary.
           ./build/mlrc --arch=x86_64 build/mlrc.kr -o build/mlrc.stable
           mv build/mlrc.stable build/mlrc
           chmod +x build/mlrc
@@ -716,13 +708,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: No build artifacts tracked
+      - name: No stray build artifacts tracked
         run: |
-          if git ls-files -- 'build/*' 'dist/*' '*.krbo' 'a.out' | grep -q .; then
-            echo "ERROR: build artifacts are tracked"
+          # build/mlrc is the committed bootstrap — intentional. Everything
+          # else under build/ or dist/ shouldn't be in git.
+          STRAY=$(git ls-files -- 'build/*' 'dist/*' '*.krbo' 'a.out' | grep -v '^build/mlrc$' || true)
+          if [ -n "$STRAY" ]; then
+            echo "ERROR: unexpected build artifacts tracked:"
+            echo "$STRAY"
             exit 1
           fi
-          echo "Clean: no artifacts tracked"
+          echo "Clean: only build/mlrc is tracked (the committed bootstrap)"
 
       - name: Source stats
         run: |
