@@ -1,0 +1,34 @@
+// MLRift — GPU kernel end-to-end smoke test.
+//
+// Exercises the M1.5 body translator in src/format_hip.kr: VarDecl,
+// While, Compare, BinOp (+, *), Assign, Ident, IntLit, PtrStore.
+// The @kernel body compiles to real AMD GCN instructions via
+// `hipcc --genco`; inspect with `rocm-objdump -d <out>.co` to see
+// the kernel's disassembly.
+//
+// Host (for now): when run directly on the CPU the @kernel marker is
+// inert, so the function executes as normal KernRift code and main()
+// calls it single-threaded. The MLRift host-side kernel launch lands
+// in M2 once the dynamic-linking pieces are in place.
+//
+// Expected output: 42   (base 36 + 0+1+2+3 = 42)
+
+@kernel
+fn kernel_accumulate(uint64 out_ptr, uint64 base, uint64 count) {
+    uint64 sum = base
+    uint64 i = 0
+    while i < count {
+        sum = sum + i
+        i = i + 1
+    }
+    unsafe { *(out_ptr as uint64) = sum }
+}
+
+fn main() {
+    uint64 buf = alloc(8)
+    kernel_accumulate(buf, 36, 4)
+    uint64 v = 0
+    unsafe { *(buf as uint64) -> v }
+    println(v)
+    exit(0)
+}

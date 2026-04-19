@@ -2172,6 +2172,47 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
         exit(1)
     }
 
+    // GPU target: emit a `<output>.hip` side-file for every @kernel fn,
+    // then fork hipcc to compile it into a `.co` code object. The CPU
+    // binary is still produced (host side is hand-written C during
+    // phase 1 per docs/GPU_BACKEND.md).
+    if target_gpu != 0 {
+        uint64 hrc = emit_hip_artifacts(root, source, output_path)
+        if hrc == 1 {
+            write(2, "mlrc: --target=hip-amd but no @kernel functions found\n", 55)
+        } else if hrc == 2 {
+            write(2, "mlrc: failed to write HIP side-file\n", 36)
+            exit(1)
+        } else {
+            uint64 opl = str_len(output_path)
+            write(1, "wrote ", 6)
+            write(1, output_path, opl)
+            write(1, ".hip (", 6)
+            uint8[24] hbuf
+            uint64 hln = fmt_uint(hbuf, emit_hip_len())
+            write(1, hbuf, hln)
+            write(1, " bytes)\n", 8)
+
+            // Fork + run hipcc on the just-written .hip file.
+            uint64 cc = invoke_hipcc(output_path)
+            if cc == 0 {
+                write(1, "wrote ", 6)
+                write(1, output_path, opl)
+                write(1, ".co\n", 4)
+            } else if cc >= 1000 {
+                // invoke_hipcc already printed a diagnostic
+                exit(1)
+            } else {
+                write(2, "mlrc: hipcc exited with status ", 31)
+                uint8[24] cbuf
+                uint64 cln = fmt_uint(cbuf, cc)
+                write(2, cbuf, cln)
+                write(2, "\n", 1)
+                exit(1)
+            }
+        }
+    }
+
     // Dead code elimination: scan AST for reachable functions
     dce_init()
     dce_scan(root)
@@ -4212,7 +4253,11 @@ fn main() {
                 parse_targets_arg(arg + 10)
             } else if str_starts_with(arg, "--target=", 9) != 0 {
                 uint64 tgt_str = arg + 9
-                if str_starts_with(tgt_str, "macos", 5) != 0 {
+                if str_starts_with(tgt_str, "hip-amd", 7) != 0 {
+                    // GPU target: trigger format_hip.kr emission alongside
+                    // the normal CPU codegen. See docs/GPU_BACKEND.md.
+                    target_gpu = 1
+                } else if str_starts_with(tgt_str, "macos", 5) != 0 {
                     target_os = 1
                 } else if str_starts_with(tgt_str, "darwin", 6) != 0 {
                     target_os = 1
