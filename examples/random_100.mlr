@@ -1,0 +1,146 @@
+// MLRift — stage 5.
+//
+// 100 LIF neurons with heterogeneous drive + RANDOM sparse E→E
+// connectivity at p=0.1. The connectivity is driven by xorshift32 with
+// a fixed seed, implemented identically on both the MLRift and Python
+// sides so the synapse table comes out bit-identical and the spike
+// trajectory is bit-identical too.
+//
+// This is the simplest possible realisation of the vision doc's
+// "stream-isolated RNG" requirement: one global stream, deterministic
+// seed, every consumer observes the same sequence, and we can certify
+// bit-for-bit reproducibility across backends. Multiple streams and
+// true stream isolation come later.
+//
+// Matches examples/random_100_reference.py byte-for-byte.
+
+static f64 dt = 0.1
+static f64 V_rest = -70.0
+static f64 V_reset = -75.0
+static f64 V_thresh = -55.0
+static f64 tau_m = 20.0
+static f64 tau_s = 10.0
+static f64 J = 2.0
+static f64 syn_weight = 1.0
+
+static f64[100] V
+static uint64[100] ref_count
+static f64[100] RI
+static f64[100] s_exc
+static uint64[100] fired_this_step
+
+// Generous upper bound for a random connectivity at p=0.1 across
+// 100×99 ordered pairs: expected ~990, 3σ ≈ 1080, budget for 2000.
+static uint64[2000] syn_src
+static uint64[2000] syn_tgt
+static f64[2000]    syn_w
+
+static uint32 rng_state = 0
+
+fn rng_next() -> uint64 {
+    uint32 s = rng_state
+    uint64 s64 = s
+    uint64 t1 = (s64 << 13) & 0xFFFFFFFF
+    s64 = s64 ^ t1
+    s64 = s64 ^ (s64 >> 17)
+    uint64 t2 = (s64 << 5) & 0xFFFFFFFF
+    s64 = s64 ^ t2
+    s64 = s64 & 0xFFFFFFFF
+    uint32 s2 = s64
+    rng_state = s2
+    return s64
+}
+
+fn main() {
+    uint64 N = 100
+    uint64 n_steps = 10000
+    uint64 ref_steps = 20
+    uint64 connect_prob_denom = 10   // 1/10 = p=0.1
+
+    rng_state = 305419896            // 0x12345678 — fixed seed
+
+    // neuron init
+    uint64 j = 0
+    while j < N {
+        V[j] = V_rest
+        ref_count[j] = 0
+        s_exc[j] = 0.0
+        RI[j] = 10.0 + int_to_f64(j) * 0.2
+        j = j + 1
+    }
+
+    // build random synapse table — every (i, j) pair i != j, coin-flip
+    uint64 n_syn = 0
+    uint64 i_s = 0
+    while i_s < N {
+        uint64 j_s = 0
+        while j_s < N {
+            if i_s != j_s {
+                uint64 r = rng_next()
+                if (r % connect_prob_denom) == 0 {
+                    syn_src[n_syn] = i_s
+                    syn_tgt[n_syn] = j_s
+                    syn_w[n_syn] = syn_weight
+                    n_syn = n_syn + 1
+                }
+            }
+            j_s = j_s + 1
+        }
+        i_s = i_s + 1
+    }
+
+    // report the synapse count once (prefixed so the comparator can skip it)
+    print("# n_syn=")
+    println(n_syn)
+
+    uint64 step = 0
+    while step < n_steps {
+        uint64 k = 0
+        while k < N {
+            f64 s = s_exc[k]
+            s_exc[k] = s - s * dt / tau_s
+            fired_this_step[k] = 0
+            k = k + 1
+        }
+
+        uint64 i = 0
+        while i < N {
+            if ref_count[i] > 0 {
+                ref_count[i] = ref_count[i] - 1
+                V[i] = V_reset
+            } else {
+                f64 v = V[i]
+                f64 ri = RI[i]
+                f64 se = s_exc[i]
+                f64 drive = ri + se * J
+                f64 dv = dt * (V_rest - v + drive) / tau_m
+                f64 v_new = v + dv
+                V[i] = v_new
+                if v_new >= V_thresh {
+                    print(i)
+                    print(" ")
+                    println(step)
+                    V[i] = V_reset
+                    ref_count[i] = ref_steps
+                    fired_this_step[i] = 1
+                }
+            }
+            i = i + 1
+        }
+
+        uint64 syn = 0
+        while syn < n_syn {
+            uint64 s_src = syn_src[syn]
+            if fired_this_step[s_src] > 0 {
+                uint64 s_tgt = syn_tgt[syn]
+                f64 cur = s_exc[s_tgt]
+                f64 w = syn_w[syn]
+                s_exc[s_tgt] = cur + w
+            }
+            syn = syn + 1
+        }
+
+        step = step + 1
+    }
+    exit(0)
+}
