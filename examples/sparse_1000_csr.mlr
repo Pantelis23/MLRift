@@ -1,0 +1,143 @@
+// MLRift — stage 4 reworked with CSR delivery.
+//
+// Same workload as examples/sparse_1000.mlr (1000 LIF neurons, ring
+// lattice fan_out=10, 10,000 synapses), but the delivery loop is
+// rewritten to iterate only over *fired source* neurons rather than
+// scanning the entire synapse table every step.
+//
+// Representation:
+//   row_ptr[N+1]       — prefix-sum of out-degrees; outgoing synapses
+//                         for neuron i live in [row_ptr[i], row_ptr[i+1]).
+//   col_tgt[n_syn]     — target indices, sorted by source.
+//   col_w[n_syn]       — weights, same ordering.
+//   fired_list[N]      — indices of neurons that fired this step.
+//   n_fired            — count in fired_list.
+//
+// Per-step delivery cost drops from O(n_syn) to
+// O(sum of fan_outs of fired neurons). For stage-4 stats (~4.3 spikes
+// per step × fan_out 10 = ~43 deposits/step) that's ~230× less per-
+// step synapse work than the coord-list scan.
+//
+// Output must match examples/sparse_1000_reference.py byte-for-byte —
+// representation change is invisible at the output boundary.
+
+static f64 dt = 0.1
+static f64 V_rest = -70.0
+static f64 V_reset = -75.0
+static f64 V_thresh = -55.0
+static f64 tau_m = 20.0
+static f64 tau_s = 10.0
+static f64 J = 2.0
+static f64 syn_weight = 1.0
+
+static f64[1000] V
+static uint64[1000] ref_count
+static f64[1000] RI
+static f64[1000] s_exc
+
+// CSR: fan_out is fixed at 10 here, so row_ptr is trivial but we
+// build it explicitly so the pattern generalises to arbitrary
+// out-degrees (which is what stages 5/6/7 will need).
+static uint64[1001] row_ptr        // size N+1
+static uint64[10000] col_tgt
+static f64[10000]    col_w
+
+// Event-driven firing: no O(N) clear between steps, just reset count.
+static uint64[1000] fired_list
+
+fn main() {
+    uint64 N = 1000
+    uint64 fan_out = 10
+    uint64 n_syn = N * fan_out
+    uint64 n_steps = 10000
+    uint64 ref_steps = 20
+
+    f64 drive_span = 20.0
+    f64 drive_base = 10.0
+    f64 Nm1 = int_to_f64(N - 1)
+
+    uint64 j = 0
+    while j < N {
+        V[j] = V_rest
+        ref_count[j] = 0
+        s_exc[j] = 0.0
+        RI[j] = drive_base + drive_span * int_to_f64(j) / Nm1
+        j = j + 1
+    }
+
+    // Build CSR. Ring lattice is already source-sorted, so we emit
+    // outgoing edges in source-major order and fill row_ptr in one pass.
+    row_ptr[0] = 0
+    uint64 src = 0
+    uint64 sidx = 0
+    while src < N {
+        uint64 off = 1
+        while off <= fan_out {
+            col_tgt[sidx] = (src + off) % N
+            col_w[sidx] = syn_weight
+            sidx = sidx + 1
+            off = off + 1
+        }
+        row_ptr[src + 1] = sidx
+        src = src + 1
+    }
+
+    uint64 step = 0
+    while step < n_steps {
+        // Decay conductances (N ops)
+        uint64 k = 0
+        while k < N {
+            f64 s = s_exc[k]
+            s_exc[k] = s - s * dt / tau_s
+            k = k + 1
+        }
+
+        // Voltage update + record firings into fired_list
+        uint64 n_fired = 0
+        uint64 i = 0
+        while i < N {
+            if ref_count[i] > 0 {
+                ref_count[i] = ref_count[i] - 1
+                V[i] = V_reset
+            } else {
+                f64 v = V[i]
+                f64 ri = RI[i]
+                f64 se = s_exc[i]
+                f64 drive = ri + se * J
+                f64 dv = dt * (V_rest - v + drive) / tau_m
+                f64 v_new = v + dv
+                V[i] = v_new
+                if v_new >= V_thresh {
+                    print(i)
+                    print(" ")
+                    println(step)
+                    V[i] = V_reset
+                    ref_count[i] = ref_steps
+                    fired_list[n_fired] = i
+                    n_fired = n_fired + 1
+                }
+            }
+            i = i + 1
+        }
+
+        // CSR delivery: only walk rows for fired neurons
+        uint64 f = 0
+        while f < n_fired {
+            uint64 s_src = fired_list[f]
+            uint64 start = row_ptr[s_src]
+            uint64 end = row_ptr[s_src + 1]
+            uint64 syn = start
+            while syn < end {
+                uint64 s_tgt = col_tgt[syn]
+                f64 cur = s_exc[s_tgt]
+                f64 w = col_w[syn]
+                s_exc[s_tgt] = cur + w
+                syn = syn + 1
+            }
+            f = f + 1
+        }
+
+        step = step + 1
+    }
+    exit(0)
+}
