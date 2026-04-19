@@ -1,0 +1,319 @@
+// MLRift — stage 13: 50,000-neuron scale test, all primitives.
+//
+// Full Noesis-shaped workload in a single example:
+//   N = 50,000 neurons (40,000 E + 10,000 I)
+//   p = 0.002 random connectivity → ~5 M synapses
+//   CSR delivery, per-pathway dispatch (csr_e + csr_i)
+//   Tsodyks-Markram STP per neuron (release factor = u·x)
+//   LTD-only STDP on E→E synapses
+//   Ring-buffer delay on E→E (5 ms = 50 steps), direct I delivery
+//   1,000-step sim (100 ms)
+//
+// Tests whether the CPU ratio holds past L2/L3 cache boundaries.
+// Per-neuron state is ~8 MB — fits in L3. Synapse CSR is ~100 MB —
+// blows the cache. Delay buffer 20 MB. If the ratio stays ≥15× at
+// this scale, Noesis tier-1 on CPU is plausible.
+//
+// Matches examples/scale_50k_reference.py byte-for-byte.
+
+static f64 dt = 0.1
+static f64 V_rest = -70.0
+static f64 V_reset = -75.0
+static f64 V_thresh = -55.0
+static f64 tau_m = 20.0
+static f64 tau_e = 10.0
+static f64 tau_i = 5.0
+static f64 tau_pre = 20.0
+static f64 tau_post = 20.0
+static f64 tau_f = 1000.0
+static f64 tau_d = 200.0
+static f64 U_baseline = 0.2
+static f64 J_E = 2.0
+static f64 J_I = 8.0
+static f64 syn_weight_init = 0.05
+static f64 A_minus = -0.006
+static f64 w_max = 0.2
+
+static uint64 delay_ee = 50           // 5 ms / dt
+
+static uint64[50000] cell_type
+static f64[50000] V
+static uint64[50000] ref_count
+static f64[50000] RI
+static f64[50000] s_exc
+static f64[50000] s_inh
+static f64[50000] x_pre
+static f64[50000] x_post
+static f64[50000] u_stp
+static f64[50000] x_stp
+static f64[50000] release_factor
+static uint64[50000] spike_count
+static uint64[50000] fired_list
+
+// CSR for E outgoing (E→E is delayed; E→I is also routed through the
+// same pathway — cross-cell-type delay simplifies bookkeeping). STDP
+// LTD is only applied to E→E entries.
+static uint64[50001]  rpe_ptr
+static uint64[4500000] rpe_tgt
+static f64[4500000]    rpe_w
+static uint64[4500000] rpe_is_ee    // 1 if tgt is also E (STDP target)
+
+// CSR for I outgoing (direct, into s_inh[tgt], no STDP)
+static uint64[50001]  rpi_ptr
+static uint64[1200000] rpi_tgt
+static f64[1200000]    rpi_w
+
+// Delay ring buffer for E outgoing:
+//   buf[slot][src] stores release_factor at source fire time,
+//   slot = step mod (delay+1). Read (step+1) mod size for arrivals
+//   from `delay` steps ago.
+static f64[2550000] buf_delay        // (50+1) × 50000
+
+static uint32 rng_state = 0
+
+fn rng_next() -> uint64 {
+    uint32 s = rng_state
+    uint64 s64 = s
+    uint64 t1 = (s64 << 13) & 0xFFFFFFFF
+    s64 = s64 ^ t1
+    s64 = s64 ^ (s64 >> 17)
+    uint64 t2 = (s64 << 5) & 0xFFFFFFFF
+    s64 = s64 ^ t2
+    s64 = s64 & 0xFFFFFFFF
+    uint32 s2 = s64
+    rng_state = s2
+    return s64
+}
+
+fn main() {
+    uint64 N = 50000
+    uint64 n_E = 40000
+    uint64 n_steps = 1000
+    uint64 ref_steps = 20
+    uint64 connect_prob_denom = 500     // p = 1/500 = 0.002
+    uint64 buf_size = delay_ee + 1      // 51
+
+    f64 drive_span = 20.0
+    f64 drive_base = 10.0
+    f64 Nm1 = int_to_f64(N - 1)
+
+    rng_state = 305419896
+
+    uint64 j = 0
+    while j < N {
+        V[j] = V_rest
+        ref_count[j] = 0
+        s_exc[j] = 0.0
+        s_inh[j] = 0.0
+        x_pre[j] = 0.0
+        x_post[j] = 0.0
+        u_stp[j] = U_baseline
+        x_stp[j] = 1.0
+        release_factor[j] = 0.0
+        spike_count[j] = 0
+        RI[j] = drive_base + drive_span * int_to_f64(j) / Nm1
+        if j < n_E { cell_type[j] = 0 } else { cell_type[j] = 1 }
+        j = j + 1
+    }
+
+    // CSR build: each source routes into its own pathway
+    rpe_ptr[0] = 0
+    rpi_ptr[0] = 0
+    uint64 idx_e = 0
+    uint64 idx_i = 0
+
+    uint64 i_s = 0
+    while i_s < N {
+        uint64 j_s = 0
+        if cell_type[i_s] == 0 {
+            // E source
+            while j_s < N {
+                if i_s != j_s {
+                    uint64 r = rng_next()
+                    if (r % connect_prob_denom) == 0 {
+                        rpe_tgt[idx_e] = j_s
+                        rpe_w[idx_e] = syn_weight_init
+                        if cell_type[j_s] == 0 { rpe_is_ee[idx_e] = 1 } else { rpe_is_ee[idx_e] = 0 }
+                        idx_e = idx_e + 1
+                    }
+                }
+                j_s = j_s + 1
+            }
+        } else {
+            // I source
+            while j_s < N {
+                if i_s != j_s {
+                    uint64 r = rng_next()
+                    if (r % connect_prob_denom) == 0 {
+                        rpi_tgt[idx_i] = j_s
+                        rpi_w[idx_i] = syn_weight_init
+                        idx_i = idx_i + 1
+                    }
+                }
+                j_s = j_s + 1
+            }
+        }
+        rpe_ptr[i_s + 1] = idx_e
+        rpi_ptr[i_s + 1] = idx_i
+        i_s = i_s + 1
+    }
+
+    uint64 n_syn_e = idx_e
+    uint64 n_syn_i = idx_i
+
+    print("# n_syn_e=")
+    println(n_syn_e)
+    print("# n_syn_i=")
+    println(n_syn_i)
+    print("# n_syn=")
+    println(n_syn_e + n_syn_i)
+
+    uint64 ltd_events = 0
+
+    uint64 step = 0
+    while step < n_steps {
+        // Decay all per-neuron state
+        uint64 k = 0
+        while k < N {
+            f64 se = s_exc[k]
+            f64 si = s_inh[k]
+            f64 xp = x_pre[k]
+            f64 xq = x_post[k]
+            f64 uv = u_stp[k]
+            f64 xv = x_stp[k]
+            s_exc[k] = se - se * dt / tau_e
+            s_inh[k] = si - si * dt / tau_i
+            x_pre[k] = xp - xp * dt / tau_pre
+            x_post[k] = xq - xq * dt / tau_post
+            u_stp[k] = uv + (U_baseline - uv) * dt / tau_f
+            x_stp[k] = xv + (1.0 - xv) * dt / tau_d
+            release_factor[k] = 0.0
+            k = k + 1
+        }
+
+        // Read delayed E arrivals at (step+1) mod buf_size and deliver.
+        uint64 read_slot = (step + 1) % buf_size
+        uint64 row_base = read_slot * N
+        uint64 ri2 = 0
+        while ri2 < N {
+            f64 rel = buf_delay[row_base + ri2]
+            if rel > 0.0 {
+                uint64 start = rpe_ptr[ri2]
+                uint64 end = rpe_ptr[ri2 + 1]
+                uint64 syn = start
+                while syn < end {
+                    uint64 tgt = rpe_tgt[syn]
+                    f64 w = rpe_w[syn]
+                    f64 effective = w * rel
+                    f64 cur = s_exc[tgt]
+                    s_exc[tgt] = cur + effective
+                    // LTD when E source fired — uses CURRENT x_post of target
+                    if rpe_is_ee[syn] > 0 {
+                        f64 xq = x_post[tgt]
+                        f64 w_new = w + A_minus * xq
+                        if w_new < 0.0 { w_new = 0.0 }
+                        if w_new > w_max { w_new = w_max }
+                        rpe_w[syn] = w_new
+                        ltd_events = ltd_events + 1
+                    }
+                    syn = syn + 1
+                }
+                buf_delay[row_base + ri2] = 0.0
+            }
+            ri2 = ri2 + 1
+        }
+
+        // Integrate voltages, record firings, TM update, write to delay buf
+        uint64 write_slot = step % buf_size
+        uint64 w_base = write_slot * N
+        uint64 n_fired = 0
+        uint64 i = 0
+        while i < N {
+            if ref_count[i] > 0 {
+                ref_count[i] = ref_count[i] - 1
+                V[i] = V_reset
+            } else {
+                f64 v = V[i]
+                f64 ri = RI[i]
+                f64 se = s_exc[i]
+                f64 si = s_inh[i]
+                f64 drive = ri + se * J_E - si * J_I
+                f64 dv = dt * (V_rest - v + drive) / tau_m
+                f64 v_new = v + dv
+                V[i] = v_new
+                if v_new >= V_thresh {
+                    V[i] = V_reset
+                    ref_count[i] = ref_steps
+                    spike_count[i] = spike_count[i] + 1
+                    fired_list[n_fired] = i
+                    n_fired = n_fired + 1
+                    x_pre[i] = x_pre[i] + 1.0
+                    x_post[i] = x_post[i] + 1.0
+                    f64 uv = u_stp[i]
+                    f64 xv = x_stp[i]
+                    f64 rel = uv * xv
+                    release_factor[i] = rel
+                    x_stp[i] = xv - rel
+                    u_stp[i] = uv + U_baseline * (1.0 - uv)
+                    if cell_type[i] == 0 {
+                        // E fire → queue onto delay ring buffer
+                        buf_delay[w_base + i] = rel
+                    }
+                }
+            }
+            i = i + 1
+        }
+
+        // I deliveries: direct, no delay, straight into s_inh[tgt]
+        uint64 f = 0
+        while f < n_fired {
+            uint64 src = fired_list[f]
+            if cell_type[src] == 1 {
+                f64 rel = release_factor[src]
+                uint64 start = rpi_ptr[src]
+                uint64 end = rpi_ptr[src + 1]
+                uint64 syn = start
+                while syn < end {
+                    uint64 tgt = rpi_tgt[syn]
+                    f64 w = rpi_w[syn]
+                    f64 effective = w * rel
+                    f64 cur = s_inh[tgt]
+                    s_inh[tgt] = cur + effective
+                    syn = syn + 1
+                }
+            }
+            f = f + 1
+        }
+
+        step = step + 1
+    }
+
+    // Per-neuron spike counts
+    uint64 oi = 0
+    while oi < N {
+        print(oi)
+        print(" ")
+        println(spike_count[oi])
+        oi = oi + 1
+    }
+
+    // Summaries
+    f64 sum_u = 0.0
+    f64 sum_x = 0.0
+    uint64 uk = 0
+    while uk < N {
+        sum_u = sum_u + u_stp[uk]
+        sum_x = sum_x + x_stp[uk]
+        uk = uk + 1
+    }
+    uint64 sum_u_milli = f64_to_int(sum_u * 1000.0)
+    uint64 sum_x_milli = f64_to_int(sum_x * 1000.0)
+
+    print("# ltd_events=")
+    println(ltd_events)
+    print("# sum_u_stp_milli=")
+    println(sum_u_milli)
+    print("# sum_x_stp_milli=")
+    println(sum_x_milli)
+    exit(0)
+}
