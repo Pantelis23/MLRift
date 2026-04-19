@@ -1,0 +1,340 @@
+// MLRift — stage 14: bidirectional STDP via CSC reverse index.
+//
+// Stage 8 only did LTD-on-pre (when the presynaptic neuron fires,
+// update w based on the post's trace). Full pair-STDP also needs
+// LTP-on-post: when the postsynaptic neuron fires, update w based
+// on the pre's trace.
+//
+// With a CSR indexed by source, LTD-on-pre is cheap (walk the
+// fired-source's outgoing row, update each synapse). LTP-on-post
+// needs target-indexed access. We build a CSC (compressed sparse
+// column) at init that, for each target j, lists the syn_idx values
+// pointing to j. Combined with an auxiliary syn_src[] array, the
+// LTP pass walks csc_ptr[j]..csc_ptr[j+1] for each fired target and
+// updates weights using x_pre[syn_src[syn_idx]].
+//
+// Size: N=500 (400 E + 100 I), p=0.02 → ~5,000 synapses. Small
+// enough to iterate fast; the infrastructure (CSC build + LTP walk)
+// is the point, not the scale.
+//
+// Matches examples/stdp_bidir_500_reference.py byte-for-byte.
+
+static f64 dt = 0.1
+static f64 V_rest = -70.0
+static f64 V_reset = -75.0
+static f64 V_thresh = -55.0
+static f64 tau_m = 20.0
+static f64 tau_e = 10.0
+static f64 tau_i = 5.0
+static f64 tau_pre = 20.0
+static f64 tau_post = 20.0
+static f64 tau_f = 1000.0
+static f64 tau_d = 200.0
+static f64 U_baseline = 0.2
+static f64 J_E = 2.0
+static f64 J_I = 8.0
+static f64 syn_weight_init = 0.1
+static f64 A_plus = 0.01
+static f64 A_minus = -0.012
+static f64 w_max = 0.3
+
+static uint64[500] cell_type
+static f64[500] V
+static uint64[500] ref_count
+static f64[500] RI
+static f64[500] s_exc
+static f64[500] s_inh
+static f64[500] x_pre
+static f64[500] x_post
+static f64[500] u_stp
+static f64[500] x_stp
+static f64[500] release_factor
+static uint64[500] fired_list
+
+// CSR (source-indexed) for ALL synapses
+static uint64[501]   row_ptr
+static uint64[20000] col_tgt
+static f64[20000]    col_w
+static uint64[20000] col_is_inh
+static uint64[20000] syn_src        // auxiliary: source of each syn_idx
+
+// CSC (target-indexed) for E→E synapses ONLY (only these get STDP).
+// csc_ptr[j+1] − csc_ptr[j] = incoming E→E count for target j.
+// csc_idx[k] = syn_idx into the CSR arrays.
+static uint64[501]   csc_ptr
+static uint64[20000] csc_idx
+// per-target counter used during CSC build
+static uint64[500]   csc_fill
+
+static uint32 rng_state = 0
+
+fn rng_next() -> uint64 {
+    uint32 s = rng_state
+    uint64 s64 = s
+    uint64 t1 = (s64 << 13) & 0xFFFFFFFF
+    s64 = s64 ^ t1
+    s64 = s64 ^ (s64 >> 17)
+    uint64 t2 = (s64 << 5) & 0xFFFFFFFF
+    s64 = s64 ^ t2
+    s64 = s64 & 0xFFFFFFFF
+    uint32 s2 = s64
+    rng_state = s2
+    return s64
+}
+
+fn main() {
+    uint64 N = 500
+    uint64 n_E = 400
+    uint64 n_steps = 10000
+    uint64 ref_steps = 20
+    uint64 connect_prob_denom = 50     // p = 1/50 = 0.02
+
+    rng_state = 305419896
+
+    uint64 j = 0
+    while j < N {
+        V[j] = V_rest
+        ref_count[j] = 0
+        s_exc[j] = 0.0
+        s_inh[j] = 0.0
+        x_pre[j] = 0.0
+        x_post[j] = 0.0
+        u_stp[j] = U_baseline
+        x_stp[j] = 1.0
+        release_factor[j] = 0.0
+        RI[j] = 10.0 + int_to_f64(j) * 0.04
+        if j < n_E { cell_type[j] = 0 } else { cell_type[j] = 1 }
+        j = j + 1
+    }
+
+    // Build CSR (source-major): iterate src, then tgt, emit synapses.
+    row_ptr[0] = 0
+    uint64 idx = 0
+    uint64 i_s = 0
+    while i_s < N {
+        uint64 j_s = 0
+        while j_s < N {
+            if i_s != j_s {
+                uint64 r = rng_next()
+                if (r % connect_prob_denom) == 0 {
+                    col_tgt[idx] = j_s
+                    col_w[idx] = syn_weight_init
+                    col_is_inh[idx] = cell_type[i_s]
+                    syn_src[idx] = i_s
+                    idx = idx + 1
+                }
+            }
+            j_s = j_s + 1
+        }
+        row_ptr[i_s + 1] = idx
+        i_s = i_s + 1
+    }
+    uint64 n_syn = idx
+
+    // Build CSC for E→E subset.
+    // Pass 1: count incoming E→E per target.
+    uint64 tj = 0
+    while tj < N {
+        csc_ptr[tj] = 0
+        csc_fill[tj] = 0
+        tj = tj + 1
+    }
+    csc_ptr[N] = 0
+    uint64 p1 = 0
+    while p1 < n_syn {
+        if col_is_inh[p1] == 0 {
+            uint64 tgt = col_tgt[p1]
+            if cell_type[tgt] == 0 {
+                // E→E: count incoming at target
+                csc_ptr[tgt + 1] = csc_ptr[tgt + 1] + 1
+            }
+        }
+        p1 = p1 + 1
+    }
+    // Prefix sum — csc_ptr[j] becomes starting offset for target j.
+    uint64 acc = 0
+    uint64 pi = 0
+    while pi <= N {
+        uint64 c = csc_ptr[pi]
+        csc_ptr[pi] = acc
+        acc = acc + c
+        pi = pi + 1
+    }
+    uint64 n_ee = acc
+    // Pass 2: fill csc_idx. csc_fill[] tracks per-target write position.
+    uint64 p2 = 0
+    while p2 < n_syn {
+        if col_is_inh[p2] == 0 {
+            uint64 tgt = col_tgt[p2]
+            if cell_type[tgt] == 0 {
+                uint64 base = csc_ptr[tgt]
+                uint64 off = csc_fill[tgt]
+                csc_idx[base + off] = p2
+                csc_fill[tgt] = off + 1
+            }
+        }
+        p2 = p2 + 1
+    }
+
+    print("# n_syn=")
+    println(n_syn)
+    print("# n_ee=")
+    println(n_ee)
+
+    uint64 ltp_events = 0
+    uint64 ltd_events = 0
+
+    uint64 step = 0
+    while step < n_steps {
+        uint64 k = 0
+        while k < N {
+            f64 se = s_exc[k]
+            f64 si = s_inh[k]
+            f64 xp = x_pre[k]
+            f64 xq = x_post[k]
+            f64 uv = u_stp[k]
+            f64 xv = x_stp[k]
+            s_exc[k] = se - se * dt / tau_e
+            s_inh[k] = si - si * dt / tau_i
+            x_pre[k] = xp - xp * dt / tau_pre
+            x_post[k] = xq - xq * dt / tau_post
+            u_stp[k] = uv + (U_baseline - uv) * dt / tau_f
+            x_stp[k] = xv + (1.0 - xv) * dt / tau_d
+            release_factor[k] = 0.0
+            k = k + 1
+        }
+
+        uint64 n_fired = 0
+        uint64 i = 0
+        while i < N {
+            if ref_count[i] > 0 {
+                ref_count[i] = ref_count[i] - 1
+                V[i] = V_reset
+            } else {
+                f64 v = V[i]
+                f64 ri = RI[i]
+                f64 se = s_exc[i]
+                f64 si = s_inh[i]
+                f64 drive = ri + se * J_E - si * J_I
+                f64 dv = dt * (V_rest - v + drive) / tau_m
+                f64 v_new = v + dv
+                V[i] = v_new
+                if v_new >= V_thresh {
+                    print(i)
+                    print(" ")
+                    println(step)
+                    V[i] = V_reset
+                    ref_count[i] = ref_steps
+                    fired_list[n_fired] = i
+                    n_fired = n_fired + 1
+                    x_pre[i] = x_pre[i] + 1.0
+                    x_post[i] = x_post[i] + 1.0
+                    f64 uv = u_stp[i]
+                    f64 xv = x_stp[i]
+                    f64 rel = uv * xv
+                    release_factor[i] = rel
+                    x_stp[i] = xv - rel
+                    u_stp[i] = uv + U_baseline * (1.0 - uv)
+                }
+            }
+            i = i + 1
+        }
+
+        // Pass A: delivery + LTD (walk CSR for each fired source)
+        uint64 fa = 0
+        while fa < n_fired {
+            uint64 src = fired_list[fa]
+            f64 rel = release_factor[src]
+            uint64 start = row_ptr[src]
+            uint64 end = row_ptr[src + 1]
+            uint64 syn = start
+            while syn < end {
+                uint64 tgt = col_tgt[syn]
+                f64 w = col_w[syn]
+                uint64 is_inh = col_is_inh[syn]
+                f64 effective = w * rel
+                if is_inh > 0 {
+                    f64 cur = s_inh[tgt]
+                    s_inh[tgt] = cur + effective
+                } else {
+                    f64 cur = s_exc[tgt]
+                    s_exc[tgt] = cur + effective
+                    if cell_type[tgt] == 0 {
+                        // E→E: LTD
+                        f64 xq = x_post[tgt]
+                        f64 w_new = w + A_minus * xq
+                        if w_new < 0.0 { w_new = 0.0 }
+                        if w_new > w_max { w_new = w_max }
+                        col_w[syn] = w_new
+                        ltd_events = ltd_events + 1
+                    }
+                }
+                syn = syn + 1
+            }
+            fa = fa + 1
+        }
+
+        // Pass B: LTP (walk CSC for each fired E target)
+        uint64 fb = 0
+        while fb < n_fired {
+            uint64 tgt = fired_list[fb]
+            if cell_type[tgt] == 0 {
+                uint64 cstart = csc_ptr[tgt]
+                uint64 cend = csc_ptr[tgt + 1]
+                uint64 ck = cstart
+                while ck < cend {
+                    uint64 syn_i = csc_idx[ck]
+                    uint64 src = syn_src[syn_i]
+                    f64 w = col_w[syn_i]
+                    f64 xp = x_pre[src]
+                    f64 w_new = w + A_plus * xp
+                    if w_new < 0.0 { w_new = 0.0 }
+                    if w_new > w_max { w_new = w_max }
+                    col_w[syn_i] = w_new
+                    ltp_events = ltp_events + 1
+                    ck = ck + 1
+                }
+            }
+            fb = fb + 1
+        }
+
+        step = step + 1
+    }
+
+    // Summary
+    f64 sum_u = 0.0
+    f64 sum_x = 0.0
+    uint64 uk = 0
+    while uk < N {
+        sum_u = sum_u + u_stp[uk]
+        sum_x = sum_x + x_stp[uk]
+        uk = uk + 1
+    }
+    f64 sum_w_ee = 0.0
+    uint64 sc = 0
+    while sc < n_syn {
+        if col_is_inh[sc] == 0 {
+            uint64 tgt = col_tgt[sc]
+            if cell_type[tgt] == 0 {
+                sum_w_ee = sum_w_ee + col_w[sc]
+            }
+        }
+        sc = sc + 1
+    }
+
+    uint64 sum_w_ee_ppm = f64_to_int(sum_w_ee * 1000000.0)
+    uint64 sum_u_milli = f64_to_int(sum_u * 1000.0)
+    uint64 sum_x_milli = f64_to_int(sum_x * 1000.0)
+
+    print("# ltp_events=")
+    println(ltp_events)
+    print("# ltd_events=")
+    println(ltd_events)
+    print("# sum_w_ee_ppm=")
+    println(sum_w_ee_ppm)
+    print("# sum_u_stp_milli=")
+    println(sum_u_milli)
+    print("# sum_x_stp_milli=")
+    println(sum_x_milli)
+    exit(0)
+}
