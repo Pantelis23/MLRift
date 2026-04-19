@@ -154,6 +154,13 @@ static uint64 edyn_buf = 0
 static uint64 edyn_cap = 0
 static uint64 edyn_pos = 0
 
+// Expose edyn_buf so drivers can write the composed ELF to disk
+// via codegen-style `file_write(fd, edyn_buf_ptr(), size)`.
+@export
+fn edyn_buf_ptr() -> uint64 {
+    return edyn_buf
+}
+
 @export
 fn edyn_init(uint64 capacity) {
     if edyn_buf == 0 {

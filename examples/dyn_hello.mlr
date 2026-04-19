@@ -1,0 +1,22 @@
+// MLRift — M2a.4 end-to-end: `.mlr` → dynamic ELF → libc puts prints.
+//
+// Declares `puts` and `exit` as @dynamic extern, calls them from
+// main. The driver sees dyn_sym_count > 0 and routes executable-ELF
+// emission through src/format_elf_dyn.kr, producing a binary with
+// PT_INTERP + PT_DYNAMIC + PLT/GOT that the Linux loader resolves
+// against libc.so.6 at startup.
+//
+// Expected:
+//   mlrc examples/dyn_hello.mlr -o /tmp/dyn_hello
+//   /tmp/dyn_hello
+//   → prints "hello from MLRift"
+//   → exit code 0 (libc's exit, not the syscall builtin)
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+fn main() {
+    uint64 msg = "hello from MLRift"
+    puts(msg)
+    exit(0)
+}

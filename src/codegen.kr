@@ -12206,6 +12206,13 @@ fn codegen_output_len() -> uint64 {
     return out_len
 }
 
+// Expose out_buf so format_elf_dyn / future format drivers can read
+// or patch codegen's output before it's flushed to disk.
+@export
+fn codegen_buf_ptr() -> uint64 {
+    return out_buf
+}
+
 // Scan the output buffer backward from out_len for the last non-zero
 // byte. Returns the offset of (one past) that byte — i.e., the length
 // of a prefix that covers every non-zero byte. If the buffer is all

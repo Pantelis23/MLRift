@@ -1204,8 +1204,11 @@ fn ir_lower_expr(uint64 node) -> uint64 {
     if kind == 35 {
         uint32 callee_tok = ast_data1(node)
         uint64 wct = callee_tok
-        // Check for exit() builtin
-        if tok_matches(wct, "exit", 4) != 0 {
+        // Check for exit() builtin — shadowed by a `@dynamic extern fn
+        // exit` so the user can route through libc's exit when linking
+        // dynamically (libc's exit flushes stdio, ours just calls
+        // exit_group directly).
+        if tok_matches(wct, "exit", 4) != 0 && dyn_sym_lookup(wct) == 0xFFFFFFFF {
             uint32 arg = ast_child(node)
             uint64 av = ir_lower_expr(arg)
             ir_emit(IR_ARG, 0, av, 0, 0, ir_current_bb)
@@ -8677,6 +8680,13 @@ fn ir_emit_x86_function(uint64 fn_node) {
     // Check for @naked attribute: bit 1 of annotation flags
     uint32 ann_flags = ast_data4(fn_node)
     uint64 is_naked = ann_flags & 2
+
+    // Extern declarations (bit 3) have no body — skip codegen so they
+    // don't get an empty prologue/epilogue stub written into .text.
+    // Call sites are resolved via extern_call_record (for .o linker
+    // fixups) or dyn_call_record (for @dynamic PLT patching).
+    uint64 is_extern_ir = ann_flags & 8
+    if is_extern_ir != 0 { return }
 
     // 1. Lower AST to IR
     ir_lower_function(fn_node)

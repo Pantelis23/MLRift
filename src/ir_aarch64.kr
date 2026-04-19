@@ -2372,6 +2372,10 @@ fn ir_emit_arm64_function(uint64 fn_node) {
     uint32 ann_flags = ast_data4(fn_node)
     uint64 is_naked = ann_flags & 2
 
+    // Extern declarations: skip codegen (see ir_emit_x86_function).
+    uint64 is_extern_ir_a = ann_flags & 8
+    if is_extern_ir_a != 0 { return }
+
     // 1. Lower AST to IR
     ir_lower_function(fn_node)
 
