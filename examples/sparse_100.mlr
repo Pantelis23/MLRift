@@ -1,0 +1,133 @@
+// MLRift — stage 3.
+//
+// 100 LIF neurons with heterogeneous drive (RI[i] = 10 + 0.2*i, same as
+// stage 2) AND a sparse recurrent excitatory wiring: each neuron has 10
+// outgoing synapses forming a deterministic ring lattice, so neuron i
+// projects to i+1, i+2, ..., i+10 (mod N). That's 1000 synapses total.
+//
+// Per-synapse: source idx, target idx, weight. Each target keeps a
+// conductance s_exc[tgt] that decays each step (tau_s = 10 ms) and
+// jumps by weight whenever its source neuron fires. Postsynaptic
+// voltage gets s_exc[i] * J added to the drive term.
+//
+// Prediction: the recurrent excitation pulls some of the subthreshold
+// neurons (i < 25 in stage 2) into firing because their neighbours
+// drive them with EPSPs. The population becomes more correlated.
+//
+// Layout is (syn_src, syn_tgt, syn_w) triples — the "coordinate list"
+// representation. We'll find out how far this carries us before
+// CSR becomes necessary (that's stage 4 or 5, when N grows past ~1k).
+//
+// Matches examples/sparse_100_reference.py byte-for-byte.
+
+static f64 dt = 0.1
+static f64 V_rest = -70.0
+static f64 V_reset = -75.0
+static f64 V_thresh = -55.0
+static f64 tau_m = 20.0
+static f64 tau_s = 10.0
+static f64 J = 2.0               // per-synapse drive scale (intentionally
+                                  // moderate — 10 converging synapses can
+                                  // drive a subthreshold neuron, one alone
+                                  // cannot)
+static f64 syn_weight = 1.0
+
+static f64[100] V
+static uint64[100] ref_count
+static f64[100] RI
+static f64[100] s_exc
+static uint64[100] fired_this_step
+
+// 1000 synapses = 100 neurons × 10 fan-out (ring lattice)
+static uint64[1000] syn_src
+static uint64[1000] syn_tgt
+static f64[1000]    syn_w
+
+fn main() {
+    uint64 N = 100
+    uint64 fan_out = 10
+    uint64 n_syn = N * fan_out
+    uint64 n_steps = 10000
+    uint64 ref_steps = 20
+
+    // --- initialise neuron state + heterogeneous drive ---
+    uint64 j = 0
+    while j < N {
+        V[j] = V_rest
+        ref_count[j] = 0
+        s_exc[j] = 0.0
+        RI[j] = 10.0 + int_to_f64(j) * 0.2
+        j = j + 1
+    }
+
+    // --- build ring-lattice synapse table (deterministic) ---
+    uint64 src = 0
+    uint64 sidx = 0
+    while src < N {
+        uint64 off = 1
+        while off <= fan_out {
+            syn_src[sidx] = src
+            syn_tgt[sidx] = (src + off) % N
+            syn_w[sidx] = syn_weight
+            sidx = sidx + 1
+            off = off + 1
+        }
+        src = src + 1
+    }
+
+    // --- integration loop ---
+    uint64 step = 0
+    while step < n_steps {
+        // decay conductances
+        uint64 k = 0
+        while k < N {
+            f64 s = s_exc[k]
+            s_exc[k] = s - s * dt / tau_s
+            fired_this_step[k] = 0
+            k = k + 1
+        }
+
+        // neuron update
+        uint64 i = 0
+        while i < N {
+            if ref_count[i] > 0 {
+                ref_count[i] = ref_count[i] - 1
+                V[i] = V_reset
+            } else {
+                f64 v = V[i]
+                f64 ri = RI[i]
+                f64 se = s_exc[i]
+                f64 drive = ri + se * J
+                f64 dv = dt * (V_rest - v + drive) / tau_m
+                f64 v_new = v + dv
+                V[i] = v_new
+                if v_new >= V_thresh {
+                    print(i)
+                    print(" ")
+                    println(step)
+                    V[i] = V_reset
+                    ref_count[i] = ref_steps
+                    fired_this_step[i] = 1
+                }
+            }
+            i = i + 1
+        }
+
+        // synaptic delivery: walk all 1000 synapses, deposit on targets
+        // whose source fired this step
+        uint64 syn = 0
+        while syn < n_syn {
+            uint64 s_src = syn_src[syn]
+            if fired_this_step[s_src] > 0 {
+                uint64 s_tgt = syn_tgt[syn]
+                f64 cur = s_exc[s_tgt]
+                f64 w = syn_w[syn]
+                s_exc[s_tgt] = cur + w
+            }
+            syn = syn + 1
+        }
+
+        step = step + 1
+    }
+    exit(0)
+}
