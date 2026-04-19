@@ -192,6 +192,17 @@ fn ast_data4(uint64 idx) -> uint32 {
     return val
 }
 
+// Predicate: bit 4 of an FnDecl's data4 — set by parser when `@kernel`
+// annotation is present. Used by format_hip.kr to identify GPU kernel
+// functions; CPU backends may eventually skip them. See src/ir_hip.kr
+// and docs/GPU_BACKEND.md.
+@export
+fn ast_fn_is_kernel(uint64 fn_node) -> uint64 {
+    uint32 flags = ast_data4(fn_node)
+    uint64 f = flags
+    return (f >> 4) & 1
+}
+
 @export
 fn ast_set_tok(uint64 idx, uint32 tok) {
     uint64 p = node_base(idx) + 20
