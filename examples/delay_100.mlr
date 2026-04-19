@@ -1,0 +1,304 @@
+// MLRift — stage 10.
+//
+// Per-pathway synaptic delay lines via ring buffers. Demonstrates the
+// vision-doc primitive that every serious biological simulator needs:
+// cross-area E→E transmission takes a per-pathway delay (5–30 ms in
+// cortex), while I→E and local E→E stay effectively instantaneous.
+//
+// Two distinct E→E pathways in an otherwise stage-7 network:
+//   pathway_fast — delay 2 ms  (20 steps at dt=0.1)
+//   pathway_slow — delay 10 ms (100 steps)
+// Each pathway has its own CSR and its own ring buffer
+//   buf[delay + 1][N]  — value at buf[step mod size][i] is what source
+//   i wrote this step. Read from (step + 1) mod size to pick up
+//   arrivals from `delay` steps ago.
+//
+// I-sourced synapses stay direct (single combined CSR with no delay),
+// matching the typical chemical-GABA assumption of fast transmission.
+//
+// To keep the example focused on the delay mechanism, STDP and STP
+// are OFF here (stages 8–9 covered those). Connectivity still uses
+// the same xorshift32 seed.
+//
+// Output: spike trace + 4 summary lines.
+// Byte-identical to examples/delay_100_reference.py.
+
+static f64 dt = 0.1
+static f64 V_rest = -70.0
+static f64 V_reset = -75.0
+static f64 V_thresh = -55.0
+static f64 tau_m = 20.0
+static f64 tau_e = 10.0
+static f64 tau_i = 5.0
+static f64 J_E = 2.0
+static f64 J_I = 8.0
+static f64 syn_weight = 0.1
+
+static uint64 delay_fast = 20        // 2 ms / dt
+static uint64 delay_slow = 100       // 10 ms / dt
+
+static uint64[100] cell_type
+static f64[100] V
+static uint64[100] ref_count
+static f64[100] RI
+static f64[100] s_exc
+static f64[100] s_inh
+static uint64[100] fired_list
+// delay buffers — one per pathway, each size (delay + 1) × N
+// stores 1.0 for "fired this step" at buf[step mod size][i], else 0.0
+static f64[2100]  buf_fast     // (20+1) × 100
+static f64[10100] buf_slow     // (100+1) × 100
+
+// CSR per E→E pathway
+static uint64[101]  rpf_ptr
+static uint64[2000] rpf_tgt
+static f64[2000]    rpf_w
+static uint64[101]  rps_ptr
+static uint64[2000] rps_tgt
+static f64[2000]    rps_w
+// CSR for direct I→* (no delay)
+static uint64[101]  ri_ptr
+static uint64[2000] ri_tgt
+static f64[2000]    ri_w
+
+static uint32 rng_state = 0
+
+fn rng_next() -> uint64 {
+    uint32 s = rng_state
+    uint64 s64 = s
+    uint64 t1 = (s64 << 13) & 0xFFFFFFFF
+    s64 = s64 ^ t1
+    s64 = s64 ^ (s64 >> 17)
+    uint64 t2 = (s64 << 5) & 0xFFFFFFFF
+    s64 = s64 ^ t2
+    s64 = s64 & 0xFFFFFFFF
+    uint32 s2 = s64
+    rng_state = s2
+    return s64
+}
+
+fn main() {
+    uint64 N = 100
+    uint64 n_E = 80
+    uint64 n_steps = 10000
+    uint64 ref_steps = 20
+
+    uint64 buf_fast_size = delay_fast + 1       // 21
+    uint64 buf_slow_size = delay_slow + 1       // 101
+
+    rng_state = 305419896
+
+    // neuron init
+    uint64 j = 0
+    while j < N {
+        V[j] = V_rest
+        ref_count[j] = 0
+        s_exc[j] = 0.0
+        s_inh[j] = 0.0
+        RI[j] = 10.0 + int_to_f64(j) * 0.2
+        if j < n_E { cell_type[j] = 0 } else { cell_type[j] = 1 }
+        j = j + 1
+    }
+
+    // zero both ring buffers explicitly (static bss is already 0, but
+    // be defensive — repeated-run determinism)
+    uint64 zi = 0
+    while zi < buf_fast_size * N { buf_fast[zi] = 0.0; zi = zi + 1 }
+    zi = 0
+    while zi < buf_slow_size * N { buf_slow[zi] = 0.0; zi = zi + 1 }
+
+    // Build connectivity. For each (i,j) pair i!=j:
+    //   - If i is E: two coin flips — one for fast E→E, one for slow E→E
+    //     (independent xorshift draws). Either or both can succeed.
+    //   - If i is I: one coin flip for I→target.
+    //
+    // Build into flat arrays first (source-sorted because we iterate
+    // in source-major order), then fill row pointers.
+
+    // counters while building
+    uint64 nf = 0    // fast synapse count
+    uint64 ns = 0    // slow synapse count
+    uint64 ni = 0    // inh synapse count
+
+    rpf_ptr[0] = 0
+    rps_ptr[0] = 0
+    ri_ptr[0] = 0
+
+    uint64 i_s = 0
+    while i_s < N {
+        if cell_type[i_s] == 0 {
+            // excitatory source — two pathways
+            uint64 j_s = 0
+            while j_s < N {
+                if i_s != j_s {
+                    uint64 rf = rng_next()
+                    if (rf % 10) == 0 {
+                        rpf_tgt[nf] = j_s
+                        rpf_w[nf] = syn_weight
+                        nf = nf + 1
+                    }
+                    uint64 rs = rng_next()
+                    if (rs % 10) == 0 {
+                        rps_tgt[ns] = j_s
+                        rps_w[ns] = syn_weight
+                        ns = ns + 1
+                    }
+                }
+                j_s = j_s + 1
+            }
+        } else {
+            // inhibitory source — single direct pathway
+            uint64 j_s = 0
+            while j_s < N {
+                if i_s != j_s {
+                    uint64 r = rng_next()
+                    if (r % 10) == 0 {
+                        ri_tgt[ni] = j_s
+                        ri_w[ni] = syn_weight
+                        ni = ni + 1
+                    }
+                }
+                j_s = j_s + 1
+            }
+        }
+        rpf_ptr[i_s + 1] = nf
+        rps_ptr[i_s + 1] = ns
+        ri_ptr[i_s + 1] = ni
+        i_s = i_s + 1
+    }
+
+    print("# n_fast=")
+    println(nf)
+    print("# n_slow=")
+    println(ns)
+    print("# n_inh=")
+    println(ni)
+
+    uint64 fast_deliveries = 0
+    uint64 slow_deliveries = 0
+
+    uint64 step = 0
+    while step < n_steps {
+        // Decay conductances
+        uint64 k = 0
+        while k < N {
+            f64 se = s_exc[k]
+            f64 si = s_inh[k]
+            s_exc[k] = se - se * dt / tau_e
+            s_inh[k] = si - si * dt / tau_i
+            k = k + 1
+        }
+
+        // Read delayed arrivals from both E→E ring buffers and deposit.
+        // Arrivals from step (step - delay) live at (step - delay) mod size.
+        // We compute that via ((step + 1) mod size) which is equivalent
+        // when size = delay + 1.
+        uint64 read_fast = (step + 1) % buf_fast_size
+        uint64 read_slow = (step + 1) % buf_slow_size
+        uint64 row_base_f = read_fast * N
+        uint64 row_base_s = read_slow * N
+
+        uint64 i = 0
+        while i < N {
+            f64 ef = buf_fast[row_base_f + i]
+            if ef > 0.0 {
+                uint64 start = rpf_ptr[i]
+                uint64 end = rpf_ptr[i + 1]
+                uint64 syn = start
+                while syn < end {
+                    uint64 tgt = rpf_tgt[syn]
+                    f64 w = rpf_w[syn]
+                    f64 cur = s_exc[tgt]
+                    s_exc[tgt] = cur + w * ef
+                    fast_deliveries = fast_deliveries + 1
+                    syn = syn + 1
+                }
+                // clear this slot for reuse
+                buf_fast[row_base_f + i] = 0.0
+            }
+            f64 es = buf_slow[row_base_s + i]
+            if es > 0.0 {
+                uint64 start2 = rps_ptr[i]
+                uint64 end2 = rps_ptr[i + 1]
+                uint64 syn2 = start2
+                while syn2 < end2 {
+                    uint64 tgt2 = rps_tgt[syn2]
+                    f64 w2 = rps_w[syn2]
+                    f64 cur2 = s_exc[tgt2]
+                    s_exc[tgt2] = cur2 + w2 * es
+                    slow_deliveries = slow_deliveries + 1
+                    syn2 = syn2 + 1
+                }
+                buf_slow[row_base_s + i] = 0.0
+            }
+            i = i + 1
+        }
+
+        // Integrate voltages; record firings
+        uint64 n_fired = 0
+        uint64 ii = 0
+        while ii < N {
+            if ref_count[ii] > 0 {
+                ref_count[ii] = ref_count[ii] - 1
+                V[ii] = V_reset
+            } else {
+                f64 v = V[ii]
+                f64 ri = RI[ii]
+                f64 se = s_exc[ii]
+                f64 si = s_inh[ii]
+                f64 drive = ri + se * J_E - si * J_I
+                f64 dv = dt * (V_rest - v + drive) / tau_m
+                f64 v_new = v + dv
+                V[ii] = v_new
+                if v_new >= V_thresh {
+                    print(ii)
+                    print(" ")
+                    println(step)
+                    V[ii] = V_reset
+                    ref_count[ii] = ref_steps
+                    fired_list[n_fired] = ii
+                    n_fired = n_fired + 1
+                }
+            }
+            ii = ii + 1
+        }
+
+        // For each fired neuron: write to E→E ring buffers (if E) or
+        // deliver directly to I-CSR (if I).
+        uint64 write_fast = step % buf_fast_size
+        uint64 write_slow = step % buf_slow_size
+        uint64 w_base_f = write_fast * N
+        uint64 w_base_s = write_slow * N
+
+        uint64 f = 0
+        while f < n_fired {
+            uint64 src = fired_list[f]
+            if cell_type[src] == 0 {
+                // E: write to both delay buffers
+                buf_fast[w_base_f + src] = 1.0
+                buf_slow[w_base_s + src] = 1.0
+            } else {
+                // I: direct CSR delivery
+                uint64 start = ri_ptr[src]
+                uint64 end = ri_ptr[src + 1]
+                uint64 syn = start
+                while syn < end {
+                    uint64 tgt = ri_tgt[syn]
+                    f64 w = ri_w[syn]
+                    f64 cur = s_inh[tgt]
+                    s_inh[tgt] = cur + w
+                    syn = syn + 1
+                }
+            }
+            f = f + 1
+        }
+
+        step = step + 1
+    }
+
+    print("# fast_deliveries=")
+    println(fast_deliveries)
+    print("# slow_deliveries=")
+    println(slow_deliveries)
+    exit(0)
+}
