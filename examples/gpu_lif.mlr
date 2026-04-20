@@ -1,0 +1,91 @@
+// MLRift — M4.b LIF integrate kernel source.
+//
+// Per-neuron leaky-integrate-and-fire step matching the body in
+// examples/scale_50k_vec.mlr's main loop:
+//
+//   if ref_count[i] > 0:
+//       ref_count[i] -= 1
+//       V[i] = V_reset
+//   else:
+//       drive  = RI[i] + s_exc[i]*J_E - s_inh[i]*J_I
+//       dv     = dt * (V_rest - V[i] + drive) / tau_m
+//       v_new  = V[i] + dv
+//       if v_new >= V_thresh:
+//           V[i]            = V_reset
+//           ref_count[i]    = ref_steps
+//           spike_count[i] += 1
+//       else:
+//           V[i] = v_new
+//
+// One thread per neuron — embarrassingly parallel, no atomics needed
+// because no other thread touches neuron i's state. Kernel args are
+// flat: 6 device-array pointers + 9 scalar params. The host launcher
+// (examples/gpu_lif_launch.mlr) runs the same step on CPU for
+// comparison.
+
+fn tid_x() -> uint64 {
+    return 0
+}
+
+@kernel
+fn lif_step(
+    uint64 V_ptr,
+    uint64 ref_ptr,
+    uint64 RI_ptr,
+    uint64 s_exc_ptr,
+    uint64 s_inh_ptr,
+    uint64 spike_ptr,
+    uint64 n,
+    f64 dt,
+    f64 V_rest,
+    f64 V_reset,
+    f64 V_thresh,
+    f64 tau_m,
+    f64 J_E,
+    f64 J_I,
+    uint64 ref_steps
+) {
+    uint64 i = tid_x()
+    if i < n {
+        uint64 V_i   = V_ptr   + i * 8
+        uint64 ref_i = ref_ptr + i * 8
+        uint64 sp_i  = spike_ptr + i * 8
+
+        uint64 rc = 0
+        unsafe { *(ref_i as uint64) -> rc }
+        if rc > 0 {
+            uint64 rc_new = rc - 1
+            unsafe { *(ref_i as uint64) = rc_new }
+            unsafe { *(V_i as f64) = V_reset }
+        } else {
+            f64 v = 0.0
+            unsafe { *(V_i as f64) -> v }
+            f64 ri = 0.0
+            uint64 RI_i = RI_ptr + i * 8
+            unsafe { *(RI_i as f64) -> ri }
+            f64 se = 0.0
+            uint64 se_i = s_exc_ptr + i * 8
+            unsafe { *(se_i as f64) -> se }
+            f64 si = 0.0
+            uint64 si_i = s_inh_ptr + i * 8
+            unsafe { *(si_i as f64) -> si }
+            f64 drive = ri + se * J_E - si * J_I
+            f64 dv = dt * (V_rest - v + drive) / tau_m
+            f64 v_new = v + dv
+            if v_new >= V_thresh {
+                unsafe { *(V_i as f64) = V_reset }
+                unsafe { *(ref_i as uint64) = ref_steps }
+                uint64 sc = 0
+                unsafe { *(sp_i as uint64) -> sc }
+                uint64 sc_new = sc + 1
+                unsafe { *(sp_i as uint64) = sc_new }
+            } else {
+                unsafe { *(V_i as f64) = v_new }
+            }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}
