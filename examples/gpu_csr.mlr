@@ -1,0 +1,74 @@
+// MLRift — M4.c CSR E-delivery kernel source.
+//
+// One thread per source neuron. Each thread reads its outgoing
+// synapse range from rpe_ptr, walks the (tgt, w) pairs, and
+// atomically adds `w * release_factor[src]` into s_exc[tgt]. The
+// atomicAdd is exactly what's needed because many (src, syn) pairs
+// can target the same neuron at the same step — a plain load/add/
+// store would lose increments to races.
+//
+// Layout mirrors stage 13 (examples/scale_50k_vec.mlr):
+//   static uint64[N+1]  rpe_ptr     -- CSR row pointers
+//   static uint64[M]    rpe_tgt     -- target neuron indices
+//   static f64[M]       rpe_w       -- synaptic weights
+//   static f64[N]       release_factor
+//   static f64[N]       s_exc
+//
+// STDP LTD + is_ee gating lands in a follow-up slice (M4.e); this
+// milestone isolates the scatter-add.
+
+fn tid_x() -> uint64 {
+    return 0
+}
+
+// CPU stub — runs single-threaded in the --target=hip-amd pre-GPU
+// codegen pass, never from a real thread.
+fn atomic_add_f64(uint64 ptr, f64 val) -> f64 {
+    f64 old = 0.0
+    unsafe { *(ptr as f64) -> old }
+    f64 nv = old + val
+    unsafe { *(ptr as f64) = nv }
+    return old
+}
+
+@kernel
+fn csr_e_deliver(
+    uint64 rpe_ptr_ptr,
+    uint64 rpe_tgt_ptr,
+    uint64 rpe_w_ptr,
+    uint64 release_ptr,
+    uint64 s_exc_ptr,
+    uint64 n
+) {
+    uint64 src = tid_x()
+    if src < n {
+        uint64 rel_p = release_ptr + src * 8
+        f64 rel = 0.0
+        unsafe { *(rel_p as f64) -> rel }
+        if rel > 0.0 {
+            uint64 start_p = rpe_ptr_ptr + src * 8
+            uint64 end_p = rpe_ptr_ptr + (src + 1) * 8
+            uint64 start = 0
+            uint64 end = 0
+            unsafe { *(start_p as uint64) -> start }
+            unsafe { *(end_p as uint64) -> end }
+            uint64 syn = start
+            while syn < end {
+                uint64 tgt_p = rpe_tgt_ptr + syn * 8
+                uint64 tgt = 0
+                unsafe { *(tgt_p as uint64) -> tgt }
+                uint64 w_p = rpe_w_ptr + syn * 8
+                f64 w = 0.0
+                unsafe { *(w_p as f64) -> w }
+                f64 effective = w * rel
+                uint64 s_exc_tgt = s_exc_ptr + tgt * 8
+                atomic_add_f64(s_exc_tgt, effective)
+                syn = syn + 1
+            }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}
