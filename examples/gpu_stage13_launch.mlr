@@ -1,0 +1,532 @@
+// MLRift — M4.g "stage 13 lite" orchestration test.
+//
+// Runs N_STEPS of a simplified spiking network on both GPU (via the
+// kernel chain in examples/gpu_stage13.mlr) and a CPU reference that
+// mirrors the same math. The per-step loop is pure on-device — no
+// host sync between kernels, only one D2H at the end to read back
+// spike_count.
+//
+// Simplifications vs. full stage 13:
+//   * E-only population (no I cells, cell_type gating irrelevant)
+//   * No short-term plasticity (release_factor is binary 0/1 on fire)
+//   * No STDP LTD (rpe_is_ee branch stays off)
+//   * No synaptic delay (ring buffer skipped)
+//   * No x_pre/x_post traces
+//
+// Scope enough to prove the orchestration end-to-end: 4 kernels per
+// step, persistent device arrays, deterministic initial state, exact
+// CPU vs. GPU match.
+
+import "../std/hip.kr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+static uint64 N         = 1024
+static uint64 SYN_E     = 8         // outgoing E synapses per source
+static uint64 N_STEPS   = 1500
+
+static f64 dt       = 0.1
+static f64 V_rest   = -70.0
+static f64 V_reset  = -75.0
+static f64 V_thresh = -55.0
+static f64 tau_m    = 20.0
+static f64 tau_e    = 10.0
+static f64 tau_i    = 5.0
+static f64 J_E      = 2.0
+static f64 J_I      = 8.0
+static uint64 ref_steps = 20
+static f64 syn_w    = 0.1
+static f64 drive_base = 10.0
+static f64 drive_span = 20.0
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 {
+        uint8 zero = 48
+        unsafe { *(buf as uint8) = zero }
+        return 1
+    }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 {
+        n = n + 1
+        tmp = tmp / 10
+    }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58
+    unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 space = 32
+    unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0
+    unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+// ---- State init (used to seed both GPU and CPU tracks) ----
+
+fn init_state(uint64 V, uint64 ref_count, uint64 RI,
+              uint64 s_exc, uint64 s_inh,
+              uint64 spike_count, uint64 release,
+              uint64 rpe_ptr, uint64 rpe_tgt, uint64 rpe_w) {
+    f64 Nm1 = 0.0
+    Nm1 = N - 1
+    uint64 i = 0
+    while i < N {
+        uint64 Vp = V + i * 8;        f64 vr = V_rest; unsafe { *(Vp as f64) = vr }
+        uint64 rp = ref_count + i * 8; uint64 zu = 0;  unsafe { *(rp as uint64) = zu }
+        uint64 sep = s_exc + i * 8;   f64 zf = 0.0;    unsafe { *(sep as f64) = zf }
+        uint64 sip = s_inh + i * 8;                     unsafe { *(sip as f64) = zf }
+        uint64 scp = spike_count + i * 8;              unsafe { *(scp as uint64) = zu }
+        uint64 relp = release + i * 8;                 unsafe { *(relp as f64) = zf }
+        uint64 RIp = RI + i * 8
+        f64 fi = 0.0; fi = i
+        f64 rv = drive_base + (fi / Nm1) * drive_span
+        unsafe { *(RIp as f64) = rv }
+        i = i + 1
+    }
+
+    uint64 s = 0
+    while s < N + 1 {
+        uint64 p = rpe_ptr + s * 8
+        uint64 v = s * SYN_E
+        unsafe { *(p as uint64) = v }
+        s = s + 1
+    }
+
+    uint64 src = 0
+    while src < N {
+        uint64 k = 0
+        while k < SYN_E {
+            uint64 syn = src * SYN_E + k
+            uint64 raw = src * 37 + k * 101 + 3
+            uint64 t = raw - (raw / N) * N
+            uint64 tp = rpe_tgt + syn * 8
+            unsafe { *(tp as uint64) = t }
+            uint64 wp = rpe_w + syn * 8
+            f64 wv = syn_w
+            unsafe { *(wp as f64) = wv }
+            k = k + 1
+        }
+        src = src + 1
+    }
+}
+
+// ---- CPU reference — mirrors the kernel chain exactly ----
+
+fn cpu_step(uint64 V, uint64 ref_count, uint64 RI,
+            uint64 s_exc, uint64 s_inh,
+            uint64 spike_count, uint64 release,
+            uint64 rpe_ptr, uint64 rpe_tgt, uint64 rpe_w,
+            f64 f_e, f64 f_i) {
+    // decay s_exc, s_inh
+    uint64 i = 0
+    while i < N {
+        uint64 sep = s_exc + i * 8
+        f64 se = 0.0
+        unsafe { *(sep as f64) -> se }
+        f64 se_new = se - se * f_e
+        unsafe { *(sep as f64) = se_new }
+        uint64 sip = s_inh + i * 8
+        f64 si = 0.0
+        unsafe { *(sip as f64) -> si }
+        f64 si_new = si - si * f_i
+        unsafe { *(sip as f64) = si_new }
+        i = i + 1
+    }
+
+    // csr_e_deliver
+    uint64 src = 0
+    while src < N {
+        uint64 rp = release + src * 8
+        f64 rel = 0.0
+        unsafe { *(rp as f64) -> rel }
+        if rel > 0.0 {
+            uint64 sp_p = rpe_ptr + src * 8
+            uint64 ep_p = rpe_ptr + (src + 1) * 8
+            uint64 start = 0; uint64 end = 0
+            unsafe { *(sp_p as uint64) -> start }
+            unsafe { *(ep_p as uint64) -> end }
+            uint64 syn = start
+            while syn < end {
+                uint64 tp = rpe_tgt + syn * 8
+                uint64 t = 0
+                unsafe { *(tp as uint64) -> t }
+                uint64 wp = rpe_w + syn * 8
+                f64 w = 0.0
+                unsafe { *(wp as f64) -> w }
+                f64 eff = w * rel
+                uint64 sep = s_exc + t * 8
+                f64 cur = 0.0
+                unsafe { *(sep as f64) -> cur }
+                f64 nv = cur + eff
+                unsafe { *(sep as f64) = nv }
+                syn = syn + 1
+            }
+        }
+        src = src + 1
+    }
+
+    // lif_fire
+    uint64 j = 0
+    while j < N {
+        uint64 Vp = V + j * 8
+        uint64 refp = ref_count + j * 8
+        uint64 spp = spike_count + j * 8
+        uint64 relp = release + j * 8
+
+        f64 zero_f = 0.0
+        unsafe { *(relp as f64) = zero_f }
+
+        uint64 rc = 0
+        unsafe { *(refp as uint64) -> rc }
+        if rc > 0 {
+            uint64 rc_new = rc - 1
+            unsafe { *(refp as uint64) = rc_new }
+            unsafe { *(Vp as f64) = V_reset }
+        } else {
+            f64 v = 0.0
+            unsafe { *(Vp as f64) -> v }
+            f64 ri = 0.0
+            uint64 RIp = RI + j * 8
+            unsafe { *(RIp as f64) -> ri }
+            f64 se = 0.0
+            uint64 sep = s_exc + j * 8
+            unsafe { *(sep as f64) -> se }
+            f64 si = 0.0
+            uint64 sip = s_inh + j * 8
+            unsafe { *(sip as f64) -> si }
+            f64 drive = ri + se * J_E - si * J_I
+            f64 dv = dt * (V_rest - v + drive) / tau_m
+            f64 v_new = v + dv
+            if v_new >= V_thresh {
+                unsafe { *(Vp as f64) = V_reset }
+                unsafe { *(refp as uint64) = ref_steps }
+                uint64 sc = 0
+                unsafe { *(spp as uint64) -> sc }
+                uint64 sc_new = sc + 1
+                unsafe { *(spp as uint64) = sc_new }
+                f64 one_f = 1.0
+                unsafe { *(relp as f64) = one_f }
+            } else {
+                unsafe { *(Vp as f64) = v_new }
+            }
+        }
+        j = j + 1
+    }
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    uint64 co_path = "/tmp/gpu_stage13.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/gpu_stage13.co — build first:")
+        puts("  mlrc --target=hip-amd examples/gpu_stage13.mlr -o /tmp/gpu_stage13")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData failed", err) }
+    uint64 mod = 0
+    unsafe { *(mod_slot as uint64) -> mod }
+
+    // Fn handles
+    uint64 fd_slot = alloc(8)
+    uint64 fname_decay = "decay_step"
+    err = hipModuleGetFunction(fd_slot, mod, fname_decay)
+    if err != 0 { die("getFn decay_step", err) }
+    uint64 fn_decay = 0
+    unsafe { *(fd_slot as uint64) -> fn_decay }
+
+    uint64 fc_slot = alloc(8)
+    uint64 fname_csr = "csr_e_deliver"
+    err = hipModuleGetFunction(fc_slot, mod, fname_csr)
+    if err != 0 { die("getFn csr_e_deliver", err) }
+    uint64 fn_csr = 0
+    unsafe { *(fc_slot as uint64) -> fn_csr }
+
+    uint64 fl_slot = alloc(8)
+    uint64 fname_lif = "lif_fire"
+    err = hipModuleGetFunction(fl_slot, mod, fname_lif)
+    if err != 0 { die("getFn lif_fire", err) }
+    uint64 fn_lif = 0
+    unsafe { *(fl_slot as uint64) -> fn_lif }
+
+    // ---- Host buffers (populated once, duplicated into CPU track) ----
+    uint64 bytes_f = N * 8
+    uint64 bytes_u = N * 8
+    uint64 bytes_rpe_ptr = (N + 1) * 8
+    uint64 n_syn = N * SYN_E
+    uint64 bytes_tgt = n_syn * 8
+    uint64 bytes_w   = n_syn * 8
+
+    uint64 h_V       = alloc(bytes_f)
+    uint64 h_ref     = alloc(bytes_u)
+    uint64 h_RI      = alloc(bytes_f)
+    uint64 h_se      = alloc(bytes_f)
+    uint64 h_si      = alloc(bytes_f)
+    uint64 h_sc      = alloc(bytes_u)
+    uint64 h_rel     = alloc(bytes_f)
+    uint64 h_rpe_ptr = alloc(bytes_rpe_ptr)
+    uint64 h_rpe_tgt = alloc(bytes_tgt)
+    uint64 h_rpe_w   = alloc(bytes_w)
+
+    uint64 c_V       = alloc(bytes_f)
+    uint64 c_ref     = alloc(bytes_u)
+    uint64 c_RI      = alloc(bytes_f)
+    uint64 c_se      = alloc(bytes_f)
+    uint64 c_si      = alloc(bytes_f)
+    uint64 c_sc      = alloc(bytes_u)
+    uint64 c_rel     = alloc(bytes_f)
+    uint64 c_rpe_ptr = alloc(bytes_rpe_ptr)
+    uint64 c_rpe_tgt = alloc(bytes_tgt)
+    uint64 c_rpe_w   = alloc(bytes_w)
+
+    init_state(h_V, h_ref, h_RI, h_se, h_si, h_sc, h_rel,
+               h_rpe_ptr, h_rpe_tgt, h_rpe_w)
+    init_state(c_V, c_ref, c_RI, c_se, c_si, c_sc, c_rel,
+               c_rpe_ptr, c_rpe_tgt, c_rpe_w)
+
+    f64 f_e = dt / tau_e
+    f64 f_i = dt / tau_i
+
+    // ---- CPU reference: N_STEPS iterations ----
+    uint64 cs = 0
+    while cs < N_STEPS {
+        cpu_step(c_V, c_ref, c_RI, c_se, c_si, c_sc, c_rel,
+                 c_rpe_ptr, c_rpe_tgt, c_rpe_w, f_e, f_i)
+        cs = cs + 1
+    }
+
+    // ---- GPU: allocate + H2D ----
+    uint64 slot = 0
+    uint64 d_V = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes_f); if err != 0 { die("malloc V", err) }
+    unsafe { *(slot as uint64) -> d_V }
+    err = hipMemcpy(d_V, h_V, bytes_f, 1); if err != 0 { die("H2D V", err) }
+
+    uint64 d_ref = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes_u); if err != 0 { die("malloc ref", err) }
+    unsafe { *(slot as uint64) -> d_ref }
+    err = hipMemcpy(d_ref, h_ref, bytes_u, 1); if err != 0 { die("H2D ref", err) }
+
+    uint64 d_RI = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes_f); if err != 0 { die("malloc RI", err) }
+    unsafe { *(slot as uint64) -> d_RI }
+    err = hipMemcpy(d_RI, h_RI, bytes_f, 1); if err != 0 { die("H2D RI", err) }
+
+    uint64 d_se = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes_f); if err != 0 { die("malloc s_exc", err) }
+    unsafe { *(slot as uint64) -> d_se }
+    err = hipMemcpy(d_se, h_se, bytes_f, 1); if err != 0 { die("H2D s_exc", err) }
+
+    uint64 d_si = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes_f); if err != 0 { die("malloc s_inh", err) }
+    unsafe { *(slot as uint64) -> d_si }
+    err = hipMemcpy(d_si, h_si, bytes_f, 1); if err != 0 { die("H2D s_inh", err) }
+
+    uint64 d_sc = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes_u); if err != 0 { die("malloc sc", err) }
+    unsafe { *(slot as uint64) -> d_sc }
+    err = hipMemcpy(d_sc, h_sc, bytes_u, 1); if err != 0 { die("H2D sc", err) }
+
+    uint64 d_rel = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes_f); if err != 0 { die("malloc rel", err) }
+    unsafe { *(slot as uint64) -> d_rel }
+    err = hipMemcpy(d_rel, h_rel, bytes_f, 1); if err != 0 { die("H2D rel", err) }
+
+    uint64 d_rpe_ptr = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes_rpe_ptr); if err != 0 { die("malloc rpe_ptr", err) }
+    unsafe { *(slot as uint64) -> d_rpe_ptr }
+    err = hipMemcpy(d_rpe_ptr, h_rpe_ptr, bytes_rpe_ptr, 1); if err != 0 { die("H2D rpe_ptr", err) }
+
+    uint64 d_rpe_tgt = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes_tgt); if err != 0 { die("malloc rpe_tgt", err) }
+    unsafe { *(slot as uint64) -> d_rpe_tgt }
+    err = hipMemcpy(d_rpe_tgt, h_rpe_tgt, bytes_tgt, 1); if err != 0 { die("H2D rpe_tgt", err) }
+
+    uint64 d_rpe_w = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes_w); if err != 0 { die("malloc rpe_w", err) }
+    unsafe { *(slot as uint64) -> d_rpe_w }
+    err = hipMemcpy(d_rpe_w, h_rpe_w, bytes_w, 1); if err != 0 { die("H2D rpe_w", err) }
+
+    // ---- Preconstructed kernel arg buffers (reused across steps) ----
+
+    // decay_step: (buf, n, factor)  — separate arg storage for s_exc/s_inh
+    uint64 a_buf_se = alloc(8); unsafe { *(a_buf_se as uint64) = d_se }
+    uint64 a_buf_si = alloc(8); unsafe { *(a_buf_si as uint64) = d_si }
+    uint64 a_dn = alloc(8); uint64 nv = N; unsafe { *(a_dn as uint64) = nv }
+    uint64 a_df_e = alloc(8); f64 fev = f_e; unsafe { *(a_df_e as f64) = fev }
+    uint64 a_df_i = alloc(8); f64 fiv = f_i; unsafe { *(a_df_i as f64) = fiv }
+
+    uint64 kp_decay_se = alloc(3 * 8)
+    unsafe { *(kp_decay_se       as uint64) = a_buf_se }
+    unsafe { *((kp_decay_se + 8)  as uint64) = a_dn }
+    unsafe { *((kp_decay_se + 16) as uint64) = a_df_e }
+
+    uint64 kp_decay_si = alloc(3 * 8)
+    unsafe { *(kp_decay_si       as uint64) = a_buf_si }
+    unsafe { *((kp_decay_si + 8)  as uint64) = a_dn }
+    unsafe { *((kp_decay_si + 16) as uint64) = a_df_i }
+
+    // csr_e_deliver
+    uint64 a_rpe_ptr = alloc(8); unsafe { *(a_rpe_ptr as uint64) = d_rpe_ptr }
+    uint64 a_rpe_tgt = alloc(8); unsafe { *(a_rpe_tgt as uint64) = d_rpe_tgt }
+    uint64 a_rpe_w   = alloc(8); unsafe { *(a_rpe_w   as uint64) = d_rpe_w }
+    uint64 a_rel_c   = alloc(8); unsafe { *(a_rel_c   as uint64) = d_rel }
+    uint64 a_se_c    = alloc(8); unsafe { *(a_se_c    as uint64) = d_se }
+    uint64 a_n_c     = alloc(8); unsafe { *(a_n_c     as uint64) = nv }
+
+    uint64 kp_csr = alloc(6 * 8)
+    unsafe { *(kp_csr       as uint64) = a_rpe_ptr }
+    unsafe { *((kp_csr + 8)  as uint64) = a_rpe_tgt }
+    unsafe { *((kp_csr + 16) as uint64) = a_rpe_w }
+    unsafe { *((kp_csr + 24) as uint64) = a_rel_c }
+    unsafe { *((kp_csr + 32) as uint64) = a_se_c }
+    unsafe { *((kp_csr + 40) as uint64) = a_n_c }
+
+    // lif_fire — 16 args
+    uint64 a_V   = alloc(8); unsafe { *(a_V   as uint64) = d_V }
+    uint64 a_ref = alloc(8); unsafe { *(a_ref as uint64) = d_ref }
+    uint64 a_RI  = alloc(8); unsafe { *(a_RI  as uint64) = d_RI }
+    uint64 a_se  = alloc(8); unsafe { *(a_se  as uint64) = d_se }
+    uint64 a_si  = alloc(8); unsafe { *(a_si  as uint64) = d_si }
+    uint64 a_sc  = alloc(8); unsafe { *(a_sc  as uint64) = d_sc }
+    uint64 a_rel = alloc(8); unsafe { *(a_rel as uint64) = d_rel }
+    uint64 a_n   = alloc(8); unsafe { *(a_n   as uint64) = nv }
+    uint64 a_dt  = alloc(8); f64 dtv = dt; unsafe { *(a_dt as f64) = dtv }
+    uint64 a_vr  = alloc(8); f64 vrv = V_rest; unsafe { *(a_vr as f64) = vrv }
+    uint64 a_vrs = alloc(8); f64 vrsv = V_reset; unsafe { *(a_vrs as f64) = vrsv }
+    uint64 a_vt  = alloc(8); f64 vtv = V_thresh; unsafe { *(a_vt as f64) = vtv }
+    uint64 a_tau = alloc(8); f64 taum = tau_m; unsafe { *(a_tau as f64) = taum }
+    uint64 a_jE  = alloc(8); f64 je = J_E; unsafe { *(a_jE as f64) = je }
+    uint64 a_jI  = alloc(8); f64 ji = J_I; unsafe { *(a_jI as f64) = ji }
+    uint64 a_rs  = alloc(8); uint64 rsv = ref_steps; unsafe { *(a_rs as uint64) = rsv }
+
+    uint64 kp_lif = alloc(16 * 8)
+    unsafe { *(kp_lif        as uint64) = a_V }
+    unsafe { *((kp_lif + 8)   as uint64) = a_ref }
+    unsafe { *((kp_lif + 16)  as uint64) = a_RI }
+    unsafe { *((kp_lif + 24)  as uint64) = a_se }
+    unsafe { *((kp_lif + 32)  as uint64) = a_si }
+    unsafe { *((kp_lif + 40)  as uint64) = a_sc }
+    unsafe { *((kp_lif + 48)  as uint64) = a_rel }
+    unsafe { *((kp_lif + 56)  as uint64) = a_n }
+    unsafe { *((kp_lif + 64)  as uint64) = a_dt }
+    unsafe { *((kp_lif + 72)  as uint64) = a_vr }
+    unsafe { *((kp_lif + 80)  as uint64) = a_vrs }
+    unsafe { *((kp_lif + 88)  as uint64) = a_vt }
+    unsafe { *((kp_lif + 96)  as uint64) = a_tau }
+    unsafe { *((kp_lif + 104) as uint64) = a_jE }
+    unsafe { *((kp_lif + 112) as uint64) = a_jI }
+    unsafe { *((kp_lif + 120) as uint64) = a_rs }
+
+    uint32 block_x = 256
+    uint64 grid_x_u = (N + 255) / 256
+    uint32 grid_x = grid_x_u
+
+    // ---- Per-step kernel chain ----
+    uint64 step = 0
+    while step < N_STEPS {
+        err = hipModuleLaunchKernel(fn_decay,
+                                     grid_x, 1, 1, block_x, 1, 1,
+                                     0, 0, kp_decay_se, 0)
+        if err != 0 { die("launch decay s_exc", err) }
+        err = hipModuleLaunchKernel(fn_decay,
+                                     grid_x, 1, 1, block_x, 1, 1,
+                                     0, 0, kp_decay_si, 0)
+        if err != 0 { die("launch decay s_inh", err) }
+        err = hipModuleLaunchKernel(fn_csr,
+                                     grid_x, 1, 1, block_x, 1, 1,
+                                     0, 0, kp_csr, 0)
+        if err != 0 { die("launch csr", err) }
+        err = hipModuleLaunchKernel(fn_lif,
+                                     grid_x, 1, 1, block_x, 1, 1,
+                                     0, 0, kp_lif, 0)
+        if err != 0 { die("launch lif", err) }
+        step = step + 1
+    }
+
+    err = hipDeviceSynchronize()
+    if err != 0 { die("sync end", err) }
+
+    // ---- D2H spike_count, sum, compare ----
+    err = hipMemcpy(h_sc, d_sc, bytes_u, 2); if err != 0 { die("D2H spike", err) }
+
+    uint64 cpu_total = 0
+    uint64 gpu_total = 0
+    uint64 mismatch = 0
+    uint64 i = 0
+    while i < N {
+        uint64 gp = h_sc + i * 8
+        uint64 cp = c_sc + i * 8
+        uint64 gv = 0; uint64 cv = 0
+        unsafe { *(gp as uint64) -> gv }
+        unsafe { *(cp as uint64) -> cv }
+        cpu_total = cpu_total + cv
+        gpu_total = gpu_total + gv
+        if gv != cv { mismatch = mismatch + 1 }
+        i = i + 1
+    }
+
+    print_label_val("CPU total spikes  ", 18, cpu_total)
+    print_label_val("GPU total spikes  ", 18, gpu_total)
+    print_label_val("per-neuron mismat ", 18, mismatch)
+
+    if cpu_total == gpu_total {
+        if mismatch == 0 {
+            puts("stage13 lite OK — GPU spike counts match CPU per-neuron")
+            hipFree(d_V); hipFree(d_ref); hipFree(d_RI); hipFree(d_se)
+            hipFree(d_si); hipFree(d_sc); hipFree(d_rel)
+            hipFree(d_rpe_ptr); hipFree(d_rpe_tgt); hipFree(d_rpe_w)
+            exit(0)
+        }
+    }
+    puts("stage13 lite FAIL")
+    hipFree(d_V); hipFree(d_ref); hipFree(d_RI); hipFree(d_se)
+    hipFree(d_si); hipFree(d_sc); hipFree(d_rel)
+    hipFree(d_rpe_ptr); hipFree(d_rpe_tgt); hipFree(d_rpe_w)
+    exit(1)
+}

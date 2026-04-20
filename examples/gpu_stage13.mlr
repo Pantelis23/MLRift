@@ -1,0 +1,155 @@
+// MLRift — M4.g combined kernel source for the "stage 13 lite"
+// simulation.
+//
+// Three kernel entry points in one .co so the host only has to
+// hipModuleLoad once:
+//
+//   decay_step          — v = v - v * factor (per-element)
+//   csr_e_deliver       — scatter-add w*release into s_exc[tgt] via
+//                         atomicAdd (no STDP, no is_ee branch)
+//   lif_fire            — LIF integrate + fire bookkeeping incl. the
+//                         release_factor write the next step needs
+//
+// For the full stage-13 model (STP, STDP, delay ring buffer,
+// I-population, cell_type gating, x_pre/x_post traces) the M4.e
+// and M4.d versions of csr_e_deliver / csr_i_deliver and the
+// scale_50k_vec.mlr CPU reference are the templates to port next.
+
+fn tid_x() -> uint64 {
+    return 0
+}
+
+fn atomic_add_f64(uint64 ptr, f64 val) -> f64 {
+    f64 old = 0.0
+    unsafe { *(ptr as f64) -> old }
+    f64 nv = old + val
+    unsafe { *(ptr as f64) = nv }
+    return old
+}
+
+// buf[i] = buf[i] - buf[i] * factor
+@kernel
+fn decay_step(uint64 buf, uint64 n, f64 factor) {
+    uint64 i = tid_x()
+    if i < n {
+        uint64 p = buf + i * 8
+        f64 v = 0.0
+        unsafe { *(p as f64) -> v }
+        v = v - v * factor
+        unsafe { *(p as f64) = v }
+    }
+}
+
+// Scatter-add w[syn] * release[src] into s_exc[tgt].
+@kernel
+fn csr_e_deliver(
+    uint64 rpe_ptr_ptr,
+    uint64 rpe_tgt_ptr,
+    uint64 rpe_w_ptr,
+    uint64 release_ptr,
+    uint64 s_exc_ptr,
+    uint64 n
+) {
+    uint64 src = tid_x()
+    if src < n {
+        uint64 rel_p = release_ptr + src * 8
+        f64 rel = 0.0
+        unsafe { *(rel_p as f64) -> rel }
+        if rel > 0.0 {
+            uint64 start_p = rpe_ptr_ptr + src * 8
+            uint64 end_p = rpe_ptr_ptr + (src + 1) * 8
+            uint64 start = 0
+            uint64 end = 0
+            unsafe { *(start_p as uint64) -> start }
+            unsafe { *(end_p as uint64) -> end }
+            uint64 syn = start
+            while syn < end {
+                uint64 tgt_p = rpe_tgt_ptr + syn * 8
+                uint64 tgt = 0
+                unsafe { *(tgt_p as uint64) -> tgt }
+                uint64 w_p = rpe_w_ptr + syn * 8
+                f64 w = 0.0
+                unsafe { *(w_p as f64) -> w }
+                f64 effective = w * rel
+                uint64 s_exc_tgt = s_exc_ptr + tgt * 8
+                atomic_add_f64(s_exc_tgt, effective)
+                syn = syn + 1
+            }
+        }
+    }
+}
+
+// LIF integrate + refractory handling + fire bookkeeping with a
+// binary release_factor (0/1 — no STP). On fire: V reset, refractory
+// armed, spike_count bumped, release set to 1.0 so the next step's
+// csr_e_deliver can route the activation.
+@kernel
+fn lif_fire(
+    uint64 V_ptr,
+    uint64 ref_ptr,
+    uint64 RI_ptr,
+    uint64 s_exc_ptr,
+    uint64 s_inh_ptr,
+    uint64 spike_ptr,
+    uint64 release_ptr,
+    uint64 n,
+    f64 dt,
+    f64 V_rest,
+    f64 V_reset,
+    f64 V_thresh,
+    f64 tau_m,
+    f64 J_E,
+    f64 J_I,
+    uint64 ref_steps
+) {
+    uint64 i = tid_x()
+    if i < n {
+        uint64 V_i    = V_ptr       + i * 8
+        uint64 ref_i  = ref_ptr     + i * 8
+        uint64 sp_i   = spike_ptr   + i * 8
+        uint64 rel_i  = release_ptr + i * 8
+
+        // Default: this neuron didn't fire this step.
+        f64 zero_f = 0.0
+        unsafe { *(rel_i as f64) = zero_f }
+
+        uint64 rc = 0
+        unsafe { *(ref_i as uint64) -> rc }
+        if rc > 0 {
+            uint64 rc_new = rc - 1
+            unsafe { *(ref_i as uint64) = rc_new }
+            unsafe { *(V_i as f64) = V_reset }
+        } else {
+            f64 v = 0.0
+            unsafe { *(V_i as f64) -> v }
+            f64 ri = 0.0
+            uint64 RI_i = RI_ptr + i * 8
+            unsafe { *(RI_i as f64) -> ri }
+            f64 se = 0.0
+            uint64 se_i = s_exc_ptr + i * 8
+            unsafe { *(se_i as f64) -> se }
+            f64 si = 0.0
+            uint64 si_i = s_inh_ptr + i * 8
+            unsafe { *(si_i as f64) -> si }
+            f64 drive = ri + se * J_E - si * J_I
+            f64 dv = dt * (V_rest - v + drive) / tau_m
+            f64 v_new = v + dv
+            if v_new >= V_thresh {
+                unsafe { *(V_i as f64) = V_reset }
+                unsafe { *(ref_i as uint64) = ref_steps }
+                uint64 sc = 0
+                unsafe { *(sp_i as uint64) -> sc }
+                uint64 sc_new = sc + 1
+                unsafe { *(sp_i as uint64) = sc_new }
+                f64 one_f = 1.0
+                unsafe { *(rel_i as f64) = one_f }
+            } else {
+                unsafe { *(V_i as f64) = v_new }
+            }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}
