@@ -2922,6 +2922,21 @@ fn ir_lower_stmt(uint64 node) {
                 val = f64v
                 fk_from_val = 1
             }
+            // Integer → f64 conversion for `f64 x = some_int_var`.
+            // Restricted to the RHS being a bare Ident (AST kind 32)
+            // referring to a known int-typed variable, so call
+            // expressions — whose result vreg has fkind=0 even when
+            // the callee returns f64 — aren't wrongly ITOF'd.
+            if vd_fk == 1 && fk_from_val == 0 {
+                uint32 rhs_kind = ast_kind(winit)
+                if rhs_kind == 32 {
+                    uint64 f64v = ir_new_vreg()
+                    ir_emit(IR_ITOF, f64v, val, 0, 0, ir_current_bb)
+                    ir_vreg_fkind_set(f64v, 1)
+                    val = f64v
+                    fk_from_val = 1
+                }
+            }
             // Always create a fresh vreg for the new variable so it doesn't
             // alias the source. This is critical when the init is a variable
             // reference (e.g., uint64 test = bits) — without the copy, both
@@ -2948,10 +2963,26 @@ fn ir_lower_stmt(uint64 node) {
         uint32 name_tok = ast_data1(node)
         uint32 val_node = ast_child(node)
         uint64 val = ir_lower_expr(val_node)
+        uint64 val_fk = ir_vreg_fkind_get(val)
         // Check if the variable exists as a local first (locals shadow statics)
         uint64 wnt = name_tok
         uint64 local_vreg = ir_var_get(wnt)
         if local_vreg != 0xFFFFFFFF {
+            // Integer → f64 for `f64_var = some_int_var`. Only
+            // triggers when the RHS is a bare Ident (AST kind 32)
+            // so we don't misclassify call results. The LHS type
+            // comes from the current vreg's fkind. See
+            // memory/project_f64_cast_bug.md.
+            uint64 lhs_fk = ir_vreg_fkind_get(local_vreg)
+            if lhs_fk == 1 && val_fk == 0 {
+                uint32 rhs_kind = ast_kind(val_node)
+                if rhs_kind == 32 {
+                    uint64 f64v = ir_new_vreg()
+                    ir_emit(IR_ITOF, f64v, val, 0, 0, ir_current_bb)
+                    ir_vreg_fkind_set(f64v, 1)
+                    val = f64v
+                }
+            }
             ir_var_set(name_tok, val)
             return
         }
