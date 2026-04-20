@@ -632,13 +632,17 @@ fn main() {
     unsafe { *(dep_slot as uint64) = prev }
     err = hipGraphAddKernelNode(n_csre_slot, g, dep_slot, 1, p_csre)
     if err != 0 { die("add csre", err) }
-    unsafe { *(n_csre_slot as uint64) -> prev }
+    uint64 n_csre = 0
+    unsafe { *(n_csre_slot as uint64) -> n_csre }
+    prev = n_csre
 
     uint64 n_lif_slot = alloc(8)
     unsafe { *(dep_slot as uint64) = prev }
     err = hipGraphAddKernelNode(n_lif_slot, g, dep_slot, 1, p_lif)
     if err != 0 { die("add lif", err) }
-    unsafe { *(n_lif_slot as uint64) -> prev }
+    uint64 n_lif = 0
+    unsafe { *(n_lif_slot as uint64) -> n_lif }
+    prev = n_lif
 
     uint64 n_csri_slot = alloc(8)
     unsafe { *(dep_slot as uint64) = prev }
@@ -654,6 +658,11 @@ fn main() {
     puts("starting GPU simulation (graph path)")
     uint64 t_start = time_ns()
 
+    // HIP graph kernarg data is snapshotted at instantiate time (or
+    // last SetParams) — hipGraphLaunch does NOT re-read the host
+    // memory pointed to by kernelParams[i]. Only the CSR-E-deliver
+    // and LIF-full nodes have args that vary per step (ring-buffer
+    // row_r / row_w), so refresh only those two each iteration.
     uint64 step = 0
     while step < N_STEPS {
         uint64 read_slot = (step + 1) - ((step + 1) / buf_size) * buf_size
@@ -662,6 +671,11 @@ fn main() {
         uint64 write_slot = step - (step / buf_size) * buf_size
         uint64 rb_w = write_slot * N
         unsafe { *(a_row_w as uint64) = rb_w }
+
+        err = hipGraphExecKernelNodeSetParams(exec, n_csre, p_csre)
+        if err != 0 { die("setparams csre", err) }
+        err = hipGraphExecKernelNodeSetParams(exec, n_lif, p_lif)
+        if err != 0 { die("setparams lif", err) }
 
         err = hipGraphLaunch(exec, 0)
         if err != 0 { die("graph launch", err) }

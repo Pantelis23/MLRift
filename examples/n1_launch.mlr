@@ -1,0 +1,386 @@
+// MLRift — Noesis port stage N1, host launcher.
+//
+// Runs examples/noesis/n1.mlr (noesis_n1_step kernel) for N_STEPS via
+// a pre-instantiated HIP graph (1 kernel node, no deps), replayed
+// N_STEPS times with the `step` arg mutated between launches. HIP
+// re-reads kernelParams at each hipGraphLaunch, so no
+// hipGraphExecKernelNodeSetParams is needed — matches the pattern
+// established in examples/gpu_stage13_graph.mlr.
+//
+// Emits "neuron step" spike events in step-major order so the output
+// diffs byte-for-byte against examples/noesis/n1_reference.py.
+//
+// Build:
+//   mlrc --target=hip-amd examples/noesis/n1.mlr -o /tmp/noesis_n1
+//   mlrc                  examples/n1_launch.mlr -o /tmp/noesis_n1_launch
+// Run:
+//   python3 examples/noesis/n1_reference.py  > /tmp/n1_ref.txt
+//   /tmp/noesis_n1_launch                    > /tmp/n1_mlrift.txt
+//   diff /tmp/n1_ref.txt /tmp/n1_mlrift.txt  # must be empty
+//
+// See examples/noesis/README.md for the stage gate.
+
+import "../std/hip.kr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+
+// ── Layout (scale=1, L4 only) ──────────────────────────────────────
+static uint64 N        = 1500
+static uint64 GROUP_SZ = 300
+static uint64 N_STEPS  = 100
+
+// ── LIF params (Noesis seed + defaults) ────────────────────────────
+static f64    V_rest    = -65.0
+static f64    V_thresh  = -47.97608125209808
+static f64    V_reset   = -70.0
+static f64    R_m       = 10.0
+static uint64 ref_steps = 2
+static f64    signal_pA = 1800.0
+
+// alpha = exp(-dt / tau_m) with dt=1.0, tau_m=15.972508788108826.
+// Python's math.exp (libc's libm on AMD64 Linux) returns the f64
+// 0x3FEE0ED81142CAFC ≈ 0.9393120133521218. Passing the literal would
+// round-trip through MLRift's int_to_f64(ffrac)/int_to_f64(fdiv) path,
+// which doesn't preserve 1 ULP against the libm result. Bit-packing
+// the exact IEEE-754 value sidesteps the issue entirely and keeps the
+// kernel byte-match gate reachable without pulling libm in as a
+// @dynamic NEEDED.
+static uint64 alpha_bits_hi = 0x3FEE0ED8
+static uint64 alpha_bits_lo = 0x1142CAFC
+
+fn load_alpha() -> f64 {
+    uint64 slot = alloc(8)
+    uint64 bits = (alpha_bits_hi << 32) | alpha_bits_lo
+    unsafe { *(slot as uint64) = bits }
+    f64 a = 0.0
+    unsafe { *(slot as f64) -> a }
+    return a
+}
+
+// ── printf helpers (no libc dep beyond write+puts) ─────────────────
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 {
+        uint8 zero = 48
+        unsafe { *(buf as uint8) = zero }
+        return 1
+    }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 {
+        n = n + 1
+        tmp = tmp / 10
+    }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58
+    unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 space = 32
+    unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0
+    unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+// Print "neuron step\n" to stdout (fd=1). Buffered via a small
+// stack of writes — we don't need a full buffered stdio because
+// the output has a known max size (N_STEPS * N ≤ 150k lines, each
+// ≤ 16 bytes).
+fn print_spike(uint64 neuron, uint64 step) {
+    uint64 buf = alloc(32)
+    uint64 n1 = u64_to_ascii_decimal(neuron, buf)
+    uint64 sp_p = buf + n1
+    uint8 sp = 32
+    unsafe { *(sp_p as uint8) = sp }
+    uint64 n2 = u64_to_ascii_decimal(step, buf + n1 + 1)
+    uint64 nl_p = buf + n1 + 1 + n2
+    uint8 nl = 10
+    unsafe { *(nl_p as uint8) = nl }
+    write(1, buf, n1 + 1 + n2 + 1)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+// hipKernelNodeParams layout (ROCm 7.x). Same packer as
+// examples/gpu_graph_smoke.mlr / gpu_stage13_graph.mlr:
+//    0: blockDim  (x,y,z uint32 + 4 pad = 16)
+//   16: extra*
+//   24: func*
+//   32: gridDim   (x,y,z + 4 pad = 16)
+//   48: kernelParams**
+//   56: sharedMemBytes
+fn fill_kernel_node_params(
+    uint64 p,
+    uint64 func,
+    uint32 grid_x, uint32 block_x,
+    uint64 kernel_params
+) {
+    uint64 z = 0
+    while z < 64 {
+        uint64 pz = p + z
+        uint8 zb = 0
+        unsafe { *(pz as uint8) = zb }
+        z = z + 1
+    }
+    uint32 b = block_x
+    unsafe { *(p as uint32) = b }
+    uint32 one32 = 1
+    uint64 p4 = p + 4
+    unsafe { *(p4 as uint32) = one32 }
+    uint64 p8 = p + 8
+    unsafe { *(p8 as uint32) = one32 }
+    uint64 p24 = p + 24
+    unsafe { *(p24 as uint64) = func }
+    uint64 p32 = p + 32
+    uint32 g = grid_x
+    unsafe { *(p32 as uint32) = g }
+    uint64 p36 = p + 36
+    unsafe { *(p36 as uint32) = one32 }
+    uint64 p40 = p + 40
+    unsafe { *(p40 as uint32) = one32 }
+    uint64 p48 = p + 48
+    unsafe { *(p48 as uint64) = kernel_params }
+}
+
+// ── Host-side state initialisation ─────────────────────────────────
+fn init_host_state(uint64 V_h, uint64 ref_h, uint64 I_h) {
+    uint64 i = 0
+    while i < N {
+        uint64 V_i   = V_h   + i * 8
+        uint64 ref_i = ref_h + i * 8
+        uint64 I_i   = I_h   + i * 8
+
+        f64 vr = V_rest
+        unsafe { *(V_i as f64) = vr }
+
+        uint64 zero = 0
+        unsafe { *(ref_i as uint64) = zero }
+
+        f64 ie = 0.0
+        if i < GROUP_SZ { ie = signal_pA }
+        unsafe { *(I_i as f64) = ie }
+
+        i = i + 1
+    }
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    // ── Load the kernel (examples/noesis/n1.mlr → /tmp/noesis_n1.co) ──
+    uint64 co_path = "/tmp/noesis_n1.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/noesis_n1.co — build first:")
+        puts("  mlrc --target=hip-amd examples/noesis/n1.mlr -o /tmp/noesis_n1")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData failed", err) }
+    uint64 mod = 0
+    unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fn_slot = alloc(8)
+    uint64 kname = "noesis_n1_step"
+    err = hipModuleGetFunction(fn_slot, mod, kname)
+    if err != 0 { die("hipModuleGetFunction failed", err) }
+    uint64 fn_handle = 0
+    unsafe { *(fn_slot as uint64) -> fn_handle }
+
+    f64 alpha = load_alpha()
+
+    // ── Host buffers ───────────────────────────────────────────────────
+    uint64 bytes_f = N * 8
+    uint64 bytes_u = N * 8
+    uint64 bytes_h = N_STEPS * N   // fired_hist is uint8
+
+    uint64 h_V   = alloc(bytes_f)
+    uint64 h_ref = alloc(bytes_u)
+    uint64 h_I   = alloc(bytes_f)
+    uint64 h_h   = alloc(bytes_h)
+
+    init_host_state(h_V, h_ref, h_I)
+
+    // Zero fired_hist host-side for cleanliness (device alloc also
+    // returns zero-initialised memory with hipMalloc in practice, but
+    // don't rely on it).
+    uint64 zi = 0
+    while zi < bytes_h {
+        uint64 p = h_h + zi
+        uint8 z = 0
+        unsafe { *(p as uint8) = z }
+        zi = zi + 1
+    }
+
+    // ── Device buffers + H2D ──────────────────────────────────────────
+    uint64 d_V = 0
+    uint64 slot = alloc(8)
+    err = hipMalloc(slot, bytes_f); if err != 0 { die("hipMalloc V", err) }
+    unsafe { *(slot as uint64) -> d_V }
+    err = hipMemcpy(d_V, h_V, bytes_f, 1); if err != 0 { die("H2D V", err) }
+
+    uint64 d_ref = 0
+    slot = alloc(8)
+    err = hipMalloc(slot, bytes_u); if err != 0 { die("hipMalloc ref", err) }
+    unsafe { *(slot as uint64) -> d_ref }
+    err = hipMemcpy(d_ref, h_ref, bytes_u, 1); if err != 0 { die("H2D ref", err) }
+
+    uint64 d_I = 0
+    slot = alloc(8)
+    err = hipMalloc(slot, bytes_f); if err != 0 { die("hipMalloc I_ext", err) }
+    unsafe { *(slot as uint64) -> d_I }
+    err = hipMemcpy(d_I, h_I, bytes_f, 1); if err != 0 { die("H2D I_ext", err) }
+
+    uint64 d_h = 0
+    slot = alloc(8)
+    err = hipMalloc(slot, bytes_h); if err != 0 { die("hipMalloc fired_hist", err) }
+    unsafe { *(slot as uint64) -> d_h }
+    err = hipMemcpy(d_h, h_h, bytes_h, 1); if err != 0 { die("H2D fired_hist", err) }
+
+    // ── Kernel-param arena (12 pointer slots) ─────────────────────────
+    // Ordering matches noesis_n1_step's signature:
+    //   V_ptr, ref_ptr, I_ext_ptr, fired_hist_ptr,
+    //   n, step, V_rest, V_thresh, V_reset, R_m, alpha, ref_steps
+    uint64 a_V    = alloc(8); unsafe { *(a_V   as uint64) = d_V }
+    uint64 a_ref  = alloc(8); unsafe { *(a_ref as uint64) = d_ref }
+    uint64 a_I    = alloc(8); unsafe { *(a_I   as uint64) = d_I }
+    uint64 a_h    = alloc(8); unsafe { *(a_h   as uint64) = d_h }
+    uint64 a_n    = alloc(8); uint64 nv  = N;         unsafe { *(a_n   as uint64) = nv }
+    uint64 a_step = alloc(8)  // patched each iteration
+    uint64 a_vr   = alloc(8); f64    vrv = V_rest;    unsafe { *(a_vr  as f64)    = vrv }
+    uint64 a_vt   = alloc(8); f64    vtv = V_thresh;  unsafe { *(a_vt  as f64)    = vtv }
+    uint64 a_vrs  = alloc(8); f64    vrsv = V_reset;  unsafe { *(a_vrs as f64)    = vrsv }
+    uint64 a_rm   = alloc(8); f64    rmv = R_m;       unsafe { *(a_rm  as f64)    = rmv }
+    uint64 a_al   = alloc(8);                         unsafe { *(a_al  as f64)    = alpha }
+    uint64 a_rs   = alloc(8); uint64 rsv = ref_steps; unsafe { *(a_rs  as uint64) = rsv }
+
+    uint64 kp = alloc(12 * 8)
+    unsafe { *((kp +  0) as uint64) = a_V }
+    unsafe { *((kp +  8) as uint64) = a_ref }
+    unsafe { *((kp + 16) as uint64) = a_I }
+    unsafe { *((kp + 24) as uint64) = a_h }
+    unsafe { *((kp + 32) as uint64) = a_n }
+    unsafe { *((kp + 40) as uint64) = a_step }
+    unsafe { *((kp + 48) as uint64) = a_vr }
+    unsafe { *((kp + 56) as uint64) = a_vt }
+    unsafe { *((kp + 64) as uint64) = a_vrs }
+    unsafe { *((kp + 72) as uint64) = a_rm }
+    unsafe { *((kp + 80) as uint64) = a_al }
+    unsafe { *((kp + 88) as uint64) = a_rs }
+
+    uint32 block_x = 64
+    uint64 grid_x_u = (N + 63) / 64
+    uint32 grid_x = grid_x_u
+
+    // ── Build + instantiate a one-node graph around noesis_n1_step ────
+    // Single kernel, no deps, kernelParams = our `kp` arena. The `step`
+    // slot inside `kp` is mutated between hipGraphLaunch calls — HIP
+    // re-reads the kernel-params pointer each launch, so the node
+    // params struct itself doesn't need updating.
+    uint64 g_slot = alloc(8)
+    err = hipGraphCreate(g_slot, 0)
+    if err != 0 { die("hipGraphCreate", err) }
+    uint64 g = 0
+    unsafe { *(g_slot as uint64) -> g }
+
+    uint64 node_params = alloc(64)
+    fill_kernel_node_params(node_params, fn_handle, grid_x, block_x, kp)
+
+    uint64 node_slot = alloc(8)
+    err = hipGraphAddKernelNode(node_slot, g, 0, 0, node_params)
+    if err != 0 { die("hipGraphAddKernelNode", err) }
+    uint64 node = 0
+    unsafe { *(node_slot as uint64) -> node }
+
+    uint64 exec_slot = alloc(8)
+    err = hipGraphInstantiate(exec_slot, g, 0, 0, 0)
+    if err != 0 { die("hipGraphInstantiate", err) }
+    uint64 exec = 0
+    unsafe { *(exec_slot as uint64) -> exec }
+
+    // ── Simulation loop: mutate step, refresh exec params, replay ────
+    // hipGraphLaunch does NOT re-read the host-side memory that the
+    // graph's captured kernelParams point to — arg data is copied into
+    // an internal kernarg segment at instantiation (and again each
+    // time hipGraphExecKernelNodeSetParams is called). Writing *a_step
+    // between launches without SetParams leaves the graph seeing the
+    // original step=0 forever, which is what broke this file before.
+    uint64 step = 0
+    while step < N_STEPS {
+        unsafe { *(a_step as uint64) = step }
+        err = hipGraphExecKernelNodeSetParams(exec, node, node_params)
+        if err != 0 { die("hipGraphExecKernelNodeSetParams", err) }
+        err = hipGraphLaunch(exec, 0)
+        if err != 0 { die("hipGraphLaunch failed", err) }
+        step = step + 1
+    }
+    err = hipDeviceSynchronize()
+    if err != 0 { die("hipDeviceSynchronize failed", err) }
+
+    hipGraphExecDestroy(exec)
+    hipGraphDestroy(g)
+
+    // ── D2H fired_hist and print in step-major order ──────────────────
+    err = hipMemcpy(h_h, d_h, bytes_h, 2)
+    if err != 0 { die("D2H fired_hist", err) }
+
+    uint64 s = 0
+    while s < N_STEPS {
+        uint64 i = 0
+        while i < N {
+            uint64 idx = s * N + i
+            uint64 p = h_h + idx
+            uint64 flag = 0
+            unsafe { *(p as uint8) -> flag }
+            if flag != 0 { print_spike(i, s) }
+            i = i + 1
+        }
+        s = s + 1
+    }
+
+    hipFree(d_V)
+    hipFree(d_ref)
+    hipFree(d_I)
+    hipFree(d_h)
+    exit(0)
+}
