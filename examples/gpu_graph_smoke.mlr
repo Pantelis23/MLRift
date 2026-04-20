@@ -1,0 +1,286 @@
+// MLRift — HIP graph API smoke test.
+//
+// Verifies the hipKernelNodeParams layout + graph API bindings by
+// building a single-kernel graph around the M3 decay kernel,
+// launching it once, and checking the result matches a direct
+// hipModuleLaunchKernel of the same kernel on the same inputs.
+//
+// Correctness strategy: fill the buffer with a single constant
+// (1.5) — no int→f64 cast, which mlrc currently mis-compiles as a
+// bit-copy instead of CVTSI2SD (see memory). After one decay with
+// factor=0.005 the expected value is 1.5 * 0.995 = 1.4925, bit
+// pattern 0x3FF7E147AE147AE1.
+//
+// Build the kernel first:
+//   mlrc --target=hip-amd examples/gpu_decay.mlr -o /tmp/gpu_decay
+// Then:
+//   mlrc --arch=x86_64 examples/gpu_graph_smoke.mlr -o /tmp/gpu_graph_smoke
+//   /tmp/gpu_graph_smoke
+
+import "../std/hip.kr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+static uint64 N = 1024
+static f64 INIT_VAL = 1.5
+static f64 FACTOR = 0.005
+// 1.5 * 0.995 = 1.4925 — f64 bit pattern:
+static uint64 EXPECT_BITS = 0x3FF7E147AE147AE1
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 {
+        uint8 zero = 48
+        unsafe { *(buf as uint8) = zero }
+        return 1
+    }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 {
+        n = n + 1
+        tmp = tmp / 10
+    }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58
+    unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 space = 32
+    unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0
+    unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+// hipKernelNodeParams is a 64-byte struct. Field offsets (verified
+// against ROCm 7.2 /opt/rocm/include/hip/hip_runtime_api.h):
+//   0:  dim3 blockDim   (x,y,z uint32; 12 bytes + 4 pad = 16)
+//   16: void** extra
+//   24: void* func
+//   32: dim3 gridDim    (12 + 4 pad = 16)
+//   48: void** kernelParams
+//   56: unsigned int sharedMemBytes
+fn fill_kernel_node_params(
+    uint64 p,
+    uint64 func,
+    uint32 grid_x, uint32 block_x,
+    uint64 kernel_params
+) {
+    uint64 z = 0
+    while z < 64 {
+        uint64 pz = p + z
+        uint8 zb = 0
+        unsafe { *(pz as uint8) = zb }
+        z = z + 1
+    }
+    uint64 p0 = p
+    uint32 b = block_x
+    unsafe { *(p0 as uint32) = b }
+    uint32 one32 = 1
+    uint64 p4 = p + 4
+    unsafe { *(p4 as uint32) = one32 }
+    uint64 p8 = p + 8
+    unsafe { *(p8 as uint32) = one32 }
+    uint64 p24 = p + 24
+    unsafe { *(p24 as uint64) = func }
+    uint64 p32 = p + 32
+    uint32 g = grid_x
+    unsafe { *(p32 as uint32) = g }
+    uint64 p36 = p + 36
+    unsafe { *(p36 as uint32) = one32 }
+    uint64 p40 = p + 40
+    unsafe { *(p40 as uint32) = one32 }
+    uint64 p48 = p + 48
+    unsafe { *(p48 as uint64) = kernel_params }
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice", err) }
+
+    uint64 co_path = "/tmp/gpu_decay.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/gpu_decay.co — build first:")
+        puts("  mlrc --target=hip-amd examples/gpu_decay.mlr -o /tmp/gpu_decay")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData", err) }
+    uint64 mod = 0
+    unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fn_slot = alloc(8)
+    uint64 kname = "decay_step"
+    err = hipModuleGetFunction(fn_slot, mod, kname)
+    if err != 0 { die("getFn decay_step", err) }
+    uint64 fn_decay = 0
+    unsafe { *(fn_slot as uint64) -> fn_decay }
+
+    // --- Fill host buffer with 1.5 via f64 literal (no int cast) ---
+    uint64 bytes = N * 8
+    uint64 host_buf = alloc(bytes)
+    uint64 i = 0
+    while i < N {
+        uint64 p = host_buf + i * 8
+        f64 v = INIT_VAL
+        unsafe { *(p as f64) = v }
+        i = i + 1
+    }
+
+    uint64 slot = alloc(8)
+    err = hipMalloc(slot, bytes)
+    if err != 0 { die("hipMalloc", err) }
+    uint64 d_buf = 0
+    unsafe { *(slot as uint64) -> d_buf }
+    err = hipMemcpy(d_buf, host_buf, bytes, 1)
+    if err != 0 { die("H2D", err) }
+
+    // --- Kernel args: (uint64 buf, uint64 n, f64 factor) ---
+    uint64 a_buf = alloc(8)
+    unsafe { *(a_buf as uint64) = d_buf }
+    uint64 a_n = alloc(8)
+    uint64 nv = N
+    unsafe { *(a_n as uint64) = nv }
+    uint64 a_f = alloc(8)
+    f64 fv = FACTOR
+    unsafe { *(a_f as f64) = fv }
+    uint64 kp = alloc(24)
+    unsafe { *(kp as uint64) = a_buf }
+    uint64 kp1 = kp + 8
+    unsafe { *(kp1 as uint64) = a_n }
+    uint64 kp2 = kp + 16
+    unsafe { *(kp2 as uint64) = a_f }
+
+    uint32 block_x = 256
+    uint64 grid_x_u = (N + 255) / 256
+    uint32 grid_x = grid_x_u
+
+    // --- Direct launch (reference) ---
+    err = hipModuleLaunchKernel(fn_decay,
+                                 grid_x, 1, 1,
+                                 block_x, 1, 1,
+                                 0, 0,
+                                 kp, 0)
+    if err != 0 { die("direct launch", err) }
+    err = hipDeviceSynchronize()
+    if err != 0 { die("sync-direct", err) }
+    err = hipMemcpy(host_buf, d_buf, bytes, 2)
+    if err != 0 { die("D2H-direct", err) }
+
+    uint64 p500 = host_buf + 500 * 8
+    uint64 direct_bits = 0
+    unsafe { *(p500 as uint64) -> direct_bits }
+    print_label_val("DIRECT buf[500]", 15, direct_bits)
+    print_label_val("EXPECT (1.4925)", 15, EXPECT_BITS)
+
+    uint64 direct_ulp = 0
+    if direct_bits > EXPECT_BITS { direct_ulp = direct_bits - EXPECT_BITS }
+    if EXPECT_BITS > direct_bits { direct_ulp = EXPECT_BITS - direct_bits }
+    print_label_val("DIRECT ULP diff", 15, direct_ulp)
+    if direct_ulp > 8 {
+        puts("FAIL: direct launch produced unexpected value")
+        exit(1)
+    }
+
+    // --- Re-prime buffer so the graph launch sees the same input ---
+    i = 0
+    while i < N {
+        uint64 rp = host_buf + i * 8
+        f64 rv = INIT_VAL
+        unsafe { *(rp as f64) = rv }
+        i = i + 1
+    }
+    err = hipMemcpy(d_buf, host_buf, bytes, 1)
+    if err != 0 { die("re-H2D", err) }
+
+    // --- Build and launch a single-kernel graph ---
+    uint64 g_slot = alloc(8)
+    err = hipGraphCreate(g_slot, 0)
+    if err != 0 { die("hipGraphCreate", err) }
+    uint64 g = 0
+    unsafe { *(g_slot as uint64) -> g }
+
+    uint64 params = alloc(64)
+    fill_kernel_node_params(params, fn_decay, grid_x, block_x, kp)
+
+    uint64 node_slot = alloc(8)
+    err = hipGraphAddKernelNode(node_slot, g, 0, 0, params)
+    if err != 0 { die("hipGraphAddKernelNode", err) }
+
+    uint64 exec_slot = alloc(8)
+    err = hipGraphInstantiate(exec_slot, g, 0, 0, 0)
+    if err != 0 { die("hipGraphInstantiate", err) }
+    uint64 exec = 0
+    unsafe { *(exec_slot as uint64) -> exec }
+
+    err = hipGraphLaunch(exec, 0)
+    if err != 0 { die("hipGraphLaunch", err) }
+    err = hipDeviceSynchronize()
+    if err != 0 { die("sync-graph", err) }
+    err = hipMemcpy(host_buf, d_buf, bytes, 2)
+    if err != 0 { die("D2H-graph", err) }
+
+    uint64 gp500 = host_buf + 500 * 8
+    uint64 graph_bits = 0
+    unsafe { *(gp500 as uint64) -> graph_bits }
+    print_label_val("GRAPH  buf[500]", 15, graph_bits)
+
+    uint64 graph_ulp = 0
+    if graph_bits > EXPECT_BITS { graph_ulp = graph_bits - EXPECT_BITS }
+    if EXPECT_BITS > graph_bits { graph_ulp = EXPECT_BITS - graph_bits }
+    print_label_val("GRAPH  ULP diff", 15, graph_ulp)
+
+    if graph_ulp > 8 {
+        puts("FAIL: graph launch produced unexpected value")
+        hipFree(d_buf)
+        hipGraphExecDestroy(exec)
+        hipGraphDestroy(g)
+        exit(1)
+    }
+
+    puts("graph smoke OK — direct and graph both match expected value")
+    hipFree(d_buf)
+    hipGraphExecDestroy(exec)
+    hipGraphDestroy(g)
+    exit(0)
+}

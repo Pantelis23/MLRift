@@ -80,3 +80,46 @@
     uint64 kernel_params,
     uint64 extra
 ) -> uint32
+
+// --- Graph API (M4g+: batching per-step kernel launches) -------------------
+//
+// Typical flow:
+//   hipGraphCreate(&g, 0)
+//   for each kernel: hipGraphAddKernelNode(&n, g, deps, n_deps, &params)
+//   hipGraphInstantiate(&exec, g, 0, 0, 0)
+//   for each step: hipGraphLaunch(exec, 0)   // plus optional param updates
+//   hipGraphExecDestroy(exec); hipGraphDestroy(g)
+//
+// hipKernelNodeParams is a 64-byte struct (offsets: 0 blockDim x/y/z,
+// 16 extra*, 24 func*, 32 gridDim x/y/z, 48 kernelParams**, 56
+// sharedMemBytes). All handles are opaque pointers (pass as uint64).
+
+@dynamic extern fn hipGraphCreate(uint64 graph_out, uint32 flags) -> uint32
+
+@dynamic extern fn hipGraphDestroy(uint64 graph) -> uint32
+
+@dynamic extern fn hipGraphAddKernelNode(
+    uint64 node_out,
+    uint64 graph,
+    uint64 deps_ptr,
+    uint64 deps_count,
+    uint64 params_ptr
+) -> uint32
+
+@dynamic extern fn hipGraphInstantiate(
+    uint64 exec_out,
+    uint64 graph,
+    uint64 err_node_out,
+    uint64 log_buf,
+    uint64 log_buf_size
+) -> uint32
+
+@dynamic extern fn hipGraphExecDestroy(uint64 exec) -> uint32
+
+@dynamic extern fn hipGraphLaunch(uint64 exec, uint64 stream) -> uint32
+
+@dynamic extern fn hipGraphExecKernelNodeSetParams(
+    uint64 exec,
+    uint64 node,
+    uint64 params_ptr
+) -> uint32
