@@ -239,7 +239,7 @@ fn ir_init() {
     ir_loop_depth = 0
 
     if ir_overflow_args == 0 {
-        ir_overflow_args = alloc(16 * 8)
+        ir_overflow_args = alloc(32 * 8)
     }
     ir_overflow_arg_count = 0
 }
@@ -904,7 +904,8 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         return dest
     }
 
-    // FloatLit (46): parse integer+fraction, emit ITOF + arithmetic
+    // FloatLit (46): parse integer+fraction[+exponent], emit ITOF + arithmetic.
+    // Supports scientific notation: `1e-3`, `5.5e-4`, `3.14E+10`, `2e5f`.
     if kind == 46 {
         uint32 lit_tok = ast_data1(node)
         uint64 wlt = lit_tok
@@ -916,13 +917,29 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         uint64 frac_divisor = 1
         uint64 past_dot = 0
         uint64 is_f32 = 0
+        uint64 in_exp = 0
+        uint64 exp_neg = 0
+        uint64 exp_val = 0
         uint64 fi = 0
         while fi < tlen {
             uint64 ch = tok_source_byte(wlt, fi)
             if ch == 46 { past_dot = 1; fi = fi + 1; continue }
             if ch == 102 { is_f32 = 1; fi = fi + 1; continue }
+            if ch == 101 || ch == 69 {
+                // 'e' or 'E' — switch to exponent parsing for the rest.
+                in_exp = 1
+                fi = fi + 1
+                if fi < tlen {
+                    uint64 sign_ch = tok_source_byte(wlt, fi)
+                    if sign_ch == 45 { exp_neg = 1; fi = fi + 1 }
+                    else if sign_ch == 43 { fi = fi + 1 }
+                }
+                continue
+            }
             if ch >= 48 && ch <= 57 {
-                if past_dot == 0 {
+                if in_exp != 0 {
+                    exp_val = exp_val * 10 + (ch - 48)
+                } else if past_dot == 0 {
                     int_val = int_val * 10 + (ch - 48)
                 } else {
                     frac_val = frac_val * 10 + (ch - 48)
@@ -959,6 +976,34 @@ fn ir_lower_expr(uint64 node) -> uint64 {
             result = ir_new_vreg()
             ir_emit(IR_FADD, result, int_f, frac_r, 1, ir_current_bb)
             ir_vreg_fkind_set(result, 1)
+        }
+        // Apply exponent: multiply (or divide) by 10^exp_val. Compile-time
+        // compute pow10 as a uint64 for |exp| <= 18 (covers the entire f64
+        // normal range minus a tiny edge) and emit ONE ITOF + ONE FMUL/FDIV.
+        if exp_val != 0 {
+            if exp_val > 18 {
+                write(2, "error: float exponent too large (max 1e18)\n", 44)
+                exit(1)
+            }
+            uint64 pow10_u = 1
+            uint64 ei = 0
+            while ei < exp_val {
+                pow10_u = pow10_u * 10
+                ei = ei + 1
+            }
+            uint64 pow10_c = ir_new_vreg()
+            ir_emit(IR_CONST, pow10_c, 0, 0, pow10_u, ir_current_bb)
+            uint64 pow10_f = ir_new_vreg()
+            ir_emit(IR_ITOF, pow10_f, pow10_c, 0, 0, ir_current_bb)
+            ir_vreg_fkind_set(pow10_f, 1)
+            uint64 scaled = ir_new_vreg()
+            if exp_neg != 0 {
+                ir_emit(IR_FDIV, scaled, result, pow10_f, 1, ir_current_bb)
+            } else {
+                ir_emit(IR_FMUL, scaled, result, pow10_f, 1, ir_current_bb)
+            }
+            ir_vreg_fkind_set(scaled, 1)
+            result = scaled
         }
         if is_f32 != 0 {
             // Narrow f64 to f32
@@ -2267,11 +2312,13 @@ fn ir_lower_expr(uint64 node) -> uint64 {
 
         // General call: evaluate all arg exprs first, then emit ARGs + CALL
         // This prevents nested calls from clobbering arg registers.
-        uint64[16] call_arg_vregs
+        // Capacity is 32 args (6 register + up to 26 stack); pushing higher
+        // also requires bumping ir_overflow_args / IR_ARG's oi guard below.
+        uint64[32] call_arg_vregs
         uint32 arg = ast_child(node)
         uint64 warg = arg
         uint64 arg_count = 0
-        while warg != 0 && arg_count < 16 {
+        while warg != 0 && arg_count < 32 {
             uint64 av = ir_lower_expr(warg)
             // Check if this is a struct variable — copy to avoid aliasing
             uint32 ak = ast_kind(warg)
@@ -6166,7 +6213,7 @@ fn ir_emit_x86_insn(uint64 ii) {
         } else if imm >= 6 {
             // Overflow arg: save vreg to overflow buffer for IR_CALL to handle
             uint64 oi = imm - 6
-            if oi < 16 {
+            if oi < 32 {
                 uint64 op_ptr = ir_overflow_args + oi * 8
                 uint64 sv = s1_v
                 unsafe { *(op_ptr as uint64) = sv }
@@ -6229,10 +6276,17 @@ fn ir_emit_x86_insn(uint64 ii) {
                 oi = oi + 1
             }
             // Simpler approach: sub rsp, then store. Adjust resolve offsets manually.
-            // sub rsp, stack_bytes
-            emit_byte(0x48); emit_byte(0x83); emit_byte(0xEC)
-            uint8 sb8 = stack_bytes
-            emit_byte(sb8)
+            // sub rsp, stack_bytes (imm8 form fits up to 127; use imm32 for
+            // larger allocations — needed once the call has enough stack
+            // args to push stack_bytes past the signed-byte boundary).
+            if stack_bytes < 128 {
+                emit_byte(0x48); emit_byte(0x83); emit_byte(0xEC)
+                uint8 sb8 = stack_bytes
+                emit_byte(sb8)
+            } else {
+                emit_byte(0x48); emit_byte(0x81); emit_byte(0xEC)
+                emit_u32_le(stack_bytes)
+            }
             // Now rsp has shifted down. Spill slots are now at rsp + stack_bytes + original_offset
             // We need to re-resolve each overflow arg with the shifted rsp
             oi = 0
@@ -6253,11 +6307,15 @@ fn ir_emit_x86_insn(uint64 ii) {
                     if soff == 0 {
                         uint8 stm = ((arg_r & 7) << 3) | 4
                         emit_byte(stm); emit_byte(0x24)
-                    } else {
+                    } else if soff < 128 {
                         uint8 stm = 0x44 | ((arg_r & 7) << 3)
                         emit_byte(stm); emit_byte(0x24)
                         uint8 so8 = soff
                         emit_byte(so8)
+                    } else {
+                        uint8 stm = 0x84 | ((arg_r & 7) << 3)
+                        emit_byte(stm); emit_byte(0x24)
+                        emit_u32_le(soff)
                     }
                 } else {
                     // Value is spilled — need to load from adjusted offset
@@ -6279,10 +6337,13 @@ fn ir_emit_x86_insn(uint64 ii) {
                     emit_byte(0x48); emit_byte(0x89)
                     if soff == 0 {
                         emit_byte(0x04); emit_byte(0x24)
-                    } else {
+                    } else if soff < 128 {
                         emit_byte(0x44); emit_byte(0x24)
                         uint8 so8 = soff
                         emit_byte(so8)
+                    } else {
+                        emit_byte(0x84); emit_byte(0x24)
+                        emit_u32_le(soff)
                     }
                 }
                 oi = oi + 1
