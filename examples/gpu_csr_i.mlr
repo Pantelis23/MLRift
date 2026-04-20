@@ -1,0 +1,72 @@
+// MLRift — M4.d CSR I-delivery kernel source.
+//
+// Mirror of csr_e_deliver (gpu_csr.mlr) trimmed for the inhibitory
+// outgoing path in stage 13:
+//   * only fires for sources where cell_type[src] == 1 (I cells)
+//   * no STDP (I→anything isn't plastic in this model)
+//   * no delay ring buffer (I delivery is direct)
+//   * writes to s_inh[tgt] via atomicAdd (many I sources can hit
+//     the same target in one step, so atomic matters)
+//
+// Kernel signature is 7 args instead of csr_e_deliver's 11:
+//   rpi_ptr, rpi_tgt, rpi_w, cell_type, release, s_inh, n
+
+fn tid_x() -> uint64 {
+    return 0
+}
+
+fn atomic_add_f64(uint64 ptr, f64 val) -> f64 {
+    f64 old = 0.0
+    unsafe { *(ptr as f64) -> old }
+    f64 nv = old + val
+    unsafe { *(ptr as f64) = nv }
+    return old
+}
+
+@kernel
+fn csr_i_deliver(
+    uint64 rpi_ptr_ptr,
+    uint64 rpi_tgt_ptr,
+    uint64 rpi_w_ptr,
+    uint64 cell_type_ptr,
+    uint64 release_ptr,
+    uint64 s_inh_ptr,
+    uint64 n
+) {
+    uint64 src = tid_x()
+    if src < n {
+        uint64 ct_p = cell_type_ptr + src * 8
+        uint64 ct = 0
+        unsafe { *(ct_p as uint64) -> ct }
+        if ct == 1 {
+            uint64 rel_p = release_ptr + src * 8
+            f64 rel = 0.0
+            unsafe { *(rel_p as f64) -> rel }
+            if rel > 0.0 {
+                uint64 start_p = rpi_ptr_ptr + src * 8
+                uint64 end_p = rpi_ptr_ptr + (src + 1) * 8
+                uint64 start = 0
+                uint64 end = 0
+                unsafe { *(start_p as uint64) -> start }
+                unsafe { *(end_p as uint64) -> end }
+                uint64 syn = start
+                while syn < end {
+                    uint64 tgt_p = rpi_tgt_ptr + syn * 8
+                    uint64 tgt = 0
+                    unsafe { *(tgt_p as uint64) -> tgt }
+                    uint64 w_p = rpi_w_ptr + syn * 8
+                    f64 w = 0.0
+                    unsafe { *(w_p as f64) -> w }
+                    f64 effective = w * rel
+                    uint64 s_inh_tgt = s_inh_ptr + tgt * 8
+                    atomic_add_f64(s_inh_tgt, effective)
+                    syn = syn + 1
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}
