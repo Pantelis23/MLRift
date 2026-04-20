@@ -1,0 +1,303 @@
+// MLRift — M4.h combined full stage-13 kernel source.
+//
+// All features from scale_50k_vec.mlr's per-step loop:
+//   decay sweeps over s_exc/s_inh/x_pre/x_post (exp. decay)
+//   relax sweeps over u_stp/x_stp (toward targets)
+//   fill release_factor = 0 between steps
+//   csr_e_deliver_delayed — reads buf_delay[row_base+src], scatters
+//                            into s_exc via atomicAdd, applies STDP
+//                            LTD on rpe_w, bumps ltd_events, clears
+//                            the consumed buf_delay slot
+//   lif_full — LIF integrate + refractory + fire bookkeeping with
+//              STP (u_stp, x_stp) + ring-buffer write to buf_delay
+//              for E-cell fires + x_pre/x_post trace bumps
+//   csr_i_deliver — direct inhibitory scatter via cell_type gate
+//
+// All kernels sit in one .co so hipModuleLoad only happens once.
+
+fn tid_x() -> uint64 {
+    return 0
+}
+
+fn atomic_add_f64(uint64 ptr, f64 val) -> f64 {
+    f64 old = 0.0
+    unsafe { *(ptr as f64) -> old }
+    f64 nv = old + val
+    unsafe { *(ptr as f64) = nv }
+    return old
+}
+
+fn atomic_add_u64(uint64 ptr, uint64 val) -> uint64 {
+    uint64 old = 0
+    unsafe { *(ptr as uint64) -> old }
+    uint64 nv = old + val
+    unsafe { *(ptr as uint64) = nv }
+    return old
+}
+
+// buf[i] = buf[i] - buf[i] * factor
+@kernel
+fn decay_step(uint64 buf, uint64 n, f64 factor) {
+    uint64 i = tid_x()
+    if i < n {
+        uint64 p = buf + i * 8
+        f64 v = 0.0
+        unsafe { *(p as f64) -> v }
+        v = v - v * factor
+        unsafe { *(p as f64) = v }
+    }
+}
+
+// buf[i] = buf[i] + (target - buf[i]) * factor
+@kernel
+fn relax_step(uint64 buf, uint64 n, f64 target, f64 factor) {
+    uint64 i = tid_x()
+    if i < n {
+        uint64 p = buf + i * 8
+        f64 v = 0.0
+        unsafe { *(p as f64) -> v }
+        f64 nv = v + (target - v) * factor
+        unsafe { *(p as f64) = nv }
+    }
+}
+
+// buf[i] = value
+@kernel
+fn fill_step(uint64 buf, uint64 n, f64 value) {
+    uint64 i = tid_x()
+    if i < n {
+        uint64 p = buf + i * 8
+        unsafe { *(p as f64) = value }
+    }
+}
+
+// Delayed E-delivery with STDP LTD. Pulls release from
+// buf_delay[row_base + src] (set `delay` steps ago), scatters into
+// s_exc, applies LTD for E→E synapses, clears the ring slot.
+@kernel
+fn csr_e_deliver_delayed(
+    uint64 rpe_ptr_ptr,
+    uint64 rpe_tgt_ptr,
+    uint64 rpe_w_ptr,
+    uint64 rpe_is_ee_ptr,
+    uint64 x_post_ptr,
+    uint64 buf_delay_ptr,
+    uint64 row_base,
+    uint64 s_exc_ptr,
+    uint64 ltd_events_ptr,
+    uint64 n,
+    f64 A_minus,
+    f64 w_max
+) {
+    uint64 src = tid_x()
+    if src < n {
+        uint64 bd_p = buf_delay_ptr + (row_base + src) * 8
+        f64 rel = 0.0
+        unsafe { *(bd_p as f64) -> rel }
+        if rel > 0.0 {
+            uint64 start_p = rpe_ptr_ptr + src * 8
+            uint64 end_p = rpe_ptr_ptr + (src + 1) * 8
+            uint64 start = 0
+            uint64 end = 0
+            unsafe { *(start_p as uint64) -> start }
+            unsafe { *(end_p as uint64) -> end }
+            uint64 syn = start
+            while syn < end {
+                uint64 tgt_p = rpe_tgt_ptr + syn * 8
+                uint64 tgt = 0
+                unsafe { *(tgt_p as uint64) -> tgt }
+                uint64 w_p = rpe_w_ptr + syn * 8
+                f64 w = 0.0
+                unsafe { *(w_p as f64) -> w }
+                f64 effective = w * rel
+                uint64 s_exc_tgt = s_exc_ptr + tgt * 8
+                atomic_add_f64(s_exc_tgt, effective)
+
+                uint64 is_ee_p = rpe_is_ee_ptr + syn * 8
+                uint64 is_ee = 0
+                unsafe { *(is_ee_p as uint64) -> is_ee }
+                if is_ee > 0 {
+                    uint64 xp_p = x_post_ptr + tgt * 8
+                    f64 xq = 0.0
+                    unsafe { *(xp_p as f64) -> xq }
+                    f64 w_new = w + A_minus * xq
+                    if w_new < 0.0 {
+                        w_new = 0.0
+                    }
+                    if w_new > w_max {
+                        w_new = w_max
+                    }
+                    unsafe { *(w_p as f64) = w_new }
+                    atomic_add_u64(ltd_events_ptr, 1)
+                }
+                syn = syn + 1
+            }
+            f64 z = 0.0
+            unsafe { *(bd_p as f64) = z }
+        }
+    }
+}
+
+// Direct inhibitory delivery — no delay, gated on cell_type == 1.
+@kernel
+fn csr_i_deliver(
+    uint64 rpi_ptr_ptr,
+    uint64 rpi_tgt_ptr,
+    uint64 rpi_w_ptr,
+    uint64 cell_type_ptr,
+    uint64 release_ptr,
+    uint64 s_inh_ptr,
+    uint64 n
+) {
+    uint64 src = tid_x()
+    if src < n {
+        uint64 ct_p = cell_type_ptr + src * 8
+        uint64 ct = 0
+        unsafe { *(ct_p as uint64) -> ct }
+        if ct == 1 {
+            uint64 rel_p = release_ptr + src * 8
+            f64 rel = 0.0
+            unsafe { *(rel_p as f64) -> rel }
+            if rel > 0.0 {
+                uint64 start_p = rpi_ptr_ptr + src * 8
+                uint64 end_p = rpi_ptr_ptr + (src + 1) * 8
+                uint64 start = 0
+                uint64 end = 0
+                unsafe { *(start_p as uint64) -> start }
+                unsafe { *(end_p as uint64) -> end }
+                uint64 syn = start
+                while syn < end {
+                    uint64 tgt_p = rpi_tgt_ptr + syn * 8
+                    uint64 tgt = 0
+                    unsafe { *(tgt_p as uint64) -> tgt }
+                    uint64 w_p = rpi_w_ptr + syn * 8
+                    f64 w = 0.0
+                    unsafe { *(w_p as f64) -> w }
+                    f64 effective = w * rel
+                    uint64 s_inh_tgt = s_inh_ptr + tgt * 8
+                    atomic_add_f64(s_inh_tgt, effective)
+                    syn = syn + 1
+                }
+            }
+        }
+    }
+}
+
+// Full LIF integrate + fire + STP + ring-buffer write. The fire path
+// mirrors scale_50k_vec.mlr lines ~235-253:
+//   V = V_reset, ref = ref_steps, spike_count += 1,
+//   x_pre += 1, x_post += 1
+//   rel = u_stp[i] * x_stp[i]
+//   release_factor[i] = rel
+//   x_stp[i] = x_stp[i] - rel                    (depression)
+//   u_stp[i] = u_stp[i] + U_baseline*(1-u_stp[i]) (facilitation)
+//   if cell_type[i] == 0: buf_delay[w_base + i] = rel
+@kernel
+fn lif_full(
+    uint64 V_ptr,
+    uint64 ref_ptr,
+    uint64 RI_ptr,
+    uint64 s_exc_ptr,
+    uint64 s_inh_ptr,
+    uint64 x_pre_ptr,
+    uint64 x_post_ptr,
+    uint64 u_stp_ptr,
+    uint64 x_stp_ptr,
+    uint64 release_ptr,
+    uint64 spike_ptr,
+    uint64 cell_type_ptr,
+    uint64 buf_delay_ptr,
+    uint64 w_base,
+    uint64 n,
+    f64 dt,
+    f64 V_rest,
+    f64 V_reset,
+    f64 V_thresh,
+    f64 tau_m,
+    f64 J_E,
+    f64 J_I,
+    f64 U_baseline,
+    uint64 ref_steps
+) {
+    uint64 i = tid_x()
+    if i < n {
+        uint64 V_i   = V_ptr     + i * 8
+        uint64 ref_i = ref_ptr   + i * 8
+        uint64 sp_i  = spike_ptr + i * 8
+
+        uint64 rc = 0
+        unsafe { *(ref_i as uint64) -> rc }
+        if rc > 0 {
+            uint64 rc_new = rc - 1
+            unsafe { *(ref_i as uint64) = rc_new }
+            unsafe { *(V_i as f64) = V_reset }
+        } else {
+            f64 v = 0.0
+            unsafe { *(V_i as f64) -> v }
+            f64 ri = 0.0
+            uint64 RI_i = RI_ptr + i * 8
+            unsafe { *(RI_i as f64) -> ri }
+            f64 se = 0.0
+            uint64 se_i = s_exc_ptr + i * 8
+            unsafe { *(se_i as f64) -> se }
+            f64 si = 0.0
+            uint64 si_i = s_inh_ptr + i * 8
+            unsafe { *(si_i as f64) -> si }
+            f64 drive = ri + se * J_E - si * J_I
+            f64 dv = dt * (V_rest - v + drive) / tau_m
+            f64 v_new = v + dv
+            if v_new >= V_thresh {
+                unsafe { *(V_i as f64) = V_reset }
+                unsafe { *(ref_i as uint64) = ref_steps }
+                uint64 sc = 0
+                unsafe { *(sp_i as uint64) -> sc }
+                uint64 sc_new = sc + 1
+                unsafe { *(sp_i as uint64) = sc_new }
+
+                // x_pre, x_post bumps
+                uint64 xpre_i = x_pre_ptr + i * 8
+                f64 xpre = 0.0
+                unsafe { *(xpre_i as f64) -> xpre }
+                f64 one_f = 1.0
+                f64 xpre_new = xpre + one_f
+                unsafe { *(xpre_i as f64) = xpre_new }
+
+                uint64 xpost_i = x_post_ptr + i * 8
+                f64 xpost = 0.0
+                unsafe { *(xpost_i as f64) -> xpost }
+                f64 xpost_new = xpost + one_f
+                unsafe { *(xpost_i as f64) = xpost_new }
+
+                // STP: release factor, then update u and x traces
+                uint64 u_i = u_stp_ptr + i * 8
+                uint64 x_i = x_stp_ptr + i * 8
+                f64 uv = 0.0
+                unsafe { *(u_i as f64) -> uv }
+                f64 xv = 0.0
+                unsafe { *(x_i as f64) -> xv }
+                f64 rel = uv * xv
+                uint64 rel_i = release_ptr + i * 8
+                unsafe { *(rel_i as f64) = rel }
+                f64 xv_new = xv - rel
+                unsafe { *(x_i as f64) = xv_new }
+                f64 uv_new = uv + U_baseline * (one_f - uv)
+                unsafe { *(u_i as f64) = uv_new }
+
+                // Ring-buffer write for E cells
+                uint64 ct_i = cell_type_ptr + i * 8
+                uint64 ct = 0
+                unsafe { *(ct_i as uint64) -> ct }
+                if ct == 0 {
+                    uint64 bd_i = buf_delay_ptr + (w_base + i) * 8
+                    unsafe { *(bd_i as f64) = rel }
+                }
+            } else {
+                unsafe { *(V_i as f64) = v_new }
+            }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}
