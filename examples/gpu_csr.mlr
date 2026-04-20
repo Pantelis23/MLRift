@@ -1,27 +1,26 @@
-// MLRift — M4.c CSR E-delivery kernel source.
+// MLRift — M4.c (scatter) + M4.e (STDP LTD) CSR E-delivery kernel.
 //
 // One thread per source neuron. Each thread reads its outgoing
-// synapse range from rpe_ptr, walks the (tgt, w) pairs, and
-// atomically adds `w * release_factor[src]` into s_exc[tgt]. The
-// atomicAdd is exactly what's needed because many (src, syn) pairs
-// can target the same neuron at the same step — a plain load/add/
-// store would lose increments to races.
+// synapse range from rpe_ptr, walks the (tgt, w) pairs, and:
+//   (1) atomically adds `w * release_factor[src]` into s_exc[tgt]
+//       — the core scatter.
+//   (2) For E→E synapses (rpe_is_ee[syn] != 0), applies Euler STDP
+//       LTD using the target's current x_post trace:
+//           w_new = clamp(w + A_minus * x_post[tgt], 0, w_max)
+//           rpe_w[syn] = w_new                          (no race:
+//                                                       one thread
+//                                                       per source)
+//           atomic_add_u64(ltd_events, 1)               (cross-source
+//                                                       shared counter)
 //
-// Layout mirrors stage 13 (examples/scale_50k_vec.mlr):
-//   static uint64[N+1]  rpe_ptr     -- CSR row pointers
-//   static uint64[M]    rpe_tgt     -- target neuron indices
-//   static f64[M]       rpe_w       -- synaptic weights
-//   static f64[N]       release_factor
-//   static f64[N]       s_exc
-//
-// STDP LTD + is_ee gating lands in a follow-up slice (M4.e); this
-// milestone isolates the scatter-add.
+// Matches the inner body of scale_50k_vec.mlr's delayed-E-arrival
+// loop (examples/scale_50k_vec.mlr lines ~195-215).
 
 fn tid_x() -> uint64 {
     return 0
 }
 
-// CPU stub — runs single-threaded in the --target=hip-amd pre-GPU
+// CPU stubs — run single-threaded in the --target=hip-amd pre-GPU
 // codegen pass, never from a real thread.
 fn atomic_add_f64(uint64 ptr, f64 val) -> f64 {
     f64 old = 0.0
@@ -31,14 +30,27 @@ fn atomic_add_f64(uint64 ptr, f64 val) -> f64 {
     return old
 }
 
+fn atomic_add_u64(uint64 ptr, uint64 val) -> uint64 {
+    uint64 old = 0
+    unsafe { *(ptr as uint64) -> old }
+    uint64 nv = old + val
+    unsafe { *(ptr as uint64) = nv }
+    return old
+}
+
 @kernel
 fn csr_e_deliver(
     uint64 rpe_ptr_ptr,
     uint64 rpe_tgt_ptr,
     uint64 rpe_w_ptr,
+    uint64 rpe_is_ee_ptr,
+    uint64 x_post_ptr,
     uint64 release_ptr,
     uint64 s_exc_ptr,
-    uint64 n
+    uint64 ltd_events_ptr,
+    uint64 n,
+    f64 A_minus,
+    f64 w_max
 ) {
     uint64 src = tid_x()
     if src < n {
@@ -63,6 +75,28 @@ fn csr_e_deliver(
                 f64 effective = w * rel
                 uint64 s_exc_tgt = s_exc_ptr + tgt * 8
                 atomic_add_f64(s_exc_tgt, effective)
+
+                // STDP LTD when the outgoing synapse lands on an E
+                // cell. x_post[tgt] reads the target's current post-
+                // spike trace (read-only; safe even when multiple
+                // sources hit the same target).
+                uint64 is_ee_p = rpe_is_ee_ptr + syn * 8
+                uint64 is_ee = 0
+                unsafe { *(is_ee_p as uint64) -> is_ee }
+                if is_ee > 0 {
+                    uint64 xp_p = x_post_ptr + tgt * 8
+                    f64 xq = 0.0
+                    unsafe { *(xp_p as f64) -> xq }
+                    f64 w_new = w + A_minus * xq
+                    if w_new < 0.0 {
+                        w_new = 0.0
+                    }
+                    if w_new > w_max {
+                        w_new = w_max
+                    }
+                    unsafe { *(w_p as f64) = w_new }
+                    atomic_add_u64(ltd_events_ptr, 1)
+                }
                 syn = syn + 1
             }
         }

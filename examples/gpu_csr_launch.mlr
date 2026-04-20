@@ -1,21 +1,24 @@
-// MLRift — M4.c CSR E-delivery host test.
+// MLRift — M4.c + M4.e CSR E-delivery host test.
 //
-// Builds a synthetic CSR graph, runs csr_e_deliver (examples/gpu_csr.mlr)
-// on the GPU, and verifies s_exc[tgt] element-wise against a CPU
-// reference that performs the same scatter-add sequentially. A GPU
-// pass with broken atomics would drop increments and produce values
-// below the reference.
+// Runs csr_e_deliver (examples/gpu_csr.mlr) on GPU and verifies the
+// full combined behaviour — scatter-add + STDP LTD — against an
+// identical sequential CPU pass. Checks:
+//
+//   * s_exc[tgt] element-wise (atomicAdd correctness)
+//   * rpe_w[syn] element-wise (per-synapse LTD update, no-race since
+//     each synapse is written by exactly one thread)
+//   * ltd_events counter (atomic_add_u64 from many source threads)
 //
 // Graph:
-//   N_SRC = N_TGT = 1024
-//   10 outgoing synapses per source (10 240 total)
-//   tgt[src * 10 + k] = (src * 31 + k * 97 + 13) % N_TGT
-//   w = 0.1 for every synapse
-//   release_factor = 1.0 for every source
+//   N_SRC = N_TGT = 1024, 10 outgoing synapses per source,
+//   tgt[src*10 + k] = (src*31 + k*97 + 13) mod N_TGT
+//   w = 0.1 initial, is_ee = 1 when (src + k) is even (half the syns)
+//   x_post[t] = 0.5 for every target
+//   release_factor[src] = 1.0 for every source
+//   A_minus = -0.006, w_max = 0.2
 //
-// Contention: each target gets hit by ~10 sources on average, so
-// concurrent atomic updates actually happen and losing any of them
-// shows up as a short count at that target.
+// Expected LTD update per is_ee synapse:
+//   w_new = clamp(0.1 + (-0.006) * 0.5, 0, 0.2) = 0.097
 
 import "../std/hip.kr"
 
@@ -25,6 +28,9 @@ import "../std/hip.kr"
 static uint64 N_SRC = 1024
 static uint64 N_TGT = 1024
 static uint64 SYN_PER_SRC = 10
+static f64    A_minus = -0.006
+static f64    w_max   = 0.2
+static f64    X_POST_INIT = 0.5
 
 fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
     if val == 0 {
@@ -83,10 +89,11 @@ fn die(uint64 msg, uint64 code) {
     exit(1)
 }
 
-// Fill rpe_ptr / rpe_tgt / rpe_w / release_factor / s_exc.
+// Fill the graph structure + initial state.
 fn build_graph(uint64 rpe_ptr, uint64 rpe_tgt, uint64 rpe_w,
+               uint64 rpe_is_ee, uint64 x_post,
                uint64 release, uint64 s_exc) {
-    // rpe_ptr: N_SRC+1 u64; row r spans [r*SYN_PER_SRC, (r+1)*SYN_PER_SRC).
+    // rpe_ptr[s] = s * SYN_PER_SRC.
     uint64 s = 0
     while s < N_SRC + 1 {
         uint64 p = rpe_ptr + s * 8
@@ -95,18 +102,23 @@ fn build_graph(uint64 rpe_ptr, uint64 rpe_tgt, uint64 rpe_w,
         s = s + 1
     }
 
-    // tgt + w per synapse; release=1, s_exc=0.
     uint64 src = 0
     while src < N_SRC {
         uint64 k = 0
         while k < SYN_PER_SRC {
             uint64 syn = src * SYN_PER_SRC + k
-            uint64 t = (src * 31 + k * 97 + 13) - ((src * 31 + k * 97 + 13) / N_TGT) * N_TGT
+            uint64 raw = src * 31 + k * 97 + 13
+            uint64 t = raw - (raw / N_TGT) * N_TGT
             uint64 tp = rpe_tgt + syn * 8
             unsafe { *(tp as uint64) = t }
             uint64 wp = rpe_w + syn * 8
             f64 wv = 0.1
             unsafe { *(wp as f64) = wv }
+            uint64 iep = rpe_is_ee + syn * 8
+            uint64 is_ee = 0
+            uint64 parity = (src + k) - ((src + k) / 2) * 2
+            if parity == 0 { is_ee = 1 }
+            unsafe { *(iep as uint64) = is_ee }
             k = k + 1
         }
         uint64 rp = release + src * 8
@@ -120,13 +132,19 @@ fn build_graph(uint64 rpe_ptr, uint64 rpe_tgt, uint64 rpe_w,
         uint64 ep = s_exc + t2 * 8
         f64 z = 0.0
         unsafe { *(ep as f64) = z }
+        uint64 xp = x_post + t2 * 8
+        f64 xv = X_POST_INIT
+        unsafe { *(xp as f64) = xv }
         t2 = t2 + 1
     }
 }
 
-// Plain sequential scatter-add — serves as the ground-truth reference.
+// Sequential CPU reference — identical body to the kernel, sans
+// parallelism. Updates s_exc, rpe_w, and *ltd_events_ptr in place.
 fn cpu_csr_deliver(uint64 rpe_ptr, uint64 rpe_tgt, uint64 rpe_w,
-                    uint64 release, uint64 s_exc) {
+                    uint64 rpe_is_ee, uint64 x_post,
+                    uint64 release, uint64 s_exc,
+                    uint64 ltd_events_ptr) {
     uint64 src = 0
     while src < N_SRC {
         uint64 rp = release + src * 8
@@ -153,6 +171,23 @@ fn cpu_csr_deliver(uint64 rpe_ptr, uint64 rpe_tgt, uint64 rpe_w,
                 unsafe { *(sep as f64) -> cur }
                 f64 nv = cur + eff
                 unsafe { *(sep as f64) = nv }
+
+                uint64 iep = rpe_is_ee + syn * 8
+                uint64 is_ee = 0
+                unsafe { *(iep as uint64) -> is_ee }
+                if is_ee > 0 {
+                    uint64 xp = x_post + t * 8
+                    f64 xq = 0.0
+                    unsafe { *(xp as f64) -> xq }
+                    f64 w_new = w + A_minus * xq
+                    if w_new < 0.0 { w_new = 0.0 }
+                    if w_new > w_max { w_new = w_max }
+                    unsafe { *(wp as f64) = w_new }
+                    uint64 lv = 0
+                    unsafe { *(ltd_events_ptr as uint64) -> lv }
+                    uint64 nlv = lv + 1
+                    unsafe { *(ltd_events_ptr as uint64) = nlv }
+                }
                 syn = syn + 1
             }
         }
@@ -189,36 +224,44 @@ fn main() {
     uint64 fn_handle = 0
     unsafe { *(fn_slot as uint64) -> fn_handle }
 
-    // ---- Host arrays ----
+    // ---- Host arrays (GPU-mirror + CPU-reference) ----
     uint64 bytes_ptr  = (N_SRC + 1) * 8
-    uint64 n_syn = N_SRC * SYN_PER_SRC
+    uint64 n_syn      = N_SRC * SYN_PER_SRC
     uint64 bytes_tgt  = n_syn * 8
     uint64 bytes_w    = n_syn * 8
+    uint64 bytes_isee = n_syn * 8
+    uint64 bytes_xp   = N_TGT * 8
     uint64 bytes_rel  = N_SRC * 8
     uint64 bytes_sexc = N_TGT * 8
 
-    uint64 h_ptr = alloc(bytes_ptr)
-    uint64 h_tgt = alloc(bytes_tgt)
-    uint64 h_w   = alloc(bytes_w)
-    uint64 h_rel = alloc(bytes_rel)
-    uint64 h_se  = alloc(bytes_sexc)       // device result mirror
-    uint64 c_se  = alloc(bytes_sexc)       // CPU reference
+    uint64 h_ptr  = alloc(bytes_ptr)
+    uint64 h_tgt  = alloc(bytes_tgt)
+    uint64 h_w    = alloc(bytes_w)
+    uint64 h_isee = alloc(bytes_isee)
+    uint64 h_xp   = alloc(bytes_xp)
+    uint64 h_rel  = alloc(bytes_rel)
+    uint64 h_se   = alloc(bytes_sexc)
 
-    build_graph(h_ptr, h_tgt, h_w, h_rel, h_se)
+    uint64 c_ptr  = alloc(bytes_ptr)
+    uint64 c_tgt  = alloc(bytes_tgt)
+    uint64 c_w    = alloc(bytes_w)
+    uint64 c_isee = alloc(bytes_isee)
+    uint64 c_xp   = alloc(bytes_xp)
+    uint64 c_rel  = alloc(bytes_rel)
+    uint64 c_se   = alloc(bytes_sexc)
 
-    // Mirror into the CPU reference buffer.
-    uint64 i = 0
-    while i < N_TGT {
-        uint64 cp = c_se + i * 8
-        f64 z = 0.0
-        unsafe { *(cp as f64) = z }
-        i = i + 1
-    }
+    build_graph(h_ptr, h_tgt, h_w, h_isee, h_xp, h_rel, h_se)
+    build_graph(c_ptr, c_tgt, c_w, c_isee, c_xp, c_rel, c_se)
 
-    // ---- CPU reference ----
-    cpu_csr_deliver(h_ptr, h_tgt, h_w, h_rel, c_se)
+    // CPU reference (mutates c_w, c_se, CPU ltd_events).
+    uint64 c_ltd_slot = alloc(8)
+    uint64 c_ltd_zero = 0
+    unsafe { *(c_ltd_slot as uint64) = c_ltd_zero }
+    cpu_csr_deliver(c_ptr, c_tgt, c_w, c_isee, c_xp, c_rel, c_se, c_ltd_slot)
+    uint64 c_ltd = 0
+    unsafe { *(c_ltd_slot as uint64) -> c_ltd }
 
-    // ---- GPU pipeline ----
+    // ---- GPU: alloc, H2D, launch ----
     uint64 slot = 0
     uint64 d_ptr = 0
     slot = alloc(8); err = hipMalloc(slot, bytes_ptr);  if err != 0 { die("hipMalloc rpe_ptr", err) }
@@ -235,6 +278,16 @@ fn main() {
     unsafe { *(slot as uint64) -> d_w }
     err = hipMemcpy(d_w, h_w, bytes_w, 1); if err != 0 { die("H2D rpe_w", err) }
 
+    uint64 d_isee = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes_isee); if err != 0 { die("hipMalloc rpe_is_ee", err) }
+    unsafe { *(slot as uint64) -> d_isee }
+    err = hipMemcpy(d_isee, h_isee, bytes_isee, 1); if err != 0 { die("H2D rpe_is_ee", err) }
+
+    uint64 d_xp = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes_xp);   if err != 0 { die("hipMalloc x_post", err) }
+    unsafe { *(slot as uint64) -> d_xp }
+    err = hipMemcpy(d_xp, h_xp, bytes_xp, 1); if err != 0 { die("H2D x_post", err) }
+
     uint64 d_rel = 0
     slot = alloc(8); err = hipMalloc(slot, bytes_rel);  if err != 0 { die("hipMalloc release", err) }
     unsafe { *(slot as uint64) -> d_rel }
@@ -245,20 +298,38 @@ fn main() {
     unsafe { *(slot as uint64) -> d_se }
     err = hipMemcpy(d_se, h_se, bytes_sexc, 1); if err != 0 { die("H2D s_exc", err) }
 
-    uint64 a_ptr = alloc(8); unsafe { *(a_ptr as uint64) = d_ptr }
-    uint64 a_tgt = alloc(8); unsafe { *(a_tgt as uint64) = d_tgt }
-    uint64 a_w   = alloc(8); unsafe { *(a_w   as uint64) = d_w }
-    uint64 a_rel = alloc(8); unsafe { *(a_rel as uint64) = d_rel }
-    uint64 a_se  = alloc(8); unsafe { *(a_se  as uint64) = d_se }
-    uint64 a_n   = alloc(8); uint64 nv = N_SRC; unsafe { *(a_n as uint64) = nv }
+    uint64 d_ltd = 0
+    slot = alloc(8); err = hipMalloc(slot, 8);          if err != 0 { die("hipMalloc ltd", err) }
+    unsafe { *(slot as uint64) -> d_ltd }
+    uint64 zero_host = alloc(8)
+    uint64 zv = 0
+    unsafe { *(zero_host as uint64) = zv }
+    err = hipMemcpy(d_ltd, zero_host, 8, 1); if err != 0 { die("H2D ltd", err) }
 
-    uint64 kp = alloc(6 * 8)
-    unsafe { *(kp       as uint64) = a_ptr }
-    unsafe { *((kp + 8)  as uint64) = a_tgt }
-    unsafe { *((kp + 16) as uint64) = a_w }
-    unsafe { *((kp + 24) as uint64) = a_rel }
-    unsafe { *((kp + 32) as uint64) = a_se }
-    unsafe { *((kp + 40) as uint64) = a_n }
+    uint64 a_ptr  = alloc(8); unsafe { *(a_ptr  as uint64) = d_ptr }
+    uint64 a_tgt  = alloc(8); unsafe { *(a_tgt  as uint64) = d_tgt }
+    uint64 a_w    = alloc(8); unsafe { *(a_w    as uint64) = d_w }
+    uint64 a_isee = alloc(8); unsafe { *(a_isee as uint64) = d_isee }
+    uint64 a_xp   = alloc(8); unsafe { *(a_xp   as uint64) = d_xp }
+    uint64 a_rel  = alloc(8); unsafe { *(a_rel  as uint64) = d_rel }
+    uint64 a_se   = alloc(8); unsafe { *(a_se   as uint64) = d_se }
+    uint64 a_ltd  = alloc(8); unsafe { *(a_ltd  as uint64) = d_ltd }
+    uint64 a_n    = alloc(8); uint64 nv = N_SRC; unsafe { *(a_n as uint64) = nv }
+    uint64 a_am   = alloc(8); f64 amv = A_minus; unsafe { *(a_am as f64) = amv }
+    uint64 a_wm   = alloc(8); f64 wmv = w_max;   unsafe { *(a_wm as f64) = wmv }
+
+    uint64 kp = alloc(11 * 8)
+    unsafe { *(kp        as uint64) = a_ptr }
+    unsafe { *((kp + 8)   as uint64) = a_tgt }
+    unsafe { *((kp + 16)  as uint64) = a_w }
+    unsafe { *((kp + 24)  as uint64) = a_isee }
+    unsafe { *((kp + 32)  as uint64) = a_xp }
+    unsafe { *((kp + 40)  as uint64) = a_rel }
+    unsafe { *((kp + 48)  as uint64) = a_se }
+    unsafe { *((kp + 56)  as uint64) = a_ltd }
+    unsafe { *((kp + 64)  as uint64) = a_n }
+    unsafe { *((kp + 72)  as uint64) = a_am }
+    unsafe { *((kp + 80)  as uint64) = a_wm }
 
     uint32 block_x = 256
     uint64 grid_x_u = (N_SRC + 255) / 256
@@ -273,16 +344,15 @@ fn main() {
     err = hipDeviceSynchronize()
     if err != 0 { die("sync failed", err) }
 
-    err = hipMemcpy(h_se, d_se, bytes_sexc, 2)
-    if err != 0 { die("D2H s_exc", err) }
+    err = hipMemcpy(h_se, d_se, bytes_sexc, 2); if err != 0 { die("D2H s_exc", err) }
+    err = hipMemcpy(h_w,  d_w,  bytes_w,    2); if err != 0 { die("D2H rpe_w", err) }
+    uint64 g_ltd_slot = alloc(8)
+    err = hipMemcpy(g_ltd_slot, d_ltd, 8, 2);   if err != 0 { die("D2H ltd", err) }
+    uint64 g_ltd = 0
+    unsafe { *(g_ltd_slot as uint64) -> g_ltd }
 
     // ---- Compare ----
-    // f64 atomic-add serialises in an unspecified order on GPU, so the
-    // accumulator's rounding differs from the CPU's fixed-order sum.
-    // Allow a generous ULP window — even 64 ULP is << 1e-10 relative on
-    // values near 1.0.
-    uint64 max_ulp = 0
-    uint64 mismatches = 0
+    uint64 se_max_ulp = 0; uint64 se_mis = 0
     uint64 t = 0
     while t < N_TGT {
         uint64 gp = h_se + t * 8
@@ -293,22 +363,46 @@ fn main() {
         uint64 d = 0
         if gb > cb { d = gb - cb }
         if cb > gb { d = cb - gb }
-        if d > max_ulp { max_ulp = d }
-        if d > 64 { mismatches = mismatches + 1 }
+        if d > se_max_ulp { se_max_ulp = d }
+        if d > 64 { se_mis = se_mis + 1 }
         t = t + 1
     }
 
-    print_label_val("max ULP      ", 13, max_ulp)
-    print_label_val("mismatches   ", 13, mismatches)
-
-    if mismatches == 0 {
-        puts("csr_e_deliver OK — all targets within 64 ULP of CPU reference")
-        hipFree(d_ptr); hipFree(d_tgt); hipFree(d_w)
-        hipFree(d_rel); hipFree(d_se)
-        exit(0)
+    uint64 w_max_ulp = 0; uint64 w_mis = 0
+    uint64 sy = 0
+    while sy < n_syn {
+        uint64 gp = h_w + sy * 8
+        uint64 cp = c_w + sy * 8
+        uint64 gb = 0; uint64 cb = 0
+        unsafe { *(gp as uint64) -> gb }
+        unsafe { *(cp as uint64) -> cb }
+        uint64 d = 0
+        if gb > cb { d = gb - cb }
+        if cb > gb { d = cb - gb }
+        if d > w_max_ulp { w_max_ulp = d }
+        if d > 8 { w_mis = w_mis + 1 }
+        sy = sy + 1
     }
-    puts("csr_e_deliver FAIL — increments lost or outside tolerance")
-    hipFree(d_ptr); hipFree(d_tgt); hipFree(d_w)
-    hipFree(d_rel); hipFree(d_se)
+
+    print_label_val("s_exc max ULP  ", 15, se_max_ulp)
+    print_label_val("s_exc mismatch ", 15, se_mis)
+    print_label_val("rpe_w max ULP  ", 15, w_max_ulp)
+    print_label_val("rpe_w mismatch ", 15, w_mis)
+    print_label_val("CPU ltd events ", 15, c_ltd)
+    print_label_val("GPU ltd events ", 15, g_ltd)
+
+    if se_mis == 0 {
+        if w_mis == 0 {
+            if c_ltd == g_ltd {
+                puts("csr_e_deliver OK — scatter + STDP LTD match CPU reference")
+                hipFree(d_ptr); hipFree(d_tgt); hipFree(d_w); hipFree(d_isee)
+                hipFree(d_xp); hipFree(d_rel); hipFree(d_se); hipFree(d_ltd)
+                exit(0)
+            }
+        }
+    }
+    puts("csr_e_deliver FAIL")
+    hipFree(d_ptr); hipFree(d_tgt); hipFree(d_w); hipFree(d_isee)
+    hipFree(d_xp); hipFree(d_rel); hipFree(d_se); hipFree(d_ltd)
     exit(1)
 }
