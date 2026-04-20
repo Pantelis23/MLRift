@@ -1,0 +1,300 @@
+// MLRift — M4.f ring-buffer host test.
+//
+// Three-step exercise of a (delay+1)=3 × N ring buffer:
+//
+//   step 0:  write pattern A into slot 0
+//   step 1:  read slot 0 into out_A, clear slot 0;  write pattern B into slot 1
+//   step 2:  read slot 1 into out_B, clear slot 1;  write pattern C into slot 2
+//   step 3:  read slot 2 into out_C, clear slot 2
+//
+// Verifies:
+//   out_A == pattern A  (writes + one-step delay correctly route)
+//   out_B == pattern B
+//   out_C == pattern C
+//   buf is fully zero after the last read-clear
+//
+// All three patterns differ so a misbehaving slot_base arithmetic
+// would show up as cross-contamination between patterns.
+
+import "../std/hip.kr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+static uint64 N_ELEMS = 2048
+static uint64 N_SLOTS = 3
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 {
+        uint8 zero = 48
+        unsafe { *(buf as uint8) = zero }
+        return 1
+    }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 {
+        n = n + 1
+        tmp = tmp / 10
+    }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58
+    unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 space = 32
+    unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0
+    unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+// buf[i] = base + i * 0.5    — distinct for every (base, i)
+fn fill_pattern(uint64 buf, uint64 base_int) {
+    uint64 i = 0
+    while i < N_ELEMS {
+        uint64 p = buf + i * 8
+        f64 base_f = 0.0
+        base_f = base_int
+        f64 off = 0.0
+        off = i
+        f64 v = base_f + off * 0.5
+        unsafe { *(p as f64) = v }
+        i = i + 1
+    }
+}
+
+fn launch_ring_write(uint64 fn_w, uint64 d_buf, uint64 slot_base,
+                     uint64 d_src, uint32 grid_x, uint32 block_x) -> uint32 {
+    uint64 a_buf  = alloc(8); unsafe { *(a_buf as uint64) = d_buf }
+    uint64 a_slot = alloc(8); unsafe { *(a_slot as uint64) = slot_base }
+    uint64 a_src  = alloc(8); unsafe { *(a_src as uint64) = d_src }
+    uint64 a_n    = alloc(8); uint64 nv = N_ELEMS; unsafe { *(a_n as uint64) = nv }
+    uint64 kp = alloc(4 * 8)
+    unsafe { *(kp       as uint64) = a_buf }
+    unsafe { *((kp + 8)  as uint64) = a_slot }
+    unsafe { *((kp + 16) as uint64) = a_src }
+    unsafe { *((kp + 24) as uint64) = a_n }
+    return hipModuleLaunchKernel(fn_w,
+                                  grid_x, 1, 1,
+                                  block_x, 1, 1,
+                                  0, 0, kp, 0)
+}
+
+fn launch_ring_read(uint64 fn_r, uint64 d_buf, uint64 slot_base,
+                    uint64 d_dst, uint32 grid_x, uint32 block_x) -> uint32 {
+    uint64 a_buf  = alloc(8); unsafe { *(a_buf as uint64) = d_buf }
+    uint64 a_slot = alloc(8); unsafe { *(a_slot as uint64) = slot_base }
+    uint64 a_dst  = alloc(8); unsafe { *(a_dst as uint64) = d_dst }
+    uint64 a_n    = alloc(8); uint64 nv = N_ELEMS; unsafe { *(a_n as uint64) = nv }
+    uint64 kp = alloc(4 * 8)
+    unsafe { *(kp       as uint64) = a_buf }
+    unsafe { *((kp + 8)  as uint64) = a_slot }
+    unsafe { *((kp + 16) as uint64) = a_dst }
+    unsafe { *((kp + 24) as uint64) = a_n }
+    return hipModuleLaunchKernel(fn_r,
+                                  grid_x, 1, 1,
+                                  block_x, 1, 1,
+                                  0, 0, kp, 0)
+}
+
+// Returns max ULP distance between two N_ELEMS-long f64 buffers.
+fn buf_diff_ulp(uint64 a, uint64 b) -> uint64 {
+    uint64 max = 0
+    uint64 i = 0
+    while i < N_ELEMS {
+        uint64 ap = a + i * 8
+        uint64 bp = b + i * 8
+        uint64 av = 0; uint64 bv = 0
+        unsafe { *(ap as uint64) -> av }
+        unsafe { *(bp as uint64) -> bv }
+        uint64 d = 0
+        if av > bv { d = av - bv }
+        if bv > av { d = bv - av }
+        if d > max { max = d }
+        i = i + 1
+    }
+    return max
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    uint64 co_path = "/tmp/gpu_ring.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/gpu_ring.co — build first:")
+        puts("  mlrc --target=hip-amd examples/gpu_ring.mlr -o /tmp/gpu_ring")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData failed", err) }
+    uint64 mod = 0
+    unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fnw_slot = alloc(8)
+    uint64 kname_w = "ring_write"
+    err = hipModuleGetFunction(fnw_slot, mod, kname_w)
+    if err != 0 { die("hipModuleGetFunction ring_write", err) }
+    uint64 fn_w = 0
+    unsafe { *(fnw_slot as uint64) -> fn_w }
+
+    uint64 fnr_slot = alloc(8)
+    uint64 kname_r = "ring_read_clear"
+    err = hipModuleGetFunction(fnr_slot, mod, kname_r)
+    if err != 0 { die("hipModuleGetFunction ring_read_clear", err) }
+    uint64 fn_r = 0
+    unsafe { *(fnr_slot as uint64) -> fn_r }
+
+    // Host patterns A / B / C — distinct so cross-slot bleed is
+    // immediately visible.
+    uint64 bytes = N_ELEMS * 8
+    uint64 pat_A = alloc(bytes); fill_pattern(pat_A, 100)
+    uint64 pat_B = alloc(bytes); fill_pattern(pat_B, 200)
+    uint64 pat_C = alloc(bytes); fill_pattern(pat_C, 300)
+
+    uint64 out_A = alloc(bytes)
+    uint64 out_B = alloc(bytes)
+    uint64 out_C = alloc(bytes)
+
+    // Device: one ring buf of (N_ELEMS * N_SLOTS) f64, one src, one dst.
+    uint64 slot = 0
+    uint64 ring_bytes = N_ELEMS * N_SLOTS * 8
+    uint64 d_buf = 0
+    slot = alloc(8); err = hipMalloc(slot, ring_bytes); if err != 0 { die("hipMalloc ring", err) }
+    unsafe { *(slot as uint64) -> d_buf }
+    // Zero-fill the whole ring up front.
+    uint64 zeros = alloc(ring_bytes)
+    uint64 z = 0
+    while z < N_ELEMS * N_SLOTS {
+        uint64 zp = zeros + z * 8
+        f64 zf = 0.0
+        unsafe { *(zp as f64) = zf }
+        z = z + 1
+    }
+    err = hipMemcpy(d_buf, zeros, ring_bytes, 1); if err != 0 { die("H2D ring zero", err) }
+
+    uint64 d_src = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes); if err != 0 { die("hipMalloc src", err) }
+    unsafe { *(slot as uint64) -> d_src }
+
+    uint64 d_dst = 0
+    slot = alloc(8); err = hipMalloc(slot, bytes); if err != 0 { die("hipMalloc dst", err) }
+    unsafe { *(slot as uint64) -> d_dst }
+
+    uint32 block_x = 256
+    uint64 grid_x_u = (N_ELEMS + 255) / 256
+    uint32 grid_x = grid_x_u
+
+    uint64 base_0 = 0              // slot 0 offset in ring
+    uint64 base_1 = N_ELEMS        // slot 1
+    uint64 base_2 = N_ELEMS * 2    // slot 2
+
+    // step 0: write pattern A to slot 0
+    err = hipMemcpy(d_src, pat_A, bytes, 1); if err != 0 { die("H2D pat A", err) }
+    err = launch_ring_write(fn_w, d_buf, base_0, d_src, grid_x, block_x)
+    if err != 0 { die("launch ring_write A", err) }
+
+    // step 1: read slot 0 into out_A; write pattern B to slot 1
+    err = launch_ring_read(fn_r, d_buf, base_0, d_dst, grid_x, block_x)
+    if err != 0 { die("launch ring_read A", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync 1", err) }
+    err = hipMemcpy(out_A, d_dst, bytes, 2); if err != 0 { die("D2H A", err) }
+
+    err = hipMemcpy(d_src, pat_B, bytes, 1); if err != 0 { die("H2D pat B", err) }
+    err = launch_ring_write(fn_w, d_buf, base_1, d_src, grid_x, block_x)
+    if err != 0 { die("launch ring_write B", err) }
+
+    // step 2: read slot 1; write pattern C to slot 2
+    err = launch_ring_read(fn_r, d_buf, base_1, d_dst, grid_x, block_x)
+    if err != 0 { die("launch ring_read B", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync 2", err) }
+    err = hipMemcpy(out_B, d_dst, bytes, 2); if err != 0 { die("D2H B", err) }
+
+    err = hipMemcpy(d_src, pat_C, bytes, 1); if err != 0 { die("H2D pat C", err) }
+    err = launch_ring_write(fn_w, d_buf, base_2, d_src, grid_x, block_x)
+    if err != 0 { die("launch ring_write C", err) }
+
+    // step 3: read slot 2
+    err = launch_ring_read(fn_r, d_buf, base_2, d_dst, grid_x, block_x)
+    if err != 0 { die("launch ring_read C", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync 3", err) }
+    err = hipMemcpy(out_C, d_dst, bytes, 2); if err != 0 { die("D2H C", err) }
+
+    // ---- Compare ----
+    uint64 ua = buf_diff_ulp(out_A, pat_A)
+    uint64 ub = buf_diff_ulp(out_B, pat_B)
+    uint64 uc = buf_diff_ulp(out_C, pat_C)
+
+    // Also verify the ring is completely zero after the sequence.
+    uint64 host_ring = alloc(ring_bytes)
+    err = hipMemcpy(host_ring, d_buf, ring_bytes, 2); if err != 0 { die("D2H ring", err) }
+    uint64 nonzero = 0
+    uint64 k = 0
+    while k < N_ELEMS * N_SLOTS {
+        uint64 p = host_ring + k * 8
+        uint64 bits = 0
+        unsafe { *(p as uint64) -> bits }
+        if bits != 0 { nonzero = nonzero + 1 }
+        k = k + 1
+    }
+
+    print_label_val("out_A ULP       ", 16, ua)
+    print_label_val("out_B ULP       ", 16, ub)
+    print_label_val("out_C ULP       ", 16, uc)
+    print_label_val("ring nonzero    ", 16, nonzero)
+
+    if ua == 0 {
+        if ub == 0 {
+            if uc == 0 {
+                if nonzero == 0 {
+                    puts("ring OK — slot routing + read-clear correct, buffer fully drained")
+                    hipFree(d_buf); hipFree(d_src); hipFree(d_dst)
+                    exit(0)
+                }
+            }
+        }
+    }
+    puts("ring FAIL")
+    hipFree(d_buf); hipFree(d_src); hipFree(d_dst)
+    exit(1)
+}

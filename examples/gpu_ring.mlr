@@ -1,0 +1,64 @@
+// MLRift — M4.f ring-buffer kernels.
+//
+// Stage 13 uses a (delay+1) × N row-major ring buffer for delayed E
+// delivery. At fire time each source writes its release factor into
+// slot `step % (delay+1)`; `delay` steps later the delivery pass
+// reads from slot `(step+1) % (delay+1)` and clears the slot so the
+// next round of the ring re-uses it cleanly.
+//
+// The two kernels below isolate those primitives:
+//
+//   ring_write(buf, slot_base, src_values, n):
+//     per-thread  buf[slot_base + i] = src_values[i]
+//
+//   ring_read_clear(buf, slot_base, dst_values, n):
+//     per-thread  dst_values[i] = buf[slot_base + i]
+//                 buf[slot_base + i] = 0
+//
+// `slot_base` is `slot * n` — the row-major start of that slot. The
+// host rotates it per step. Both kernels are per-element parallel,
+// no atomics needed (each slot+i is touched by exactly one thread).
+
+fn tid_x() -> uint64 {
+    return 0
+}
+
+@kernel
+fn ring_write(
+    uint64 buf_ptr,
+    uint64 slot_base,
+    uint64 src_ptr,
+    uint64 n
+) {
+    uint64 i = tid_x()
+    if i < n {
+        uint64 sp = src_ptr + i * 8
+        f64 v = 0.0
+        unsafe { *(sp as f64) -> v }
+        uint64 dp = buf_ptr + (slot_base + i) * 8
+        unsafe { *(dp as f64) = v }
+    }
+}
+
+@kernel
+fn ring_read_clear(
+    uint64 buf_ptr,
+    uint64 slot_base,
+    uint64 dst_ptr,
+    uint64 n
+) {
+    uint64 i = tid_x()
+    if i < n {
+        uint64 sp = buf_ptr + (slot_base + i) * 8
+        f64 v = 0.0
+        unsafe { *(sp as f64) -> v }
+        uint64 dp = dst_ptr + i * 8
+        unsafe { *(dp as f64) = v }
+        f64 z = 0.0
+        unsafe { *(sp as f64) = z }
+    }
+}
+
+fn main() {
+    exit(0)
+}
