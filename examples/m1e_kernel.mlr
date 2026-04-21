@@ -1,0 +1,27 @@
+// MLRift Stage-1 M1e: two-kernarg dispatch — host supplies the
+// stored value. Same PtrStore body as M1d, but the value comes
+// from a second kernarg (u32 by-value) instead of being baked
+// into the kernel as a literal.
+//
+// The M1e lowerer recognises this exact shape in
+// emit_amdgpu_from_module:
+//   * 2 params: (uint64 out, uint32 value)
+//   * body = one PtrStore *out <- value, with value an Ident
+//     referring to the 2nd param.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/m1e_kernel.mlr -o /tmp/m1e
+// Verify:
+//   ./build/mlrc --arch=x86_64 examples/m1e_load.mlr -o /tmp/m1e_load
+//   /tmp/m1e_load
+//     -> out[0] bits (u32) : <whatever host passed>
+//     -> M1e gate: GREEN
+
+@kernel
+fn write_value(uint64 out, uint32 value) {
+    unsafe { *(out as uint32) = value }
+}
+
+fn main() {
+    exit(0)
+}

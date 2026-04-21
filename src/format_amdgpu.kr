@@ -229,11 +229,33 @@ fn mp_false() { amd_byte(0xC2) }
 // inspects for a zero-kernarg / zero-resource kernel. Future
 // milestones (M1b onwards) will extend `.args`.
 
+// Args descriptor layout:
+//   [arg0_size, arg0_kind, arg1_size, arg1_kind, ...]
+// Each entry is 16 bytes (two u64s). Kinds: 0 = global_buffer,
+// 1 = by_value. The encoder treats an empty (n_args=0) descriptor
+// as "no kernargs" — same as the M1a nop kernel.
+static uint64 AMD_ARG_KIND_GLOBAL_BUFFER = 0
+static uint64 AMD_ARG_KIND_BY_VALUE      = 1
+
+fn amd_arg_size_at(uint64 desc, uint64 i) -> uint64 {
+    uint64 p = desc + i * 16
+    uint64 v = 0
+    unsafe { *(p as uint64) -> v }
+    return v
+}
+
+fn amd_arg_kind_at(uint64 desc, uint64 i) -> uint64 {
+    uint64 p = desc + i * 16 + 8
+    uint64 v = 0
+    unsafe { *(p as uint64) -> v }
+    return v
+}
+
 fn amd_emit_metadata_body(uint64 kname, uint64 kname_len,
                           uint64 ksym,  uint64 ksym_len,
                           uint64 kernarg_size, uint64 kernarg_align,
                           uint64 sgpr_count, uint64 vgpr_count,
-                          uint64 n_args) -> uint64 {
+                          uint64 args_desc, uint64 n_args) -> uint64 {
     uint64 start = amd_len
 
     // Top-level map with 3 entries.
@@ -274,12 +296,24 @@ fn amd_emit_metadata_body(uint64 kname, uint64 kname_len,
     mp_str_lit(".args")
     mp_fixarray(n_args)
     uint64 aai = 0
+    uint64 aoff = 0
     while aai < n_args {
-        mp_fixmap(4)
-        mp_str_lit(".address_space"); mp_str_lit("global")
-        mp_str_lit(".offset");        mp_uint(aai * 8)
-        mp_str_lit(".size");          mp_uint(8)
-        mp_str_lit(".value_kind");    mp_str_lit("global_buffer")
+        uint64 sz   = amd_arg_size_at(args_desc, aai)
+        uint64 kind = amd_arg_kind_at(args_desc, aai)
+        if kind == AMD_ARG_KIND_GLOBAL_BUFFER {
+            mp_fixmap(4)
+            mp_str_lit(".address_space"); mp_str_lit("global")
+            mp_str_lit(".offset");        mp_uint(aoff)
+            mp_str_lit(".size");          mp_uint(sz)
+            mp_str_lit(".value_kind");    mp_str_lit("global_buffer")
+        } else {
+            // by_value scalar — no .address_space key, matching clang.
+            mp_fixmap(3)
+            mp_str_lit(".offset");        mp_uint(aoff)
+            mp_str_lit(".size");          mp_uint(sz)
+            mp_str_lit(".value_kind");    mp_str_lit("by_value")
+        }
+        aoff = aoff + sz
         aai = aai + 1
     }
     mp_str_lit(".group_segment_fixed_size");   mp_uint(0)
@@ -426,7 +460,7 @@ fn amd_emit_note_section(uint64 kname, uint64 kname_len,
                          uint64 ksym,  uint64 ksym_len,
                          uint64 kernarg_size, uint64 kernarg_align,
                          uint64 sgpr_count, uint64 vgpr_count,
-                         uint64 n_args) -> uint64 {
+                         uint64 args_desc, uint64 n_args) -> uint64 {
     uint64 start = amd_len
     // To get exact sizes we emit the MsgPack body first into a side
     // scratch? Easier: emit placeholder 12-byte header, then body,
@@ -450,7 +484,7 @@ fn amd_emit_note_section(uint64 kname, uint64 kname_len,
     uint64 body_len = amd_emit_metadata_body(kname, kname_len, ksym, ksym_len,
                                               kernarg_size, kernarg_align,
                                               sgpr_count, vgpr_count,
-                                              n_args)
+                                              args_desc, n_args)
     // Back-patch n_descsz
     amd_patch_u32(hdr_off + 4, body_len)
     // Pad note body to 4-byte alignment
@@ -523,6 +557,12 @@ fn asm_sopp(uint64 op, uint64 simm16) {
 
 fn asm_s_endpgm() { asm_sopp(0x30, 0) }
 
+// s_clause <count> — scheduling hint that the next (count+1)
+// instructions form a group with no intervening memory ops. Clang
+// emits this ahead of back-to-back s_load_* pairs to let the
+// hardware batch their SMEM accesses. op = 0x05 on gfx11.
+fn asm_s_clause(uint64 count) { asm_sopp(0x05, count & 0xFFFF) }
+
 // s_waitcnt lgkmcnt(0) — wait for scalar/LDS memory, ignore vmcnt.
 // simm16 encoding for gfx11 combined waitcnt:
 //   [3:0]    vmcnt[3:0]
@@ -566,6 +606,25 @@ fn asm_s_load_b64(uint64 sdata, uint64 sbase_pair) {
     asm_u32(0xF8000000)
 }
 
+// s_load_b32 s<SGPR>, s[sbase_pair:+1], <imm_offset>  (SMEM op 0x00)
+//
+// Gotcha: the SMEM sdata field is pair-index-encoded even for b32
+// loads (the destination must be an even SGPR for hardware
+// alignment reasons), so a load into s2 needs sdata_pair=1 — not 2.
+// The 6-bit field lives at [12:7] of word 1. This mirrors how the
+// b64 loader already takes "pair index"; asm_s_load_b64(0,0)
+// coincidentally works because 0/2==0, but sdata_pair=N here means
+// the destination SGPR is 2N.
+fn asm_s_load_b32(uint64 sdata_pair, uint64 sbase_pair, uint64 imm_offset) {
+    uint64 word1 = (GFX11_SMEM_PREFIX << 26)
+                   | (0x00 << 18)
+                   | ((sdata_pair & 0x3F) << 7)
+                   | (sbase_pair & 0x7F)
+    asm_u32(word1)
+    uint64 word2 = (0x7C << 25) | (imm_offset & 0x1FFFFFF)
+    asm_u32(word2)
+}
+
 // ── VOPD: dual-issue VOP1/VOP2 pair in one 64-bit instruction (gfx11+).
 // Full encoding is intricate; we only need the specific form
 //   v_dual_mov_b32 v0, 0 :: v_dual_mov_b32 v1, <literal32>
@@ -590,6 +649,25 @@ fn asm_v_dual_mov_b32_mov_b32_lit(uint64 vdst_x, uint64 vdst_y, uint64 lit32) {
     asm_u32(0xCA100080)
     asm_u32(0x000000FF)
     asm_u32(lit32)
+}
+
+// VOPD sibling of the _lit variant above: src_y comes from an
+// already-populated SGPR instead of a 32-bit literal word. Word-1
+// is unchanged (same opcode pair + vdst encoding); word-2 holds
+// the slot-Y src0 directly — SGPR indices encode in the low 9
+// bits. Save 4 bytes and one instruction-cache cycle relative to
+// the literal form.
+fn asm_v_dual_mov_b32_mov_b32_sgpr(uint64 vdst_x, uint64 vdst_y, uint64 src_y_sgpr) {
+    if vdst_x != 0 {
+        write(2, "format_amdgpu: asm_v_dual_mov_b32 only supports vdst_x=0\n", 57)
+        exit(1)
+    }
+    if vdst_y != 1 {
+        write(2, "format_amdgpu: asm_v_dual_mov_b32 only supports vdst_y=1\n", 57)
+        exit(1)
+    }
+    asm_u32(0xCA100080)
+    asm_u32(src_y_sgpr & 0x1FF)
 }
 
 // ── FLAT/GLOBAL (gfx11) — 64-bit instruction.
@@ -628,7 +706,8 @@ fn emit_amdgpu_code_object(uint64 kname_ptr, uint64 kname_len,
                             uint64 kernarg_size, uint64 kernarg_align,
                             uint64 sgpr_count, uint64 vgpr_count,
                             uint64 rsrc1, uint64 rsrc2, uint64 rsrc3,
-                            uint64 properties, uint64 n_args) -> uint64 {
+                            uint64 properties,
+                            uint64 args_desc, uint64 n_args) -> uint64 {
     amd_init()
 
     // Build the kernel-descriptor symbol name: "<kname>.kd".
@@ -708,7 +787,7 @@ fn emit_amdgpu_code_object(uint64 kname_ptr, uint64 kname_len,
                                               ksym_buf, ksym_len,
                                               kernarg_size, kernarg_align,
                                               sgpr_count, vgpr_count,
-                                              n_args)
+                                              args_desc, n_args)
     amd_align(8)
 
     // .hash — single-bucket SysV hash covering our 3 dynsym entries
@@ -1255,7 +1334,7 @@ fn emit_amdgpu_nop_blob(uint64 out_path) -> uint64 {
                                            0,       // sgpr_count
                                            0,       // vgpr_count
                                            rsrc1, rsrc2, rsrc3, props,
-                                           0)       // n_args
+                                           0, 0)    // args_desc, n_args
 
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
@@ -1328,6 +1407,11 @@ fn emit_amdgpu_sentinel_blob(uint64 out_path) -> uint64 {
     uint64 rsrc3 = 0x00000010
     uint64 props = 0x0408    // KERNARG_SEGMENT_PTR | WAVEFRONT_SIZE32
 
+    // One arg: 8-byte global_buffer.
+    uint64[2] args_desc
+    uint64 adp0 = args_desc + 0;  unsafe { *(adp0 as uint64) = 8 }
+    uint64 adp1 = args_desc + 8;  unsafe { *(adp1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+
     uint64 size = emit_amdgpu_code_object(kname, klen,
                                            asm_text_buf, asm_text_len,
                                            8,       // kernarg_size (one 8-byte ptr)
@@ -1335,7 +1419,7 @@ fn emit_amdgpu_sentinel_blob(uint64 out_path) -> uint64 {
                                            2,       // sgpr_count
                                            2,       // vgpr_count
                                            rsrc1, rsrc2, rsrc3, props,
-                                           1)       // n_args
+                                           args_desc, 1)
 
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
@@ -1348,20 +1432,22 @@ fn emit_amdgpu_sentinel_blob(uint64 out_path) -> uint64 {
 }
 
 // ---------------------------------------------------------------------------
-// M1d: lower a MLRift @kernel fn to our code object.
+// AST→AMDGPU lowerer (M1d, extended by M1e).
 //
-// Scope is deliberately narrow — first AST→AMDGPU lowering, so the
-// pattern space is tiny:
-//   * exactly one `uint64` param (global pointer)
-//   * body = single PtrStore of a u32 IntLit through that pointer
-// i.e. the direct MLRift transcription of write_sentinel:
+// Two supported kernel shapes. Both require the body to be a
+// single PtrStore of a u32 value:
 //
-//   @kernel
-//   fn write_sentinel(uint64 out) {
-//       unsafe { *(out as uint32) = 0xDEADBEEF }
-//   }
+//   M1d (1 arg):
+//     @kernel fn write_sentinel(uint64 out) {
+//         unsafe { *(out as uint32) = INT_LITERAL }
+//     }
 //
-// Everything outside that shape prints an error pointing at the
+//   M1e (2 args):
+//     @kernel fn write_value(uint64 out, uint32 value) {
+//         unsafe { *(out as uint32) = value }
+//     }
+//
+// Everything outside those shapes prints an error pointing at the
 // offending kernel — the shape grows as the encoder and lowerer do.
 //
 // Return codes: 0 OK, 1 unsupported shape, 2 I/O failure,
@@ -1398,17 +1484,23 @@ fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> u
     uint64 nl = tok_text_len(name_tok)
     uint64 kname_ptr = source + ns
 
-    // Param list — count them; only uint64 / one-arg supported here.
+    // Param list — 1 or 2 params. If there are 2, the 2nd is taken
+    // as a u32 by-value scalar and its PARAM name is remembered so
+    // we can match it against the PtrStore value Ident.
     uint64 n_params = 0
+    uint32 param0_tok = 0
+    uint32 param1_tok = 0
     uint32 p = ast_child(fn_node)
     uint64 wp = p
     while wp != 0 {
+        if n_params == 0 { param0_tok = ast_data2(wp) }
+        if n_params == 1 { param1_tok = ast_data2(wp) }
         n_params = n_params + 1
         uint32 np = ast_next(wp)
         wp = np
     }
-    if n_params != 1 {
-        write(2, "mlrc: M1d lowering supports exactly 1 uint64 pointer arg (got ", 62)
+    if n_params != 1 && n_params != 2 {
+        write(2, "mlrc: amdgpu-native lowering supports 1 or 2 params (got ", 57)
         uint8[24] cbuf
         uint64 clen = fmt_uint(cbuf, n_params)
         write(2, cbuf, clen)
@@ -1416,68 +1508,123 @@ fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> u
         return 1
     }
 
-    // Body — expect one PtrStore (kind 42) writing a u32 IntLit.
+    // Body — expect exactly one PtrStore.
     uint32 body = ast_data3(fn_node)
     if body == 0 {
-        write(2, "mlrc: M1d: kernel has empty body\n", 33)
+        write(2, "mlrc: amdgpu-native: kernel has empty body\n", 43)
         return 1
     }
     uint32 stmt = ast_child(body)
     if stmt == 0 {
-        write(2, "mlrc: M1d: kernel body has no statements\n", 41)
+        write(2, "mlrc: amdgpu-native: kernel body has no statements\n", 51)
         return 1
     }
     uint32 after = ast_next(stmt)
     if after != 0 {
-        write(2, "mlrc: M1d: kernel body must be a single PtrStore\n", 49)
+        write(2, "mlrc: amdgpu-native: kernel body must be a single PtrStore\n", 59)
         return 1
     }
     uint64 wstmt = stmt
     uint32 skind = ast_kind(wstmt)
     if skind != 42 {
-        write(2, "mlrc: M1d: first stmt must be PtrStore (unsafe { *(p as TYPE) = v })\n", 69)
+        write(2, "mlrc: amdgpu-native: first stmt must be PtrStore (unsafe { *(p as TYPE) = v })\n", 79)
         return 1
     }
     uint32 ts = ast_data1(wstmt)
     uint64 type_size = ts
     if type_size != 4 {
-        write(2, "mlrc: M1d: only u32 stores supported\n", 37)
+        write(2, "mlrc: amdgpu-native: only u32 stores supported\n", 47)
         return 1
     }
     uint32 val_node = ast_data2(wstmt)
     uint64 wvn = val_node
     uint32 vkind = ast_kind(wvn)
-    if vkind != 30 {
-        write(2, "mlrc: M1d: store value must be an IntLit\n", 41)
+
+    // Decide lowering path: IntLit (1-arg sentinel) vs Ident
+    // pointing at the 2nd param (2-arg forwarder).
+    uint64 is_lit_shape = 0
+    uint64 lit32 = 0
+    if vkind == 30 {
+        is_lit_shape = 1
+        uint32 lit_tok = ast_data1(wvn)
+        lit32 = parse_int_token(lit_tok) & 0xFFFFFFFF
+        if n_params != 1 {
+            write(2, "mlrc: amdgpu-native: 1-arg sentinel shape expects exactly 1 param\n", 66)
+            return 1
+        }
+    } else if vkind == 32 {
+        uint32 ident_tok = ast_data1(wvn)
+        if n_params != 2 {
+            write(2, "mlrc: amdgpu-native: 2-arg forwarder shape expects exactly 2 params\n", 68)
+            return 1
+        }
+        if tok_text_eq(ident_tok, param1_tok) == 0 {
+            write(2, "mlrc: amdgpu-native: store value must reference the 2nd kernel param\n", 69)
+            return 1
+        }
+    } else {
+        write(2, "mlrc: amdgpu-native: store value must be an IntLit or a param Ident\n", 68)
         return 1
     }
-    uint32 lit_tok = ast_data1(wvn)
-    uint64 lit = parse_int_token(lit_tok) & 0xFFFFFFFF
 
-    // Lower to gfx1100 via the encoders established in M1c.
-    asm_init()
-    asm_s_load_b64(0, 0)                              // s[0:1] = *kernarg
-    asm_v_dual_mov_b32_mov_b32_lit(0, 1, lit)         // v0 = 0, v1 = lit
-    asm_s_waitcnt_lgkmcnt_zero()
-    asm_global_store_b32(0, 1, 0)                     // *(s[0:1]+v0) = v1
-    asm_s_endpgm()
-
-    // Resource layout mirrors what clang picks for this kernel class.
-    // As lowering grows we'll compute these from live-range/atomics
-    // analysis — for now they're a safe over-approximation.
+    // Lower to gfx1100 via the encoders. Resource layout mirrors
+    // what clang picks for these kernel classes — safe
+    // over-approximation until we derive them from analysis.
     uint64 rsrc1 = 0xE0AF0000
     uint64 rsrc2 = 0x0000009E
     uint64 rsrc3 = 0x00000010
     uint64 props = 0x0408       // KERNARG_SEGMENT_PTR | WAVEFRONT_SIZE32
 
+    asm_init()
+    uint64 kernarg_size = 0
+    uint64 sgpr_count   = 0
+    uint64 n_args       = 0
+    uint64[4] args_desc
+
+    if is_lit_shape != 0 {
+        // 1-arg write_sentinel shape.
+        asm_s_load_b64(0, 0)
+        asm_v_dual_mov_b32_mov_b32_lit(0, 1, lit32)
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_global_store_b32(0, 1, 0)
+        asm_s_endpgm()
+
+        uint64 adp0 = args_desc + 0;  unsafe { *(adp0 as uint64) = 8 }
+        uint64 adp1 = args_desc + 8;  unsafe { *(adp1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        kernarg_size = 8
+        sgpr_count   = 2
+        n_args       = 1
+    } else {
+        // 2-arg write_value shape: kernarg[0..7] = ptr, kernarg[8..11] = u32
+        // value. Hardware is given the kernarg base in s[0:1] on entry;
+        // we load the u32 into s2 first so the subsequent s_load_b64
+        // (which clobbers s[0:1]) doesn't also clobber the kernarg base
+        // before we're done with it.
+        asm_s_clause(1)                      // batch the two SMEM loads
+        asm_s_load_b32(1, 0, 8)              // s2  <- kernarg[8] (sdata_pair=1 → s2)
+        asm_s_load_b64(0, 0)                 // s[0:1] <- kernarg[0..7] (ptr)
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_v_dual_mov_b32_mov_b32_sgpr(0, 1, 2)   // v0=0, v1=s2
+        asm_global_store_b32(0, 1, 0)              // *(s[0:1]) = v1
+        asm_s_endpgm()
+
+        uint64 adp0 = args_desc + 0;   unsafe { *(adp0 as uint64) = 8 }
+        uint64 adp1 = args_desc + 8;   unsafe { *(adp1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        uint64 adp2 = args_desc + 16;  unsafe { *(adp2 as uint64) = 4 }
+        uint64 adp3 = args_desc + 24;  unsafe { *(adp3 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        kernarg_size = 12
+        sgpr_count   = 3
+        n_args       = 2
+    }
+
     uint64 size = emit_amdgpu_code_object(kname_ptr, nl,
                                            asm_text_buf, asm_text_len,
-                                           8,       // kernarg_size (one 8-byte ptr)
-                                           8,       // kernarg_align
-                                           2,       // sgpr_count
-                                           2,       // vgpr_count
+                                           kernarg_size,
+                                           8,                 // kernarg_align
+                                           sgpr_count,
+                                           2,                 // vgpr_count
                                            rsrc1, rsrc2, rsrc3, props,
-                                           1)
+                                           args_desc, n_args)
 
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 { return 2 }
