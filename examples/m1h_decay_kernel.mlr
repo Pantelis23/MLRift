@@ -1,0 +1,27 @@
+// MLRift Stage-1 M1h: f64 decay via native emitter.
+//
+//   @kernel
+//   fn decay_step(uint64 buf, uint32 n, f64 factor) {
+//       if tid_x() < n {
+//           uint64 p = buf + tid_x() * 8
+//           f64 v = 0.0
+//           unsafe { *(p as f64) -> v }
+//           v = v - v * factor
+//           unsafe { *(p as f64) = v }
+//       }
+//   }
+
+@kernel
+fn decay_step(uint64 buf, uint32 n, f64 factor) {
+    if tid_x() < n {
+        uint64 p = buf + tid_x() * 8
+        f64 v = 0.0
+        unsafe { *(p as f64) -> v }
+        v = v - v * factor
+        unsafe { *(p as f64) = v }
+    }
+}
+
+fn main() {
+    exit(0)
+}

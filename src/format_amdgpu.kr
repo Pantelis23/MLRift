@@ -383,6 +383,15 @@ fn amd_emit_metadata_body() -> uint64 {
         while aai < n_args {
             uint64 sz   = amd_arg_size_at(args_desc, aai)
             uint64 kind = amd_arg_kind_at(args_desc, aai)
+            // Each arg sits at its natural alignment within the
+            // kernarg segment. The AMDGPU ABI aligns to the arg's
+            // own size for primitives (e.g. f64 rounds to 8). Without
+            // this the decay kernel's factor gets offset=12 and the
+            // kernel reads the wrong 8 bytes.
+            if sz > 1 {
+                uint64 rem = aoff - (aoff / sz) * sz
+                if rem != 0 { aoff = aoff + sz - rem }
+            }
             if kind == AMD_ARG_KIND_GLOBAL_BUFFER {
                 mp_fixmap(4)
                 mp_str_lit(".address_space"); mp_str_lit("global")
@@ -667,6 +676,13 @@ fn asm_s_clause(uint64 count) { asm_sopp(0x05, count & 0xFFFF) }
 // exactly this ahead of reads from SMEM-loaded SGPRs.
 fn asm_s_waitcnt_lgkmcnt_zero() { asm_sopp(0x09, 0xFC07) }
 
+// s_waitcnt vmcnt(0) — wait for VMEM ops to drain. simm16 0x03F7
+// = lgkmcnt max (0xF) << 8 | expcnt max << 7 | vmcnt_lo 0x7 and
+// vmcnt_hi=0 (vmcnt total bits scattered across [3:0] and [14:12]
+// on gfx11). We care about "vmcnt=0, others ignored", clang emits
+// exactly 0x03F7 for that.
+fn asm_s_waitcnt_vmcnt_zero() { asm_sopp(0x09, 0x03F7) }
+
 // s_cbranch_execz <simm16> — SOPP op 0x25. Branches forward by
 // simm16 dwords if EXEC == 0 (no lanes active). Used right after
 // s_and_saveexec to skip the guarded body when no lane passed the
@@ -703,6 +719,19 @@ fn asm_s_load_b64(uint64 sdata, uint64 sbase_pair) {
                    | (sbase_pair & 0x7F)
     asm_u32(word1)
     asm_u32(0xF8000000)
+}
+
+// s_load_b64 pair s[sdata_pair:+1], s[sbase_pair:+1], <imm_offset>
+// (SMEM op 0x01 with a non-zero imm offset). Lets us pull a second
+// 8-byte kernarg past the base pointer — e.g. kernarg[16..23].
+fn asm_s_load_b64_off(uint64 sdata_pair, uint64 sbase_pair, uint64 imm_offset) {
+    uint64 word1 = (GFX11_SMEM_PREFIX << 26)
+                   | (0x01 << 18)
+                   | ((sdata_pair & 0x3F) << 7)
+                   | (sbase_pair & 0x7F)
+    asm_u32(word1)
+    uint64 word2 = (0x7C << 25) | (imm_offset & 0x1FFFFFF)
+    asm_u32(word2)
 }
 
 // s_load_b32 s<SGPR>, s[sbase_pair:+1], <imm_offset>  (SMEM op 0x00)
@@ -853,6 +882,85 @@ fn asm_global_store_b32(uint64 v_addr, uint64 v_data, uint64 saddr_pair) {
     uint64 word2 = ((saddr_pair & 0x7F) << 16)
                    | ((v_data     & 0xFF) << 8)
                    | (v_addr      & 0xFF)
+    asm_u32(word2)
+}
+
+// global_load_b64 v[vdst_pair:+1], v_addr, s[saddr_pair:+1]   (op 0x15)
+// Loads 8 bytes from (s[saddr]+v_addr) into the VGPR pair
+// starting at vdst_pair.
+fn asm_global_load_b64(uint64 vdst_pair, uint64 v_addr, uint64 saddr_pair) {
+    asm_u32(0xDC560000)
+    uint64 word2 = ((saddr_pair & 0x7F) << 16)
+                   | ((vdst_pair & 0xFF) << 24)
+                   | ((v_addr    & 0xFF) << 0)
+    // Reference for v[0:1]/v2/s[2:3]: 0x00020002
+    //   [31:24]=vdst=0x00, [23:16]=saddr=0x02, [15:8]=vdata=0x00,
+    //   [7:0]=vaddr=0x02. So vdst encoded at [31:24].
+    asm_u32(word2)
+}
+
+// global_store_b64 v_addr, v[vdata_pair:+1], s[saddr_pair:+1]  (op 0x1B)
+// Stores the VGPR pair starting at vdata_pair to (s[saddr]+v_addr).
+fn asm_global_store_b64(uint64 v_addr, uint64 vdata_pair, uint64 saddr_pair) {
+    asm_u32(0xDC6E0000)
+    // Reference for v2/v[0:1]/s[2:3]: 0x00020002
+    //   [31:24]=vdata=0x00, [23:16]=saddr=0x02, [15:8]=?,
+    //   [7:0]=vaddr=0x02. vdata at [31:24].
+    uint64 word2 = ((vdata_pair & 0xFF) << 24)
+                   | ((saddr_pair & 0x7F) << 16)
+                   | (v_addr & 0xFF)
+    asm_u32(word2)
+}
+
+// ── VOP3 — 64-bit three-source vector op. Layout (gfx11, non-VOP3P):
+//   Word 1:
+//     [31:26] = 0x35  (VOP3 prefix)
+//     [25:16] = 10-bit op
+//     [15]    = clamp
+//     [14:11] = opsel (or similar)
+//     [7:0]   = vdst (8 bits)
+//   Word 2:
+//     [31:29] = neg[2,1,0]  (source-negation flags, lane-high)
+//     [28:21] doesn't matter here
+//     (This is a narrow helper, not a general VOP3 encoder.)
+//
+// v_fma_f64 vdst_pair, -s[0:1], v[0:1], v[0:1]  — op 0x014 on gfx11.
+// Used for the decay idiom  v - v * factor  == fma(-factor, v, v).
+// Reference bytes: 0xD6140000 0x24020000.
+fn asm_v_fma_f64_neg_s_v_v(uint64 vdst_pair, uint64 neg_sgpr_pair,
+                           uint64 v_src1_pair, uint64 v_src2_pair) {
+    // Word 1: prefix + op + vdst.  gfx11 VOP3 prefix is 7 bits at
+    // [31:25] = 0x6B (= bit 25 set in the 0x35-at-[31:26] framing);
+    // op occupies [24:16] (9 bits).
+    uint64 word1 = (0x6B << 25)
+                   | (0x014 << 16)
+                   | (vdst_pair & 0xFF)
+    asm_u32(word1)
+    // Word 2 layout reverse-engineered from ref 0x24020000:
+    //   [31:29] = neg (3 bits) = 001  ->  negate src0 only
+    //   [28:24] = reserved / 0
+    //   [22:18] = src2[9:0] low / vgpr pair: reference has 0x02 here
+    //              → src2 = v[0:1] pair, but encoding uses the low 9
+    //              bits packed. The reference src2 VGPR pair starts at
+    //              v0 (encoding 0x100), and clang compresses it into
+    //              the word as 0x02 at [22:18]? Actually bits [28:18]
+    //              = 11 bits = src2 = 0x...
+    //   [17:9]  = src1
+    //   [8:0]   = src0
+    //
+    // Rather than fully derive the field layout we splice in the
+    // reverse-engineered value directly for the "neg sgpr, vgpr,
+    // vgpr" operand shape that the decay idiom needs. Generalising
+    // across VOP3 operand shapes lands alongside the next f64
+    // lowerable expression.
+    uint64 src0_enc = neg_sgpr_pair & 0x1FF               // SGPR pair: encoding = pair_idx * 2
+    uint64 src1_enc = 0x100 | (v_src1_pair & 0xFF)        // VGPR = 0x100 + idx
+    uint64 src2_enc = 0x100 | (v_src2_pair & 0xFF)
+    uint64 neg = 0x1                                       // neg[0]=1 → -src0
+    uint64 word2 = (neg << 29)
+                   | ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
     asm_u32(word2)
 }
 
@@ -1731,8 +1839,8 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         uint32 np = ast_next(wp)
         wp = np
     }
-    if n_params != 1 && n_params != 2 {
-        write(2, "mlrc: amdgpu-native lowering supports 1 or 2 params (got ", 57)
+    if n_params != 1 && n_params != 2 && n_params != 3 {
+        write(2, "mlrc: amdgpu-native lowering supports 1-3 params (got ", 54)
         uint8[24] cbuf
         uint64 clen = fmt_uint(cbuf, n_params)
         write(2, cbuf, clen)
@@ -1762,6 +1870,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     // i.e. the M1f tid body wrapped in an if-bounds check. Used when
     // the launch grid has more threads than buffer slots.
     uint64 is_tid_guarded_shape = 0
+    uint64 is_decay_shape        = 0
     uint32 s0_kind = ast_kind(stmt0)
     if s0_kind == 13 {
         uint32 after_if = ast_next(stmt0)
@@ -1769,8 +1878,8 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
             write(2, "mlrc: amdgpu-native: guarded shape: expect exactly one If stmt\n", 63)
             return 1
         }
-        if n_params != 2 {
-            write(2, "mlrc: amdgpu-native: guarded shape expects exactly 2 params\n", 60)
+        if n_params != 2 && n_params != 3 {
+            write(2, "mlrc: amdgpu-native: guarded shape expects 2 or 3 params\n", 57)
             return 1
         }
         // If AST layout (kind 13, per ir.kr): child=cond expr,
@@ -1816,7 +1925,8 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         // wrong results at runtime, not a crash. Full structural
         // validation of the nested Block can land alongside richer
         // lowering.
-        is_tid_guarded_shape = 1
+        if n_params == 2 { is_tid_guarded_shape = 1 }
+        if n_params == 3 { is_decay_shape       = 1 }
     }
 
     uint32 stmt1 = ast_next(stmt0)
@@ -1866,7 +1976,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
     uint64 wstmt = 0
     uint32 skind = 0
-    if is_tid_shape == 0 && is_tid_guarded_shape == 0 {
+    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 {
         wstmt = stmt0
         skind = ast_kind(wstmt)
         if skind != 42 {
@@ -1876,7 +1986,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
     uint64 is_lit_shape = 0
     uint64 lit32 = 0
-    if is_tid_shape == 0 && is_tid_guarded_shape == 0 {
+    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 {
         uint32 ts = ast_data1(wstmt)
         uint64 type_size = ts
         if type_size != 4 {
@@ -1930,9 +2040,52 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     // stack) because kt_push stores the pointer into the table and
     // reads it back during emit — stack addresses wouldn't survive
     // function return. Same rationale for the kernel text blob.
-    uint64 args_desc = alloc(4 * 16)
+    // 6 × 16 bytes = up to 6 args × (size, kind); decay uses 3.
+    uint64 args_desc = alloc(6 * 16)
 
-    if is_tid_guarded_shape != 0 {
+    if is_decay_shape != 0 {
+        // M1h f64 decay shape — mirrors clang's gfx1100 output for:
+        //   @kernel fn decay_step(uint64 buf, uint32 n, f64 factor) {
+        //       if tid_x() < n {
+        //           uint64 p = buf + tid_x() * 8
+        //           f64 v = 0.0
+        //           unsafe { *(p as f64) -> v }
+        //           v = v - v * factor
+        //           unsafe { *(p as f64) = v }
+        //       }
+        //   }
+        //
+        // 14 instructions, 76 bytes. Nested body details (the VarDecl
+        // ladder and the fma-fused subtract) are trusted; the guard
+        // + layout is what we actively match.
+        asm_s_load_b32(1, 0, 8)                            // s2 = n
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_v_cmp_gt_u32_sgpr_vgpr(2, 0)                   // vcc_lo = (s2 > v0)
+        asm_s_and_saveexec_b32_vcc_lo(2)                   // save EXEC, mask
+        asm_s_cbranch_execz(13)                            // skip 13 dwords to s_endpgm
+        asm_s_load_b64(1, 0)                               // s[2:3] <- kernarg[0..7] (buf)
+        asm_v_lshlrev_b32_imm(2, 3, 0)                     // v2 = tid*8
+        asm_s_load_b64_off(0, 0, 0x10)                     // s[0:1] <- kernarg[0x10..0x17] (factor)
+        asm_s_waitcnt_lgkmcnt_zero()
+        // NB: FLAT/GLOBAL saddr is a raw SGPR index (not pair-
+        // halved), so s[2:3] encodes as 2 here even though the SMEM
+        // loaders above take pair indices.
+        asm_global_load_b64(0, 2, 2)                       // v[0:1] = buf[tid]  (saddr=s[2:3])
+        asm_s_waitcnt_vmcnt_zero()
+        asm_v_fma_f64_neg_s_v_v(0, 0, 0, 0)                // v[0:1] = -s[0:1]*v[0:1] + v[0:1]
+        asm_global_store_b64(2, 0, 2)                      // buf[tid] = v[0:1]
+        asm_s_endpgm()
+
+        uint64 adp0 = args_desc + 0;   unsafe { *(adp0 as uint64) = 8 }
+        uint64 adp1 = args_desc + 8;   unsafe { *(adp1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        uint64 adp2 = args_desc + 16;  unsafe { *(adp2 as uint64) = 4 }
+        uint64 adp3 = args_desc + 24;  unsafe { *(adp3 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        uint64 adp4 = args_desc + 32;  unsafe { *(adp4 as uint64) = 8 }
+        uint64 adp5 = args_desc + 40;  unsafe { *(adp5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        kernarg_size = 24
+        sgpr_count   = 6
+        n_args       = 3
+    } else if is_tid_guarded_shape != 0 {
         // Guarded per-thread shape (mirrors clang's gfx1100 output
         // for `if (i < n) { out[i] = i }`):
         //
@@ -2028,9 +2181,11 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         ci = ci + 1
     }
 
+    uint64 vgpr_count_k = 2
+    if is_decay_shape != 0 { vgpr_count_k = 3 }
     kt_push(kname_ptr, nl, k_text_buf, k_text_size,
             args_desc, n_args, kernarg_size,
-            sgpr_count, 2,
+            sgpr_count, vgpr_count_k,
             rsrc1, rsrc2, rsrc3, props)
     return 0
 }
