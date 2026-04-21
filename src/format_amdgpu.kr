@@ -41,6 +41,10 @@ static uint64 amd_buf = 0
 static uint64 amd_len = 0
 static uint64 amd_cap = 0
 
+// Set to 1 by main.kr when `--target=amdgpu-native` is on the CLI.
+// Gates the M1d emission path (see emit_amdgpu_from_module below).
+static uint64 target_amdgpu_native = 0
+
 @export
 fn amd_buf_ptr() -> uint64 { return amd_buf }
 
@@ -1338,6 +1342,145 @@ fn emit_amdgpu_sentinel_blob(uint64 out_path) -> uint64 {
         write(2, "emit_amdgpu_sentinel_blob: cannot open output\n", 46)
         return 1
     }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// M1d: lower a MLRift @kernel fn to our code object.
+//
+// Scope is deliberately narrow — first AST→AMDGPU lowering, so the
+// pattern space is tiny:
+//   * exactly one `uint64` param (global pointer)
+//   * body = single PtrStore of a u32 IntLit through that pointer
+// i.e. the direct MLRift transcription of write_sentinel:
+//
+//   @kernel
+//   fn write_sentinel(uint64 out) {
+//       unsafe { *(out as uint32) = 0xDEADBEEF }
+//   }
+//
+// Everything outside that shape prints an error pointing at the
+// offending kernel — the shape grows as the encoder and lowerer do.
+//
+// Return codes: 0 OK, 1 unsupported shape, 2 I/O failure,
+// 3 no @kernel fn in module.
+@export
+fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> uint64 {
+    // Find the first (and for M1d, only) @kernel fn. Multi-kernel
+    // support is a follow-up: it needs emit_amdgpu_code_object to
+    // accept more than one kernel payload.
+    uint64 fn_node = 0
+    uint64 kernels_seen = 0
+    uint32 c0 = ast_child(mod_node)
+    uint64 wc = c0
+    while wc != 0 {
+        uint32 k = ast_kind(wc)
+        if k == 2 {
+            if ast_fn_is_kernel(wc) != 0 {
+                if fn_node == 0 { fn_node = wc }
+                kernels_seen = kernels_seen + 1
+            }
+        }
+        uint32 nxt = ast_next(wc)
+        wc = nxt
+    }
+    if fn_node == 0 { return 3 }
+    if kernels_seen > 1 {
+        write(2, "mlrc: --target=amdgpu-native: multi-kernel modules not supported yet\n", 70)
+        return 1
+    }
+
+    // Kernel name (source-relative token).
+    uint32 name_tok = ast_data1(fn_node)
+    uint64 ns = tok_text_start(name_tok)
+    uint64 nl = tok_text_len(name_tok)
+    uint64 kname_ptr = source + ns
+
+    // Param list — count them; only uint64 / one-arg supported here.
+    uint64 n_params = 0
+    uint32 p = ast_child(fn_node)
+    uint64 wp = p
+    while wp != 0 {
+        n_params = n_params + 1
+        uint32 np = ast_next(wp)
+        wp = np
+    }
+    if n_params != 1 {
+        write(2, "mlrc: M1d lowering supports exactly 1 uint64 pointer arg (got ", 62)
+        uint8[24] cbuf
+        uint64 clen = fmt_uint(cbuf, n_params)
+        write(2, cbuf, clen)
+        write(2, ")\n", 2)
+        return 1
+    }
+
+    // Body — expect one PtrStore (kind 42) writing a u32 IntLit.
+    uint32 body = ast_data3(fn_node)
+    if body == 0 {
+        write(2, "mlrc: M1d: kernel has empty body\n", 33)
+        return 1
+    }
+    uint32 stmt = ast_child(body)
+    if stmt == 0 {
+        write(2, "mlrc: M1d: kernel body has no statements\n", 41)
+        return 1
+    }
+    uint32 after = ast_next(stmt)
+    if after != 0 {
+        write(2, "mlrc: M1d: kernel body must be a single PtrStore\n", 49)
+        return 1
+    }
+    uint64 wstmt = stmt
+    uint32 skind = ast_kind(wstmt)
+    if skind != 42 {
+        write(2, "mlrc: M1d: first stmt must be PtrStore (unsafe { *(p as TYPE) = v })\n", 69)
+        return 1
+    }
+    uint32 ts = ast_data1(wstmt)
+    uint64 type_size = ts
+    if type_size != 4 {
+        write(2, "mlrc: M1d: only u32 stores supported\n", 37)
+        return 1
+    }
+    uint32 val_node = ast_data2(wstmt)
+    uint64 wvn = val_node
+    uint32 vkind = ast_kind(wvn)
+    if vkind != 30 {
+        write(2, "mlrc: M1d: store value must be an IntLit\n", 41)
+        return 1
+    }
+    uint32 lit_tok = ast_data1(wvn)
+    uint64 lit = parse_int_token(lit_tok) & 0xFFFFFFFF
+
+    // Lower to gfx1100 via the encoders established in M1c.
+    asm_init()
+    asm_s_load_b64(0, 0)                              // s[0:1] = *kernarg
+    asm_v_dual_mov_b32_mov_b32_lit(0, 1, lit)         // v0 = 0, v1 = lit
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_global_store_b32(0, 1, 0)                     // *(s[0:1]+v0) = v1
+    asm_s_endpgm()
+
+    // Resource layout mirrors what clang picks for this kernel class.
+    // As lowering grows we'll compute these from live-range/atomics
+    // analysis — for now they're a safe over-approximation.
+    uint64 rsrc1 = 0xE0AF0000
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408       // KERNARG_SEGMENT_PTR | WAVEFRONT_SIZE32
+
+    uint64 size = emit_amdgpu_code_object(kname_ptr, nl,
+                                           asm_text_buf, asm_text_len,
+                                           8,       // kernarg_size (one 8-byte ptr)
+                                           8,       // kernarg_align
+                                           2,       // sgpr_count
+                                           2,       // vgpr_count
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           1)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 { return 2 }
     file_write(fd, amd_buf, size)
     file_close(fd)
     return 0

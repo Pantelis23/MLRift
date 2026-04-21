@@ -1,0 +1,31 @@
+// MLRift Stage-1 M1d: first AST→AMDGPU round-trip.
+//
+// A @kernel fn compiled by MLRift itself into a raw gfx1100 code
+// object — no hipcc, no clang. The body has to match the narrow
+// pattern the M1d lowerer recognises (see emit_amdgpu_from_module
+// in src/format_amdgpu.kr): one uint64 pointer arg, single u32
+// PtrStore of an IntLit. That's enough to reproduce the
+// write_sentinel kernel from MLRift source rather than a pasted
+// byte table.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/m1d_kernel.mlr -o /tmp/m1d
+//     -> writes /tmp/m1d.co via format_amdgpu.kr.
+//
+// Verify:
+//   ./build/mlrc --arch=x86_64 examples/m1d_load.mlr -o /tmp/m1d_load
+//   /tmp/m1d_load
+//     -> out[0] bits (u32) : 3735928559
+//     -> M1d gate: GREEN
+
+@kernel
+fn write_sentinel(uint64 out) {
+    unsafe { *(out as uint32) = 0xDEADBEEF }
+}
+
+fn main() {
+    // CPU-side stub so mlrc's normal pipeline still produces a
+    // binary. --target=amdgpu-native is a peer of --target=hip-amd
+    // in that regard: the .co sits alongside the main executable.
+    exit(0)
+}

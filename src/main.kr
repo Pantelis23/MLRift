@@ -2226,6 +2226,52 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
         }
     }
 
+    // Stage-1 native AMDGPU path (M1d): same slot as --target=hip-amd
+    // but driven by our own emitter. Produces <output_path>.co. Current
+    // lowering only recognises the narrow sentinel-kernel shape (one
+    // uint64 arg, body = one u32 PtrStore of an IntLit); every other
+    // shape prints a diagnostic and exits.
+    if target_amdgpu_native != 0 {
+        uint64 co_suffix = ".co"
+        uint64 opl_an = str_len(output_path)
+        uint8[1024] co_path_buf
+        uint64 ai_cp = 0
+        while ai_cp < opl_an {
+            uint64 sp = output_path + ai_cp
+            uint64 b = 0
+            unsafe { *(sp as uint8) -> b }
+            uint64 dp = co_path_buf + ai_cp
+            uint8 b8 = b
+            unsafe { *(dp as uint8) = b8 }
+            ai_cp = ai_cp + 1
+        }
+        // Append ".co\0"
+        uint64 dpa = co_path_buf + opl_an
+        uint8 dot = 46;  unsafe { *(dpa as uint8) = dot }
+        uint64 dpb = co_path_buf + opl_an + 1
+        uint8 cc1 = 99;  unsafe { *(dpb as uint8) = cc1 }
+        uint64 dpc = co_path_buf + opl_an + 2
+        uint8 co1 = 111; unsafe { *(dpc as uint8) = co1 }
+        uint64 dpd = co_path_buf + opl_an + 3
+        uint8 z   = 0;   unsafe { *(dpd as uint8) = z }
+
+        uint64 anrc = emit_amdgpu_from_module(root, source, co_path_buf)
+        if anrc == 3 {
+            write(2, "mlrc: --target=amdgpu-native but no @kernel functions found\n", 61)
+            exit(1)
+        } else if anrc == 1 {
+            // emit_amdgpu_from_module already printed a pointed-at-shape
+            // diagnostic pointing at the offending kernel.
+            exit(1)
+        } else if anrc == 2 {
+            write(2, "mlrc: failed to write .co for --target=amdgpu-native\n", 53)
+            exit(1)
+        }
+        write(1, "wrote ", 6)
+        write(1, co_path_buf, opl_an + 3)
+        write(1, " (native amdgpu code object)\n", 29)
+    }
+
     // Dead code elimination: scan AST for reachable functions
     dce_init()
     dce_scan(root)
@@ -4517,6 +4563,14 @@ fn main() {
                     // GPU target: trigger format_hip.kr emission alongside
                     // the normal CPU codegen. See docs/GPU_BACKEND.md.
                     target_gpu = 1
+                } else if str_starts_with(tgt_str, "amdgpu-native", 13) != 0 {
+                    // Stage-1 native AMDGPU target (M1d): bypass hipcc,
+                    // lower the @kernel fn ourselves into a gfx1100 code
+                    // object via src/format_amdgpu.kr. Peer of hip-amd —
+                    // the two target paths are mutually exclusive on a
+                    // per-invocation basis because both would write
+                    // `<output>.co`.
+                    target_amdgpu_native = 1
                 } else if str_starts_with(tgt_str, "macos", 5) != 0 {
                     target_os = 1
                 } else if str_starts_with(tgt_str, "darwin", 6) != 0 {

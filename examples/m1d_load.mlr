@@ -1,0 +1,151 @@
+// MLRift Stage-1 M1b test: load the hand-built AMDGPU code object
+// that contains write_sentinel(out) and verify *out == 0xDEADBEEF
+// after a single-thread launch.
+//
+// The kernel body comes from clang's gfx1100 output (see
+// src/format_amdgpu.kr's emit_amdgpu_sentinel_blob); the ELF
+// wrapper + MsgPack metadata + kernel descriptor are built by
+// MLRift. The point of this gate is to prove our kernarg layout
+// and the ".args" metadata shape are correct end to end.
+//
+// Build:
+//   ./build/mlrc --emit-amdgpu-sentinel=/tmp/m1d.co
+//   ./build/mlrc --arch=x86_64 examples/m1b_load_sentinel.mlr -o /tmp/m1b_load_sentinel
+// Run:
+//   /tmp/m1b_load_sentinel
+//     → out[0] bits: 3735928559     (0xDEADBEEF)
+//     → M1d gate: GREEN
+
+import "../std/hip.kr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    uint64 co_path = "/tmp/m1d.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/m1d.co — run first:")
+        puts("  ./build/mlrc --emit-amdgpu-sentinel=/tmp/m1d.co")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData failed", err) }
+    uint64 mod = 0
+    unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fn_slot = alloc(8)
+    uint64 kname = "write_sentinel"
+    err = hipModuleGetFunction(fn_slot, mod, kname)
+    if err != 0 { die("hipModuleGetFunction failed", err) }
+    uint64 fn_handle = 0
+    unsafe { *(fn_slot as uint64) -> fn_handle }
+
+    // ── Device buffer for the sentinel write (4 bytes is enough but
+    // we round to 8 to avoid alignment surprises on the D2H). Prime
+    // it to 0 so any kernel failure leaves a detectable before-state. ──
+    uint64 d_slot = alloc(8)
+    err = hipMalloc(d_slot, 8)
+    if err != 0 { die("hipMalloc failed", err) }
+    uint64 d_out = 0
+    unsafe { *(d_slot as uint64) -> d_out }
+
+    uint64 h_prime = alloc(8)
+    uint64 ha_hi = h_prime
+    unsafe { *(ha_hi as uint64) = 0 }
+    err = hipMemcpy(d_out, h_prime, 8, 1)
+    if err != 0 { die("hipMemcpy prime failed", err) }
+
+    // ── Kernel arg: one 8-byte pointer, so kernelParams points at an
+    // 8-byte slot that itself holds d_out. ──
+    uint64 arg_slot = alloc(8)
+    unsafe { *(arg_slot as uint64) = d_out }
+    uint64 kp = alloc(8)
+    unsafe { *(kp as uint64) = arg_slot }
+
+    err = hipModuleLaunchKernel(fn_handle,
+                                 1, 1, 1,     // grid
+                                 1, 1, 1,     // block
+                                 0, 0,        // shared, stream
+                                 kp, 0)
+    if err != 0 { die("hipModuleLaunchKernel failed", err) }
+
+    err = hipDeviceSynchronize()
+    if err != 0 { die("hipDeviceSynchronize failed", err) }
+
+    // ── Read back. Only the low 4 bytes should be written, but a
+    // u64 D2H is fine — upper bytes were zeroed by the prime. ──
+    uint64 h_out = alloc(8)
+    err = hipMemcpy(h_out, d_out, 8, 2)
+    if err != 0 { die("hipMemcpy D2H failed", err) }
+
+    uint64 bits = 0
+    unsafe { *(h_out as uint64) -> bits }
+    uint64 low = bits & 0xFFFFFFFF
+    print_label_val("out[0] bits (u32) ", 18, low)
+
+    uint64 expected = 0xDEADBEEF
+    if low == expected {
+        puts("M1d gate: GREEN")
+        hipFree(d_out)
+        exit(0)
+    }
+    puts("FAIL: value mismatch")
+    print_label_val("expected          ", 18, expected)
+    hipFree(d_out)
+    exit(1)
+}
