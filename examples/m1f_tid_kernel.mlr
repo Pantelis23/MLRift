@@ -1,0 +1,20 @@
+// MLRift Stage-1 M1f tid-shape: per-thread kernel lowered by our
+// own compiler. Each thread writes its workgroup-local x index into
+// out[tid]. Proves tid_x() + VOP2 shift + multi-thread grid launch
+// end to end.
+//
+// Pattern matched by emit_amdgpu_from_module:
+//   @kernel fn NAME(uint64 out) {
+//       uint64 p = out + tid_x() * 4
+//       unsafe { *(p as uint32) = tid_x() }
+//   }
+
+@kernel
+fn write_tid(uint64 out) {
+    uint64 p = out + tid_x() * 4
+    unsafe { *(p as uint32) = tid_x() }
+}
+
+fn main() {
+    exit(0)
+}

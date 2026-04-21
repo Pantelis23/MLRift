@@ -1,0 +1,27 @@
+// MLRift Stage-1 M1f: two @kernel fns in one source module compile
+// into one .co. Until M1f, emit_amdgpu_from_module rejected any
+// module with more than one @kernel; now it walks them all and
+// packs every kernel + its descriptor + its metadata into a single
+// ELF.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/m1f_multi_kernel.mlr -o /tmp/m1f
+//     -> writes /tmp/m1f.co (contains write_sentinel AND write_value)
+//
+// Verify: examples/m1f_load.mlr loads the .co once, resolves both
+// symbols, invokes each with different data, and checks both
+// read-backs. Gate: one loaded module services two distinct kernels.
+
+@kernel
+fn write_sentinel(uint64 out) {
+    unsafe { *(out as uint32) = 0xDEADBEEF }
+}
+
+@kernel
+fn write_value(uint64 out, uint32 value) {
+    unsafe { *(out as uint32) = value }
+}
+
+fn main() {
+    exit(0)
+}

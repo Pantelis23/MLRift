@@ -45,6 +45,102 @@ static uint64 amd_cap = 0
 // Gates the M1d emission path (see emit_amdgpu_from_module below).
 static uint64 target_amdgpu_native = 0
 
+// ---------------------------------------------------------------------------
+// Kernel table (M1f)
+//
+// emit_amdgpu_code_object used to be a single-kernel path — everything
+// from .dynsym to .rodata to .note hard-wired two symbols and one
+// kernel body. M1f pluralises that: callers push entries into this
+// table, then emit_amdgpu_multi_code_object walks them once to lay
+// out every section.
+//
+// Entry layout (13 u64 fields × 8 bytes = 104 bytes/entry):
+//   0: name_ptr      (host pointer to the kernel name string)
+//   1: name_len
+//   2: bytes_ptr     (host pointer to assembled kernel text)
+//   3: bytes_len
+//   4: args_desc     (host pointer to args descriptor, see amd_arg_*)
+//   5: n_args
+//   6: kernarg_size
+//   7: sgpr_count
+//   8: vgpr_count
+//   9: rsrc1
+//   10: rsrc2
+//   11: rsrc3
+//   12: props
+//
+// Plus per-kernel computed offsets filled in during emit (kept in
+// parallel arrays because they're only relevant during the emit):
+//   kt_kd_off[i]     — .rodata byte offset of kernel i's descriptor
+//   kt_text_off[i]   — .text   byte offset of kernel i's first instr
+//   kt_text_vaddr[i] — kd-to-entry delta lives in KD offset 0x10
+
+static uint64 KT_STRIDE = 104
+static uint64 KT_MAX    = 32
+static uint64 kt_buf    = 0
+static uint64 kt_count  = 0
+
+// Per-kernel computed offsets, filled during emit_amdgpu_multi_code_object.
+static uint64 kt_kd_off       = 0
+static uint64 kt_text_off     = 0
+static uint64 kt_text_vaddr   = 0
+
+fn kt_reset() {
+    if kt_buf == 0 {
+        kt_buf        = alloc(KT_MAX * KT_STRIDE)
+        kt_kd_off     = alloc(KT_MAX * 8)
+        kt_text_off   = alloc(KT_MAX * 8)
+        kt_text_vaddr = alloc(KT_MAX * 8)
+    }
+    kt_count = 0
+}
+
+fn kt_push(uint64 name_ptr, uint64 name_len,
+           uint64 bytes_ptr, uint64 bytes_len,
+           uint64 args_desc, uint64 n_args,
+           uint64 kernarg_size,
+           uint64 sgpr_count, uint64 vgpr_count,
+           uint64 rsrc1, uint64 rsrc2, uint64 rsrc3, uint64 props) {
+    if kt_count >= KT_MAX {
+        write(2, "format_amdgpu: kernel table overflow\n", 37)
+        exit(1)
+    }
+    uint64 base = kt_buf + kt_count * KT_STRIDE
+    uint64 p0  = base +   0; unsafe { *(p0  as uint64) = name_ptr }
+    uint64 p1  = base +   8; unsafe { *(p1  as uint64) = name_len }
+    uint64 p2  = base +  16; unsafe { *(p2  as uint64) = bytes_ptr }
+    uint64 p3  = base +  24; unsafe { *(p3  as uint64) = bytes_len }
+    uint64 p4  = base +  32; unsafe { *(p4  as uint64) = args_desc }
+    uint64 p5  = base +  40; unsafe { *(p5  as uint64) = n_args }
+    uint64 p6  = base +  48; unsafe { *(p6  as uint64) = kernarg_size }
+    uint64 p7  = base +  56; unsafe { *(p7  as uint64) = sgpr_count }
+    uint64 p8  = base +  64; unsafe { *(p8  as uint64) = vgpr_count }
+    uint64 p9  = base +  72; unsafe { *(p9  as uint64) = rsrc1 }
+    uint64 p10 = base +  80; unsafe { *(p10 as uint64) = rsrc2 }
+    uint64 p11 = base +  88; unsafe { *(p11 as uint64) = rsrc3 }
+    uint64 p12 = base +  96; unsafe { *(p12 as uint64) = props }
+    kt_count = kt_count + 1
+}
+
+fn kt_get(uint64 idx, uint64 field_idx) -> uint64 {
+    uint64 p = kt_buf + idx * KT_STRIDE + field_idx * 8
+    uint64 v = 0
+    unsafe { *(p as uint64) -> v }
+    return v
+}
+
+fn kt_set_u64_arr(uint64 arr, uint64 idx, uint64 v) {
+    uint64 p = arr + idx * 8
+    unsafe { *(p as uint64) = v }
+}
+
+fn kt_get_u64_arr(uint64 arr, uint64 idx) -> uint64 {
+    uint64 p = arr + idx * 8
+    uint64 v = 0
+    unsafe { *(p as uint64) -> v }
+    return v
+}
+
 @export
 fn amd_buf_ptr() -> uint64 { return amd_buf }
 
@@ -251,86 +347,96 @@ fn amd_arg_kind_at(uint64 desc, uint64 i) -> uint64 {
     return v
 }
 
-fn amd_emit_metadata_body(uint64 kname, uint64 kname_len,
-                          uint64 ksym,  uint64 ksym_len,
-                          uint64 kernarg_size, uint64 kernarg_align,
-                          uint64 sgpr_count, uint64 vgpr_count,
-                          uint64 args_desc, uint64 n_args) -> uint64 {
+// Emit the MsgPack body for all kernels currently registered in
+// the kernel table. Each kernel contributes one entry in the
+// `amdhsa.kernels` fixarray; top-level keys (`amdhsa.target`,
+// `amdhsa.version`) are singletons.
+fn amd_emit_metadata_body() -> uint64 {
     uint64 start = amd_len
 
     // Top-level map with 3 entries.
     mp_fixmap(3)
 
-    //   "amdhsa.kernels" -> [ {...} ]
+    // "amdhsa.kernels" -> [ {...} × kt_count ]
     mp_str_lit("amdhsa.kernels")
-    mp_fixarray(1)
+    mp_fixarray(kt_count)
 
-    //     {
-    //       ".args":                       [ … n_args global_buffer entries],
-    //                                                   (16 keys total —
-    //                                                   needs map16, not
-    //                                                   fixmap, since
-    //                                                   fixmap caps at 15.)
-    //       ".group_segment_fixed_size":   0,
-    //       ".kernarg_segment_align":      kernarg_align,
-    //       ".kernarg_segment_size":       kernarg_size,
-    //       ".max_flat_workgroup_size":    1024,
-    //       ".name":                       kname,
-    //       ".private_segment_fixed_size": 0,
-    //       ".sgpr_count":                 sgpr_count,
-    //       ".sgpr_spill_count":           0,
-    //       ".symbol":                     ksym,           // "<name>.kd"
-    //       ".uniform_work_group_size":    1,
-    //       ".uses_dynamic_stack":         false,
-    //       ".vgpr_count":                 vgpr_count,
-    //       ".vgpr_spill_count":           0,
-    //       ".wavefront_size":             32,
-    //       ".workgroup_processor_mode":   1,
-    //     }
-    mp_map16(16)
-    // .args — array of n_args global_buffer (pointer) entries. Each
-    // arg occupies 8 bytes of kernarg starting at offset i*8. For
-    // richer ABI shapes (by-value scalars, images, hidden args) this
-    // helper will grow; M1b only ever wires up 8-byte device
-    // pointers, which is what the simple `fn(ptr)` host stub does.
-    mp_str_lit(".args")
-    mp_fixarray(n_args)
-    uint64 aai = 0
-    uint64 aoff = 0
-    while aai < n_args {
-        uint64 sz   = amd_arg_size_at(args_desc, aai)
-        uint64 kind = amd_arg_kind_at(args_desc, aai)
-        if kind == AMD_ARG_KIND_GLOBAL_BUFFER {
-            mp_fixmap(4)
-            mp_str_lit(".address_space"); mp_str_lit("global")
-            mp_str_lit(".offset");        mp_uint(aoff)
-            mp_str_lit(".size");          mp_uint(sz)
-            mp_str_lit(".value_kind");    mp_str_lit("global_buffer")
-        } else {
-            // by_value scalar — no .address_space key, matching clang.
-            mp_fixmap(3)
-            mp_str_lit(".offset");        mp_uint(aoff)
-            mp_str_lit(".size");          mp_uint(sz)
-            mp_str_lit(".value_kind");    mp_str_lit("by_value")
+    uint64 ki = 0
+    while ki < kt_count {
+        uint64 kname_ptr    = kt_get(ki, 0)
+        uint64 kname_len    = kt_get(ki, 1)
+        uint64 args_desc    = kt_get(ki, 4)
+        uint64 n_args       = kt_get(ki, 5)
+        uint64 kernarg_sz   = kt_get(ki, 6)
+        uint64 sgpr_count   = kt_get(ki, 7)
+        uint64 vgpr_count   = kt_get(ki, 8)
+
+        // 16-entry inner map: needs map16 not fixmap (caps at 15).
+        mp_map16(16)
+
+        // .args — per-arg fixmap, shape depends on kind. See
+        // amd_emit_metadata_body's original comment for field layout.
+        mp_str_lit(".args")
+        mp_fixarray(n_args)
+        uint64 aai  = 0
+        uint64 aoff = 0
+        while aai < n_args {
+            uint64 sz   = amd_arg_size_at(args_desc, aai)
+            uint64 kind = amd_arg_kind_at(args_desc, aai)
+            if kind == AMD_ARG_KIND_GLOBAL_BUFFER {
+                mp_fixmap(4)
+                mp_str_lit(".address_space"); mp_str_lit("global")
+                mp_str_lit(".offset");        mp_uint(aoff)
+                mp_str_lit(".size");          mp_uint(sz)
+                mp_str_lit(".value_kind");    mp_str_lit("global_buffer")
+            } else {
+                mp_fixmap(3)
+                mp_str_lit(".offset");        mp_uint(aoff)
+                mp_str_lit(".size");          mp_uint(sz)
+                mp_str_lit(".value_kind");    mp_str_lit("by_value")
+            }
+            aoff = aoff + sz
+            aai  = aai + 1
         }
-        aoff = aoff + sz
-        aai = aai + 1
+        mp_str_lit(".group_segment_fixed_size");   mp_uint(0)
+        mp_str_lit(".kernarg_segment_align");      mp_uint(8)
+        mp_str_lit(".kernarg_segment_size");       mp_uint(kernarg_sz)
+        mp_str_lit(".max_flat_workgroup_size");    mp_uint(1024)
+        mp_str_lit(".name");                       mp_str_bytes(kname_ptr, kname_len)
+        mp_str_lit(".private_segment_fixed_size"); mp_uint(0)
+        mp_str_lit(".sgpr_count");                 mp_uint(sgpr_count)
+        mp_str_lit(".sgpr_spill_count");           mp_uint(0)
+
+        // .symbol = <name>.kd — built inline per kernel.
+        uint8[256] ksym_buf
+        uint64 ki_sb = 0
+        while ki_sb < kname_len {
+            uint64 src = kname_ptr + ki_sb
+            uint64 b = 0
+            unsafe { *(src as uint8) -> b }
+            uint64 dst = ksym_buf + ki_sb
+            uint8 b8 = b
+            unsafe { *(dst as uint8) = b8 }
+            ki_sb = ki_sb + 1
+        }
+        uint64 sp_dot = ksym_buf + kname_len
+        uint8 dot = 46; unsafe { *(sp_dot as uint8) = dot }
+        uint64 sp_k = ksym_buf + kname_len + 1
+        uint8 k8 = 107; unsafe { *(sp_k as uint8) = k8 }
+        uint64 sp_d = ksym_buf + kname_len + 2
+        uint8 d8 = 100; unsafe { *(sp_d as uint8) = d8 }
+        uint64 ksym_len = kname_len + 3
+        mp_str_lit(".symbol");                     mp_str_bytes(ksym_buf, ksym_len)
+
+        mp_str_lit(".uniform_work_group_size");    mp_uint(1)
+        mp_str_lit(".uses_dynamic_stack");         mp_false()
+        mp_str_lit(".vgpr_count");                 mp_uint(vgpr_count)
+        mp_str_lit(".vgpr_spill_count");           mp_uint(0)
+        mp_str_lit(".wavefront_size");             mp_uint(32)
+        mp_str_lit(".workgroup_processor_mode");   mp_uint(1)
+
+        ki = ki + 1
     }
-    mp_str_lit(".group_segment_fixed_size");   mp_uint(0)
-    mp_str_lit(".kernarg_segment_align");      mp_uint(kernarg_align)
-    mp_str_lit(".kernarg_segment_size");       mp_uint(kernarg_size)
-    mp_str_lit(".max_flat_workgroup_size");    mp_uint(1024)
-    mp_str_lit(".name");                       mp_str_bytes(kname, kname_len)
-    mp_str_lit(".private_segment_fixed_size"); mp_uint(0)
-    mp_str_lit(".sgpr_count");                 mp_uint(sgpr_count)
-    mp_str_lit(".sgpr_spill_count");           mp_uint(0)
-    mp_str_lit(".symbol");                     mp_str_bytes(ksym, ksym_len)
-    mp_str_lit(".uniform_work_group_size");    mp_uint(1)
-    mp_str_lit(".uses_dynamic_stack");         mp_false()
-    mp_str_lit(".vgpr_count");                 mp_uint(vgpr_count)
-    mp_str_lit(".vgpr_spill_count");           mp_uint(0)
-    mp_str_lit(".wavefront_size");             mp_uint(32)
-    mp_str_lit(".workgroup_processor_mode");   mp_uint(1)
 
     //   "amdhsa.target" -> "amdgcn-amd-amdhsa--gfx1100"
     mp_str_lit("amdhsa.target")
@@ -455,17 +561,10 @@ fn amd_st_info(uint64 bind, uint64 typ) -> uint64 {
 }
 
 // Emit the NT_AMDGPU_METADATA note: name="AMDGPU\0\0" (8 bytes) +
-// MsgPack body. Returns total note bytes written.
-fn amd_emit_note_section(uint64 kname, uint64 kname_len,
-                         uint64 ksym,  uint64 ksym_len,
-                         uint64 kernarg_size, uint64 kernarg_align,
-                         uint64 sgpr_count, uint64 vgpr_count,
-                         uint64 args_desc, uint64 n_args) -> uint64 {
+// MsgPack body. Returns total note bytes written. Pulls kernel
+// list from the kernel table.
+fn amd_emit_note_section() -> uint64 {
     uint64 start = amd_len
-    // To get exact sizes we emit the MsgPack body first into a side
-    // scratch? Easier: emit placeholder 12-byte header, then body,
-    // then back-patch the note header's "desc_size" field with the
-    // actual body length.
     uint64 hdr_off = amd_len
     amd_u32(7)            // n_namesz = strlen("AMDGPU") + 1 = 7
     amd_u32(0)            // n_descsz — back-patched
@@ -480,14 +579,8 @@ fn amd_emit_note_section(uint64 kname, uint64 kname_len,
     amd_byte(0)
     amd_byte(0)   // padding to 8-byte name area
     // Body
-    uint64 body_start = amd_len
-    uint64 body_len = amd_emit_metadata_body(kname, kname_len, ksym, ksym_len,
-                                              kernarg_size, kernarg_align,
-                                              sgpr_count, vgpr_count,
-                                              args_desc, n_args)
-    // Back-patch n_descsz
+    uint64 body_len = amd_emit_metadata_body()
     amd_patch_u32(hdr_off + 4, body_len)
-    // Pad note body to 4-byte alignment
     amd_align(4)
     return amd_len - start
 }
@@ -670,6 +763,31 @@ fn asm_v_dual_mov_b32_mov_b32_sgpr(uint64 vdst_x, uint64 vdst_y, uint64 src_y_sg
     asm_u32(src_y_sgpr & 0x1FF)
 }
 
+// ── VOP2 — two-operand VGPR math in 32 bits. Layout (gfx11):
+//   [31]     = 0   (VOP2 marker — zero bit distinguishes from VOP3/VOPC)
+//   [30:25]  = op (6 bits)
+//   [24:17]  = vdst (8 bits, VGPR)
+//   [16:9]   = vsrc1 (8 bits, VGPR)
+//   [8:0]    = src0 (9 bits, general — SGPR / VGPR / inline / literal)
+//
+// Inline-constant src0 encodings used here:
+//   128..192  = 0..64  (for 0 <= K <= 64, encoding is 128 + K)
+//
+// For `v_lshlrev_b32 vdst, K, vsrc`, semantics = vdst = vsrc << K.
+// src0 holds the shift amount (inline const), vsrc1 the value.
+fn asm_v_lshlrev_b32_imm(uint64 vdst_vgpr, uint64 shift_amount, uint64 src_vgpr) {
+    // VOP2 op 0x18 = v_lshlrev_b32 on gfx11. (First draft used 0x30,
+    // which would set bit 30 of the word and break the VOP2-family
+    // marker convention; confirmed against clang's v_lshlrev_b32
+    // output.)
+    uint64 src0_enc = 128 + (shift_amount & 0x3F)
+    uint64 word = (0x18 << 25)
+                  | ((vdst_vgpr & 0xFF) << 17)
+                  | ((src_vgpr  & 0xFF) << 9)
+                  | (src0_enc & 0x1FF)
+    asm_u32(word)
+}
+
 // ── FLAT/GLOBAL (gfx11) — 64-bit instruction.
 // Word 1: opcode + flags. For global_store_b32 with SADDR variant
 // clang emits 0xDC6A0000 (opcode field encodes the SEG=global + the
@@ -694,12 +812,9 @@ fn asm_global_store_b32(uint64 v_addr, uint64 v_data, uint64 saddr_pair) {
 // Top-level emitter
 // ---------------------------------------------------------------------------
 
-// Emits a complete amdgcn code object into the internal buffer.
-// `kname_ptr`/`kname_len` is the kernel symbol name (e.g. "nop_kernel");
-// the ".kd" variant is synthesised here.
-// `kernel_bytes` is a host pointer to `kernel_size` bytes of raw
-// instruction words for .text. Returns the final file size in bytes;
-// callers retrieve the buffer via amd_buf_ptr() + amd_buf_len().
+// Back-compat single-kernel emit: push one entry and emit. Used by
+// emit_amdgpu_nop_blob, emit_amdgpu_sentinel_blob, and any other
+// single-shot caller.
 @export
 fn emit_amdgpu_code_object(uint64 kname_ptr, uint64 kname_len,
                             uint64 kernel_bytes, uint64 kernel_size,
@@ -708,35 +823,27 @@ fn emit_amdgpu_code_object(uint64 kname_ptr, uint64 kname_len,
                             uint64 rsrc1, uint64 rsrc2, uint64 rsrc3,
                             uint64 properties,
                             uint64 args_desc, uint64 n_args) -> uint64 {
+    kt_reset()
+    kt_push(kname_ptr, kname_len, kernel_bytes, kernel_size,
+            args_desc, n_args, kernarg_size,
+            sgpr_count, vgpr_count,
+            rsrc1, rsrc2, rsrc3, properties)
+    return emit_amdgpu_multi_code_object()
+}
+
+// Emit an amdgcn ELF containing every kernel currently in the
+// kernel table (populated via kt_push). Returns the final file size
+// in bytes; callers retrieve the buffer via amd_buf_ptr() +
+// amd_buf_len(). The single-kernel entry point above is just a
+// thin wrapper around this.
+@export
+fn emit_amdgpu_multi_code_object() -> uint64 {
     amd_init()
 
-    // Build the kernel-descriptor symbol name: "<kname>.kd".
-    uint8[256] ksym_buf
-    uint64 kbi = 0
-    while kbi < kname_len {
-        uint64 sp = kname_ptr + kbi
-        uint64 b = 0
-        unsafe { *(sp as uint8) -> b }
-        uint64 dp = ksym_buf + kbi
-        uint8 b8 = b
-        unsafe { *(dp as uint8) = b8 }
-        kbi = kbi + 1
+    if kt_count == 0 {
+        write(2, "format_amdgpu: no kernels in table\n", 35)
+        exit(1)
     }
-    uint64 ksym_end = ksym_buf + kname_len
-    uint8 dot = 46
-    unsafe { *(ksym_end as uint8) = dot }
-    uint64 ksym_end2 = ksym_buf + kname_len + 1
-    uint8 k = 107
-    unsafe { *(ksym_end2 as uint8) = k }
-    uint64 ksym_end3 = ksym_buf + kname_len + 2
-    uint8 d = 100
-    unsafe { *(ksym_end3 as uint8) = d }
-    uint64 ksym_len = kname_len + 3
-
-    // ---- Phase 1: write ELF header + PHDRs with placeholder offsets.
-    // We come back and patch the phdrs once we know each segment's
-    // (offset, filesz, vaddr). There are 3 phdrs: PHDR self-descriptor,
-    // LOAD R (metadata+dynsym+dynstr+rodata), LOAD RX (.text), PT_NOTE.
 
     uint64 n_phdrs = 5
 
@@ -781,82 +888,99 @@ fn emit_amdgpu_code_object(uint64 kname_ptr, uint64 kname_len,
     uint64 r_seg_start = 0                  // R segment starts at file 0 (covers header+phdrs+everything below)
     uint64 r_vaddr = 0
 
-    // .note — we don't yet know metadata body size, so emit now.
+    // .note — emit all kernels' metadata in one note.
     uint64 note_off = amd_len
-    uint64 note_size = amd_emit_note_section(kname_ptr, kname_len,
-                                              ksym_buf, ksym_len,
-                                              kernarg_size, kernarg_align,
-                                              sgpr_count, vgpr_count,
-                                              args_desc, n_args)
+    uint64 note_size = amd_emit_note_section()
     amd_align(8)
 
-    // .hash — single-bucket SysV hash covering our 3 dynsym entries
-    // (NULL, kernel, kernel.kd). With one bucket every name lookup
-    // walks the chain in insertion order. Layout:
-    //   u32 nbuckets = 1
-    //   u32 nchain   = 3
-    //   u32 buckets[nbuckets]
-    //   u32 chain[nchain]
-    // Chain-walk: start at buckets[0]. Walk chain[sym] until
-    // STN_UNDEF (0). We set buckets[0]=2 so the walk visits sym 2
-    // then follows chain[2]=1 to sym 1, then chain[1]=0 (stop).
+    // .hash — single-bucket SysV hash covering 1 + 2 * kt_count
+    // dynsym entries. With one bucket every name lookup walks the
+    // chain in insertion order: bucket[0] points at the highest
+    // sym index, then chain[] walks back down to sym 1 (sym 0 is
+    // STN_UNDEF and terminates). This is O(N) per lookup — fine at
+    // the current scale; a proper gnu-hash variant lands when we
+    // start emitting .co files with dozens of kernels.
     uint64 hash_off = amd_len
-    amd_u32(1)                  // nbuckets
-    amd_u32(3)                  // nchain
-    amd_u32(2)                  // buckets[0] = start at nop_kernel.kd
-    amd_u32(0)                  // chain[0] — STN_UNDEF entry
-    amd_u32(0)                  // chain[1] — nop_kernel terminates chain
-    amd_u32(1)                  // chain[2] — nop_kernel.kd → next = sym 1
+    uint64 n_syms_total = 1 + kt_count * 2      // NULL + {FUNC, OBJECT} per kernel
+    amd_u32(1)                                  // nbuckets
+    amd_u32(n_syms_total)                       // nchain
+    amd_u32(n_syms_total - 1)                   // buckets[0] = last sym idx
+    amd_u32(0)                                  // chain[0] — STN_UNDEF
+    uint64 hi = 1
+    while hi < n_syms_total {
+        if hi == 1 {
+            amd_u32(0)                          // chain[1] terminates
+        } else {
+            amd_u32(hi - 1)                     // chain[i] -> i-1
+        }
+        hi = hi + 1
+    }
     uint64 hash_size = amd_len - hash_off
     amd_align(8)
 
-    // .dynsym — 3 entries: NULL, kernel (FUNC), kernel.kd (OBJECT).
-    //   Elf64_Sym: st_name(u32) st_info(u8) st_other(u8) st_shndx(u16)
-    //              st_value(u64) st_size(u64)
-    // We fill st_value + st_shndx later when .rodata / .text offsets
-    // are known — patch after.
+    // .dynsym — NULL + {FUNC, OBJECT} per kernel. st_value / st_shndx
+    // are back-patched once we know the .text and .rodata vaddrs.
+    // Elf64_Sym: st_name(u32) st_info(u8) st_other(u8) st_shndx(u16)
+    //            st_value(u64) st_size(u64) — 24 bytes.
     uint64 dynsym_off = amd_len
-    // [0] NULL
     amd_u32(0); amd_byte(0); amd_byte(0); amd_u16(0)
     amd_u64(0); amd_u64(0)
-    // [1] kernel_name (FUNC, global, in .text)
-    uint64 sym1_off = amd_len
-    amd_u32(1)                         // st_name — first string after the leading NUL
-    amd_byte(amd_st_info(ELF_STB_GLOBAL, ELF_STT_FUNC))
-    amd_byte(ELF_STV_PROTECTED)
-    uint64 sym1_shndx_off = amd_len
-    amd_u16(0)                         // st_shndx — patch to .text index
-    uint64 sym1_value_off = amd_len
-    amd_u64(0)                         // st_value — patch to .text vaddr
-    amd_u64(kernel_size)               // st_size = size of kernel code
-    // [2] kernel_name.kd (OBJECT, global, in .rodata, 64 bytes)
-    uint64 sym2_off = amd_len
-    amd_u32(1 + kname_len + 1)         // st_name — after first name's NUL
-    amd_byte(amd_st_info(ELF_STB_GLOBAL, ELF_STT_OBJECT))
-    amd_byte(ELF_STV_PROTECTED)
-    uint64 sym2_shndx_off = amd_len
-    amd_u16(0)                         // st_shndx — patch to .rodata index
-    uint64 sym2_value_off = amd_len
-    amd_u64(0)                         // st_value — patch to kd vaddr
-    amd_u64(64)                        // st_size = kernel descriptor size
+    uint64 dynstr_running = 1                   // skip leading \0
+    uint64 dki = 0
+    while dki < kt_count {
+        uint64 kname_len_k = kt_get(dki, 1)
+        uint64 kernel_sz_k = kt_get(dki, 3)
+        // FUNC sym — name at dynstr_running, value/shndx patched.
+        amd_u32(dynstr_running)
+        amd_byte(amd_st_info(ELF_STB_GLOBAL, ELF_STT_FUNC))
+        amd_byte(ELF_STV_PROTECTED)
+        amd_u16(0)                              // st_shndx patched
+        amd_u64(0)                              // st_value patched
+        amd_u64(kernel_sz_k)
+        dynstr_running = dynstr_running + kname_len_k + 1
+        // OBJECT sym for "<name>.kd" — +3 chars ("." "k" "d").
+        amd_u32(dynstr_running)
+        amd_byte(amd_st_info(ELF_STB_GLOBAL, ELF_STT_OBJECT))
+        amd_byte(ELF_STV_PROTECTED)
+        amd_u16(0)                              // st_shndx patched
+        amd_u64(0)                              // st_value patched
+        amd_u64(64)
+        dynstr_running = dynstr_running + kname_len_k + 3 + 1
+        dki = dki + 1
+    }
     uint64 dynsym_size = amd_len - dynsym_off
 
-    // .dynstr: \0 + kname\0 + ksym\0
+    // .dynstr: \0 + for each kernel: kname\0 + kname.kd\0
     uint64 dynstr_off = amd_len
     amd_byte(0)
-    amd_bytes(kname_ptr, kname_len); amd_byte(0)
-    amd_bytes(ksym_buf, ksym_len);  amd_byte(0)
+    uint64 dsi = 0
+    while dsi < kt_count {
+        uint64 kname_ptr_k = kt_get(dsi, 0)
+        uint64 kname_len_k = kt_get(dsi, 1)
+        amd_bytes(kname_ptr_k, kname_len_k); amd_byte(0)
+        amd_bytes(kname_ptr_k, kname_len_k)
+        amd_byte(46); amd_byte(107); amd_byte(100); amd_byte(0)
+        dsi = dsi + 1
+    }
     uint64 dynstr_size = amd_len - dynstr_off
 
-    // .rodata — 64-byte aligned, kernel descriptor.
+    // .rodata — one 64-byte kernel descriptor per kernel. The entry
+    // byte offset inside each KD is back-patched once we've laid
+    // out .text (different per-kernel delta).
     amd_align(64)
     uint64 rodata_off = amd_len
-    // kernel_code_entry_byte_offset: relative from the KD's start to
-    // the first byte of the kernel's .text. We know KD's virtual
-    // address once we pick it (= rodata_vaddr); we know text_vaddr
-    // below. For now, leave placeholder and back-patch.
-    uint64 entry_off_patch = amd_len + 0x10      // offset of the i64 field
-    amd_emit_kernel_descriptor(kernarg_size, 0, rsrc1, rsrc2, rsrc3, properties)
+    uint64 rdi = 0
+    while rdi < kt_count {
+        uint64 kd_off_this = amd_len
+        kt_set_u64_arr(kt_kd_off, rdi, kd_off_this)
+        uint64 kernarg_sz = kt_get(rdi, 6)
+        uint64 k_rsrc1    = kt_get(rdi, 9)
+        uint64 k_rsrc2    = kt_get(rdi, 10)
+        uint64 k_rsrc3    = kt_get(rdi, 11)
+        uint64 k_props    = kt_get(rdi, 12)
+        amd_emit_kernel_descriptor(kernarg_sz, 0, k_rsrc1, k_rsrc2, k_rsrc3, k_props)
+        rdi = rdi + 1
+    }
     amd_align(8)
 
     // .dynamic — minimum tags ROCm's loader follows to locate the
@@ -884,26 +1008,44 @@ fn emit_amdgpu_code_object(uint64 kname_ptr, uint64 kname_len,
     // above 0x800, then vaddr = file_off + 0x1000.
     amd_align(256)
     uint64 text_file_off = amd_len
-    uint64 text_vaddr = text_file_off + 0x1000
+    uint64 text_vaddr_base = text_file_off + 0x1000
 
-    // Emit kernel bytes.
-    amd_bytes(kernel_bytes, kernel_size)
-    uint64 text_size = kernel_size
-    amd_align(16)   // small tail padding so section ends clean
+    // Emit each kernel's bytes back-to-back. 256-align kernels 2..N
+    // (the ABI wants each kernel entry to start on a cache line);
+    // kernel 0 already inherits the section's 256-alignment. We
+    // deliberately compute text_size BEFORE any trailing pad so
+    // the single-kernel N=1 case matches the pre-M1f byte layout
+    // exactly (phdr filesz and .text sh_size cover only real
+    // instruction bytes, not file padding).
+    uint64 txi = 0
+    while txi < kt_count {
+        if txi > 0 { amd_align(256) }
+        uint64 k_bytes = kt_get(txi, 2)
+        uint64 k_bsize = kt_get(txi, 3)
+        uint64 k_vaddr = amd_len - text_file_off + text_vaddr_base
+        kt_set_u64_arr(kt_text_vaddr, txi, k_vaddr)
+        amd_bytes(k_bytes, k_bsize)
+        txi = txi + 1
+    }
+    uint64 text_size = amd_len - text_file_off
+    amd_align(16)
 
-    // Back-patch KD entry offset: entry_va - kd_va. KD's vaddr =
-    // rodata_off (since R segment vaddr = file offset in that segment).
-    uint64 kd_vaddr = rodata_off
-    uint64 entry_delta = text_vaddr - kd_vaddr
-    uint64 epp0 = amd_buf + entry_off_patch
-    uint8 e0 = entry_delta & 0xFF
-    unsafe { *(epp0 as uint8) = e0 }
-    uint64 ei = 1
-    while ei < 8 {
-        uint64 ep = amd_buf + entry_off_patch + ei
-        uint8 eb = (entry_delta >> (ei * 8)) & 0xFF
-        unsafe { *(ep as uint8) = eb }
-        ei = ei + 1
+    // Back-patch each KD's entry_byte_offset (i64 at KD+0x10) with
+    // its own kernel's text vaddr delta.
+    uint64 pki = 0
+    while pki < kt_count {
+        uint64 kd_off_k = kt_get_u64_arr(kt_kd_off, pki)
+        uint64 text_va  = kt_get_u64_arr(kt_text_vaddr, pki)
+        uint64 delta    = text_va - kd_off_k
+        uint64 patch_at = kd_off_k + 0x10
+        uint64 ei = 0
+        while ei < 8 {
+            uint64 ep = amd_buf + patch_at + ei
+            uint8 eb = (delta >> (ei * 8)) & 0xFF
+            unsafe { *(ep as uint8) = eb }
+            ei = ei + 1
+        }
+        pki = pki + 1
     }
 
     // ---- Phase 2b: emit .symtab + .strtab at the tail of the file.
@@ -916,31 +1058,46 @@ fn emit_amdgpu_code_object(uint64 kname_ptr, uint64 kname_len,
     amd_align(8)
     uint64 strtab_off = amd_len
     amd_byte(0)
-    uint64 st_name_kernel = amd_len - strtab_off
-    amd_bytes(kname_ptr, kname_len); amd_byte(0)
-    uint64 st_name_kd     = amd_len - strtab_off
-    amd_bytes(ksym_buf, ksym_len); amd_byte(0)
+    uint64 sti = 0
+    while sti < kt_count {
+        uint64 knm_ptr = kt_get(sti, 0)
+        uint64 knm_len = kt_get(sti, 1)
+        amd_bytes(knm_ptr, knm_len); amd_byte(0)
+        amd_bytes(knm_ptr, knm_len)
+        amd_byte(46); amd_byte(107); amd_byte(100); amd_byte(0)
+        sti = sti + 1
+    }
     uint64 strtab_size = amd_len - strtab_off
 
     amd_align(8)
     uint64 symtab_off = amd_len
-    // [0] NULL
     amd_u32(0); amd_byte(0); amd_byte(0); amd_u16(0)
     amd_u64(0); amd_u64(0)
-    // [1] kernel (FUNC, global, .text, value=text_vaddr)
-    amd_u32(st_name_kernel)
-    amd_byte(amd_st_info(ELF_STB_GLOBAL, ELF_STT_FUNC))
-    amd_byte(ELF_STV_PROTECTED)
-    amd_u16(6)                       // .text section index
-    amd_u64(text_vaddr)
-    amd_u64(kernel_size)
-    // [2] kernel.kd (OBJECT, global, .rodata)
-    amd_u32(st_name_kd)
-    amd_byte(amd_st_info(ELF_STB_GLOBAL, ELF_STT_OBJECT))
-    amd_byte(ELF_STV_PROTECTED)
-    amd_u16(5)                       // .rodata section index
-    amd_u64(rodata_off)
-    amd_u64(64)
+    uint64 strtab_running = 1
+    uint64 syi = 0
+    while syi < kt_count {
+        uint64 kn_len_s = kt_get(syi, 1)
+        uint64 kn_sz_s  = kt_get(syi, 3)
+        uint64 k_vaddr_s = kt_get_u64_arr(kt_text_vaddr, syi)
+        uint64 kd_off_s  = kt_get_u64_arr(kt_kd_off, syi)
+        // FUNC sym
+        amd_u32(strtab_running)
+        amd_byte(amd_st_info(ELF_STB_GLOBAL, ELF_STT_FUNC))
+        amd_byte(ELF_STV_PROTECTED)
+        amd_u16(6)                       // .text section index
+        amd_u64(k_vaddr_s)
+        amd_u64(kn_sz_s)
+        strtab_running = strtab_running + kn_len_s + 1
+        // OBJECT sym
+        amd_u32(strtab_running)
+        amd_byte(amd_st_info(ELF_STB_GLOBAL, ELF_STT_OBJECT))
+        amd_byte(ELF_STV_PROTECTED)
+        amd_u16(5)                       // .rodata section index
+        amd_u64(kd_off_s)
+        amd_u64(64)
+        strtab_running = strtab_running + kn_len_s + 3 + 1
+        syi = syi + 1
+    }
     uint64 symtab_size = amd_len - symtab_off
 
     // ---- Phase 3: section headers.
@@ -1029,20 +1186,20 @@ fn emit_amdgpu_code_object(uint64 kname_ptr, uint64 kname_len,
     amd_u64(dynstr_size)
     amd_u32(0); amd_u32(0)
     amd_u64(1); amd_u64(0)
-    // [5] .rodata
+    // [5] .rodata — size is 64 per kernel descriptor.
     amd_u32(sh_name_rodata)
     amd_u32(ELF_SHT_PROGBITS)
     amd_u64(ELF_SHF_ALLOC)
     amd_u64(rodata_off)
     amd_u64(rodata_off)
-    amd_u64(64)
+    amd_u64(64 * kt_count)
     amd_u32(0); amd_u32(0)
     amd_u64(64); amd_u64(0)
-    // [6] .text
+    // [6] .text — sh_addr at the first kernel's vaddr.
     amd_u32(sh_name_text)
     amd_u32(ELF_SHT_PROGBITS)
     amd_u64(ELF_SHF_ALLOC | ELF_SHF_EXECINSTR)
-    amd_u64(text_vaddr)
+    amd_u64(text_vaddr_base)
     amd_u64(text_file_off)
     amd_u64(text_size)
     amd_u32(0); amd_u32(0)
@@ -1112,34 +1269,43 @@ fn emit_amdgpu_code_object(uint64 kname_ptr, uint64 kname_len,
     uint8 ss1 = (shstrndx >> 8) & 0xFF
     unsafe { *(ssp1 as uint8) = ss1 }
 
-    // Patch the .dynsym entries' st_shndx / st_value.
-    // sym1 = kernel function: shndx=6 (.text), value=text_vaddr
-    uint64 p1s = amd_buf + sym1_shndx_off
-    uint8 b1s = 6
-    unsafe { *(p1s as uint8) = b1s }
-    uint64 p1s1 = amd_buf + sym1_shndx_off + 1
-    uint8 b1s1 = 0
-    unsafe { *(p1s1 as uint8) = b1s1 }
-    uint64 v1i = 0
-    while v1i < 8 {
-        uint64 vp = amd_buf + sym1_value_off + v1i
-        uint8 vb = (text_vaddr >> (v1i * 8)) & 0xFF
-        unsafe { *(vp as uint8) = vb }
-        v1i = v1i + 1
-    }
-    // sym2 = kernel.kd object: shndx=5 (.rodata), value=rodata_off (== vaddr)
-    uint64 p2s = amd_buf + sym2_shndx_off
-    uint8 b2s = 5
-    unsafe { *(p2s as uint8) = b2s }
-    uint64 p2s1 = amd_buf + sym2_shndx_off + 1
-    uint8 b2s1 = 0
-    unsafe { *(p2s1 as uint8) = b2s1 }
-    uint64 v2i = 0
-    while v2i < 8 {
-        uint64 vp = amd_buf + sym2_value_off + v2i
-        uint8 vb = (kd_vaddr >> (v2i * 8)) & 0xFF
-        unsafe { *(vp as uint8) = vb }
-        v2i = v2i + 1
+    // Patch every .dynsym entry's st_shndx + st_value now that
+    // .text / .rodata vaddrs are known. Entry layout: 24 bytes
+    // each, st_shndx at +6, st_value at +8. Entry k's FUNC sym is
+    // at dynsym_off + (1 + 2k) * 24; its OBJECT sym at +1.
+    uint64 patch_k = 0
+    while patch_k < kt_count {
+        uint64 func_off = dynsym_off + (1 + patch_k * 2) * 24
+        uint64 obj_off  = dynsym_off + (1 + patch_k * 2 + 1) * 24
+        uint64 tv       = kt_get_u64_arr(kt_text_vaddr, patch_k)
+        uint64 kdv      = kt_get_u64_arr(kt_kd_off, patch_k)
+
+        // FUNC — .text shndx = 6, value = text vaddr
+        uint64 pfs = amd_buf + func_off + 6
+        uint8 fs0 = 6; unsafe { *(pfs as uint8) = fs0 }
+        uint64 pfs1 = amd_buf + func_off + 7
+        uint8 fs1 = 0; unsafe { *(pfs1 as uint8) = fs1 }
+        uint64 fvi = 0
+        while fvi < 8 {
+            uint64 vp = amd_buf + func_off + 8 + fvi
+            uint8 vb = (tv >> (fvi * 8)) & 0xFF
+            unsafe { *(vp as uint8) = vb }
+            fvi = fvi + 1
+        }
+
+        // OBJECT — .rodata shndx = 5, value = KD file offset == vaddr
+        uint64 pos = amd_buf + obj_off + 6
+        uint8 os0 = 5; unsafe { *(pos as uint8) = os0 }
+        uint64 pos1 = amd_buf + obj_off + 7
+        uint8 os1 = 0; unsafe { *(pos1 as uint8) = os1 }
+        uint64 ovi = 0
+        while ovi < 8 {
+            uint64 vp = amd_buf + obj_off + 8 + ovi
+            uint8 vb = (kdv >> (ovi * 8)) & 0xFF
+            unsafe { *(vp as uint8) = vb }
+            ovi = ovi + 1
+        }
+        patch_k = patch_k + 1
     }
 
     // ---- Phase 4: emit the real phdrs at the reserved location.
@@ -1225,7 +1391,7 @@ fn emit_amdgpu_code_object(uint64 kname_ptr, uint64 kname_len,
     while wd < 8 {
         uint64 bp1 = amd_buf + ph2 + 16 + wd
         uint64 bp2 = amd_buf + ph2 + 24 + wd
-        uint8 bb = (text_vaddr >> (wd * 8)) & 0xFF
+        uint8 bb = (text_vaddr_base >> (wd * 8)) & 0xFF
         unsafe { *(bp1 as uint8) = bb }
         unsafe { *(bp2 as uint8) = bb }
         wd = wd + 1
@@ -1454,31 +1620,49 @@ fn emit_amdgpu_sentinel_blob(uint64 out_path) -> uint64 {
 // 3 no @kernel fn in module.
 @export
 fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> uint64 {
-    // Find the first (and for M1d, only) @kernel fn. Multi-kernel
-    // support is a follow-up: it needs emit_amdgpu_code_object to
-    // accept more than one kernel payload.
-    uint64 fn_node = 0
-    uint64 kernels_seen = 0
+    // Walk the module for every @kernel fn and lower each into the
+    // kernel table. The M1f refactor made emit_amdgpu_multi_code_object
+    // accept any number of entries, so all kernels in the .mlr file
+    // land in one .co.
+    kt_reset()
     uint32 c0 = ast_child(mod_node)
     uint64 wc = c0
     while wc != 0 {
         uint32 k = ast_kind(wc)
         if k == 2 {
             if ast_fn_is_kernel(wc) != 0 {
-                if fn_node == 0 { fn_node = wc }
-                kernels_seen = kernels_seen + 1
+                uint64 lrc = amdgpu_lower_kernel_to_table(wc, source)
+                if lrc != 0 { return lrc }
             }
         }
         uint32 nxt = ast_next(wc)
         wc = nxt
     }
-    if fn_node == 0 { return 3 }
-    if kernels_seen > 1 {
-        write(2, "mlrc: --target=amdgpu-native: multi-kernel modules not supported yet\n", 70)
-        return 1
-    }
+    if kt_count == 0 { return 3 }
 
-    // Kernel name (source-relative token).
+    uint64 size = emit_amdgpu_multi_code_object()
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 { return 2 }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// Lower one @kernel fn_node into the kernel table. Returns 0 on
+// success, 1 on unsupported shape. Recognises the same two shapes
+// the M1d/M1e lowerer already handled:
+//
+//   M1d (1 arg):
+//     @kernel fn name(uint64 out) {
+//         unsafe { *(out as uint32) = INT_LITERAL }
+//     }
+//
+//   M1e (2 args):
+//     @kernel fn name(uint64 out, uint32 value) {
+//         unsafe { *(out as uint32) = value }
+//     }
+fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
+    // Kernel name.
     uint32 name_tok = ast_data1(fn_node)
     uint64 ns = tok_text_start(name_tok)
     uint64 nl = tok_text_len(name_tok)
@@ -1508,63 +1692,110 @@ fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> u
         return 1
     }
 
-    // Body — expect exactly one PtrStore.
+    // Body — either a single PtrStore (M1d/M1e shapes) or a
+    // VarDecl followed by a PtrStore (M1f tid-aware shape).
     uint32 body = ast_data3(fn_node)
     if body == 0 {
         write(2, "mlrc: amdgpu-native: kernel has empty body\n", 43)
         return 1
     }
-    uint32 stmt = ast_child(body)
-    if stmt == 0 {
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 {
         write(2, "mlrc: amdgpu-native: kernel body has no statements\n", 51)
         return 1
     }
-    uint32 after = ast_next(stmt)
-    if after != 0 {
-        write(2, "mlrc: amdgpu-native: kernel body must be a single PtrStore\n", 59)
-        return 1
+    uint32 stmt1 = ast_next(stmt0)
+    uint64 is_tid_shape = 0
+    if stmt1 != 0 {
+        // Two-stmt body → must be VarDecl then PtrStore. The PtrStore's
+        // value must be a Call to tid_x(); the VarDecl's init computes
+        // the byte offset via `param0 + tid_x() * SCALE` and is trusted
+        // (we don't verify the arithmetic yet — that's next cut).
+        uint32 third = ast_next(stmt1)
+        if third != 0 {
+            write(2, "mlrc: amdgpu-native: kernel body has more than 2 stmts\n", 55)
+            return 1
+        }
+        uint64 ws0 = stmt0
+        uint64 ws1 = stmt1
+        if ast_kind(ws0) != 10 {
+            write(2, "mlrc: amdgpu-native: tid shape: first stmt must be VarDecl\n", 59)
+            return 1
+        }
+        if ast_kind(ws1) != 42 {
+            write(2, "mlrc: amdgpu-native: tid shape: second stmt must be PtrStore\n", 61)
+            return 1
+        }
+        uint32 ws1_ts = ast_data1(ws1)
+        uint64 ws1_tsz = ws1_ts
+        if ws1_tsz != 4 {
+            write(2, "mlrc: amdgpu-native: tid shape: only u32 store supported\n", 57)
+            return 1
+        }
+        uint32 ws1_val = ast_data2(ws1)
+        uint64 wval1 = ws1_val
+        if ast_kind(wval1) != 35 {
+            write(2, "mlrc: amdgpu-native: tid shape: store value must be a Call\n", 59)
+            return 1
+        }
+        uint32 callee = ast_data1(wval1)
+        if tok_matches(callee, "tid_x", 5) == 0 {
+            write(2, "mlrc: amdgpu-native: tid shape: only tid_x() calls supported\n", 61)
+            return 1
+        }
+        if n_params != 1 {
+            write(2, "mlrc: amdgpu-native: tid shape expects exactly 1 param\n", 55)
+            return 1
+        }
+        is_tid_shape = 1
     }
-    uint64 wstmt = stmt
-    uint32 skind = ast_kind(wstmt)
-    if skind != 42 {
-        write(2, "mlrc: amdgpu-native: first stmt must be PtrStore (unsafe { *(p as TYPE) = v })\n", 79)
-        return 1
+    uint64 wstmt = 0
+    uint32 skind = 0
+    if is_tid_shape == 0 {
+        wstmt = stmt0
+        skind = ast_kind(wstmt)
+        if skind != 42 {
+            write(2, "mlrc: amdgpu-native: first stmt must be PtrStore\n", 49)
+            return 1
+        }
     }
-    uint32 ts = ast_data1(wstmt)
-    uint64 type_size = ts
-    if type_size != 4 {
-        write(2, "mlrc: amdgpu-native: only u32 stores supported\n", 47)
-        return 1
-    }
-    uint32 val_node = ast_data2(wstmt)
-    uint64 wvn = val_node
-    uint32 vkind = ast_kind(wvn)
-
-    // Decide lowering path: IntLit (1-arg sentinel) vs Ident
-    // pointing at the 2nd param (2-arg forwarder).
     uint64 is_lit_shape = 0
     uint64 lit32 = 0
-    if vkind == 30 {
-        is_lit_shape = 1
-        uint32 lit_tok = ast_data1(wvn)
-        lit32 = parse_int_token(lit_tok) & 0xFFFFFFFF
-        if n_params != 1 {
-            write(2, "mlrc: amdgpu-native: 1-arg sentinel shape expects exactly 1 param\n", 66)
+    if is_tid_shape == 0 {
+        uint32 ts = ast_data1(wstmt)
+        uint64 type_size = ts
+        if type_size != 4 {
+            write(2, "mlrc: amdgpu-native: only u32 stores supported\n", 47)
             return 1
         }
-    } else if vkind == 32 {
-        uint32 ident_tok = ast_data1(wvn)
-        if n_params != 2 {
-            write(2, "mlrc: amdgpu-native: 2-arg forwarder shape expects exactly 2 params\n", 68)
+        uint32 val_node = ast_data2(wstmt)
+        uint64 wvn = val_node
+        uint32 vkind = ast_kind(wvn)
+
+        // Decide lowering path: IntLit (1-arg sentinel) vs Ident
+        // pointing at the 2nd param (2-arg forwarder).
+        if vkind == 30 {
+            is_lit_shape = 1
+            uint32 lit_tok = ast_data1(wvn)
+            lit32 = parse_int_token(lit_tok) & 0xFFFFFFFF
+            if n_params != 1 {
+                write(2, "mlrc: amdgpu-native: 1-arg sentinel shape expects exactly 1 param\n", 66)
+                return 1
+            }
+        } else if vkind == 32 {
+            uint32 ident_tok = ast_data1(wvn)
+            if n_params != 2 {
+                write(2, "mlrc: amdgpu-native: 2-arg forwarder shape expects exactly 2 params\n", 68)
+                return 1
+            }
+            if tok_text_eq(ident_tok, param1_tok) == 0 {
+                write(2, "mlrc: amdgpu-native: store value must reference the 2nd kernel param\n", 69)
+                return 1
+            }
+        } else {
+            write(2, "mlrc: amdgpu-native: store value must be an IntLit or a param Ident\n", 68)
             return 1
         }
-        if tok_text_eq(ident_tok, param1_tok) == 0 {
-            write(2, "mlrc: amdgpu-native: store value must reference the 2nd kernel param\n", 69)
-            return 1
-        }
-    } else {
-        write(2, "mlrc: amdgpu-native: store value must be an IntLit or a param Ident\n", 68)
-        return 1
     }
 
     // Lower to gfx1100 via the encoders. Resource layout mirrors
@@ -1579,10 +1810,33 @@ fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> u
     uint64 kernarg_size = 0
     uint64 sgpr_count   = 0
     uint64 n_args       = 0
-    uint64[4] args_desc
 
-    if is_lit_shape != 0 {
-        // 1-arg write_sentinel shape.
+    // Each kernel owns its own args_desc buffer (alloc instead of
+    // stack) because kt_push stores the pointer into the table and
+    // reads it back during emit — stack addresses wouldn't survive
+    // function return. Same rationale for the kernel text blob.
+    uint64 args_desc = alloc(4 * 16)
+
+    if is_tid_shape != 0 {
+        // Per-thread shape: byte_offset = tid * 4, value = tid.
+        //
+        //   s_load_b64  s[0:1], s[0:1], null
+        //   v_lshlrev_b32 v1, 2, v0               ; v1 = tid * 4
+        //   s_waitcnt lgkmcnt(0)
+        //   global_store_b32 v1, v0, s[0:1]       ; *(s[0:1] + v1) = v0
+        //   s_endpgm
+        asm_s_load_b64(0, 0)
+        asm_v_lshlrev_b32_imm(1, 2, 0)             // vdst=v1, shift=2, src=v0
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_global_store_b32(1, 0, 0)              // v_addr=v1, v_data=v0, saddr_pair=0
+        asm_s_endpgm()
+
+        uint64 adp0 = args_desc + 0;  unsafe { *(adp0 as uint64) = 8 }
+        uint64 adp1 = args_desc + 8;  unsafe { *(adp1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        kernarg_size = 8
+        sgpr_count   = 2
+        n_args       = 1
+    } else if is_lit_shape != 0 {
         asm_s_load_b64(0, 0)
         asm_v_dual_mov_b32_mov_b32_lit(0, 1, lit32)
         asm_s_waitcnt_lgkmcnt_zero()
@@ -1595,17 +1849,12 @@ fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> u
         sgpr_count   = 2
         n_args       = 1
     } else {
-        // 2-arg write_value shape: kernarg[0..7] = ptr, kernarg[8..11] = u32
-        // value. Hardware is given the kernarg base in s[0:1] on entry;
-        // we load the u32 into s2 first so the subsequent s_load_b64
-        // (which clobbers s[0:1]) doesn't also clobber the kernarg base
-        // before we're done with it.
-        asm_s_clause(1)                      // batch the two SMEM loads
-        asm_s_load_b32(1, 0, 8)              // s2  <- kernarg[8] (sdata_pair=1 → s2)
-        asm_s_load_b64(0, 0)                 // s[0:1] <- kernarg[0..7] (ptr)
+        asm_s_clause(1)
+        asm_s_load_b32(1, 0, 8)
+        asm_s_load_b64(0, 0)
         asm_s_waitcnt_lgkmcnt_zero()
-        asm_v_dual_mov_b32_mov_b32_sgpr(0, 1, 2)   // v0=0, v1=s2
-        asm_global_store_b32(0, 1, 0)              // *(s[0:1]) = v1
+        asm_v_dual_mov_b32_mov_b32_sgpr(0, 1, 2)
+        asm_global_store_b32(0, 1, 0)
         asm_s_endpgm()
 
         uint64 adp0 = args_desc + 0;   unsafe { *(adp0 as uint64) = 8 }
@@ -1617,18 +1866,24 @@ fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> u
         n_args       = 2
     }
 
-    uint64 size = emit_amdgpu_code_object(kname_ptr, nl,
-                                           asm_text_buf, asm_text_len,
-                                           kernarg_size,
-                                           8,                 // kernarg_align
-                                           sgpr_count,
-                                           2,                 // vgpr_count
-                                           rsrc1, rsrc2, rsrc3, props,
-                                           args_desc, n_args)
+    // Copy the just-assembled kernel text into a dedicated buffer —
+    // the next kernel's asm_init() will otherwise clobber it.
+    uint64 k_text_size = asm_text_len
+    uint64 k_text_buf  = alloc(k_text_size)
+    uint64 ci = 0
+    while ci < k_text_size {
+        uint64 sp = asm_text_buf + ci
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        uint64 dp = k_text_buf + ci
+        uint8 b8 = b
+        unsafe { *(dp as uint8) = b8 }
+        ci = ci + 1
+    }
 
-    uint64 fd = file_open(out_path, 1)
-    if fd > 0xFFFFFFFFFFFFF000 { return 2 }
-    file_write(fd, amd_buf, size)
-    file_close(fd)
+    kt_push(kname_ptr, nl, k_text_buf, k_text_size,
+            args_desc, n_args, kernarg_size,
+            sgpr_count, 2,
+            rsrc1, rsrc2, rsrc3, props)
     return 0
 }

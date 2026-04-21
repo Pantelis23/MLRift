@@ -1,0 +1,167 @@
+// MLRift Stage-1 M1f launcher: one .co, two kernels. Proves the
+// module-load path resolves both symbols and that each kernel
+// runs its own body against its own arg convention.
+
+import "../std/hip.kr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    uint64 co_path = "/tmp/m1f.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/m1f.co — run first:")
+        puts("  ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/m1f_multi_kernel.mlr -o /tmp/m1f")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData failed", err) }
+    uint64 mod = 0
+    unsafe { *(mod_slot as uint64) -> mod }
+
+    // ── Resolve BOTH kernels from the same module ────────────────────
+    uint64 fn_slot_s = alloc(8)
+    uint64 kname_s = "write_sentinel"
+    err = hipModuleGetFunction(fn_slot_s, mod, kname_s)
+    if err != 0 { die("hipModuleGetFunction(write_sentinel) failed", err) }
+    uint64 fn_sentinel = 0
+    unsafe { *(fn_slot_s as uint64) -> fn_sentinel }
+
+    uint64 fn_slot_v = alloc(8)
+    uint64 kname_v = "write_value"
+    err = hipModuleGetFunction(fn_slot_v, mod, kname_v)
+    if err != 0 { die("hipModuleGetFunction(write_value) failed", err) }
+    uint64 fn_write_value = 0
+    unsafe { *(fn_slot_v as uint64) -> fn_write_value }
+
+    // ── Two device buffers, one per kernel ───────────────────────────
+    uint64 d_slot_a = alloc(8)
+    err = hipMalloc(d_slot_a, 8); if err != 0 { die("hipMalloc A", err) }
+    uint64 d_out_a = 0
+    unsafe { *(d_slot_a as uint64) -> d_out_a }
+
+    uint64 d_slot_b = alloc(8)
+    err = hipMalloc(d_slot_b, 8); if err != 0 { die("hipMalloc B", err) }
+    uint64 d_out_b = 0
+    unsafe { *(d_slot_b as uint64) -> d_out_b }
+
+    uint64 h_prime = alloc(8)
+    unsafe { *(h_prime as uint64) = 0 }
+    err = hipMemcpy(d_out_a, h_prime, 8, 1); if err != 0 { die("prime A", err) }
+    err = hipMemcpy(d_out_b, h_prime, 8, 1); if err != 0 { die("prime B", err) }
+
+    // ── Launch write_sentinel(d_out_a) — expect 0xDEADBEEF ───────────
+    uint64 a_slot_s = alloc(8)
+    unsafe { *(a_slot_s as uint64) = d_out_a }
+    uint64 kp_s = alloc(8)
+    unsafe { *(kp_s as uint64) = a_slot_s }
+
+    err = hipModuleLaunchKernel(fn_sentinel, 1, 1, 1, 1, 1, 1, 0, 0, kp_s, 0)
+    if err != 0 { die("launch sentinel", err) }
+
+    // ── Launch write_value(d_out_b, 0xC0FFEE) — expect 0xC0FFEE ──────
+    uint64 a_slot_p = alloc(8)
+    unsafe { *(a_slot_p as uint64) = d_out_b }
+    uint64 a_slot_val = alloc(8)
+    uint64 v_send = 0xC0FFEE
+    unsafe { *(a_slot_val as uint64) = v_send }
+    uint64 kp_v = alloc(16)
+    unsafe { *(kp_v as uint64) = a_slot_p }
+    uint64 kp_v_2 = kp_v + 8
+    unsafe { *(kp_v_2 as uint64) = a_slot_val }
+
+    err = hipModuleLaunchKernel(fn_write_value, 1, 1, 1, 1, 1, 1, 0, 0, kp_v, 0)
+    if err != 0 { die("launch write_value", err) }
+
+    err = hipDeviceSynchronize()
+    if err != 0 { die("sync", err) }
+
+    // ── Read back both ───────────────────────────────────────────────
+    uint64 h_a = alloc(8)
+    uint64 h_b = alloc(8)
+    err = hipMemcpy(h_a, d_out_a, 8, 2); if err != 0 { die("D2H A", err) }
+    err = hipMemcpy(h_b, d_out_b, 8, 2); if err != 0 { die("D2H B", err) }
+
+    uint64 bits_a = 0
+    uint64 bits_b = 0
+    unsafe { *(h_a as uint64) -> bits_a }
+    unsafe { *(h_b as uint64) -> bits_b }
+    uint64 got_a = bits_a & 0xFFFFFFFF
+    uint64 got_b = bits_b & 0xFFFFFFFF
+
+    print_label_val("sentinel -> buf[A]", 18, got_a)
+    print_label_val("write_value -> buf[B]", 21, got_b)
+
+    uint64 expect_a = 0xDEADBEEF
+    uint64 ok = 1
+    if got_a != expect_a {
+        puts("FAIL: sentinel wrote wrong value")
+        ok = 0
+    }
+    if got_b != v_send {
+        puts("FAIL: write_value wrote wrong value")
+        ok = 0
+    }
+    if ok == 1 {
+        puts("M1f gate: GREEN")
+        hipFree(d_out_a); hipFree(d_out_b)
+        exit(0)
+    }
+    hipFree(d_out_a); hipFree(d_out_b)
+    exit(1)
+}
