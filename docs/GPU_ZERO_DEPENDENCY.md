@@ -1,6 +1,52 @@
 # MLRift GPU — path to zero dependencies
 
-Status: phase-1 backend (M0-M4.h) is complete. The self-hosted
+## Stage-1 progress (live)
+
+Milestones landed on the native AMDGPU emitter path (no hipcc,
+no clang; the bytes written to `.co` come from
+`src/format_amdgpu.kr`'s encoder directly). Each is byte-
+identical to clang's gfx1100 output for the equivalent HIP
+source, verified at commit time with `cmp` against the hipcc-
+produced reference and at runtime with a HIP-launch gate.
+
+| Milestone | What it adds | Gate |
+|-----------|--------------|------|
+| M1a | Raw code-object ELF, `s_endpgm` no-op | hipModuleLoadData accepts |
+| M1b | `.args` metadata + one 64-bit kernarg | Host-sent `0xDEADBEEF` echoes back |
+| M1c | gfx1100 encoder (SOPP, SMEM, VOPD, FLAT) | Sentinel kernel built structurally |
+| M1d | First AST→AMDGPU: `@kernel` → `.co` | `--target=amdgpu-native` wired |
+| M1e | Two-kernarg dispatch (ptr + u32 by-value) | Host forwards value |
+| M1f | Multi-kernel `.co` (N kernels per emit) + `tid_x()` | 2 kernels / 1 module; 64-thread per-lane writes |
+| M1g | Bounds guard (`if tid_x() < n`) via `s_and_saveexec` + `s_cbranch_execz` | 64 threads / 40 slots, no stray writes |
+| M1h | f64 arithmetic: `v_fma_f64`, `global_load_b64`, `global_store_b64`, natural-alignment kernarg offsets | M3 decay single-block: max ULP = 0 vs CPU ref |
+
+Not yet done in Stage 1:
+
+- **Grid-wide thread ID** (`global_tid = blockIdx.x * blockDim.x
+  + threadIdx.x`). Gates `--target=amdgpu-native` retiring hipcc
+  from `examples/gpu_decay.mlr` and everything downstream of it
+  (the stage-13 examples launch multi-block). Clang's reference
+  uses `v_mad_u64_u32` + a dispatch-ptr load for `blockDim.x` +
+  `v_lshlrev_b64` / `v_add_co_u32` for 64-bit address compute,
+  plus hidden kernarg slots — each of those is a new encoder.
+  Target for M1j.
+- **VOP3P / richer arithmetic**. Stage-13 needs atomic_add_f64,
+  conditional-select, STP/STDP updates — more ops but the
+  encoder skeleton from M1h covers the format.
+- **Multi-kernel sharing of a single dispatch-ptr header**. When
+  many small kernels run back-to-back, the native path can
+  arrange for one dispatch ptr read to serve many kernels.
+  Not on the critical path.
+
+For full single-block workloads M1h is already the replacement
+for the hipcc build step: `examples/m1h_decay_kernel.mlr`
+through `--target=amdgpu-native` produces the same bytes hipcc
+would. `examples/gpu_decay.mlr`'s multi-block launcher path
+stays on `--target=hip-amd` until M1j lands.
+
+---
+
+Status (original kickoff): phase-1 backend (M0-M4.h) is complete. The self-hosted
 MLRift compiler emits `@kernel` functions as HIP C++ source,
 shells out to `hipcc` to produce a code object, then at runtime
 dynamically links against `libamdhip64.so.7` to load + launch

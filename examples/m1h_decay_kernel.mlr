@@ -1,4 +1,13 @@
-// MLRift Stage-1 M1h: f64 decay via native emitter.
+// MLRift Stage-1 M1h: f64 decay via native emitter. This is the
+// canonical "M3 decay, compiled by MLRift itself" source as of
+// Stage-1 M1i — launch with a single workgroup (block_x ≤ 1024,
+// grid_x = 1) and the bytes we produce are byte-identical to
+// clang -O3 for the same kernel.
+//
+// Multi-block launches (grid_x > 1) still need hipcc today
+// because our `tid_x()` intrinsic lowers to `threadIdx.x` only,
+// not `blockIdx.x * blockDim.x + threadIdx.x`. That's the M1j
+// target — see docs/GPU_ZERO_DEPENDENCY.md.
 //
 //   @kernel
 //   fn decay_step(uint64 buf, uint32 n, f64 factor) {
