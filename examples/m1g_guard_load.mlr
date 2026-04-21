@@ -1,0 +1,159 @@
+// MLRift Stage-1 M1g launcher: dispatch 64 threads against a
+// 40-slot buffer. The kernel's `if tid_x() < n` guard should
+// mask lanes 40..63 so only the first 40 threads write their IDs
+// (and the tail of the buffer stays at the 0xCC primer).
+
+import "../std/hip.kr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+static uint64 N_THREADS   = 64
+static uint64 N_BUF_SLOTS = 40
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    uint64 co_path = "/tmp/m1g.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/m1g.co — build first:")
+        puts("  ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/m1g_guard_kernel.mlr -o /tmp/m1g")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData failed", err) }
+    uint64 mod = 0
+    unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fn_slot = alloc(8)
+    uint64 kname = "write_tid_guarded"
+    err = hipModuleGetFunction(fn_slot, mod, kname)
+    if err != 0 { die("hipModuleGetFunction failed", err) }
+    uint64 fn_handle = 0
+    unsafe { *(fn_slot as uint64) -> fn_handle }
+
+    // Device buffer sized for 40 slots exactly — any write past
+    // out[39] would reach unmapped memory if the guard failed.
+    // Prime with a distinct byte pattern (0xCC) so an accidental
+    // write leaves a fingerprint.
+    uint64 nbytes = N_BUF_SLOTS * 4
+    uint64 d_slot = alloc(8)
+    err = hipMalloc(d_slot, nbytes)
+    if err != 0 { die("hipMalloc failed", err) }
+    uint64 d_out = 0
+    unsafe { *(d_slot as uint64) -> d_out }
+
+    uint64 h_prime = alloc(nbytes)
+    uint64 pi = 0
+    while pi < nbytes {
+        uint64 p = h_prime + pi
+        uint8 cc = 204    // 0xCC
+        unsafe { *(p as uint8) = cc }
+        pi = pi + 1
+    }
+    err = hipMemcpy(d_out, h_prime, nbytes, 1)
+    if err != 0 { die("prime H2D failed", err) }
+
+    uint64 arg_ptr = alloc(8)
+    unsafe { *(arg_ptr as uint64) = d_out }
+    uint64 arg_n = alloc(8)
+    uint64 bound = N_BUF_SLOTS
+    unsafe { *(arg_n as uint64) = bound }
+    uint64 kp = alloc(16)
+    unsafe { *(kp as uint64) = arg_ptr }
+    uint64 kp1 = kp + 8
+    unsafe { *(kp1 as uint64) = arg_n }
+
+    uint32 block_x = N_THREADS
+    err = hipModuleLaunchKernel(fn_handle,
+                                 1, 1, 1,
+                                 block_x, 1, 1,
+                                 0, 0,
+                                 kp, 0)
+    if err != 0 { die("hipModuleLaunchKernel failed", err) }
+
+    err = hipDeviceSynchronize()
+    if err != 0 { die("hipDeviceSynchronize failed", err) }
+
+    uint64 h_out = alloc(nbytes)
+    err = hipMemcpy(h_out, d_out, nbytes, 2)
+    if err != 0 { die("D2H failed", err) }
+
+    // Expect out[i] == i for 0..N_BUF_SLOTS-1. Threads >= N_BUF_SLOTS
+    // were masked out by the guard.
+    uint64 bad = 0
+    uint64 i = 0
+    while i < N_BUF_SLOTS {
+        uint64 p = h_out + i * 4
+        uint64 v = 0
+        unsafe { *(p as uint32) -> v }
+        if v != i { bad = bad + 1 }
+        i = i + 1
+    }
+
+    print_label_val("dispatched threads", 18, N_THREADS)
+    print_label_val("bounded slots    ", 17, N_BUF_SLOTS)
+    print_label_val("mismatches       ", 17, bad)
+
+    if bad == 0 {
+        puts("M1g gate: GREEN")
+        hipFree(d_out)
+        exit(0)
+    }
+    puts("FAIL: guarded values wrong")
+    hipFree(d_out)
+    exit(1)
+}

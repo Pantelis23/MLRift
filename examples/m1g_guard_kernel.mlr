@@ -1,0 +1,25 @@
+// MLRift Stage-1 M1g: tid-shape with a bounds guard.
+//
+//   @kernel
+//   fn write_tid_guarded(uint64 out, uint32 n) {
+//       if tid_x() < n {
+//           uint64 p = out + tid_x() * 4
+//           unsafe { *(p as uint32) = tid_x() }
+//       }
+//   }
+//
+// Lowerer recognises the single-If shape with cond = tid_x() < param1
+// and emits the clang-equivalent vcmp + s_and_saveexec + s_cbranch_execz
+// predication idiom.
+
+@kernel
+fn write_tid_guarded(uint64 out, uint32 n) {
+    if tid_x() < n {
+        uint64 p = out + tid_x() * 4
+        unsafe { *(p as uint32) = tid_x() }
+    }
+}
+
+fn main() {
+    exit(0)
+}

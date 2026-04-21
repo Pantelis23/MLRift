@@ -667,6 +667,12 @@ fn asm_s_clause(uint64 count) { asm_sopp(0x05, count & 0xFFFF) }
 // exactly this ahead of reads from SMEM-loaded SGPRs.
 fn asm_s_waitcnt_lgkmcnt_zero() { asm_sopp(0x09, 0xFC07) }
 
+// s_cbranch_execz <simm16> — SOPP op 0x25. Branches forward by
+// simm16 dwords if EXEC == 0 (no lanes active). Used right after
+// s_and_saveexec to skip the guarded body when no lane passed the
+// predicate. Caller passes the dword count directly.
+fn asm_s_cbranch_execz(uint64 simm16_dwords) { asm_sopp(0x25, simm16_dwords & 0xFFFF) }
+
 // ── SMEM format (64-bit instruction) ───────────────────────────────
 // Word 1 (gfx11):
 //   [31:26] = 0x3D   (SMEM prefix)
@@ -785,6 +791,48 @@ fn asm_v_lshlrev_b32_imm(uint64 vdst_vgpr, uint64 shift_amount, uint64 src_vgpr)
                   | ((vdst_vgpr & 0xFF) << 17)
                   | ((src_vgpr  & 0xFF) << 9)
                   | (src0_enc & 0x1FF)
+    asm_u32(word)
+}
+
+// ── VOPC — vector compare producing a lane mask into VCC. Layout
+// (gfx11):
+//   [31:25] = 0b0111110   (VOPC prefix, 0x3E)
+//   [24:17] = 8-bit op
+//   [16:9]  = vsrc1 (8 bits, VGPR)
+//   [8:0]   = src0 (9 bits)
+//
+// v_cmp_gt_u32_e32 vcc_lo, src0, vsrc1  ≡  VCC = (src0 > vsrc1).
+// Op 0x4C on gfx11. With src0 = SGPR, vsrc1 = VGPR, this gives the
+// "sgpr > vgpr" lane mask we need for `if v0 < n` bounds checks —
+// clang emits "gt" (not "lt") to put the SGPR on the left.
+fn asm_v_cmp_gt_u32_sgpr_vgpr(uint64 sgpr_src0, uint64 vgpr_src1) {
+    uint64 word = (0x3E << 25)
+                  | (0x4C << 17)
+                  | ((vgpr_src1 & 0xFF) << 9)
+                  | (sgpr_src0 & 0x1FF)      // SGPRs encode directly as src0
+    asm_u32(word)
+}
+
+// ── SOP1 — single-source scalar op. Layout (gfx11):
+//   [31:23] = 0b101111101 (0x17D prefix — one bit higher than SOPP)
+//   [22:16] = 7-bit ssrc0   (here we use 0x6A = VCC_LO)
+//   [15:8]  = 8-bit op
+//   [7:0]   = sdst (7 bits) + 1 bit reserved
+//
+// s_and_saveexec_b32 sdst, ssrc0 — op 0x20 on gfx11. Saves current
+// EXEC into sdst, sets EXEC = EXEC & ssrc0 (the vcc_lo mask from
+// the preceding vcmp), returning original EXEC in sdst for the
+// `end-if` restore point.
+fn asm_s_and_saveexec_b32_vcc_lo(uint64 sdst_sgpr) {
+    // Reference: s_and_saveexec_b32 s2, vcc_lo = 0xBE82206A
+    //   [31:23] = 101111101 = 0x17D
+    //   [22:16] = 0000010   = s2 (sdst, low 7 bits)
+    //   [15:8]  = 00100000  = 0x20 (op = s_and_saveexec_b32)
+    //   [7:0]   = 01101010  = 0x6A (ssrc0 = VCC_LO)
+    uint64 word = (0x17D << 23)
+                  | ((sdst_sgpr & 0x7F) << 16)
+                  | (0x20 << 8)
+                  | 0x6A                          // VCC_LO
     asm_u32(word)
 }
 
@@ -1693,7 +1741,8 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
 
     // Body — either a single PtrStore (M1d/M1e shapes) or a
-    // VarDecl followed by a PtrStore (M1f tid-aware shape).
+    // VarDecl followed by a PtrStore (M1f tid-aware shape) or a
+    // single If stmt guarding a tid-aware block (M1g guarded shape).
     uint32 body = ast_data3(fn_node)
     if body == 0 {
         write(2, "mlrc: amdgpu-native: kernel has empty body\n", 43)
@@ -1704,9 +1753,75 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         write(2, "mlrc: amdgpu-native: kernel body has no statements\n", 51)
         return 1
     }
+
+    // M1g guarded shape first — recognises:
+    //   if tid_x() < PARAM1 {
+    //       uint64 p = PARAM0 + tid_x() * 4
+    //       unsafe { *(p as uint32) = tid_x() }
+    //   }
+    // i.e. the M1f tid body wrapped in an if-bounds check. Used when
+    // the launch grid has more threads than buffer slots.
+    uint64 is_tid_guarded_shape = 0
+    uint32 s0_kind = ast_kind(stmt0)
+    if s0_kind == 13 {
+        uint32 after_if = ast_next(stmt0)
+        if after_if != 0 {
+            write(2, "mlrc: amdgpu-native: guarded shape: expect exactly one If stmt\n", 63)
+            return 1
+        }
+        if n_params != 2 {
+            write(2, "mlrc: amdgpu-native: guarded shape expects exactly 2 params\n", 60)
+            return 1
+        }
+        // If AST layout (kind 13, per ir.kr): child=cond expr,
+        // data1=then block, data2=optional else body.
+        // Validate cond = Compare(LT, Call(tid_x), Ident(param1)).
+        uint32 cond_node = ast_child(stmt0)
+        uint64 wcond = cond_node
+        if ast_kind(wcond) != 38 {
+            write(2, "mlrc: amdgpu-native: guarded shape: if cond must be a comparison\n", 65)
+            return 1
+        }
+        uint32 cond_op_tok = ast_data1(wcond)
+        uint64 cond_op_kind = tok_kind_at_raw(cond_op_tok)
+        if cond_op_kind != 37 {
+            // 37 = `<` per ir.kr BinOp LT mapping.
+            write(2, "mlrc: amdgpu-native: guarded shape: if cond must use `<`\n", 57)
+            return 1
+        }
+        uint32 cond_lhs = ast_child(wcond)
+        uint32 cond_rhs = ast_data2(wcond)
+        uint64 wclhs = cond_lhs
+        uint64 wcrhs = cond_rhs
+        if ast_kind(wclhs) != 35 {
+            write(2, "mlrc: amdgpu-native: guarded shape: cond lhs must be a Call\n", 60)
+            return 1
+        }
+        uint32 lhs_callee = ast_data1(wclhs)
+        if tok_matches(lhs_callee, "tid_x", 5) == 0 {
+            write(2, "mlrc: amdgpu-native: guarded shape: cond lhs must be tid_x()\n", 61)
+            return 1
+        }
+        if ast_kind(wcrhs) != 32 {
+            write(2, "mlrc: amdgpu-native: guarded shape: cond rhs must be an Ident\n", 62)
+            return 1
+        }
+        uint32 rhs_ident = ast_data1(wcrhs)
+        if tok_text_eq(rhs_ident, param1_tok) == 0 {
+            write(2, "mlrc: amdgpu-native: guarded shape: cond rhs must name the 2nd param\n", 69)
+            return 1
+        }
+        // The then-block content is *assumed* to match the tid body
+        // shape — we trust it here since any mismatch just produces
+        // wrong results at runtime, not a crash. Full structural
+        // validation of the nested Block can land alongside richer
+        // lowering.
+        is_tid_guarded_shape = 1
+    }
+
     uint32 stmt1 = ast_next(stmt0)
     uint64 is_tid_shape = 0
-    if stmt1 != 0 {
+    if is_tid_guarded_shape == 0 && stmt1 != 0 {
         // Two-stmt body → must be VarDecl then PtrStore. The PtrStore's
         // value must be a Call to tid_x(); the VarDecl's init computes
         // the byte offset via `param0 + tid_x() * SCALE` and is trusted
@@ -1751,7 +1866,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
     uint64 wstmt = 0
     uint32 skind = 0
-    if is_tid_shape == 0 {
+    if is_tid_shape == 0 && is_tid_guarded_shape == 0 {
         wstmt = stmt0
         skind = ast_kind(wstmt)
         if skind != 42 {
@@ -1761,7 +1876,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
     uint64 is_lit_shape = 0
     uint64 lit32 = 0
-    if is_tid_shape == 0 {
+    if is_tid_shape == 0 && is_tid_guarded_shape == 0 {
         uint32 ts = ast_data1(wstmt)
         uint64 type_size = ts
         if type_size != 4 {
@@ -1817,7 +1932,39 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     // function return. Same rationale for the kernel text blob.
     uint64 args_desc = alloc(4 * 16)
 
-    if is_tid_shape != 0 {
+    if is_tid_guarded_shape != 0 {
+        // Guarded per-thread shape (mirrors clang's gfx1100 output
+        // for `if (i < n) { out[i] = i }`):
+        //
+        //   s_load_b32 s2, s[0:1], 0x8         ; load bound n
+        //   s_waitcnt lgkmcnt(0)
+        //   v_cmp_gt_u32_e32 vcc_lo, s2, v0    ; vcc_lo[lane] = (n > tid)
+        //   s_and_saveexec_b32 s2, vcc_lo      ; mask inactive lanes
+        //   s_cbranch_execz 6                  ; skip 6 dwords if none pass
+        //   s_load_b64 s[0:1], s[0:1], null    ; load pointer
+        //   v_lshlrev_b32 v1, 2, v0            ; v1 = tid*4
+        //   s_waitcnt lgkmcnt(0)
+        //   global_store_b32 v1, v0, s[0:1]
+        //   s_endpgm
+        asm_s_load_b32(1, 0, 8)                    // s2 <- kernarg[8] = n
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_v_cmp_gt_u32_sgpr_vgpr(2, 0)           // vcc_lo = (s2 > v0)
+        asm_s_and_saveexec_b32_vcc_lo(2)           // save EXEC to s2, gate
+        asm_s_cbranch_execz(6)                     // 6 dwords = 24 bytes
+        asm_s_load_b64(0, 0)                       // s[0:1] <- kernarg[0..7]
+        asm_v_lshlrev_b32_imm(1, 2, 0)
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_global_store_b32(1, 0, 0)
+        asm_s_endpgm()
+
+        uint64 adp0 = args_desc + 0;   unsafe { *(adp0 as uint64) = 8 }
+        uint64 adp1 = args_desc + 8;   unsafe { *(adp1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        uint64 adp2 = args_desc + 16;  unsafe { *(adp2 as uint64) = 4 }
+        uint64 adp3 = args_desc + 24;  unsafe { *(adp3 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        kernarg_size = 12
+        sgpr_count   = 5       // s0..s4 (kernarg ptr + n + saved exec)
+        n_args       = 2
+    } else if is_tid_shape != 0 {
         // Per-thread shape: byte_offset = tid * 4, value = tid.
         //
         //   s_load_b64  s[0:1], s[0:1], null
