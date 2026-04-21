@@ -2352,6 +2352,14 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         }
         uint64 dest = ir_new_vreg()
         ir_emit(IR_CALL, dest, arg_count, 0, callee_tok, ir_current_bb)
+        // Propagate the callee's declared float return kind onto the
+        // result vreg. Without this, `some_f64_fn() * local_f64` sees
+        // fkind=0 on the LHS and picks IR_MUL (integer) instead of
+        // IR_FMUL (mulsd), silently producing garbage. Works because
+        // float bits live in GPRs throughout (see IR_FMUL codegen),
+        // so fkind only gates op selection, not register class.
+        uint64 ret_fk_call = fn_ret_float_lookup(callee_tok)
+        if ret_fk_call != 0 { ir_vreg_fkind_set(dest, ret_fk_call) }
         // Check if callee returns a struct (small, <=16 bytes, via rax/rdx)
         uint64 ret_si = fn_ret_struct_lookup(callee_tok)
         if ret_si != 0xFFFFFFFF {
@@ -8779,6 +8787,20 @@ fn ir_emit_x86_function(uint64 fn_node) {
     // fixups) or dyn_call_record (for @dynamic PLT patching).
     uint64 is_extern_ir = ann_flags & 8
     if is_extern_ir != 0 { return }
+
+    // Record the function's float return kind so later callers can
+    // tag their IR_CALL result vreg with the right fkind (mirrors
+    // gen_function's legacy registration at src/codegen.kr:9072).
+    // Without this, `f64_fn() * local_f64` picks IR_MUL instead of
+    // IR_FMUL inside the BinOp lowering.
+    uint32 ir_fn_name_tok = ast_data1(fn_node)
+    uint32 ir_ret_type_tok = ast_data2(fn_node)
+    uint64 wirt = ir_ret_type_tok
+    if wirt != 0 {
+        uint64 ir_ret_kind = tok_kind_at_raw(wirt)
+        if ir_ret_kind == 96 { fn_ret_float_register(ir_fn_name_tok, 1) }
+        if ir_ret_kind == 95 { fn_ret_float_register(ir_fn_name_tok, 2) }
+    }
 
     // 1. Lower AST to IR
     ir_lower_function(fn_node)

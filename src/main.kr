@@ -2379,10 +2379,21 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
     }
     uint64 data_start = codegen_output_len()
     emit_static_data()
-    if arch == 0 {
-        resolve_static_fixups(data_start)
-    } else {
-        resolve_static_fixups_a64(data_start)
+    // In the dyn-ELF path, static data is relocated into the RW .data
+    // section so mutations don't fault on the RX code page. Defer
+    // fixup resolution to the dyn-ELF branch in that case — calling
+    // resolve_static_fixups here would point the disps at the RX copy
+    // and leave the RW copy unreachable.
+    uint64 dyn_elf_active = 0
+    if dyn_sym_count_get() > 0 {
+        if emit_mode == 0 { dyn_elf_active = 1 }
+    }
+    if dyn_elf_active == 0 {
+        if arch == 0 {
+            resolve_static_fixups(data_start)
+        } else {
+            resolve_static_fixups_a64(data_start)
+        }
     }
 
     uint64 text_size = codegen_output_len() - text_start
@@ -2465,7 +2476,12 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
     // user main() runs.
     if dyn_sym_count_get() > 0 && emit_mode == 0 {
         uint64 text_start_dyn = header_size            // 120 for elfexe
-        uint64 text_len_orig = codegen_output_len() - text_start_dyn
+        // Exclude the static-data bytes that emit_static_data wrote
+        // after the code — those will live in the RW segment's .data
+        // tail, not RX. `data_start` is the byte offset inside the
+        // codegen buffer where those bytes begin.
+        uint64 sdata_size_dyn = codegen_static_data_size_get()
+        uint64 text_len_orig = (data_start - text_start_dyn)
         uint64 main_off_orig = entry_off - text_start_dyn
 
         // Combined .text layout: [stub_size bytes of _start] + [original
@@ -2523,6 +2539,14 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
         uint64 cg_buf = codegen_buf_ptr()
         memcpy(combined_text + stub_size, cg_buf + text_start_dyn, text_len_orig)
 
+        // Tell the dyn-ELF layout about the writable static data so
+        // it reserves space inside the RW segment. emit_static_data
+        // already serialized the bytes at cg_buf + data_start above;
+        // we just point the emitter at them.
+        if sdata_size_dyn > 0 {
+            edyn_set_data(cg_buf + data_start, sdata_size_dyn)
+        }
+
         // Pass 1: compute layout so va_text + plt_va(i) are known.
         edyn_compute_dyn_layout_for(lib_list, lib_count, sym_list, nsym_ext, text_len_dyn)
 
@@ -2533,6 +2557,20 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
         // patcher's code_off_base.
         uint64 base = text_start_dyn - stub_size
         edyn_patch_dyn_calls(combined_text, base)
+
+        // Pass 2b: resolve static-variable RIP-relative fixups. Each
+        // entry's code_off is out_buf-relative, data_off is an offset
+        // inside the static-data blob; edyn_patch_static_fixup
+        // rewrites the 4-byte disp placeholder in combined_text so
+        // the load/store reaches edyn_va_data + data_off in RW.
+        uint64 sfx_n = codegen_static_fixup_count_get()
+        uint64 sfi = 0
+        while sfi < sfx_n {
+            uint64 sfx_co = codegen_static_fixup_code_off_at(sfi)
+            uint64 sfx_do = codegen_static_fixup_data_off_at(sfi)
+            edyn_patch_static_fixup(combined_text, base, sfx_co, sfx_do)
+            sfi = sfi + 1
+        }
 
         // Pass 3: patch the stub's own `call __libc_start_main@plt`
         // rel32 now that edyn_sym_plt_va() is valid.

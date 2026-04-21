@@ -1725,6 +1725,36 @@ fn emit_static_data() {
 }
 
 // ---------------------------------------------------------------------------
+// Static fixup accessors — used by format_elf_dyn to repoint static
+// RIP-relative patches into the RW segment (the dyn-ELF path keeps
+// writable static data out of the executable RX segment).
+// ---------------------------------------------------------------------------
+
+@export
+fn codegen_static_data_size_get() -> uint64 { return static_data_size }
+
+@export
+fn codegen_static_fixup_count_get() -> uint64 { return static_fixup_count }
+
+@export
+fn codegen_static_fixup_code_off_at(uint64 i) -> uint64 {
+    uint64 entry = static_fixups + i * 8
+    uint32 co = 0
+    unsafe { *(entry as uint32) -> co }
+    uint64 wco = co
+    return wco
+}
+
+@export
+fn codegen_static_fixup_data_off_at(uint64 i) -> uint64 {
+    uint64 entry = static_fixups + i * 8 + 4
+    uint32 dof = 0
+    unsafe { *(entry as uint32) -> dof }
+    uint64 wdo = dof
+    return wdo
+}
+
+// ---------------------------------------------------------------------------
 // Function table
 // ---------------------------------------------------------------------------
 

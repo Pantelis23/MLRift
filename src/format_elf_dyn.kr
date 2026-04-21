@@ -259,6 +259,16 @@ static uint64 edyn_va_text        = 0
 static uint64 edyn_off_gotplt     = 0    // page-aligned, follows RX
 static uint64 edyn_va_gotplt      = 0
 
+// Writable .data section follows .got.plt inside the RW segment.
+// Populated from the codegen's static-data table; the dyn-ELF path
+// keeps static variables out of RX so stores like `rng_state =
+// rng_state ^ (rng_state << 13)` don't SIGSEGV on the read-only
+// code segment.
+static uint64 edyn_in_data_ptr    = 0
+static uint64 edyn_in_data_size   = 0
+static uint64 edyn_off_data       = 0
+static uint64 edyn_va_data        = 0
+
 // ---------------------------------------------------------------------------
 // Library-list accessors (16 bytes per entry: name_ptr + name_len)
 // ---------------------------------------------------------------------------
@@ -381,7 +391,12 @@ fn edyn_compute_layout() {
     edyn_off_gotplt    = (rx_end + 0xFFF) & 0xFFFFFFFFFFFFF000
 
     edyn_gotplt_size = 8 * (3 + n)
-    edyn_size_rw     = edyn_gotplt_size
+    // .data tail inside RW: writable static variables live here so
+    // the dyn-ELF binary can mutate them. When there are none the
+    // section stays zero-sized and the layout matches the pre-M2a
+    // shape.
+    edyn_off_data    = edyn_off_gotplt + edyn_gotplt_size
+    edyn_size_rw     = edyn_gotplt_size + edyn_in_data_size
     edyn_file_end    = edyn_off_gotplt + edyn_size_rw
 
     edyn_va_dynstr  = EDYN_BASE_VADDR + EDYN_OFF_DYNSTR
@@ -391,6 +406,7 @@ fn edyn_compute_layout() {
     edyn_va_dynamic = EDYN_BASE_VADDR + edyn_off_dynamic
     edyn_va_text    = EDYN_VA_PLT + edyn_plt_size
     edyn_va_gotplt  = EDYN_BASE_VADDR + edyn_off_gotplt
+    edyn_va_data    = EDYN_BASE_VADDR + edyn_off_data
 
     // Only the R segment is still hardcapped: it carries ELF header +
     // phdrs + dyn tables, and those fit well under one page for any
@@ -672,6 +688,55 @@ fn edyn_compute_dyn_layout_for(uint64 lib_list_ptr, uint64 lib_count,
     edyn_compute_layout()
 }
 
+// Register writable static-data bytes to emit at the end of the RW
+// segment. Must be called before edyn_compute_dyn_layout_for so the
+// size participates in the RW sizing. Size 0 keeps the pre-static
+// layout intact.
+@export
+fn edyn_set_data(uint64 data_ptr, uint64 data_size) {
+    edyn_in_data_ptr  = data_ptr
+    edyn_in_data_size = data_size
+}
+
+// VA of the first byte of writable static data inside the RW segment.
+// Callers use this to resolve RIP-relative fixups whose target lives
+// in .data rather than the legacy RX-embedded data region.
+@export
+fn edyn_va_data_get() -> uint64 { return edyn_va_data }
+
+// RIP-relative patch helper for static-variable accesses. The code
+// stream already contains the 4-byte disp placeholder at
+// (code_off - code_off_base) inside combined_text; we overwrite it
+// with the disp that reaches static_va + data_off in .data. Mirrors
+// edyn_patch_dyn_calls in shape; callers compute the (code_off,
+// data_off) pairs from the codegen's static_fixups table.
+@export
+fn edyn_patch_static_fixup(uint64 text_ptr, uint64 code_off_base,
+                           uint64 code_off, uint64 data_off) {
+    if code_off < code_off_base {
+        write(2, "format_elf_dyn: static fixup before text start\n", 47)
+        exit(1)
+    }
+    uint64 text_off = code_off - code_off_base
+    if text_off + 4 > edyn_in_text_len {
+        write(2, "format_elf_dyn: static fixup past text end\n", 43)
+        exit(1)
+    }
+    uint64 rip_after = edyn_va_text + text_off + 4
+    uint64 target_va = edyn_va_data + data_off
+    uint64 rel32 = (target_va - rip_after) & 0xFFFFFFFF
+
+    uint64 p = text_ptr + text_off
+    uint8 b0 = rel32 & 0xFF
+    uint8 b1 = (rel32 >> 8) & 0xFF
+    uint8 b2 = (rel32 >> 16) & 0xFF
+    uint8 b3 = (rel32 >> 24) & 0xFF
+    unsafe { *(p as uint8) = b0 }
+    uint64 p1 = p + 1; unsafe { *(p1 as uint8) = b1 }
+    uint64 p2 = p + 2; unsafe { *(p2 as uint8) = b2 }
+    uint64 p3 = p + 3; unsafe { *(p3 as uint8) = b3 }
+}
+
 // Patch every recorded @dynamic call site in `text_ptr` with the rel32
 // that reaches the corresponding PLT entry. Assumes edyn_compute_layout
 // has been run so edyn_va_text and edyn_sym_plt_va(i) are valid.
@@ -785,6 +850,19 @@ fn emit_dynamic_elf(uint64 lib_list_ptr, uint64 lib_count,
     edyn_write_text()
     edyn_pad_to(edyn_off_gotplt)
     edyn_write_gotplt()
+    // .data: raw static-variable bytes handed in by main.kr. Written
+    // inside the RW segment so `mov [rip+disp], val` stores from
+    // user code land on writable pages.
+    if edyn_in_data_size > 0 {
+        uint64 di = 0
+        while di < edyn_in_data_size {
+            uint64 sp = edyn_in_data_ptr + di
+            uint8 sb = 0
+            unsafe { *(sp as uint8) -> sb }
+            edyn_byte(sb)
+            di = di + 1
+        }
+    }
     edyn_pad_to(edyn_file_end)
 
     return edyn_file_end
