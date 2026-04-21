@@ -927,6 +927,27 @@ fn asm_global_store_b64(uint64 v_addr, uint64 vdata_pair, uint64 saddr_pair) {
 // v_fma_f64 vdst_pair, -s[0:1], v[0:1], v[0:1]  — op 0x014 on gfx11.
 // Used for the decay idiom  v - v * factor  == fma(-factor, v, v).
 // Reference bytes: 0xD6140000 0x24020000.
+// v_mad_u32_u24 vdst, s_src0, s_src1, v_src2   (VOP3 op 0x0B)
+// vdst = src0 * src1 + src2, interpreting src0/src1 as u24. On
+// gfx1100 this is the compact way to compute a 32-bit fused
+// multiply-add across an SGPR pair and a VGPR — which is exactly
+// what the grid-tid formula needs (gid = wg_id_x * bdim + tid).
+// Verified against llvm-mc: op=0x0B, word1=0xD60B0001 for
+// `v_mad_u32_u24 v1, s3, s2, v0`.
+fn asm_v_mad_u32_u24(uint64 vdst_vgpr,
+                     uint64 src0_sgpr, uint64 src1_sgpr,
+                     uint64 src2_vgpr) {
+    uint64 word1 = (0x6B << 25) | (0x00B << 16) | (vdst_vgpr & 0xFF)
+    asm_u32(word1)
+    uint64 src0_enc = src0_sgpr & 0x1FF                // SGPR raw
+    uint64 src1_enc = src1_sgpr & 0x1FF                // SGPR raw
+    uint64 src2_enc = 0x100 | (src2_vgpr & 0xFF)       // VGPR 0x100+N
+    uint64 word2 = ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word2)
+}
+
 fn asm_v_fma_f64_neg_s_v_v(uint64 vdst_pair, uint64 neg_sgpr_pair,
                            uint64 v_src1_pair, uint64 v_src2_pair) {
     // Word 1: prefix + op + vdst.  gfx11 VOP3 prefix is 7 bits at
@@ -1839,8 +1860,8 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         uint32 np = ast_next(wp)
         wp = np
     }
-    if n_params != 1 && n_params != 2 && n_params != 3 {
-        write(2, "mlrc: amdgpu-native lowering supports 1-3 params (got ", 54)
+    if n_params != 1 && n_params != 2 && n_params != 3 && n_params != 4 {
+        write(2, "mlrc: amdgpu-native lowering supports 1-4 params (got ", 54)
         uint8[24] cbuf
         uint64 clen = fmt_uint(cbuf, n_params)
         write(2, cbuf, clen)
@@ -1871,6 +1892,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     // the launch grid has more threads than buffer slots.
     uint64 is_tid_guarded_shape = 0
     uint64 is_decay_shape        = 0
+    uint64 is_grid_decay_shape   = 0
     uint32 s0_kind = ast_kind(stmt0)
     if s0_kind == 13 {
         uint32 after_if = ast_next(stmt0)
@@ -1878,8 +1900,8 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
             write(2, "mlrc: amdgpu-native: guarded shape: expect exactly one If stmt\n", 63)
             return 1
         }
-        if n_params != 2 && n_params != 3 {
-            write(2, "mlrc: amdgpu-native: guarded shape expects 2 or 3 params\n", 57)
+        if n_params != 2 && n_params != 3 && n_params != 4 {
+            write(2, "mlrc: amdgpu-native: guarded shape expects 2-4 params\n", 54)
             return 1
         }
         // If AST layout (kind 13, per ir.kr): child=cond expr,
@@ -1902,14 +1924,20 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         uint32 cond_rhs = ast_data2(wcond)
         uint64 wclhs = cond_lhs
         uint64 wcrhs = cond_rhs
-        if ast_kind(wclhs) != 35 {
-            write(2, "mlrc: amdgpu-native: guarded shape: cond lhs must be a Call\n", 60)
-            return 1
-        }
-        uint32 lhs_callee = ast_data1(wclhs)
-        if tok_matches(lhs_callee, "tid_x", 5) == 0 {
-            write(2, "mlrc: amdgpu-native: guarded shape: cond lhs must be tid_x()\n", 61)
-            return 1
+        // For 2/3-param shapes the cond LHS must be a direct Call
+        // to tid_x(). For the 4-param grid shape the LHS is a richer
+        // expression — `block_id_x() * bdim + tid_x()` — and we
+        // trust the user source rather than walking the BinOp here.
+        if n_params != 4 {
+            if ast_kind(wclhs) != 35 {
+                write(2, "mlrc: amdgpu-native: guarded shape: cond lhs must be a Call\n", 60)
+                return 1
+            }
+            uint32 lhs_callee = ast_data1(wclhs)
+            if tok_matches(lhs_callee, "tid_x", 5) == 0 {
+                write(2, "mlrc: amdgpu-native: guarded shape: cond lhs must be tid_x()\n", 61)
+                return 1
+            }
         }
         if ast_kind(wcrhs) != 32 {
             write(2, "mlrc: amdgpu-native: guarded shape: cond rhs must be an Ident\n", 62)
@@ -1927,6 +1955,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         // lowering.
         if n_params == 2 { is_tid_guarded_shape = 1 }
         if n_params == 3 { is_decay_shape       = 1 }
+        if n_params == 4 { is_grid_decay_shape  = 1 }
     }
 
     uint32 stmt1 = ast_next(stmt0)
@@ -1976,7 +2005,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
     uint64 wstmt = 0
     uint32 skind = 0
-    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 {
+    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 && is_grid_decay_shape == 0 {
         wstmt = stmt0
         skind = ast_kind(wstmt)
         if skind != 42 {
@@ -1986,7 +2015,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
     uint64 is_lit_shape = 0
     uint64 lit32 = 0
-    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 {
+    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 && is_grid_decay_shape == 0 {
         uint32 ts = ast_data1(wstmt)
         uint64 type_size = ts
         if type_size != 4 {
@@ -2043,7 +2072,66 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     // 6 × 16 bytes = up to 6 args × (size, kind); decay uses 3.
     uint64 args_desc = alloc(6 * 16)
 
-    if is_decay_shape != 0 {
+    if is_grid_decay_shape != 0 {
+        // M1j grid-decay shape: decay body with a grid-wide tid.
+        //     gid = wg_id_x * bdim + threadIdx.x
+        // bdim is supplied as an explicit 4th kernarg (u32) —
+        // saves us from wiring up hidden-arg / dispatch-ptr reads
+        // for this first pass at grid support.
+        //
+        // Keep rsrc2 = 0x9E (same as all prior native kernels).
+        // That places wg_id_x at s15 per the 15-user-sgpr
+        // convention clang also uses; s0..s1 stay as kernarg ptr,
+        // s2/s4 hold loaded kernargs (b32 dests must be even-SGPR
+        // aligned, so sdata_pair=1 → s2, sdata_pair=2 → s4).
+        //
+        //   s_clause 0x1
+        //   s_load_b32 s2, s[0:1], 0x18    ; s2 = bdim
+        //   s_load_b32 s4, s[0:1], 0x8     ; s4 = n
+        //   s_waitcnt lgkmcnt(0)
+        //   v_mad_u32_u24 v1, s2, s15, v0  ; v1 = bdim*wg_id_x + tid
+        //   v_cmp_gt_u32_e32 vcc_lo, s4, v1
+        //   s_and_saveexec_b32 s3, vcc_lo
+        //   s_cbranch_execz 13             ; skip 13 dwords to s_endpgm
+        //   s_load_b64 s[2:3], s[0:1], null
+        //   v_lshlrev_b32 v2, 3, v1
+        //   s_load_b64 s[0:1], s[0:1], 0x10
+        //   s_waitcnt lgkmcnt(0)
+        //   global_load_b64 v[0:1], v2, s[2:3]
+        //   s_waitcnt vmcnt(0)
+        //   v_fma_f64 v[0:1], -s[0:1], v[0:1], v[0:1]
+        //   global_store_b64 v2, v[0:1], s[2:3]
+        //   s_endpgm
+        asm_s_clause(1)
+        asm_s_load_b32(1, 0, 0x18)                  // s2 = bdim
+        asm_s_load_b32(2, 0, 0x8)                   // s4 = n
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_v_mad_u32_u24(1, 2, 15, 0)              // v1 = s2 * s15 + v0
+        asm_v_cmp_gt_u32_sgpr_vgpr(4, 1)            // vcc_lo = (s4 > v1)
+        asm_s_and_saveexec_b32_vcc_lo(3)            // save EXEC in s3
+        asm_s_cbranch_execz(13)
+        asm_s_load_b64(1, 0)                        // s[2:3] <- buf
+        asm_v_lshlrev_b32_imm(2, 3, 1)              // v2 = v1 << 3
+        asm_s_load_b64_off(0, 0, 0x10)              // s[0:1] <- factor
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_global_load_b64(0, 2, 2)
+        asm_s_waitcnt_vmcnt_zero()
+        asm_v_fma_f64_neg_s_v_v(0, 0, 0, 0)
+        asm_global_store_b64(2, 0, 2)
+        asm_s_endpgm()
+
+        uint64 adp0 = args_desc + 0;   unsafe { *(adp0 as uint64) = 8 }
+        uint64 adp1 = args_desc + 8;   unsafe { *(adp1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        uint64 adp2 = args_desc + 16;  unsafe { *(adp2 as uint64) = 4 }
+        uint64 adp3 = args_desc + 24;  unsafe { *(adp3 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        uint64 adp4 = args_desc + 32;  unsafe { *(adp4 as uint64) = 8 }
+        uint64 adp5 = args_desc + 40;  unsafe { *(adp5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        uint64 adp6 = args_desc + 48;  unsafe { *(adp6 as uint64) = 4 }
+        uint64 adp7 = args_desc + 56;  unsafe { *(adp7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        kernarg_size = 28
+        sgpr_count   = 18       // s0..s15 + slop — match clang's heuristic
+        n_args       = 4
+    } else if is_decay_shape != 0 {
         // M1h f64 decay shape — mirrors clang's gfx1100 output for:
         //   @kernel fn decay_step(uint64 buf, uint32 n, f64 factor) {
         //       if tid_x() < n {
@@ -2182,7 +2270,8 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
 
     uint64 vgpr_count_k = 2
-    if is_decay_shape != 0 { vgpr_count_k = 3 }
+    if is_decay_shape != 0       { vgpr_count_k = 3 }
+    if is_grid_decay_shape != 0  { vgpr_count_k = 3 }
     kt_push(kname_ptr, nl, k_text_buf, k_text_size,
             args_desc, n_args, kernarg_size,
             sgpr_count, vgpr_count_k,

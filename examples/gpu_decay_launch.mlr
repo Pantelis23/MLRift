@@ -162,17 +162,27 @@ fn main() {
     f64 f_val = FACTOR
     unsafe { *(arg_factor as f64) = f_val }
 
-    uint64 kernel_params = alloc(3 * 8)
+    // grid = ceil(N / 256), block = 256
+    uint32 block_x = 256
+    uint64 grid_x_u = (N + 255) / 256
+    uint32 grid_x = grid_x_u
+
+    // MLRift's --target=amdgpu-native decay shape wants bdim as an
+    // explicit 4th kernarg (see examples/gpu_decay.mlr). Pass
+    // block_x here — the kernel multiplies it by wg_id_x to get
+    // the global thread index.
+    uint64 arg_bdim = alloc(8)
+    uint64 bdim_v = block_x
+    unsafe { *(arg_bdim as uint64) = bdim_v }
+
+    uint64 kernel_params = alloc(4 * 8)
     unsafe { *(kernel_params as uint64) = arg_buf }
     uint64 kp1 = kernel_params + 8
     unsafe { *(kp1 as uint64) = arg_n }
     uint64 kp2 = kernel_params + 16
     unsafe { *(kp2 as uint64) = arg_factor }
-
-    // grid = ceil(N / 256), block = 256
-    uint32 block_x = 256
-    uint64 grid_x_u = (N + 255) / 256
-    uint32 grid_x = grid_x_u
+    uint64 kp3 = kernel_params + 24
+    unsafe { *(kp3 as uint64) = arg_bdim }
 
     err = hipModuleLaunchKernel(fn_handle,
                                  grid_x, 1, 1,

@@ -5,28 +5,33 @@
 //
 //     buf[i] = buf[i] - buf[i] * factor    for i in 0..n
 //
-// Each CUDA/HIP thread handles a single element. Launch with any
-// grid/block shape that satisfies `grid.x * block.x >= n`; the `i < n`
-// bounds check handles the tail.
+// As of Stage 1 M1j this kernel compiles through MLRift's OWN
+// AMDGPU emitter (no hipcc, no clang):
 //
-// The companion host (examples/gpu_decay_launch.mlr) loads the .co,
-// fills a 50 000-element host buffer, copies it to device, launches
-// this kernel, copies back, and verifies against a CPU reference
-// computation within a tolerance.
-
-// CPU-side stub so `fn tid_x()` resolves during --target=hip-amd's
-// pre-GPU CPU codegen. format_hip.kr's body translator recognises
-// `tid_x()` at emit time and replaces it with the real
-// `blockIdx.x * blockDim.x + threadIdx.x` on the GPU side.
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//                examples/gpu_decay.mlr -o /tmp/gpu_decay
+//
+// The kernel takes a fourth arg `bdim` (block dimension) rather
+// than reading it from the HSA dispatch packet — this keeps the
+// encoder surface small (no dispatch-ptr plumbing, no hidden
+// kernargs). Callers pass block_x explicitly. Launches with
+// grid_x > 1 now produce correct per-element results: each
+// thread's global id is `wg_id_x * bdim + threadIdx.x`.
+//
+// CPU-side stubs so MLRift's normal pipeline still parses the
+// intrinsic references (they're replaced in lowering).
 fn tid_x() -> uint64 {
     return 0
 }
 
+fn block_id_x() -> uint64 {
+    return 0
+}
+
 @kernel
-fn decay_step(uint64 buf, uint64 n, f64 factor) {
-    uint64 i = tid_x()
-    if i < n {
-        uint64 p = buf + i * 8
+fn decay_step(uint64 buf, uint32 n, f64 factor, uint32 bdim) {
+    if block_id_x() * bdim + tid_x() < n {
+        uint64 p = buf + (block_id_x() * bdim + tid_x()) * 8
         f64 v = 0.0
         unsafe { *(p as f64) -> v }
         v = v - v * factor
