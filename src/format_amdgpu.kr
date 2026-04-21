@@ -1,0 +1,1089 @@
+// MLRift — AMDGPU code-object ELF emitter (Stage 1, milestone M1a).
+//
+// Produces a ROCm-loadable code object (raw amdgcn ELF, NOT a clang
+// offload bundle) for a single handcrafted kernel. The target
+// scenario for M1a is: write a no-op kernel (just `s_endpgm`),
+// hand the blob to hipModuleLoadData, and confirm the loader
+// accepts it plus hipModuleGetFunction resolves the kernel symbol.
+//
+// This is the scaffolding for Stage 1 as described in
+// docs/GPU_ZERO_DEPENDENCY.md — it still keeps the existing
+// --target=hip-amd (hipcc-driven) path intact. A new CLI flag
+// `--target=amdgpu-native` drives this emitter instead.
+//
+// Layout mirrors what hipcc emits (stripped of the clang offload
+// bundle wrapper), trimmed to the minimum the ROCm loader checks
+// for code-object v4. References: /tmp/gpu_decay_amdgcn.co (from
+// hipcc --genco, bundle-stripped) and the AMDGPU-ABI doc
+// (https://llvm.org/docs/AMDGPUUsage.html#code-object-v4-metadata).
+//
+// File layout (matches hipcc's structural pattern):
+//
+//   0x000  ELF64 header
+//   0x040  program headers (6 phdrs × 56 bytes)
+//   0x1A0  .note                 (AMDGPU metadata, MsgPack)
+//   ...    .dynsym               (3 entries: null, kernel, kernel.kd)
+//   ...    .dynstr               (kernel name + ".kd" variant)
+//   ...    .rodata               (64-byte kernel descriptor)
+//   0x900  .text                 (page-aligned virtually)
+//   ...    section headers
+//   ...    .shstrtab
+//
+// Virtual addresses keep RX's page alignment modulo 0x1000:
+// .text sits at vaddr = file_offset + 0x1000 so the RX PT_LOAD is
+// a 0x1000-aligned page segment.
+
+// ---------------------------------------------------------------------------
+// Output buffer
+// ---------------------------------------------------------------------------
+
+static uint64 amd_buf = 0
+static uint64 amd_len = 0
+static uint64 amd_cap = 0
+
+@export
+fn amd_buf_ptr() -> uint64 { return amd_buf }
+
+@export
+fn amd_buf_len() -> uint64 { return amd_len }
+
+fn amd_init() {
+    if amd_buf == 0 {
+        amd_cap = 65536   // 64 KB is plenty for M1a/M1b
+        amd_buf = alloc(amd_cap)
+    }
+    amd_len = 0
+    // zero the buffer — we rely on zero-init for reserved fields
+    uint64 i = 0
+    while i < amd_cap {
+        uint64 p = amd_buf + i
+        uint8 z = 0
+        unsafe { *(p as uint8) = z }
+        i = i + 1
+    }
+}
+
+fn amd_byte(uint64 v) {
+    if amd_len >= amd_cap {
+        write(2, "format_amdgpu: output buffer overflow\n", 38)
+        exit(1)
+    }
+    uint64 p = amd_buf + amd_len
+    uint8 b = v & 0xFF
+    unsafe { *(p as uint8) = b }
+    amd_len = amd_len + 1
+}
+
+fn amd_u16(uint64 v) {
+    amd_byte(v & 0xFF)
+    amd_byte((v >> 8) & 0xFF)
+}
+
+fn amd_u32(uint64 v) {
+    amd_byte(v & 0xFF)
+    amd_byte((v >> 8) & 0xFF)
+    amd_byte((v >> 16) & 0xFF)
+    amd_byte((v >> 24) & 0xFF)
+}
+
+fn amd_u64(uint64 v) {
+    amd_u32(v & 0xFFFFFFFF)
+    amd_u32((v >> 32) & 0xFFFFFFFF)
+}
+
+fn amd_bytes(uint64 src, uint64 n) {
+    uint64 i = 0
+    while i < n {
+        uint64 sp = src + i
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        amd_byte(b)
+        i = i + 1
+    }
+}
+
+fn amd_pad_to(uint64 target) {
+    while amd_len < target { amd_byte(0) }
+}
+
+fn amd_align_up(uint64 n, uint64 a) -> uint64 {
+    uint64 m = a - 1
+    return (n + m) & ~m
+}
+
+fn amd_align(uint64 a) { amd_pad_to(amd_align_up(amd_len, a)) }
+
+// Write a u32 at a specific offset (for back-patching).
+fn amd_patch_u32(uint64 off, uint64 v) {
+    uint64 p0 = amd_buf + off
+    uint8 b0 = v & 0xFF
+    unsafe { *(p0 as uint8) = b0 }
+    uint64 p1 = amd_buf + off + 1
+    uint8 b1 = (v >> 8) & 0xFF
+    unsafe { *(p1 as uint8) = b1 }
+    uint64 p2 = amd_buf + off + 2
+    uint8 b2 = (v >> 16) & 0xFF
+    unsafe { *(p2 as uint8) = b2 }
+    uint64 p3 = amd_buf + off + 3
+    uint8 b3 = (v >> 24) & 0xFF
+    unsafe { *(p3 as uint8) = b3 }
+}
+
+// ---------------------------------------------------------------------------
+// MsgPack mini-encoder — just enough for the AMD metadata we produce
+// ---------------------------------------------------------------------------
+//
+// The metadata is a small map: top-level has 3 keys (amdhsa.kernels,
+// amdhsa.target, amdhsa.version), and each kernel is a map with
+// 15-ish keys. All strings are ASCII, short enough for fixstr; two
+// values in the kernel map can overflow 32 (kernarg_size, max flat
+// workgroup size) so we need the uint16 tag too.
+//
+// MsgPack reference (packed specification):
+//   positive fixint  0x00..0x7F
+//   fixmap N         0x80 | (N & 0x0F)        (N < 16)
+//   fixarray N       0x90 | (N & 0x0F)        (N < 16)
+//   fixstr len       0xA0 | (len & 0x1F)      (len <= 31)
+//   false            0xC2
+//   true             0xC3
+//   uint8            0xCC <u8>
+//   uint16           0xCD <u16 BE>
+//   uint32           0xCE <u32 BE>
+//   str8             0xD9 <u8 len> <bytes>
+//   map16            0xDE <u16 BE count>
+
+fn mp_fixmap(uint64 n) {
+    uint64 tag = 0x80 | (n & 0x0F)
+    amd_byte(tag)
+}
+
+fn mp_fixarray(uint64 n) {
+    uint64 tag = 0x90 | (n & 0x0F)
+    amd_byte(tag)
+}
+
+fn mp_map16(uint64 n) {
+    amd_byte(0xDE)
+    amd_byte((n >> 8) & 0xFF)
+    amd_byte(n & 0xFF)
+}
+
+fn mp_str_bytes(uint64 ptr, uint64 len) {
+    if len <= 31 {
+        uint64 tag = 0xA0 | (len & 0x1F)
+        amd_byte(tag)
+    } else if len <= 255 {
+        amd_byte(0xD9)
+        amd_byte(len & 0xFF)
+    } else {
+        write(2, "format_amdgpu: mp_str length > 255 unsupported\n", 47)
+        exit(1)
+    }
+    amd_bytes(ptr, len)
+}
+
+// mp_str_lit — convenience for compile-time constant strings.
+fn mp_str_lit(uint64 s) { mp_str_bytes(s, str_len(s)) }
+
+fn mp_uint(uint64 v) {
+    if v < 0x80 {
+        amd_byte(v)
+    } else if v <= 0xFF {
+        amd_byte(0xCC)
+        amd_byte(v)
+    } else if v <= 0xFFFF {
+        amd_byte(0xCD)
+        amd_byte((v >> 8) & 0xFF)
+        amd_byte(v & 0xFF)
+    } else if v <= 0xFFFFFFFF {
+        amd_byte(0xCE)
+        amd_byte((v >> 24) & 0xFF)
+        amd_byte((v >> 16) & 0xFF)
+        amd_byte((v >> 8)  & 0xFF)
+        amd_byte(v & 0xFF)
+    } else {
+        write(2, "format_amdgpu: mp_uint > 2^32 unsupported\n", 42)
+        exit(1)
+    }
+}
+
+fn mp_true()  { amd_byte(0xC3) }
+fn mp_false() { amd_byte(0xC2) }
+
+// ---------------------------------------------------------------------------
+// AMD kernel metadata (.note body)
+// ---------------------------------------------------------------------------
+//
+// Emits the complete MsgPack blob that goes inside the NT_AMDGPU_METADATA
+// note. Returns the byte length written. Shape:
+//
+//   { "amdhsa.kernels": [ {...} ],
+//     "amdhsa.target":  "amdgcn-amd-amdhsa--gfx1100",
+//     "amdhsa.version": [1, 2] }
+//
+// The inner kernel map lists the bare minimum fields ROCm's loader
+// inspects for a zero-kernarg / zero-resource kernel. Future
+// milestones (M1b onwards) will extend `.args`.
+
+fn amd_emit_metadata_body(uint64 kname, uint64 kname_len,
+                          uint64 ksym,  uint64 ksym_len,
+                          uint64 kernarg_size, uint64 kernarg_align,
+                          uint64 sgpr_count, uint64 vgpr_count) -> uint64 {
+    uint64 start = amd_len
+
+    // Top-level map with 3 entries.
+    mp_fixmap(3)
+
+    //   "amdhsa.kernels" -> [ {...} ]
+    mp_str_lit("amdhsa.kernels")
+    mp_fixarray(1)
+
+    //     {
+    //       ".args":                       [],         (16 entries total —
+    //                                                   needs map16, not
+    //                                                   fixmap, since
+    //                                                   fixmap caps at 15.)
+    //       ".group_segment_fixed_size":   0,
+    //       ".kernarg_segment_align":      kernarg_align,
+    //       ".kernarg_segment_size":       kernarg_size,
+    //       ".max_flat_workgroup_size":    1024,
+    //       ".name":                       kname,
+    //       ".private_segment_fixed_size": 0,
+    //       ".sgpr_count":                 sgpr_count,
+    //       ".sgpr_spill_count":           0,
+    //       ".symbol":                     ksym,           // "<name>.kd"
+    //       ".uniform_work_group_size":    1,
+    //       ".uses_dynamic_stack":         false,
+    //       ".vgpr_count":                 vgpr_count,
+    //       ".vgpr_spill_count":           0,
+    //       ".wavefront_size":             32,
+    //       ".workgroup_processor_mode":   1,
+    //     }
+    mp_map16(16)
+    mp_str_lit(".args");                       mp_fixarray(0)
+    mp_str_lit(".group_segment_fixed_size");   mp_uint(0)
+    mp_str_lit(".kernarg_segment_align");      mp_uint(kernarg_align)
+    mp_str_lit(".kernarg_segment_size");       mp_uint(kernarg_size)
+    mp_str_lit(".max_flat_workgroup_size");    mp_uint(1024)
+    mp_str_lit(".name");                       mp_str_bytes(kname, kname_len)
+    mp_str_lit(".private_segment_fixed_size"); mp_uint(0)
+    mp_str_lit(".sgpr_count");                 mp_uint(sgpr_count)
+    mp_str_lit(".sgpr_spill_count");           mp_uint(0)
+    mp_str_lit(".symbol");                     mp_str_bytes(ksym, ksym_len)
+    mp_str_lit(".uniform_work_group_size");    mp_uint(1)
+    mp_str_lit(".uses_dynamic_stack");         mp_false()
+    mp_str_lit(".vgpr_count");                 mp_uint(vgpr_count)
+    mp_str_lit(".vgpr_spill_count");           mp_uint(0)
+    mp_str_lit(".wavefront_size");             mp_uint(32)
+    mp_str_lit(".workgroup_processor_mode");   mp_uint(1)
+
+    //   "amdhsa.target" -> "amdgcn-amd-amdhsa--gfx1100"
+    mp_str_lit("amdhsa.target")
+    mp_str_lit("amdgcn-amd-amdhsa--gfx1100")
+
+    //   "amdhsa.version" -> [1, 2]
+    mp_str_lit("amdhsa.version")
+    mp_fixarray(2)
+    mp_uint(1)
+    mp_uint(2)
+
+    return amd_len - start
+}
+
+// ---------------------------------------------------------------------------
+// Kernel descriptor (64 bytes) — lives in .rodata, referenced by the
+// symbol "<kernel>.kd". Layout from AMDGPU ABI v4 (same offsets as v5).
+//
+//   0x00 u32  group_segment_fixed_size
+//   0x04 u32  private_segment_fixed_size
+//   0x08 u32  kernarg_size
+//   0x0C u8[4] reserved
+//   0x10 i64  kernel_code_entry_byte_offset   (from KD start to .text entry)
+//   0x18 u8[20] reserved
+//   0x2C u32  compute_pgm_rsrc3
+//   0x30 u32  compute_pgm_rsrc1
+//   0x34 u32  compute_pgm_rsrc2
+//   0x38 u16  kernel_code_properties
+//   0x3A u8   kernarg_preload_length
+//   0x3B u8   kernarg_preload_offset
+//   0x3C u8[4] reserved
+
+fn amd_emit_kernel_descriptor(uint64 kernarg_size, uint64 entry_offset,
+                              uint64 rsrc1, uint64 rsrc2, uint64 rsrc3,
+                              uint64 properties) {
+    // 0x00
+    amd_u32(0)                        // group_segment_fixed_size
+    amd_u32(0)                        // private_segment_fixed_size
+    amd_u32(kernarg_size)             // kernarg_size
+    amd_u32(0)                        // reserved
+    // 0x10
+    amd_u64(entry_offset)             // signed offset to entry
+    // 0x18
+    amd_u64(0)
+    amd_u64(0)
+    amd_u32(0)                        // reserved block (20 bytes)
+    // 0x2C
+    amd_u32(rsrc3)                    // compute_pgm_rsrc3
+    // 0x30
+    amd_u32(rsrc1)                    // compute_pgm_rsrc1
+    amd_u32(rsrc2)                    // compute_pgm_rsrc2
+    // 0x38
+    amd_u16(properties)
+    amd_byte(0)                       // kernarg_preload_length
+    amd_byte(0)                       // kernarg_preload_offset
+    amd_u32(0)                        // reserved tail
+}
+
+// ---------------------------------------------------------------------------
+// ELF emission
+// ---------------------------------------------------------------------------
+//
+// We lay the file out in a single pass, using fixed offsets that
+// mirror the hipcc-produced code object but trimmed for M1a. All
+// offsets below are PICKED at layout time; there is no back-patch
+// pass. The section / segment sizes follow from string/content
+// lengths we compute up front.
+
+static uint64 AMD_ELF_HEADER_SIZE   = 64
+static uint64 AMD_PHDR_SIZE         = 56
+static uint64 AMD_SHDR_SIZE         = 64
+static uint64 AMD_SYMBOL_SIZE       = 24
+
+// ELF constants
+static uint64 ELF_ET_DYN            = 3
+static uint64 ELF_EM_AMDGPU         = 224
+static uint64 ELF_OSABI_AMDGPU_HSA  = 64
+static uint64 ELF_AMDHSA_ABI_V4     = 4
+static uint64 ELF_EF_AMDGPU_GFX1100 = 0x41
+
+static uint64 ELF_PT_LOAD           = 1
+static uint64 ELF_PT_DYNAMIC        = 2
+static uint64 ELF_PT_NOTE           = 4
+static uint64 ELF_PT_PHDR           = 6
+
+static uint64 ELF_PF_X              = 1
+static uint64 ELF_PF_W              = 2
+static uint64 ELF_PF_R              = 4
+
+static uint64 ELF_SHT_NULL          = 0
+static uint64 ELF_SHT_PROGBITS      = 1
+static uint64 ELF_SHT_SYMTAB        = 2
+static uint64 ELF_SHT_STRTAB        = 3
+static uint64 ELF_SHT_HASH          = 5
+static uint64 ELF_SHT_DYNAMIC       = 6
+static uint64 ELF_SHT_NOTE          = 7
+static uint64 ELF_SHT_DYNSYM        = 11
+
+// .dynamic DT_* tags
+static uint64 DT_NULL               = 0
+static uint64 DT_HASH               = 4
+static uint64 DT_STRTAB             = 5
+static uint64 DT_SYMTAB             = 6
+static uint64 DT_STRSZ              = 10
+static uint64 DT_SYMENT             = 11
+
+static uint64 ELF_SHF_WRITE         = 1
+static uint64 ELF_SHF_ALLOC         = 2
+static uint64 ELF_SHF_EXECINSTR     = 4
+
+// Symbol binding + type packed into st_info
+static uint64 ELF_STB_LOCAL         = 0
+static uint64 ELF_STB_GLOBAL        = 1
+static uint64 ELF_STT_NOTYPE        = 0
+static uint64 ELF_STT_OBJECT        = 1
+static uint64 ELF_STT_FUNC          = 2
+static uint64 ELF_STV_DEFAULT       = 0
+static uint64 ELF_STV_PROTECTED     = 3
+
+fn amd_st_info(uint64 bind, uint64 typ) -> uint64 {
+    return ((bind & 0xF) << 4) | (typ & 0xF)
+}
+
+// Emit the NT_AMDGPU_METADATA note: name="AMDGPU\0\0" (8 bytes) +
+// MsgPack body. Returns total note bytes written.
+fn amd_emit_note_section(uint64 kname, uint64 kname_len,
+                         uint64 ksym,  uint64 ksym_len,
+                         uint64 kernarg_size, uint64 kernarg_align,
+                         uint64 sgpr_count, uint64 vgpr_count) -> uint64 {
+    uint64 start = amd_len
+    // To get exact sizes we emit the MsgPack body first into a side
+    // scratch? Easier: emit placeholder 12-byte header, then body,
+    // then back-patch the note header's "desc_size" field with the
+    // actual body length.
+    uint64 hdr_off = amd_len
+    amd_u32(7)            // n_namesz = strlen("AMDGPU") + 1 = 7
+    amd_u32(0)            // n_descsz — back-patched
+    amd_u32(0x20)         // n_type = NT_AMDGPU_METADATA = 32
+    // name: "AMDGPU\0" padded to 4 bytes → "AMDGPU\0\0"
+    amd_byte(65)  // A
+    amd_byte(77)  // M
+    amd_byte(68)  // D
+    amd_byte(71)  // G
+    amd_byte(80)  // P
+    amd_byte(85)  // U
+    amd_byte(0)
+    amd_byte(0)   // padding to 8-byte name area
+    // Body
+    uint64 body_start = amd_len
+    uint64 body_len = amd_emit_metadata_body(kname, kname_len, ksym, ksym_len,
+                                              kernarg_size, kernarg_align,
+                                              sgpr_count, vgpr_count)
+    // Back-patch n_descsz
+    amd_patch_u32(hdr_off + 4, body_len)
+    // Pad note body to 4-byte alignment
+    amd_align(4)
+    return amd_len - start
+}
+
+// ---------------------------------------------------------------------------
+// Top-level emitter
+// ---------------------------------------------------------------------------
+
+// Emits a complete amdgcn code object into the internal buffer.
+// `kname_ptr`/`kname_len` is the kernel symbol name (e.g. "nop_kernel");
+// the ".kd" variant is synthesised here.
+// `kernel_bytes` is a host pointer to `kernel_size` bytes of raw
+// instruction words for .text. Returns the final file size in bytes;
+// callers retrieve the buffer via amd_buf_ptr() + amd_buf_len().
+@export
+fn emit_amdgpu_code_object(uint64 kname_ptr, uint64 kname_len,
+                            uint64 kernel_bytes, uint64 kernel_size,
+                            uint64 kernarg_size, uint64 kernarg_align,
+                            uint64 sgpr_count, uint64 vgpr_count,
+                            uint64 rsrc1, uint64 rsrc2, uint64 rsrc3,
+                            uint64 properties) -> uint64 {
+    amd_init()
+
+    // Build the kernel-descriptor symbol name: "<kname>.kd".
+    uint8[256] ksym_buf
+    uint64 kbi = 0
+    while kbi < kname_len {
+        uint64 sp = kname_ptr + kbi
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        uint64 dp = ksym_buf + kbi
+        uint8 b8 = b
+        unsafe { *(dp as uint8) = b8 }
+        kbi = kbi + 1
+    }
+    uint64 ksym_end = ksym_buf + kname_len
+    uint8 dot = 46
+    unsafe { *(ksym_end as uint8) = dot }
+    uint64 ksym_end2 = ksym_buf + kname_len + 1
+    uint8 k = 107
+    unsafe { *(ksym_end2 as uint8) = k }
+    uint64 ksym_end3 = ksym_buf + kname_len + 2
+    uint8 d = 100
+    unsafe { *(ksym_end3 as uint8) = d }
+    uint64 ksym_len = kname_len + 3
+
+    // ---- Phase 1: write ELF header + PHDRs with placeholder offsets.
+    // We come back and patch the phdrs once we know each segment's
+    // (offset, filesz, vaddr). There are 3 phdrs: PHDR self-descriptor,
+    // LOAD R (metadata+dynsym+dynstr+rodata), LOAD RX (.text), PT_NOTE.
+
+    uint64 n_phdrs = 5
+
+    // ELF header
+    amd_byte(0x7F); amd_byte(0x45); amd_byte(0x4C); amd_byte(0x46) // \x7fELF
+    amd_byte(2)                       // ELFCLASS64
+    amd_byte(1)                       // ELFDATA2LSB
+    amd_byte(1)                       // EV_CURRENT
+    amd_byte(ELF_OSABI_AMDGPU_HSA)
+    amd_byte(ELF_AMDHSA_ABI_V4)
+    amd_byte(0); amd_byte(0); amd_byte(0); amd_byte(0)
+    amd_byte(0); amd_byte(0); amd_byte(0)
+    amd_u16(ELF_ET_DYN)               // e_type
+    amd_u16(ELF_EM_AMDGPU)            // e_machine
+    amd_u32(1)                        // e_version
+    amd_u64(0)                        // e_entry (unused for code objects)
+    amd_u64(AMD_ELF_HEADER_SIZE)      // e_phoff (right after header)
+    uint64 shoff_patch = amd_len
+    amd_u64(0)                        // e_shoff — patched later
+    amd_u32(ELF_EF_AMDGPU_GFX1100)    // e_flags
+    amd_u16(AMD_ELF_HEADER_SIZE)      // e_ehsize
+    amd_u16(AMD_PHDR_SIZE)            // e_phentsize
+    amd_u16(n_phdrs)                  // e_phnum
+    amd_u16(AMD_SHDR_SIZE)            // e_shentsize
+    uint64 shnum_patch = amd_len
+    amd_u16(0)                        // e_shnum — patched later
+    uint64 shstrndx_patch = amd_len
+    amd_u16(0)                        // e_shstrndx — patched later
+
+    // PHDR placeholders (we'll emit actual phdrs after we compute
+    // the layout). Reserve `n_phdrs * AMD_PHDR_SIZE` zeroed bytes.
+    uint64 phdr_off = amd_len
+    uint64 phdr_area = n_phdrs * AMD_PHDR_SIZE
+    uint64 pi = 0
+    while pi < phdr_area { amd_byte(0); pi = pi + 1 }
+
+    // ---- Phase 2: emit the R-segment payload.
+
+    // Pad to 16 bytes for cleanliness.
+    amd_align(16)
+
+    uint64 r_seg_start = 0                  // R segment starts at file 0 (covers header+phdrs+everything below)
+    uint64 r_vaddr = 0
+
+    // .note — we don't yet know metadata body size, so emit now.
+    uint64 note_off = amd_len
+    uint64 note_size = amd_emit_note_section(kname_ptr, kname_len,
+                                              ksym_buf, ksym_len,
+                                              kernarg_size, kernarg_align,
+                                              sgpr_count, vgpr_count)
+    amd_align(8)
+
+    // .hash — single-bucket SysV hash covering our 3 dynsym entries
+    // (NULL, kernel, kernel.kd). With one bucket every name lookup
+    // walks the chain in insertion order. Layout:
+    //   u32 nbuckets = 1
+    //   u32 nchain   = 3
+    //   u32 buckets[nbuckets]
+    //   u32 chain[nchain]
+    // Chain-walk: start at buckets[0]. Walk chain[sym] until
+    // STN_UNDEF (0). We set buckets[0]=2 so the walk visits sym 2
+    // then follows chain[2]=1 to sym 1, then chain[1]=0 (stop).
+    uint64 hash_off = amd_len
+    amd_u32(1)                  // nbuckets
+    amd_u32(3)                  // nchain
+    amd_u32(2)                  // buckets[0] = start at nop_kernel.kd
+    amd_u32(0)                  // chain[0] — STN_UNDEF entry
+    amd_u32(0)                  // chain[1] — nop_kernel terminates chain
+    amd_u32(1)                  // chain[2] — nop_kernel.kd → next = sym 1
+    uint64 hash_size = amd_len - hash_off
+    amd_align(8)
+
+    // .dynsym — 3 entries: NULL, kernel (FUNC), kernel.kd (OBJECT).
+    //   Elf64_Sym: st_name(u32) st_info(u8) st_other(u8) st_shndx(u16)
+    //              st_value(u64) st_size(u64)
+    // We fill st_value + st_shndx later when .rodata / .text offsets
+    // are known — patch after.
+    uint64 dynsym_off = amd_len
+    // [0] NULL
+    amd_u32(0); amd_byte(0); amd_byte(0); amd_u16(0)
+    amd_u64(0); amd_u64(0)
+    // [1] kernel_name (FUNC, global, in .text)
+    uint64 sym1_off = amd_len
+    amd_u32(1)                         // st_name — first string after the leading NUL
+    amd_byte(amd_st_info(ELF_STB_GLOBAL, ELF_STT_FUNC))
+    amd_byte(ELF_STV_PROTECTED)
+    uint64 sym1_shndx_off = amd_len
+    amd_u16(0)                         // st_shndx — patch to .text index
+    uint64 sym1_value_off = amd_len
+    amd_u64(0)                         // st_value — patch to .text vaddr
+    amd_u64(kernel_size)               // st_size = size of kernel code
+    // [2] kernel_name.kd (OBJECT, global, in .rodata, 64 bytes)
+    uint64 sym2_off = amd_len
+    amd_u32(1 + kname_len + 1)         // st_name — after first name's NUL
+    amd_byte(amd_st_info(ELF_STB_GLOBAL, ELF_STT_OBJECT))
+    amd_byte(ELF_STV_PROTECTED)
+    uint64 sym2_shndx_off = amd_len
+    amd_u16(0)                         // st_shndx — patch to .rodata index
+    uint64 sym2_value_off = amd_len
+    amd_u64(0)                         // st_value — patch to kd vaddr
+    amd_u64(64)                        // st_size = kernel descriptor size
+    uint64 dynsym_size = amd_len - dynsym_off
+
+    // .dynstr: \0 + kname\0 + ksym\0
+    uint64 dynstr_off = amd_len
+    amd_byte(0)
+    amd_bytes(kname_ptr, kname_len); amd_byte(0)
+    amd_bytes(ksym_buf, ksym_len);  amd_byte(0)
+    uint64 dynstr_size = amd_len - dynstr_off
+
+    // .rodata — 64-byte aligned, kernel descriptor.
+    amd_align(64)
+    uint64 rodata_off = amd_len
+    // kernel_code_entry_byte_offset: relative from the KD's start to
+    // the first byte of the kernel's .text. We know KD's virtual
+    // address once we pick it (= rodata_vaddr); we know text_vaddr
+    // below. For now, leave placeholder and back-patch.
+    uint64 entry_off_patch = amd_len + 0x10      // offset of the i64 field
+    amd_emit_kernel_descriptor(kernarg_size, 0, rsrc1, rsrc2, rsrc3, properties)
+    amd_align(8)
+
+    // .dynamic — minimum tags ROCm's loader follows to locate the
+    // symbol table. We don't write a DT_GNU_HASH; DT_HASH alone is
+    // enough for the SysV lookup path.
+    uint64 dynamic_off = amd_len
+    uint64 dyn_count = 6
+    amd_u64(DT_HASH);   amd_u64(hash_off)
+    amd_u64(DT_STRTAB); amd_u64(dynstr_off)
+    amd_u64(DT_SYMTAB); amd_u64(dynsym_off)
+    amd_u64(DT_STRSZ);  amd_u64(dynstr_size)
+    amd_u64(DT_SYMENT); amd_u64(AMD_SYMBOL_SIZE)
+    amd_u64(DT_NULL);   amd_u64(0)
+    uint64 dynamic_size = amd_len - dynamic_off
+
+    // End of R-segment payload.
+    uint64 r_seg_end = amd_len
+
+    // ---- .text must be page-aligned (0x1000) VIRTUALLY. We keep
+    // file_offset ≡ vaddr (mod 0x1000) and give .text its own page.
+    // File: pad to next 0x1000 boundary starting from 0x1000.
+    // hipcc puts .text at file 0x900 / vaddr 0x1900. We'll do the
+    // same modular offset: file 0x?00 / vaddr 0x1?00 where ? is the
+    // same low-nibble. Simplest is file-align to 0x100 once we're
+    // above 0x800, then vaddr = file_off + 0x1000.
+    amd_align(256)
+    uint64 text_file_off = amd_len
+    uint64 text_vaddr = text_file_off + 0x1000
+
+    // Emit kernel bytes.
+    amd_bytes(kernel_bytes, kernel_size)
+    uint64 text_size = kernel_size
+    amd_align(16)   // small tail padding so section ends clean
+
+    // Back-patch KD entry offset: entry_va - kd_va. KD's vaddr =
+    // rodata_off (since R segment vaddr = file offset in that segment).
+    uint64 kd_vaddr = rodata_off
+    uint64 entry_delta = text_vaddr - kd_vaddr
+    uint64 epp0 = amd_buf + entry_off_patch
+    uint8 e0 = entry_delta & 0xFF
+    unsafe { *(epp0 as uint8) = e0 }
+    uint64 ei = 1
+    while ei < 8 {
+        uint64 ep = amd_buf + entry_off_patch + ei
+        uint8 eb = (entry_delta >> (ei * 8)) & 0xFF
+        unsafe { *(ep as uint8) = eb }
+        ei = ei + 1
+    }
+
+    // ---- Phase 2b: emit .symtab + .strtab at the tail of the file.
+    // ROCm's ELF loader walks the section table looking up string
+    // tables for every strtab-linked section; a code object without
+    // a non-dynamic .strtab trips its "null sections(STRTAB)" check
+    // even though runtime symbol resolution only reads .dynsym. Keep
+    // these unallocated (outside any LOAD segment) — they exist
+    // purely for the loader's sanity check.
+    amd_align(8)
+    uint64 strtab_off = amd_len
+    amd_byte(0)
+    uint64 st_name_kernel = amd_len - strtab_off
+    amd_bytes(kname_ptr, kname_len); amd_byte(0)
+    uint64 st_name_kd     = amd_len - strtab_off
+    amd_bytes(ksym_buf, ksym_len); amd_byte(0)
+    uint64 strtab_size = amd_len - strtab_off
+
+    amd_align(8)
+    uint64 symtab_off = amd_len
+    // [0] NULL
+    amd_u32(0); amd_byte(0); amd_byte(0); amd_u16(0)
+    amd_u64(0); amd_u64(0)
+    // [1] kernel (FUNC, global, .text, value=text_vaddr)
+    amd_u32(st_name_kernel)
+    amd_byte(amd_st_info(ELF_STB_GLOBAL, ELF_STT_FUNC))
+    amd_byte(ELF_STV_PROTECTED)
+    amd_u16(6)                       // .text section index
+    amd_u64(text_vaddr)
+    amd_u64(kernel_size)
+    // [2] kernel.kd (OBJECT, global, .rodata)
+    amd_u32(st_name_kd)
+    amd_byte(amd_st_info(ELF_STB_GLOBAL, ELF_STT_OBJECT))
+    amd_byte(ELF_STV_PROTECTED)
+    amd_u16(5)                       // .rodata section index
+    amd_u64(rodata_off)
+    amd_u64(64)
+    uint64 symtab_size = amd_len - symtab_off
+
+    // ---- Phase 3: section headers.
+    // Sections (in this order — index must match):
+    //   0: NULL
+    //   1: .note
+    //   2: .hash
+    //   3: .dynsym
+    //   4: .dynstr
+    //   5: .rodata
+    //   6: .text
+    //   7: .dynamic
+    //   8: .symtab
+    //   9: .strtab
+    //  10: .shstrtab
+
+    // Build .shstrtab contents. We collect names and their offsets as
+    // we write. Each section's sh_name is the offset within .shstrtab.
+    amd_align(8)
+    uint64 shstrtab_off = amd_len
+    amd_byte(0)
+    uint64 sh_name_note     = amd_len - shstrtab_off
+    uint64 s_note   = ".note";    amd_bytes(s_note,   5);  amd_byte(0)
+    uint64 sh_name_hash     = amd_len - shstrtab_off
+    uint64 s_hash   = ".hash";    amd_bytes(s_hash,   5);  amd_byte(0)
+    uint64 sh_name_dynsym   = amd_len - shstrtab_off
+    uint64 s_dynsym = ".dynsym";  amd_bytes(s_dynsym, 7);  amd_byte(0)
+    uint64 sh_name_dynstr   = amd_len - shstrtab_off
+    uint64 s_dynstr = ".dynstr";  amd_bytes(s_dynstr, 7);  amd_byte(0)
+    uint64 sh_name_rodata   = amd_len - shstrtab_off
+    uint64 s_rodata = ".rodata";  amd_bytes(s_rodata, 7);  amd_byte(0)
+    uint64 sh_name_text     = amd_len - shstrtab_off
+    uint64 s_text   = ".text";    amd_bytes(s_text,   5);  amd_byte(0)
+    uint64 sh_name_dynamic  = amd_len - shstrtab_off
+    uint64 s_dyn    = ".dynamic"; amd_bytes(s_dyn,    8);  amd_byte(0)
+    uint64 sh_name_symtab   = amd_len - shstrtab_off
+    uint64 s_symtab = ".symtab"; amd_bytes(s_symtab, 7);  amd_byte(0)
+    uint64 sh_name_strtab   = amd_len - shstrtab_off
+    uint64 s_strtab = ".strtab"; amd_bytes(s_strtab, 7);  amd_byte(0)
+    uint64 sh_name_shstr    = amd_len - shstrtab_off
+    uint64 s_shstr  = ".shstrtab"; amd_bytes(s_shstr, 9);  amd_byte(0)
+    uint64 shstrtab_size = amd_len - shstrtab_off
+
+    // Section header table.
+    amd_align(8)
+    uint64 shoff = amd_len
+    // [0] NULL
+    uint64 si = 0
+    while si < AMD_SHDR_SIZE { amd_byte(0); si = si + 1 }
+    // [1] .note
+    amd_u32(sh_name_note)
+    amd_u32(ELF_SHT_NOTE)
+    amd_u64(ELF_SHF_ALLOC)
+    amd_u64(note_off)
+    amd_u64(note_off)
+    amd_u64(note_size)
+    amd_u32(0); amd_u32(0)
+    amd_u64(4); amd_u64(0)
+    // [2] .hash
+    amd_u32(sh_name_hash)
+    amd_u32(ELF_SHT_HASH)
+    amd_u64(ELF_SHF_ALLOC)
+    amd_u64(hash_off)
+    amd_u64(hash_off)
+    amd_u64(hash_size)
+    amd_u32(3)                      // sh_link = .dynsym (index 3)
+    amd_u32(0)
+    amd_u64(4); amd_u64(4)
+    // [3] .dynsym
+    amd_u32(sh_name_dynsym)
+    amd_u32(ELF_SHT_DYNSYM)
+    amd_u64(ELF_SHF_ALLOC)
+    amd_u64(dynsym_off)
+    amd_u64(dynsym_off)
+    amd_u64(dynsym_size)
+    amd_u32(4)                      // sh_link = .dynstr (index 4)
+    amd_u32(1)                      // sh_info — first non-local sym index
+    amd_u64(8)
+    amd_u64(AMD_SYMBOL_SIZE)
+    // [4] .dynstr
+    amd_u32(sh_name_dynstr)
+    amd_u32(ELF_SHT_STRTAB)
+    amd_u64(ELF_SHF_ALLOC)
+    amd_u64(dynstr_off)
+    amd_u64(dynstr_off)
+    amd_u64(dynstr_size)
+    amd_u32(0); amd_u32(0)
+    amd_u64(1); amd_u64(0)
+    // [5] .rodata
+    amd_u32(sh_name_rodata)
+    amd_u32(ELF_SHT_PROGBITS)
+    amd_u64(ELF_SHF_ALLOC)
+    amd_u64(rodata_off)
+    amd_u64(rodata_off)
+    amd_u64(64)
+    amd_u32(0); amd_u32(0)
+    amd_u64(64); amd_u64(0)
+    // [6] .text
+    amd_u32(sh_name_text)
+    amd_u32(ELF_SHT_PROGBITS)
+    amd_u64(ELF_SHF_ALLOC | ELF_SHF_EXECINSTR)
+    amd_u64(text_vaddr)
+    amd_u64(text_file_off)
+    amd_u64(text_size)
+    amd_u32(0); amd_u32(0)
+    amd_u64(256); amd_u64(0)
+    // [7] .dynamic
+    amd_u32(sh_name_dynamic)
+    amd_u32(ELF_SHT_DYNAMIC)
+    amd_u64(ELF_SHF_ALLOC)
+    amd_u64(dynamic_off)
+    amd_u64(dynamic_off)
+    amd_u64(dynamic_size)
+    amd_u32(4)                      // sh_link = .dynstr
+    amd_u32(0)
+    amd_u64(8); amd_u64(16)
+    // [8] .symtab — non-allocated, keeps the loader's sanity check happy.
+    amd_u32(sh_name_symtab)
+    amd_u32(ELF_SHT_SYMTAB)
+    amd_u64(0)
+    amd_u64(0)
+    amd_u64(symtab_off)
+    amd_u64(symtab_size)
+    amd_u32(9)                      // sh_link = .strtab (index 9)
+    amd_u32(1)                      // sh_info — first non-local
+    amd_u64(8)
+    amd_u64(AMD_SYMBOL_SIZE)
+    // [9] .strtab
+    amd_u32(sh_name_strtab)
+    amd_u32(ELF_SHT_STRTAB)
+    amd_u64(0)
+    amd_u64(0)
+    amd_u64(strtab_off)
+    amd_u64(strtab_size)
+    amd_u32(0); amd_u32(0)
+    amd_u64(1); amd_u64(0)
+    // [10] .shstrtab
+    amd_u32(sh_name_shstr)
+    amd_u32(ELF_SHT_STRTAB)
+    amd_u64(0)
+    amd_u64(0)
+    amd_u64(shstrtab_off)
+    amd_u64(shstrtab_size)
+    amd_u32(0); amd_u32(0)
+    amd_u64(1); amd_u64(0)
+
+    uint64 shnum = 11
+
+    // Patch e_shoff, e_shnum, e_shstrndx.
+    uint64 sp0 = amd_buf + shoff_patch
+    uint64 wi = 0
+    while wi < 8 {
+        uint64 bp = amd_buf + shoff_patch + wi
+        uint8 bb = (shoff >> (wi * 8)) & 0xFF
+        unsafe { *(bp as uint8) = bb }
+        wi = wi + 1
+    }
+    uint64 snp0 = amd_buf + shnum_patch
+    uint8 sn0 = shnum & 0xFF
+    unsafe { *(snp0 as uint8) = sn0 }
+    uint64 snp1 = amd_buf + shnum_patch + 1
+    uint8 sn1 = (shnum >> 8) & 0xFF
+    unsafe { *(snp1 as uint8) = sn1 }
+    uint64 ssp0 = amd_buf + shstrndx_patch
+    uint64 shstrndx = 10
+    uint8 ss0 = shstrndx & 0xFF
+    unsafe { *(ssp0 as uint8) = ss0 }
+    uint64 ssp1 = amd_buf + shstrndx_patch + 1
+    uint8 ss1 = (shstrndx >> 8) & 0xFF
+    unsafe { *(ssp1 as uint8) = ss1 }
+
+    // Patch the .dynsym entries' st_shndx / st_value.
+    // sym1 = kernel function: shndx=6 (.text), value=text_vaddr
+    uint64 p1s = amd_buf + sym1_shndx_off
+    uint8 b1s = 6
+    unsafe { *(p1s as uint8) = b1s }
+    uint64 p1s1 = amd_buf + sym1_shndx_off + 1
+    uint8 b1s1 = 0
+    unsafe { *(p1s1 as uint8) = b1s1 }
+    uint64 v1i = 0
+    while v1i < 8 {
+        uint64 vp = amd_buf + sym1_value_off + v1i
+        uint8 vb = (text_vaddr >> (v1i * 8)) & 0xFF
+        unsafe { *(vp as uint8) = vb }
+        v1i = v1i + 1
+    }
+    // sym2 = kernel.kd object: shndx=5 (.rodata), value=rodata_off (== vaddr)
+    uint64 p2s = amd_buf + sym2_shndx_off
+    uint8 b2s = 5
+    unsafe { *(p2s as uint8) = b2s }
+    uint64 p2s1 = amd_buf + sym2_shndx_off + 1
+    uint8 b2s1 = 0
+    unsafe { *(p2s1 as uint8) = b2s1 }
+    uint64 v2i = 0
+    while v2i < 8 {
+        uint64 vp = amd_buf + sym2_value_off + v2i
+        uint8 vb = (kd_vaddr >> (v2i * 8)) & 0xFF
+        unsafe { *(vp as uint8) = vb }
+        v2i = v2i + 1
+    }
+
+    // ---- Phase 4: emit the real phdrs at the reserved location.
+    // Segment layout:
+    //   PHDR_self : covers the phdrs themselves
+    //   LOAD R    : file 0 -> r_seg_end, vaddr 0
+    //   LOAD RX   : file text_file_off -> text_end, vaddr text_vaddr
+    //   NOTE      : .note area
+
+    uint64 r_filesz  = r_seg_end                // end of R-covered payload
+    uint64 r_memsz   = r_filesz
+    uint64 rx_filesz = (text_file_off + text_size) - text_file_off
+    uint64 rx_memsz  = rx_filesz
+
+    uint64 ph = phdr_off
+    // [0] PHDR
+    amd_patch_u32(ph,      ELF_PT_PHDR)
+    amd_patch_u32(ph +  4, ELF_PF_R)
+    uint64 wj = 0
+    while wj < 8 {
+        uint64 bp = amd_buf + ph + 8 + wj
+        uint8 bb = (AMD_ELF_HEADER_SIZE >> (wj * 8)) & 0xFF
+        unsafe { *(bp as uint8) = bb }
+        wj = wj + 1
+    }
+    // p_vaddr, p_paddr
+    uint64 wk = 0
+    while wk < 8 {
+        uint64 bp1 = amd_buf + ph + 16 + wk
+        uint64 bp2 = amd_buf + ph + 24 + wk
+        uint8 bb = (AMD_ELF_HEADER_SIZE >> (wk * 8)) & 0xFF
+        unsafe { *(bp1 as uint8) = bb }
+        unsafe { *(bp2 as uint8) = bb }
+        wk = wk + 1
+    }
+    // filesz, memsz
+    uint64 wl = 0
+    while wl < 8 {
+        uint64 bp3 = amd_buf + ph + 32 + wl
+        uint64 bp4 = amd_buf + ph + 40 + wl
+        uint8 bb = (phdr_area >> (wl * 8)) & 0xFF
+        unsafe { *(bp3 as uint8) = bb }
+        unsafe { *(bp4 as uint8) = bb }
+        wl = wl + 1
+    }
+    amd_patch_u32(ph + 48, 8)         // align
+
+    // [1] LOAD R
+    uint64 ph1 = phdr_off + AMD_PHDR_SIZE
+    amd_patch_u32(ph1,      ELF_PT_LOAD)
+    amd_patch_u32(ph1 +  4, ELF_PF_R)
+    // offset=0, vaddr=0, paddr=0
+    uint64 wa = 0
+    while wa < 24 {
+        uint64 bp = amd_buf + ph1 + 8 + wa
+        uint8 bb = 0
+        unsafe { *(bp as uint8) = bb }
+        wa = wa + 1
+    }
+    uint64 wb = 0
+    while wb < 8 {
+        uint64 bp3 = amd_buf + ph1 + 32 + wb
+        uint64 bp4 = amd_buf + ph1 + 40 + wb
+        uint8 bb = (r_filesz >> (wb * 8)) & 0xFF
+        unsafe { *(bp3 as uint8) = bb }
+        unsafe { *(bp4 as uint8) = bb }
+        wb = wb + 1
+    }
+    amd_patch_u32(ph1 + 48, 0x1000)
+
+    // [2] LOAD RX
+    uint64 ph2 = phdr_off + 2 * AMD_PHDR_SIZE
+    amd_patch_u32(ph2,      ELF_PT_LOAD)
+    amd_patch_u32(ph2 +  4, ELF_PF_R | ELF_PF_X)
+    uint64 wc = 0
+    while wc < 8 {
+        uint64 bp = amd_buf + ph2 + 8 + wc
+        uint8 bb = (text_file_off >> (wc * 8)) & 0xFF
+        unsafe { *(bp as uint8) = bb }
+        wc = wc + 1
+    }
+    uint64 wd = 0
+    while wd < 8 {
+        uint64 bp1 = amd_buf + ph2 + 16 + wd
+        uint64 bp2 = amd_buf + ph2 + 24 + wd
+        uint8 bb = (text_vaddr >> (wd * 8)) & 0xFF
+        unsafe { *(bp1 as uint8) = bb }
+        unsafe { *(bp2 as uint8) = bb }
+        wd = wd + 1
+    }
+    uint64 we = 0
+    while we < 8 {
+        uint64 bp3 = amd_buf + ph2 + 32 + we
+        uint64 bp4 = amd_buf + ph2 + 40 + we
+        uint8 bb = (rx_filesz >> (we * 8)) & 0xFF
+        unsafe { *(bp3 as uint8) = bb }
+        unsafe { *(bp4 as uint8) = bb }
+        we = we + 1
+    }
+    amd_patch_u32(ph2 + 48, 0x1000)
+
+    // [3] NOTE
+    uint64 ph3 = phdr_off + 3 * AMD_PHDR_SIZE
+    amd_patch_u32(ph3,      ELF_PT_NOTE)
+    amd_patch_u32(ph3 +  4, ELF_PF_R)
+    uint64 wf = 0
+    while wf < 8 {
+        uint64 bp1 = amd_buf + ph3 + 8  + wf     // offset
+        uint64 bp2 = amd_buf + ph3 + 16 + wf     // vaddr
+        uint64 bp3 = amd_buf + ph3 + 24 + wf     // paddr
+        uint8 bb = (note_off >> (wf * 8)) & 0xFF
+        unsafe { *(bp1 as uint8) = bb }
+        unsafe { *(bp2 as uint8) = bb }
+        unsafe { *(bp3 as uint8) = bb }
+        wf = wf + 1
+    }
+    uint64 wg = 0
+    while wg < 8 {
+        uint64 bp1 = amd_buf + ph3 + 32 + wg
+        uint64 bp2 = amd_buf + ph3 + 40 + wg
+        uint8 bb = (note_size >> (wg * 8)) & 0xFF
+        unsafe { *(bp1 as uint8) = bb }
+        unsafe { *(bp2 as uint8) = bb }
+        wg = wg + 1
+    }
+    amd_patch_u32(ph3 + 48, 4)
+
+    // [4] PT_DYNAMIC — points at .dynamic so loaders pick up the
+    // DT_HASH/DT_SYMTAB/DT_STRTAB tags. Addr space is same as the R
+    // segment (vaddr == file offset).
+    uint64 ph4 = phdr_off + 4 * AMD_PHDR_SIZE
+    amd_patch_u32(ph4,      ELF_PT_DYNAMIC)
+    amd_patch_u32(ph4 +  4, ELF_PF_R)
+    uint64 wm = 0
+    while wm < 8 {
+        uint64 bp1 = amd_buf + ph4 + 8  + wm
+        uint64 bp2 = amd_buf + ph4 + 16 + wm
+        uint64 bp3 = amd_buf + ph4 + 24 + wm
+        uint8 bb = (dynamic_off >> (wm * 8)) & 0xFF
+        unsafe { *(bp1 as uint8) = bb }
+        unsafe { *(bp2 as uint8) = bb }
+        unsafe { *(bp3 as uint8) = bb }
+        wm = wm + 1
+    }
+    uint64 wn = 0
+    while wn < 8 {
+        uint64 bp1 = amd_buf + ph4 + 32 + wn
+        uint64 bp2 = amd_buf + ph4 + 40 + wn
+        uint8 bb = (dynamic_size >> (wn * 8)) & 0xFF
+        unsafe { *(bp1 as uint8) = bb }
+        unsafe { *(bp2 as uint8) = bb }
+        wn = wn + 1
+    }
+    amd_patch_u32(ph4 + 48, 8)
+
+    return amd_len
+}
+
+// ---------------------------------------------------------------------------
+// High-level driver: emit a no-op kernel code object (M1a).
+//
+// One kernel named "nop_kernel" whose body is a single s_endpgm
+// (0xBF810000 in little-endian: 00 00 81 BF). Used to verify the
+// code-object format is accepted by hipModuleLoadData before any
+// instruction encoder lands in Stage 1 proper.
+
+@export
+fn emit_amdgpu_nop_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "nop_kernel"
+    uint64 klen  = 10
+
+    // s_endpgm — SOPP encoding bf810000, little-endian.
+    uint8[4] kcode
+    uint64 kp0 = kcode + 0; uint8 b0 = 0x00; unsafe { *(kp0 as uint8) = b0 }
+    uint64 kp1 = kcode + 1; uint8 b1 = 0x00; unsafe { *(kp1 as uint8) = b1 }
+    uint64 kp2 = kcode + 2; uint8 b2 = 0x81; unsafe { *(kp2 as uint8) = b2 }
+    uint64 kp3 = kcode + 3; uint8 b3 = 0xBF; unsafe { *(kp3 as uint8) = b3 }
+
+    // Resource values: copied verbatim from hipcc's decay_step
+    // reference object. They encode a wavefront-size-32 kernel with
+    // sensible float modes. We don't need any of this to be tight
+    // for s_endpgm, and overreporting resources is harmless.
+    uint64 rsrc1 = 0xE0AF0000
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000020
+    uint64 props = 0x0408          // KERNARG_SEGMENT_PTR | WAVEFRONT_SIZE32
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           kcode, 4,
+                                           0,       // kernarg_size
+                                           8,       // kernarg_align
+                                           0,       // sgpr_count
+                                           0,       // vgpr_count
+                                           rsrc1, rsrc2, rsrc3, props)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_nop_blob: cannot open output\n", 41)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}

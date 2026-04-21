@@ -4473,6 +4473,25 @@ fn main() {
                 emit_mode = 3
             } else if str_starts_with(arg, "--targets=", 10) != 0 {
                 parse_targets_arg(arg + 10)
+            } else if str_starts_with(arg, "--emit-amdgpu-nop=", 18) != 0 {
+                // Stage-1 M1a smoke: write a hand-crafted gfx1100 code
+                // object with a single no-op kernel ("nop_kernel")
+                // straight to <path>. Bypasses the normal compile
+                // pipeline — this flag exists only to confirm the
+                // ELF/metadata layout round-trips through
+                // hipModuleLoadData before any instruction encoder
+                // is wired in. See docs/GPU_ZERO_DEPENDENCY.md.
+                uint64 nop_path = arg + 18
+                uint64 nop_rc = emit_amdgpu_nop_blob(nop_path)
+                if nop_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-nop failed\n", 31)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 npl = str_len(nop_path)
+                write(1, nop_path, npl)
+                write(1, " (amdgpu nop kernel code object)\n", 33)
+                exit(0)
             } else if str_starts_with(arg, "--target=", 9) != 0 {
                 uint64 tgt_str = arg + 9
                 if str_starts_with(tgt_str, "hip-amd", 7) != 0 {
