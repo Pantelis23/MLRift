@@ -455,6 +455,160 @@ fn amd_emit_note_section(uint64 kname, uint64 kname_len,
 }
 
 // ---------------------------------------------------------------------------
+// gfx1100 instruction encoder (M1c subset)
+//
+// We only encode what write_sentinel needs: SOPP (s_endpgm,
+// s_waitcnt), SMEM (s_load_b64), a single VOPD shape
+// (v_dual_mov_b32 + v_dual_mov_b32 with a 32-bit literal), and
+// one FLAT/GLOBAL form (global_store_b32 with SADDR). Enough to
+// take the kernel from hand-pasted bytes to structured calls;
+// broader coverage grows as Stage 1 proper lands.
+//
+// All encoders write 32-bit words little-endian into a dedicated
+// kernel-text buffer (`asm_text_buf`) so the caller can pass the
+// full text to emit_amdgpu_code_object without tangling it with
+// the surrounding ELF layout.
+// ---------------------------------------------------------------------------
+
+static uint64 asm_text_buf = 0
+static uint64 asm_text_len = 0
+static uint64 asm_text_cap = 0
+
+fn asm_init() {
+    if asm_text_buf == 0 {
+        asm_text_cap = 4096
+        asm_text_buf = alloc(asm_text_cap)
+    }
+    asm_text_len = 0
+}
+
+fn asm_byte(uint64 v) {
+    if asm_text_len >= asm_text_cap {
+        write(2, "format_amdgpu: asm text overflow\n", 33)
+        exit(1)
+    }
+    uint64 p = asm_text_buf + asm_text_len
+    uint8 b = v & 0xFF
+    unsafe { *(p as uint8) = b }
+    asm_text_len = asm_text_len + 1
+}
+
+fn asm_u32(uint64 word) {
+    asm_byte(word & 0xFF)
+    asm_byte((word >> 8)  & 0xFF)
+    asm_byte((word >> 16) & 0xFF)
+    asm_byte((word >> 24) & 0xFF)
+}
+
+// ── SOPP format (single 32-bit word) ────────────────────────────────
+// [31:23] = 0x17F   (SOPP prefix on gfx11)
+// [22:16] = 7-bit opcode
+// [15:0]  = simm16
+//
+// SOPP opcodes we care about:
+//   0x30  s_endpgm
+//   0x09  s_waitcnt
+static uint64 GFX11_SOPP_PREFIX = 0x17F
+
+fn asm_sopp(uint64 op, uint64 simm16) {
+    uint64 word = (GFX11_SOPP_PREFIX << 23)
+                  | ((op & 0x7F) << 16)
+                  | (simm16 & 0xFFFF)
+    asm_u32(word)
+}
+
+fn asm_s_endpgm() { asm_sopp(0x30, 0) }
+
+// s_waitcnt lgkmcnt(0) — wait for scalar/LDS memory, ignore vmcnt.
+// simm16 encoding for gfx11 combined waitcnt:
+//   [3:0]    vmcnt[3:0]
+//   [7]      expcnt
+//   [11:8]   lgkmcnt
+//   [14:12]  vmcnt[6:4]
+//   [15]     reserved (set by clang)
+// The composed "lgkmcnt=0, others max" value is 0xFC07; clang emits
+// exactly this ahead of reads from SMEM-loaded SGPRs.
+fn asm_s_waitcnt_lgkmcnt_zero() { asm_sopp(0x09, 0xFC07) }
+
+// ── SMEM format (64-bit instruction) ───────────────────────────────
+// Word 1 (gfx11):
+//   [31:26] = 0x3D   (SMEM prefix)
+//   [25:18] = 8-bit opcode
+//   [17]     reserved
+//   [14]     DLC
+//   [13]     GLC
+//   [12:7]   sdata (6-bit) — SGPR index for load dst / store src
+//   [6:0]    sbase_pair (7-bit) — SGPR-pair index (the even sgpr's
+//             index; gfx11 pairs align to even SGPR so the encoding
+//             is literally the SGPR number, not halved).
+// Word 2 (offset):
+//   [31:25]  soffset (7-bit SGPR index; 0x7D = SGPR_NULL)
+//   [24:0]   25-bit signed immediate offset
+//
+// For "s[sdata:sdata+1], s[sbase:sbase+1], null" with zero offset:
+//   clang emits 0xF8000000 as the offset word. That's soffset bits
+//   [31:25] = 0x7C — the gfx11 "no SGPR offset" sentinel, not the
+//   SGPR_NULL (0x7D) reg index. Leave as opaque for now; exposing
+//   it properly comes when we grow the encoder.
+static uint64 GFX11_SMEM_PREFIX = 0x3D
+
+// s_load_b64 s[sdata:sdata+1], s[sbase:sbase+1], null  (op 0x01)
+fn asm_s_load_b64(uint64 sdata, uint64 sbase_pair) {
+    uint64 word1 = (GFX11_SMEM_PREFIX << 26)
+                   | (0x01 << 18)
+                   | ((sdata & 0x3F) << 7)
+                   | (sbase_pair & 0x7F)
+    asm_u32(word1)
+    asm_u32(0xF8000000)
+}
+
+// ── VOPD: dual-issue VOP1/VOP2 pair in one 64-bit instruction (gfx11+).
+// Full encoding is intricate; we only need the specific form
+//   v_dual_mov_b32 v0, 0 :: v_dual_mov_b32 v1, <literal32>
+// which clang emits for the sentinel kernel. Words are:
+//   0xCA100080   — VOPD + op pair (mov, mov), v_dst_x=v0, v_dst_y=v1,
+//                  src_x=inline-zero, src_y=VGPR encoding 0xFF (literal)
+//   0x000000FF   — per-slot operand word; 0xFF in the slot-y source
+//                  means "literal follows"
+//   <literal32>  — the 32-bit immediate for dst_y
+fn asm_v_dual_mov_b32_mov_b32_lit(uint64 vdst_x, uint64 vdst_y, uint64 lit32) {
+    // Reference encoding depends on vdst_x=0, vdst_y=1; if the
+    // caller uses other dsts we'd need to splice them into word 1's
+    // [14:9] / [23:17] fields. Today the one caller passes (0,1).
+    if vdst_x != 0 {
+        write(2, "format_amdgpu: asm_v_dual_mov_b32 only supports vdst_x=0\n", 57)
+        exit(1)
+    }
+    if vdst_y != 1 {
+        write(2, "format_amdgpu: asm_v_dual_mov_b32 only supports vdst_y=1\n", 57)
+        exit(1)
+    }
+    asm_u32(0xCA100080)
+    asm_u32(0x000000FF)
+    asm_u32(lit32)
+}
+
+// ── FLAT/GLOBAL (gfx11) — 64-bit instruction.
+// Word 1: opcode + flags. For global_store_b32 with SADDR variant
+// clang emits 0xDC6A0000 (opcode field encodes the SEG=global + the
+// specific b32-store op).
+// Word 2 fields:
+//   [31:24] = reserved / scratch_offset (we hold at 0)
+//   [23:16] = saddr (SGPR pair index for the base pointer)
+//   [15:8]  = vdata (VGPR holding the value to store)
+//   [7:0]   = vaddr (VGPR holding byte offset from saddr)
+//
+// For v0/v1/s[0:1] the reference is 0x00000100 — saddr=0, vdata=1,
+// vaddr=0.
+fn asm_global_store_b32(uint64 v_addr, uint64 v_data, uint64 saddr_pair) {
+    asm_u32(0xDC6A0000)
+    uint64 word2 = ((saddr_pair & 0x7F) << 16)
+                   | ((v_data     & 0xFF) << 8)
+                   | (v_addr      & 0xFF)
+    asm_u32(word2)
+}
+
+// ---------------------------------------------------------------------------
 // Top-level emitter
 // ---------------------------------------------------------------------------
 
@@ -1141,57 +1295,25 @@ fn emit_amdgpu_sentinel_blob(uint64 out_path) -> uint64 {
     uint64 kname = "write_sentinel"
     uint64 klen  = 14
 
-    uint8[36] kcode
-    // LE byte stream (first bug in M1b was writing word bytes in
-    // objdump-print order rather than LE — it loads fine but the
-    // kernel faults because the opcodes are scrambled). Confirmed
-    // by comparing against hipcc's .text at the same offsets.
-    uint64 b0  = 0x00; uint64 b1  = 0x00; uint64 b2  = 0x04; uint64 b3  = 0xF4
-    uint64 b4  = 0x00; uint64 b5  = 0x00; uint64 b6  = 0x00; uint64 b7  = 0xF8
-    uint64 b8  = 0x80; uint64 b9  = 0x00; uint64 b10 = 0x10; uint64 b11 = 0xCA
-    uint64 b12 = 0xFF; uint64 b13 = 0x00; uint64 b14 = 0x00; uint64 b15 = 0x00
-    uint64 b16 = 0xEF; uint64 b17 = 0xBE; uint64 b18 = 0xAD; uint64 b19 = 0xDE
-    uint64 b20 = 0x07; uint64 b21 = 0xFC; uint64 b22 = 0x89; uint64 b23 = 0xBF
-    uint64 b24 = 0x00; uint64 b25 = 0x00; uint64 b26 = 0x6A; uint64 b27 = 0xDC
-    uint64 b28 = 0x00; uint64 b29 = 0x01; uint64 b30 = 0x00; uint64 b31 = 0x00
-    uint64 b32 = 0x00; uint64 b33 = 0x00; uint64 b34 = 0xB0; uint64 b35 = 0xBF
-    uint64 pp = kcode
-    uint8 w0  = b0;  unsafe { *(pp as uint8) = w0  };  pp = pp + 1
-    uint8 w1  = b1;  unsafe { *(pp as uint8) = w1  };  pp = pp + 1
-    uint8 w2  = b2;  unsafe { *(pp as uint8) = w2  };  pp = pp + 1
-    uint8 w3  = b3;  unsafe { *(pp as uint8) = w3  };  pp = pp + 1
-    uint8 w4  = b4;  unsafe { *(pp as uint8) = w4  };  pp = pp + 1
-    uint8 w5  = b5;  unsafe { *(pp as uint8) = w5  };  pp = pp + 1
-    uint8 w6  = b6;  unsafe { *(pp as uint8) = w6  };  pp = pp + 1
-    uint8 w7  = b7;  unsafe { *(pp as uint8) = w7  };  pp = pp + 1
-    uint8 w8  = b8;  unsafe { *(pp as uint8) = w8  };  pp = pp + 1
-    uint8 w9  = b9;  unsafe { *(pp as uint8) = w9  };  pp = pp + 1
-    uint8 w10 = b10; unsafe { *(pp as uint8) = w10 };  pp = pp + 1
-    uint8 w11 = b11; unsafe { *(pp as uint8) = w11 };  pp = pp + 1
-    uint8 w12 = b12; unsafe { *(pp as uint8) = w12 };  pp = pp + 1
-    uint8 w13 = b13; unsafe { *(pp as uint8) = w13 };  pp = pp + 1
-    uint8 w14 = b14; unsafe { *(pp as uint8) = w14 };  pp = pp + 1
-    uint8 w15 = b15; unsafe { *(pp as uint8) = w15 };  pp = pp + 1
-    uint8 w16 = b16; unsafe { *(pp as uint8) = w16 };  pp = pp + 1
-    uint8 w17 = b17; unsafe { *(pp as uint8) = w17 };  pp = pp + 1
-    uint8 w18 = b18; unsafe { *(pp as uint8) = w18 };  pp = pp + 1
-    uint8 w19 = b19; unsafe { *(pp as uint8) = w19 };  pp = pp + 1
-    uint8 w20 = b20; unsafe { *(pp as uint8) = w20 };  pp = pp + 1
-    uint8 w21 = b21; unsafe { *(pp as uint8) = w21 };  pp = pp + 1
-    uint8 w22 = b22; unsafe { *(pp as uint8) = w22 };  pp = pp + 1
-    uint8 w23 = b23; unsafe { *(pp as uint8) = w23 };  pp = pp + 1
-    uint8 w24 = b24; unsafe { *(pp as uint8) = w24 };  pp = pp + 1
-    uint8 w25 = b25; unsafe { *(pp as uint8) = w25 };  pp = pp + 1
-    uint8 w26 = b26; unsafe { *(pp as uint8) = w26 };  pp = pp + 1
-    uint8 w27 = b27; unsafe { *(pp as uint8) = w27 };  pp = pp + 1
-    uint8 w28 = b28; unsafe { *(pp as uint8) = w28 };  pp = pp + 1
-    uint8 w29 = b29; unsafe { *(pp as uint8) = w29 };  pp = pp + 1
-    uint8 w30 = b30; unsafe { *(pp as uint8) = w30 };  pp = pp + 1
-    uint8 w31 = b31; unsafe { *(pp as uint8) = w31 };  pp = pp + 1
-    uint8 w32 = b32; unsafe { *(pp as uint8) = w32 };  pp = pp + 1
-    uint8 w33 = b33; unsafe { *(pp as uint8) = w33 };  pp = pp + 1
-    uint8 w34 = b34; unsafe { *(pp as uint8) = w34 };  pp = pp + 1
-    uint8 w35 = b35; unsafe { *(pp as uint8) = w35 };  pp = pp + 1
+    // Build the kernel body through the structured encoders. After
+    // M1c this replaces M1b's 36-byte hand-pasted blob; callers
+    // elsewhere can now generate kernels opcode-by-opcode rather
+    // than copy-pasting clang output.
+    //
+    // Source-level semantics: out[0] = 0xDEADBEEF.
+    //
+    //   s_load_b64  s[0:1], s[0:1], null         ; kernarg -> device ptr
+    //   v_dual_mov_b32 v0, 0                     ; byte offset
+    //       :: v_dual_mov_b32 v1, 0xdeadbeef     ; store value
+    //   s_waitcnt   lgkmcnt(0)
+    //   global_store_b32  v0, v1, s[0:1]
+    //   s_endpgm
+    asm_init()
+    asm_s_load_b64(0, 0)                              // s[0:1] <- [s[0:1]]
+    asm_v_dual_mov_b32_mov_b32_lit(0, 1, 0xDEADBEEF)  // v0 = 0, v1 = sentinel
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_global_store_b32(0, 1, 0)                     // *s[0:1] = v1
+    asm_s_endpgm()
 
     // Resource values from clang's gfx1100 -O3 output for this kernel.
     // rsrc3 = 0x10 (differs from M1a's 0x20 — hipcc's decay uses 0x20
@@ -1203,7 +1325,7 @@ fn emit_amdgpu_sentinel_blob(uint64 out_path) -> uint64 {
     uint64 props = 0x0408    // KERNARG_SEGMENT_PTR | WAVEFRONT_SIZE32
 
     uint64 size = emit_amdgpu_code_object(kname, klen,
-                                           kcode, 36,
+                                           asm_text_buf, asm_text_len,
                                            8,       // kernarg_size (one 8-byte ptr)
                                            8,       // kernarg_align
                                            2,       // sgpr_count
