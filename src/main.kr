@@ -4473,6 +4473,25 @@ fn main() {
                 emit_mode = 3
             } else if str_starts_with(arg, "--targets=", 10) != 0 {
                 parse_targets_arg(arg + 10)
+            } else if str_starts_with(arg, "--emit-amdgpu-sentinel=", 23) != 0 {
+                // Stage-1 M1b: emit a single-kernel blob named
+                // `write_sentinel` that writes 0xDEADBEEF to *out,
+                // with one 64-bit pointer kernarg. The body is the
+                // LLVM-compiled gfx1100 encoding of the corresponding
+                // HIP kernel — this milestone validates the kernarg-
+                // passing metadata + ELF wrapper, not the instruction
+                // encoder (that lands later in Stage 1).
+                uint64 sent_path = arg + 23
+                uint64 sent_rc = emit_amdgpu_sentinel_blob(sent_path)
+                if sent_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-sentinel failed\n", 36)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 spl = str_len(sent_path)
+                write(1, sent_path, spl)
+                write(1, " (amdgpu sentinel kernel code object)\n", 38)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-nop=", 18) != 0 {
                 // Stage-1 M1a smoke: write a hand-crafted gfx1100 code
                 // object with a single no-op kernel ("nop_kernel")
