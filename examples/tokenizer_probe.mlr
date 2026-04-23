@@ -1,0 +1,48 @@
+import "../std/tokenizer.kr"
+import "../std/io.kr"
+import "../std/fmt.kr"
+
+fn print_id(u64 v) { u64 s = fmt_dec(v); print_str(s) }
+
+fn main() {
+    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/tokenizer.json"
+    print("[tokenizer_probe] loading...\n")
+    Tokenizer tk = tokenizer_load(path)
+    if tk.file_size == 0 {
+        print("[tokenizer_probe] load failed\n")
+        exit(1)
+    }
+
+    print("vocab_count    = "); print_id(tk.vocab_count); print("\n")
+    print("max_tok_len    = "); print_id(tk.max_tok_len); print("\n")
+    print("bos_id         = "); print_id(tk.bos_id); print("\n")
+    print("eos_id         = "); print_id(tk.eos_id); print("\n")
+    print("pad_id         = "); print_id(tk.pad_id); print("\n")
+    print("unk_id         = "); print_id(tk.unk_id); print("\n")
+    print("byte_fallback0 = "); print_id(tk.byte_fallback_base); print("\n")
+
+    print("\nFirst 10 ids:\n")
+    uint64[1] optr_slot
+    uint64[1] olen_slot
+    u64 optr_p = optr_slot
+    u64 olen_p = olen_slot
+    u64 i = 0
+    while i < 10 {
+        tokenizer_lookup(tk, i, optr_p, olen_p)
+        u64 optr = 0
+        u64 olen = 0
+        unsafe { *(optr_p as u64) -> optr }
+        unsafe { *(olen_p as u64) -> olen }
+        print("  id="); print_id(i); print(" len="); print_id(olen); print(" '")
+        write(1, optr, olen)
+        print("'\n")
+        i = i + 1
+    }
+
+    u64 fb_id = tokenizer_id_of(tk, "<0x41>", 6)
+    print("\nid_of(\"<0x41>\") = "); print_id(fb_id); print(" (expect 303)\n")
+
+    tokenizer_free(tk)
+    print("[tokenizer_probe] done\n")
+    exit(0)
+}
