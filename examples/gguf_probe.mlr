@@ -1,0 +1,135 @@
+// gguf_probe — dump the container structure of a GGUF file to verify the
+// Phase A parser against llama.cpp's `gguf-dump`.
+
+import "../std/gguf.kr"
+import "../std/io.kr"
+import "../std/fmt.kr"
+import "../std/string.kr"
+import "../std/math_float.kr"
+
+fn print_u(u64 v) { u64 s = fmt_dec(v); print_str(s) }
+
+fn print_bytes(u64 p, u64 l) {
+    write(1, p, l)
+}
+
+fn main() {
+    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3.5-9B-Q8_0.gguf"
+    print("[gguf_probe] loading ")
+    println_str(path)
+
+    GGUFFile gf = gguf_open(path)
+    if gf.file_size == 0 {
+        print("[gguf_probe] open failed\n")
+        exit(1)
+    }
+
+    print("version         = "); print_u(gf.version); print("\n")
+    print("tensor_count    = "); print_u(gf.tensor_count); print("\n")
+    print("metadata_count  = "); print_u(gf.metadata_count); print("\n")
+    print("alignment       = "); print_u(gguf_align_bytes); print("\n")
+    print("data_start      = "); print_u(gf.data_start); print("\n")
+    print("file_size       = "); print_u(gf.file_size); print("\n")
+
+    print("\nFirst 15 metadata keys:\n")
+    u64 i = 0
+    while i < 15 {
+        if i >= gf.metadata_count { i = 15; continue }
+        u64 kp = 0
+        unsafe { *((gf.key_ptrs + i * 8) as u64) -> kp }
+        u64 kl = 0
+        unsafe { *((gf.key_lens + i * 8) as u64) -> kl }
+        u64 vt = 0
+        unsafe { *((gf.value_types + i * 8) as u64) -> vt }
+        print("  ["); print_u(i); print("] type="); print_u(vt); print(" key='")
+        print_bytes(kp, kl)
+        print("'\n")
+        i = i + 1
+    }
+
+    // Pull a handful of well-known scalar metadata entries.
+    uint64[1] sp_slot
+    uint64[1] sl_slot
+    u64 sp = sp_slot
+    u64 sl = sl_slot
+    gguf_meta_string(gf, "general.architecture", sp, sl)
+    u64 arch_p = 0; unsafe { *(sp as u64) -> arch_p }
+    u64 arch_l = 0; unsafe { *(sl as u64) -> arch_l }
+    print("\ngeneral.architecture = '")
+    if arch_l != 0 { print_bytes(arch_p, arch_l) }
+    print("'\n")
+
+    gguf_meta_string(gf, "general.name", sp, sl)
+    u64 name_p = 0; unsafe { *(sp as u64) -> name_p }
+    u64 name_l = 0; unsafe { *(sl as u64) -> name_l }
+    print("general.name         = '")
+    if name_l != 0 { print_bytes(name_p, name_l) }
+    print("'\n")
+
+    // Qwen35-style scalars.
+    u64 ctx_len = gguf_meta_u32(gf, "qwen35.context_length", 0)
+    u64 emb_len = gguf_meta_u32(gf, "qwen35.embedding_length", 0)
+    u64 block_n = gguf_meta_u32(gf, "qwen35.block_count", 0)
+    u64 head_n  = gguf_meta_u32(gf, "qwen35.attention.head_count", 0)
+    u64 head_kv = gguf_meta_u32(gf, "qwen35.attention.head_count_kv", 0)
+    print("qwen35.context_length        = "); print_u(ctx_len); print("\n")
+    print("qwen35.embedding_length      = "); print_u(emb_len); print("\n")
+    print("qwen35.block_count           = "); print_u(block_n); print("\n")
+    print("qwen35.attention.head_count  = "); print_u(head_n); print("\n")
+    print("qwen35.attention.head_count_kv = "); print_u(head_kv); print("\n")
+
+    print("\nFirst 5 tensors:\n")
+    u64 ti = 0
+    while ti < 5 {
+        if ti >= gf.tensor_count { ti = 5; continue }
+        uint64[1] np_slot
+        uint64[1] nl_slot
+        u64 nnp = np_slot
+        u64 nnl = nl_slot
+        gguf_tensor_name(gf, ti, nnp, nnl)
+        u64 tname_p = 0; unsafe { *(nnp as u64) -> tname_p }
+        u64 tname_l = 0; unsafe { *(nnl as u64) -> tname_l }
+        u64 nd = 0
+        unsafe { *((gf.tensor_ndims + ti * 4) as uint32) -> nd }
+        u64 tt = 0
+        unsafe { *((gf.tensor_types + ti * 4) as uint32) -> tt }
+        u64 toff = 0
+        unsafe { *((gf.tensor_offsets + ti * 8) as u64) -> toff }
+        print("  [" ); print_u(ti); print("] type="); print_u(tt)
+        print(" ndims="); print_u(nd); print(" off="); print_u(toff)
+        print(" name='")
+        print_bytes(tname_p, tname_l)
+        print("'\n")
+        ti = ti + 1
+    }
+
+    // Look up the token-embedding tensor by name and print its shape + size.
+    print("\ngguf_get(\"token_embd.weight\"):\n")
+    GGUFTensor t = gguf_get(gf, "token_embd.weight")
+    if t.ptr == 0 {
+        print("  not found\n")
+    } else {
+        print("  type="); print_u(t.gtype); print(" n_dims="); print_u(t.n_dims)
+        print(" shape=["); print_u(t.dim0); print(","); print_u(t.dim1); print("]")
+        print(" elements="); print_u(t.n_elements); print(" bytes="); print_u(t.size_bytes); print("\n")
+    }
+
+    // Dequant the first 32 values (one Q8_0 block) to verify Phase B.
+    print("\nFirst 32 dequantised values of token_embd.weight (Q8_0):\n  ")
+    u64 buf = alloc(32 * 4)
+    gguf_deq_q8_0(buf, t.ptr, 32)
+    u64 di = 0
+    while di < 32 {
+        if di != 0 { print(" ") }
+        f32 fv = 0.0f
+        unsafe { *((buf + di * 4) as f32) -> fv }
+        u64 fs = fmt_f32(fv, 6)
+        print_str(fs)
+        di = di + 1
+    }
+    print("\n")
+    dealloc(buf)
+
+    gguf_free(gf)
+    exit(0)
+}

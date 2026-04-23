@@ -1,0 +1,608 @@
+// MLRift Standard Library — GGUF (llama.cpp) parser
+//
+// Reads the GGUF container format: header, typed metadata KV pairs, tensor
+// descriptors, alignment padding, raw tensor data. The tensor-data region
+// stays mmap'd — callers get a pointer + length + quant type per tensor
+// and dequantize on demand through separate helpers (not in this file).
+//
+// GGUF version 3 layout:
+//   [4]   magic "GGUF"
+//   [4]   version (u32)
+//   [8]   tensor_count (u64)
+//   [8]   metadata_kv_count (u64)
+//   [...] metadata KV pairs:
+//           key:    [u64 len][bytes]
+//           type:   u32 (see GGUF_TYPE_* below)
+//           value:  per-type payload
+//   [...] tensor descriptors:
+//           name:   [u64 len][bytes]
+//           n_dims: u32 (1..4)
+//           dims:   n_dims × u64
+//           type:   u32 (ggml_type — see GGML_TYPE_* below)
+//           offset: u64, relative to data section
+//   [...] alignment padding to `general.alignment` (default 32)
+//   [...] tensor data blob
+//
+// This file handles Phase A (container) only. Dequantization (F32, F16,
+// BF16, Q8_0, Q4_K, Q6_K) lives in the same std/gguf.kr section below
+// but is exposed through separate entry points.
+
+import "io.kr"
+import "string.kr"
+import "fmt.kr"
+
+// ---------------------------------------------------------------------------
+// GGUF metadata value types
+// ---------------------------------------------------------------------------
+static u64 GGUF_TYPE_UINT8   = 0
+static u64 GGUF_TYPE_INT8    = 1
+static u64 GGUF_TYPE_UINT16  = 2
+static u64 GGUF_TYPE_INT16   = 3
+static u64 GGUF_TYPE_UINT32  = 4
+static u64 GGUF_TYPE_INT32   = 5
+static u64 GGUF_TYPE_FLOAT32 = 6
+static u64 GGUF_TYPE_BOOL    = 7
+static u64 GGUF_TYPE_STRING  = 8
+static u64 GGUF_TYPE_ARRAY   = 9
+static u64 GGUF_TYPE_UINT64  = 10
+static u64 GGUF_TYPE_INT64   = 11
+static u64 GGUF_TYPE_FLOAT64 = 12
+
+// ---------------------------------------------------------------------------
+// ggml_type — tensor quantisation type codes
+// Only the ones we plan to handle through this file's dequant helpers.
+// Callers can still *identify* other types via gguf_tensor_type() and skip
+// them when a model ships in a format we don't support yet.
+// ---------------------------------------------------------------------------
+static u64 GGML_TYPE_F32   = 0
+static u64 GGML_TYPE_F16   = 1
+static u64 GGML_TYPE_Q4_0  = 2
+static u64 GGML_TYPE_Q4_1  = 3
+static u64 GGML_TYPE_Q5_0  = 6
+static u64 GGML_TYPE_Q5_1  = 7
+static u64 GGML_TYPE_Q8_0  = 8
+static u64 GGML_TYPE_Q8_1  = 9
+static u64 GGML_TYPE_Q2_K  = 10
+static u64 GGML_TYPE_Q3_K  = 11
+static u64 GGML_TYPE_Q4_K  = 12
+static u64 GGML_TYPE_Q5_K  = 13
+static u64 GGML_TYPE_Q6_K  = 14
+static u64 GGML_TYPE_Q8_K  = 15
+static u64 GGML_TYPE_BF16  = 30
+
+// Per-type block size (elements) and type-size (bytes). Used to compute
+// total tensor bytes from its element count.
+fn ggml_type_block_size(u64 t) -> u64 {
+    if t == 0 { return 1 }              // F32
+    if t == 1 { return 1 }              // F16
+    if t == 30 { return 1 }             // BF16
+    if t == 2 || t == 3 { return 32 }   // Q4_0, Q4_1
+    if t == 6 || t == 7 { return 32 }   // Q5_0, Q5_1
+    if t == 8 || t == 9 { return 32 }   // Q8_0, Q8_1
+    if t >= 10 && t <= 15 { return 256 }// K-quants
+    return 0   // unsupported — caller checks
+}
+
+fn ggml_type_size(u64 t) -> u64 {
+    if t == 0 { return 4 }              // F32
+    if t == 1 { return 2 }              // F16
+    if t == 30 { return 2 }             // BF16
+    if t == 2 { return 18 }             // Q4_0: 2 (scale f16) + 16 (4-bit × 32)
+    if t == 3 { return 20 }             // Q4_1: 2+2 + 16
+    if t == 6 { return 22 }             // Q5_0: 2 + 4 (hi bits) + 16
+    if t == 7 { return 24 }             // Q5_1: 2+2+4+16
+    if t == 8 { return 34 }             // Q8_0: 2 + 32
+    if t == 9 { return 36 }             // Q8_1: 2+2+32
+    if t == 10 { return 82 }            // Q2_K: 16 (mins) + 64 (qs) + 2 (d) + 0
+    if t == 11 { return 110 }           // Q3_K
+    if t == 12 { return 144 }           // Q4_K: 2 (d) + 2 (dmin) + 12 (scales) + 128 (qs)
+    if t == 13 { return 176 }           // Q5_K
+    if t == 14 { return 210 }           // Q6_K: 128 (ql) + 64 (qh) + 16 (scales) + 2 (d)
+    if t == 15 { return 292 }           // Q8_K
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Handle + tensor descriptor
+// ---------------------------------------------------------------------------
+
+// NOTE: limited to 16 u64 fields. A 17th field at offset 128 segfaults on
+// write in MLRift's current codegen even with generous alloc sizing — likely
+// a struct-field-offset table with an off-by-one on its 16th entry somewhere
+// in the IR path. Kept at 16 here; the alignment value is stashed in a
+// module-level static instead of the struct. File a separate issue.
+struct GGUFFile {
+    u64 file_size
+    u64 base_addr
+
+    u64 version
+    u64 tensor_count
+    u64 metadata_count
+
+    u64 key_ptrs
+    u64 key_lens
+    u64 value_ptrs
+    u64 value_types
+
+    u64 tensor_name_ptrs
+    u64 tensor_name_lens
+    u64 tensor_ndims
+    u64 tensor_dims
+    u64 tensor_types
+    u64 tensor_offsets
+
+    u64 data_start
+}
+
+// Alignment is stored here (rather than as a struct field) to keep GGUFFile
+// at 16 u64 fields — see the note above.
+static u64 gguf_align_bytes = 32
+
+struct GGUFTensor {
+    u64 ptr          // absolute pointer into the mmap (or 0 if missing)
+    u64 size_bytes   // total byte size of the tensor data
+    u64 n_elements   // product of dims
+    u64 n_dims
+    u64 dim0         // shape[0]..shape[3] (0 if not used)
+    u64 dim1
+    u64 dim2
+    u64 dim3
+    u64 gtype        // ggml_type (9 u64 fields → 72 bytes — matches gguf_get alloc)
+}
+
+// ---------------------------------------------------------------------------
+// Little-endian readers at arbitrary byte offsets
+// ---------------------------------------------------------------------------
+fn gg_read_u32(u64 ptr) -> u64 {
+    u64 b0 = load8(ptr)
+    u64 b1 = load8(ptr + 1)
+    u64 b2 = load8(ptr + 2)
+    u64 b3 = load8(ptr + 3)
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+fn gg_read_u64(u64 ptr) -> u64 {
+    u64 lo = gg_read_u32(ptr)
+    u64 hi = gg_read_u32(ptr + 4)
+    return lo | (hi << 32)
+}
+
+// ---------------------------------------------------------------------------
+// Per-type value sizing — given a pointer at the *start* of a typed value,
+// return how many bytes it consumes. Used to walk the metadata blob.
+// ---------------------------------------------------------------------------
+fn gg_scalar_size(u64 t) -> u64 {
+    if t == 0 || t == 1 { return 1 }                      // uint8 / int8
+    if t == 2 || t == 3 { return 2 }                      // uint16 / int16
+    if t == 4 || t == 5 || t == 6 { return 4 }            // uint32 / int32 / f32
+    if t == 7 { return 1 }                                // bool
+    if t == 10 || t == 11 || t == 12 { return 8 }         // uint64 / int64 / f64
+    return 0xFFFFFFFFFFFFFFFF                             // string / array — caller handles
+}
+
+// Walk forward past a typed value of type `t` at pointer `vp`. Returns
+// the new pointer (past the value). Recursive for arrays.
+fn gg_skip_value(u64 vp, u64 t) -> u64 {
+    u64 s = gg_scalar_size(t)
+    if s != 0xFFFFFFFFFFFFFFFF { return vp + s }
+    if t == 8 {    // STRING: [len u64][bytes]
+        u64 ln = gg_read_u64(vp)
+        return vp + 8 + ln
+    }
+    if t == 9 {    // ARRAY: [elem_type u32][count u64][items]
+        u64 elem_t = gg_read_u32(vp)
+        u64 count  = gg_read_u64(vp + 4)
+        u64 p = vp + 12
+        u64 ss = gg_scalar_size(elem_t)
+        if ss != 0xFFFFFFFFFFFFFFFF {
+            return p + ss * count
+        }
+        // Non-scalar element: walk each individually.
+        u64 i = 0
+        while i < count {
+            p = gg_skip_value(p, elem_t)
+            i = i + 1
+        }
+        return p
+    }
+    write(2, "[gguf] unknown value type\n", 26)
+    exit(1)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Metadata key lookup
+// ---------------------------------------------------------------------------
+
+fn gg_key_matches(u64 kp, u64 kl, u64 needle, u64 nl) -> u64 {
+    if kl != nl { return 0 }
+    u64 i = 0
+    while i < nl {
+        if load8(kp + i) != load8(needle + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Find metadata entry index for key `name`. Returns 0xFF..FF if absent.
+fn gguf_meta_find(GGUFFile gf, u64 name) -> u64 {
+    u64 nl = str_len(name)
+    u64 i = 0
+    while i < gf.metadata_count {
+        u64 kp = 0
+        unsafe { *((gf.key_ptrs + i * 8) as u64) -> kp }
+        u64 kl = 0
+        unsafe { *((gf.key_lens + i * 8) as u64) -> kl }
+        if gg_key_matches(kp, kl, name, nl) != 0 { return i }
+        i = i + 1
+    }
+    return 0xFFFFFFFFFFFFFFFF
+}
+
+fn gguf_meta_type(GGUFFile gf, u64 idx) -> u64 {
+    u64 t = 0
+    unsafe { *((gf.value_types + idx * 8) as u64) -> t }
+    return t
+}
+
+fn gguf_meta_value_ptr(GGUFFile gf, u64 idx) -> u64 {
+    u64 p = 0
+    unsafe { *((gf.value_ptrs + idx * 8) as u64) -> p }
+    return p
+}
+
+// Unpack a STRING-type metadata value into (out_ptr, out_len). The ptr
+// points into the mmap (valid until gguf_free).
+fn gguf_meta_string(GGUFFile gf, u64 name, u64 out_ptr, u64 out_len) {
+    u64 idx = gguf_meta_find(gf, name)
+    if idx == 0xFFFFFFFFFFFFFFFF {
+        unsafe { *(out_ptr as u64) = 0 }
+        unsafe { *(out_len as u64) = 0 }
+        return
+    }
+    u64 vp = gguf_meta_value_ptr(gf, idx)
+    u64 ln = gg_read_u64(vp)
+    unsafe { *(out_ptr as u64) = (vp + 8) }
+    unsafe { *(out_len as u64) = ln }
+}
+
+fn gguf_meta_u32(GGUFFile gf, u64 name, u64 default_val) -> u64 {
+    u64 idx = gguf_meta_find(gf, name)
+    if idx == 0xFFFFFFFFFFFFFFFF { return default_val }
+    u64 vp = gguf_meta_value_ptr(gf, idx)
+    return gg_read_u32(vp)
+}
+
+fn gguf_meta_u64(GGUFFile gf, u64 name, u64 default_val) -> u64 {
+    u64 idx = gguf_meta_find(gf, name)
+    if idx == 0xFFFFFFFFFFFFFFFF { return default_val }
+    u64 vp = gguf_meta_value_ptr(gf, idx)
+    return gg_read_u64(vp)
+}
+
+// ---------------------------------------------------------------------------
+// Tensor lookup
+// ---------------------------------------------------------------------------
+
+fn gguf_get(GGUFFile gf, u64 name) -> GGUFTensor {
+    GGUFTensor r = alloc(72)
+    r.ptr = 0
+    r.size_bytes = 0
+    r.n_elements = 0
+    r.n_dims = 0
+    r.dim0 = 0
+    r.dim1 = 0
+    r.dim2 = 0
+    r.dim3 = 0
+    r.gtype = 0
+
+    u64 nl = str_len(name)
+    u64 i = 0
+    while i < gf.tensor_count {
+        u64 np = 0
+        unsafe { *((gf.tensor_name_ptrs + i * 8) as u64) -> np }
+        u64 nlen = 0
+        unsafe { *((gf.tensor_name_lens + i * 8) as u64) -> nlen }
+        if gg_key_matches(np, nlen, name, nl) != 0 {
+            u64 nd = 0
+            unsafe { *((gf.tensor_ndims + i * 4) as uint32) -> nd }
+            r.n_dims = nd
+            u64 d0 = 0
+            unsafe { *((gf.tensor_dims + i * 32 + 0)  as u64) -> d0 }
+            u64 d1 = 0
+            unsafe { *((gf.tensor_dims + i * 32 + 8)  as u64) -> d1 }
+            u64 d2 = 0
+            unsafe { *((gf.tensor_dims + i * 32 + 16) as u64) -> d2 }
+            u64 d3 = 0
+            unsafe { *((gf.tensor_dims + i * 32 + 24) as u64) -> d3 }
+            r.dim0 = d0
+            r.dim1 = d1
+            r.dim2 = d2
+            r.dim3 = d3
+            u64 elem = 1
+            if nd > 0 { elem = d0 }
+            if nd > 1 { elem = elem * d1 }
+            if nd > 2 { elem = elem * d2 }
+            if nd > 3 { elem = elem * d3 }
+            r.n_elements = elem
+            u64 tt = 0
+            unsafe { *((gf.tensor_types + i * 4) as uint32) -> tt }
+            r.gtype = tt
+            u64 off = 0
+            unsafe { *((gf.tensor_offsets + i * 8) as u64) -> off }
+            u64 bs = ggml_type_block_size(tt)
+            u64 ts = ggml_type_size(tt)
+            if bs == 0 {
+                write(2, "[gguf] unsupported ggml_type for sizing\n", 40)
+                r.size_bytes = 0
+            } else {
+                r.size_bytes = (elem / bs) * ts
+            }
+            r.ptr = gf.base_addr + gf.data_start + off
+            return r
+        }
+        i = i + 1
+    }
+    return r
+}
+
+// Dump helpers for diagnostics — walk the tensor table.
+fn gguf_tensor_name(GGUFFile gf, u64 i, u64 out_ptr, u64 out_len) {
+    u64 np = 0
+    unsafe { *((gf.tensor_name_ptrs + i * 8) as u64) -> np }
+    u64 nlen = 0
+    unsafe { *((gf.tensor_name_lens + i * 8) as u64) -> nlen }
+    unsafe { *(out_ptr as u64) = np }
+    unsafe { *(out_len as u64) = nlen }
+}
+
+// ---------------------------------------------------------------------------
+// Open / free
+// ---------------------------------------------------------------------------
+
+fn gguf_open(u64 path) -> GGUFFile {
+    GGUFFile gf = alloc(128)   // 16 u64 fields × 8 bytes
+    gf.file_size = 0
+    gf.base_addr = 0
+    gf.version = 0
+    gf.tensor_count = 0
+    gf.metadata_count = 0
+    gf.key_ptrs = 0
+    gf.key_lens = 0
+    gf.value_ptrs = 0
+    gf.value_types = 0
+    gf.tensor_name_ptrs = 0
+    gf.tensor_name_lens = 0
+    gf.tensor_ndims = 0
+    gf.tensor_dims = 0
+    gf.tensor_types = 0
+    gf.tensor_offsets = 0
+    gf.data_start = 0
+    gguf_align_bytes = 32
+
+    u64 fd = file_open(path, 0)
+    if is_errno(fd) != 0 {
+        print("[gguf] open failed: ")
+        println_str(path)
+        return gf
+    }
+    u64 sz = file_size(fd)
+    u64 base = syscall_raw(9, 0, sz, 1, 2, fd, 0)   // mmap PROT_READ MAP_PRIVATE
+    if is_errno(base) != 0 {
+        print("[gguf] mmap failed\n")
+        file_close(fd)
+        return gf
+    }
+    file_close(fd)
+    gf.file_size = sz
+    gf.base_addr = base
+
+    // Header: magic (4B) + version (4B) + tensor_count (8B) + metadata_count (8B).
+    u64 m0 = load8(base + 0)
+    u64 m1 = load8(base + 1)
+    u64 m2 = load8(base + 2)
+    u64 m3 = load8(base + 3)
+    if m0 != 71 || m1 != 71 || m2 != 85 || m3 != 70 {     // 'G' 'G' 'U' 'F'
+        print("[gguf] bad magic\n")
+        syscall_raw(11, base, sz, 0, 0, 0, 0)
+        gf.base_addr = 0
+        gf.file_size = 0
+        return gf
+    }
+    gf.version        = gg_read_u32(base + 4)
+    gf.tensor_count   = gg_read_u64(base + 8)
+    gf.metadata_count = gg_read_u64(base + 16)
+
+    // Allocate metadata tables.
+    u64 mc = gf.metadata_count
+    gf.key_ptrs     = alloc(mc * 8)
+    gf.key_lens     = alloc(mc * 8)
+    gf.value_ptrs   = alloc(mc * 8)
+    gf.value_types  = alloc(mc * 8)
+
+    // Walk metadata KV entries.
+    u64 pos = 24
+    u64 i = 0
+    while i < mc {
+        u64 klen = gg_read_u64(base + pos)
+        u64 kp   = base + pos + 8
+        pos = pos + 8 + klen
+        u64 vtype = gg_read_u32(base + pos)
+        pos = pos + 4
+        u64 vp = base + pos
+        unsafe { *((gf.key_ptrs   + i * 8) as u64) = kp    }
+        unsafe { *((gf.key_lens   + i * 8) as u64) = klen  }
+        unsafe { *((gf.value_types + i * 8) as u64) = vtype }
+        unsafe { *((gf.value_ptrs + i * 8) as u64) = vp    }
+        u64 after = gg_skip_value(vp, vtype)
+        pos = after - base
+        i = i + 1
+    }
+
+    // Allocate tensor-descriptor tables.
+    u64 tc = gf.tensor_count
+    gf.tensor_name_ptrs = alloc(tc * 8)
+    gf.tensor_name_lens = alloc(tc * 8)
+    gf.tensor_ndims     = alloc(tc * 4)
+    gf.tensor_dims      = alloc(tc * 32)    // up to 4 dims per tensor
+    gf.tensor_types     = alloc(tc * 4)
+    gf.tensor_offsets   = alloc(tc * 8)
+
+    u64 j = 0
+    while j < tc {
+        u64 nlen = gg_read_u64(base + pos)
+        u64 np   = base + pos + 8
+        pos = pos + 8 + nlen
+        u64 nd = gg_read_u32(base + pos)
+        pos = pos + 4
+        u64 d0 = 0
+        u64 d1 = 0
+        u64 d2 = 0
+        u64 d3 = 0
+        if nd > 0 { d0 = gg_read_u64(base + pos); pos = pos + 8 }
+        if nd > 1 { d1 = gg_read_u64(base + pos); pos = pos + 8 }
+        if nd > 2 { d2 = gg_read_u64(base + pos); pos = pos + 8 }
+        if nd > 3 { d3 = gg_read_u64(base + pos); pos = pos + 8 }
+        u64 tt = gg_read_u32(base + pos)
+        pos = pos + 4
+        u64 toff = gg_read_u64(base + pos)
+        pos = pos + 8
+
+        unsafe { *((gf.tensor_name_ptrs + j * 8) as u64)    = np }
+        unsafe { *((gf.tensor_name_lens + j * 8) as u64)    = nlen }
+        u32 nd32 = nd
+        unsafe { *((gf.tensor_ndims + j * 4) as uint32)     = nd32 }
+        unsafe { *((gf.tensor_dims  + j * 32 + 0 ) as u64)  = d0 }
+        unsafe { *((gf.tensor_dims  + j * 32 + 8 ) as u64)  = d1 }
+        unsafe { *((gf.tensor_dims  + j * 32 + 16) as u64)  = d2 }
+        unsafe { *((gf.tensor_dims  + j * 32 + 24) as u64)  = d3 }
+        u32 tt32 = tt
+        unsafe { *((gf.tensor_types + j * 4) as uint32)     = tt32 }
+        unsafe { *((gf.tensor_offsets + j * 8) as u64)      = toff }
+        j = j + 1
+    }
+
+    // Read general.alignment if present (default 32). Data section starts at
+    // the smallest multiple of `alignment` that's ≥ `pos`.
+    gguf_align_bytes = gguf_meta_u32(gf, "general.alignment", 32)
+    u64 a = gguf_align_bytes
+    if a == 0 { a = 32 }
+    u64 rem = pos % a
+    if rem != 0 { pos = pos + (a - rem) }
+    gf.data_start = pos
+    return gf
+}
+
+// ---------------------------------------------------------------------------
+// Phase B — basic dequantization (F32, F16, BF16, Q8_0)
+//
+// Each dequant writes `n_elements` f32 values into `dst_f32` from the raw
+// `src` bytes. `src` is whatever `gguf_get(...).ptr` returned, and
+// `n_elements` is the element count from `.n_elements`. The caller is
+// responsible for sizing `dst_f32` (n_elements × 4 bytes).
+// ---------------------------------------------------------------------------
+
+// F32 — memcpy fast path.
+fn gguf_deq_f32(u64 dst_f32, u64 src, u64 n_elements) {
+    memcpy(dst_f32, src, n_elements * 4)
+}
+
+// F16 → F32 per element. Uses the compiler's built-in conversion.
+fn gguf_deq_f16(u64 dst_f32, u64 src, u64 n_elements) {
+    u64 i = 0
+    while i < n_elements {
+        u64 lo = load8(src + i * 2)
+        u64 hi = load8(src + i * 2 + 1)
+        u64 bits16 = lo | (hi << 8)
+        f32 v = f16_to_f32(bits16)
+        unsafe { *((dst_f32 + i * 4) as f32) = v }
+        i = i + 1
+    }
+}
+
+// BF16 → F32. BF16 *is* the top 16 bits of an IEEE-754 binary32, so widen
+// by placing the 2 bytes in the high half of a 4-byte buffer and reading
+// it as f32.
+fn gguf_deq_bf16(u64 dst_f32, u64 src, u64 n_elements) {
+    u64 i = 0
+    while i < n_elements {
+        u64 b0 = load8(src + i * 2)
+        u64 b1 = load8(src + i * 2 + 1)
+        u8 zero = 0
+        u8 b0u = b0
+        u8 b1u = b1
+        u64 outp = dst_f32 + i * 4
+        store8(outp + 0, zero)
+        store8(outp + 1, zero)
+        store8(outp + 2, b0u)
+        store8(outp + 3, b1u)
+        i = i + 1
+    }
+}
+
+// Q8_0 — 32 int8 values + one f16 scale per block of 32.
+// Block layout (34 bytes):
+//   [0..1]  d      f16 scale
+//   [2..33] qs[32] int8 quantised
+// dequant:  out[i] = d * qs[i]
+fn gguf_deq_q8_0(u64 dst_f32, u64 src, u64 n_elements) {
+    u64 n_blocks = n_elements / 32
+    u64 bi = 0
+    while bi < n_blocks {
+        u64 block = src + bi * 34
+        u64 lo = load8(block)
+        u64 hi = load8(block + 1)
+        u64 dbits = lo | (hi << 8)
+        f32 d = f16_to_f32(dbits)
+        u64 qs = block + 2
+        u64 j = 0
+        while j < 32 {
+            u64 bval = load8(qs + j)
+            // int8 sign extension: bytes >= 128 decode as negative.
+            f32 q = 0.0f
+            if bval >= 128 {
+                f32 pos = int_to_f32_gguf(256 - bval)
+                q = 0.0f - pos
+            } else {
+                q = int_to_f32_gguf(bval)
+            }
+            f32 out_val = d * q
+            unsafe { *((dst_f32 + (bi * 32 + j) * 4) as f32) = out_val }
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// int-to-f32 helper local to this file (keep gguf standalone).
+fn int_to_f32_gguf(u64 v) -> f32 {
+    f64 d = int_to_f64(v)
+    f32 f = f64_to_f32(d)
+    return f
+}
+
+// Dispatch wrapper — picks the right dequant kernel by ggml_type. Returns
+// 0 on success, 1 if the type isn't supported yet.
+fn gguf_dequant(u64 dst_f32, GGUFTensor t) -> u64 {
+    if t.gtype == 0 { gguf_deq_f32(dst_f32, t.ptr, t.n_elements); return 0 }
+    if t.gtype == 1 { gguf_deq_f16(dst_f32, t.ptr, t.n_elements); return 0 }
+    if t.gtype == 30 { gguf_deq_bf16(dst_f32, t.ptr, t.n_elements); return 0 }
+    if t.gtype == 8 { gguf_deq_q8_0(dst_f32, t.ptr, t.n_elements); return 0 }
+    return 1
+}
+
+fn gguf_free(GGUFFile gf) {
+    if gf.key_ptrs    != 0 { dealloc(gf.key_ptrs) }
+    if gf.key_lens    != 0 { dealloc(gf.key_lens) }
+    if gf.value_ptrs  != 0 { dealloc(gf.value_ptrs) }
+    if gf.value_types != 0 { dealloc(gf.value_types) }
+    if gf.tensor_name_ptrs != 0 { dealloc(gf.tensor_name_ptrs) }
+    if gf.tensor_name_lens != 0 { dealloc(gf.tensor_name_lens) }
+    if gf.tensor_ndims     != 0 { dealloc(gf.tensor_ndims) }
+    if gf.tensor_dims      != 0 { dealloc(gf.tensor_dims) }
+    if gf.tensor_types     != 0 { dealloc(gf.tensor_types) }
+    if gf.tensor_offsets   != 0 { dealloc(gf.tensor_offsets) }
+    if gf.base_addr != 0 && gf.file_size != 0 {
+        syscall_raw(11, gf.base_addr, gf.file_size, 0, 0, 0, 0)    // munmap
+    }
+}
