@@ -1,0 +1,25 @@
+// MLRift Stage-1 M1l: grid-wide exponential relaxation through
+// the native emitter.
+//
+//   buf[gid] = buf[gid] + (target - buf[gid]) * factor
+//
+// Same 5-instruction tid+guard preamble as decay/fill, with a
+// two-op f64 body (v_add_f64 for the diff, v_fma_f64 to fold it
+// back into v + factor*diff). bdim is passed explicitly so we
+// can ignore dispatch-packet / hidden-arg plumbing.
+
+fn tid_x() -> uint64 { return 0 }
+fn block_id_x() -> uint64 { return 0 }
+
+@kernel
+fn relax_step(uint64 buf, uint32 n, f64 target, f64 factor, uint32 bdim) {
+    if block_id_x() * bdim + tid_x() < n {
+        uint64 p = buf + (block_id_x() * bdim + tid_x()) * 8
+        f64 v = 0.0
+        unsafe { *(p as f64) -> v }
+        f64 nv = v + (target - v) * factor
+        unsafe { *(p as f64) = nv }
+    }
+}
+
+fn main() { exit(0) }

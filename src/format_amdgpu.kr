@@ -973,6 +973,45 @@ fn asm_v_mad_u32_u24(uint64 vdst_vgpr,
     asm_u32(word2)
 }
 
+// v_add_f64 vdst_pair, s_pair, -v_pair  (VOP3 op 0x127, neg[1]=1)
+//
+// Used by the relax idiom: `diff = target - v` is lowered as
+// `add_f64(target_sgpr_pair, -v_src_pair)`. Encoding verified
+// against clang for `v_add_f64 v[4:5], s[0:1], -v[2:3]`
+// = 0xD7270004 0x40020400.
+fn asm_v_add_f64_s_negv(uint64 vdst_pair, uint64 s_src_pair,
+                         uint64 v_src_pair) {
+    uint64 word1 = (0x6B << 25) | (0x127 << 16) | (vdst_pair & 0xFF)
+    asm_u32(word1)
+    uint64 src0_enc = s_src_pair & 0x1FF                // SGPR raw
+    uint64 src1_enc = 0x100 | (v_src_pair & 0xFF)       // VGPR 0x100+N
+    uint64 neg = 0x2                                     // neg[1] = 1 → -src1
+    uint64 word2 = (neg << 29)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word2)
+}
+
+// v_fma_f64 vdst_pair, s_pair, v_src1_pair, v_src2_pair  (no neg)
+//
+// Companion to asm_v_fma_f64_neg_s_v_v — same op (0x014) but with
+// neg=0 and src0 from an SGPR pair rather than a negated one.
+// Used by relax: `nv = factor * diff + v` lowers as fma(factor_s,
+// diff_v, v_v). Verified against clang for
+// `v_fma_f64 v[2:3], s[2:3], v[4:5], v[2:3]` = 0xD6140002 0x040A0802.
+fn asm_v_fma_f64_s_v_v(uint64 vdst_pair, uint64 s_src0_pair,
+                        uint64 v_src1_pair, uint64 v_src2_pair) {
+    uint64 word1 = (0x6B << 25) | (0x014 << 16) | (vdst_pair & 0xFF)
+    asm_u32(word1)
+    uint64 src0_enc = s_src0_pair & 0x1FF               // SGPR raw
+    uint64 src1_enc = 0x100 | (v_src1_pair & 0xFF)
+    uint64 src2_enc = 0x100 | (v_src2_pair & 0xFF)
+    uint64 word2 = ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word2)
+}
+
 fn asm_v_fma_f64_neg_s_v_v(uint64 vdst_pair, uint64 neg_sgpr_pair,
                            uint64 v_src1_pair, uint64 v_src2_pair) {
     // Word 1: prefix + op + vdst.  gfx11 VOP3 prefix is 7 bits at
@@ -1885,8 +1924,8 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         uint32 np = ast_next(wp)
         wp = np
     }
-    if n_params != 1 && n_params != 2 && n_params != 3 && n_params != 4 {
-        write(2, "mlrc: amdgpu-native lowering supports 1-4 params (got ", 54)
+    if n_params != 1 && n_params != 2 && n_params != 3 && n_params != 4 && n_params != 5 {
+        write(2, "mlrc: amdgpu-native lowering supports 1-5 params (got ", 54)
         uint8[24] cbuf
         uint64 clen = fmt_uint(cbuf, n_params)
         write(2, cbuf, clen)
@@ -1919,6 +1958,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     uint64 is_decay_shape        = 0
     uint64 is_grid_decay_shape   = 0
     uint64 is_grid_fill_shape    = 0
+    uint64 is_grid_relax_shape   = 0
     uint32 s0_kind = ast_kind(stmt0)
     if s0_kind == 13 {
         uint32 after_if = ast_next(stmt0)
@@ -1926,8 +1966,8 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
             write(2, "mlrc: amdgpu-native: guarded shape: expect exactly one If stmt\n", 63)
             return 1
         }
-        if n_params != 2 && n_params != 3 && n_params != 4 {
-            write(2, "mlrc: amdgpu-native: guarded shape expects 2-4 params\n", 54)
+        if n_params != 2 && n_params != 3 && n_params != 4 && n_params != 5 {
+            write(2, "mlrc: amdgpu-native: guarded shape expects 2-5 params\n", 54)
             return 1
         }
         // If AST layout (kind 13, per ir.kr): child=cond expr,
@@ -1951,10 +1991,11 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         uint64 wclhs = cond_lhs
         uint64 wcrhs = cond_rhs
         // For 2/3-param shapes the cond LHS must be a direct Call
-        // to tid_x(). For the 4-param grid shape the LHS is a richer
-        // expression — `block_id_x() * bdim + tid_x()` — and we
-        // trust the user source rather than walking the BinOp here.
-        if n_params != 4 {
+        // to tid_x(). For the 4+-param grid shapes the LHS is a
+        // richer expression — `block_id_x() * bdim + tid_x()` —
+        // and we trust the user source rather than walking the
+        // BinOp here.
+        if n_params != 4 && n_params != 5 {
             if ast_kind(wclhs) != 35 {
                 write(2, "mlrc: amdgpu-native: guarded shape: cond lhs must be a Call\n", 60)
                 return 1
@@ -2000,6 +2041,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
             if then_stmts <= 2 { is_grid_fill_shape  = 1 }
             if then_stmts >= 3 { is_grid_decay_shape = 1 }
         }
+        if n_params == 5 { is_grid_relax_shape = 1 }
     }
 
     uint32 stmt1 = ast_next(stmt0)
@@ -2049,7 +2091,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
     uint64 wstmt = 0
     uint32 skind = 0
-    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 && is_grid_decay_shape == 0 && is_grid_fill_shape == 0 {
+    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 && is_grid_decay_shape == 0 && is_grid_fill_shape == 0 && is_grid_relax_shape == 0 {
         wstmt = stmt0
         skind = ast_kind(wstmt)
         if skind != 42 {
@@ -2059,7 +2101,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
     uint64 is_lit_shape = 0
     uint64 lit32 = 0
-    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 && is_grid_decay_shape == 0 && is_grid_fill_shape == 0 {
+    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 && is_grid_decay_shape == 0 && is_grid_fill_shape == 0 && is_grid_relax_shape == 0 {
         uint32 ts = ast_data1(wstmt)
         uint64 type_size = ts
         if type_size != 4 {
@@ -2116,7 +2158,69 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     // 6 × 16 bytes = up to 6 args × (size, kind); decay uses 3.
     uint64 args_desc = alloc(6 * 16)
 
-    if is_grid_fill_shape != 0 {
+    if is_grid_relax_shape != 0 {
+        // M1l grid-relax: nv = v + (target - v) * factor.
+        // Lowered as  diff = target - v ; nv = fma(factor, diff, v).
+        // Kernarg layout (5 args):
+        //   0:  buf           u64
+        //   8:  n             u32
+        //   16: target        f64
+        //   24: factor        f64
+        //   32: bdim          u32    (= kernarg_size 36)
+        //
+        //   s_clause 0x1
+        //   s_load_b32 s2, s[0:1], 0x20    ; bdim
+        //   s_load_b32 s4, s[0:1], 0x8     ; n
+        //   s_waitcnt lgkmcnt(0)
+        //   v_mad_u32_u24 v1, s2, s15, v0  ; gid
+        //   v_cmp_gt_u32 vcc_lo, s4, v1
+        //   s_and_saveexec_b32 s3, vcc_lo
+        //   s_cbranch_execz 15
+        //   s_load_b64 s[2:3], s[0:1], null  ; buf
+        //   s_load_b64 s[4:5], s[0:1], 0x10  ; target
+        //   s_load_b64_off s[6:7], 0x18       ; factor
+        //   v_lshlrev_b32 v4, 3, v1           ; byte offset
+        //   s_waitcnt lgkmcnt(0)
+        //   global_load_b64 v[0:1], v4, s[2:3]
+        //   s_waitcnt vmcnt(0)
+        //   v_add_f64 v[2:3], s[4:5], -v[0:1]   ; diff = target - v
+        //   v_fma_f64 v[0:1], s[6:7], v[2:3], v[0:1] ; nv = factor*diff + v
+        //   global_store_b64 v4, v[0:1], s[2:3]
+        //   s_endpgm
+        asm_s_clause(1)
+        asm_s_load_b32(1, 0, 0x20)                  // s2 = bdim
+        asm_s_load_b32(2, 0, 0x8)                   // s4 = n
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_v_mad_u32_u24(1, 2, 15, 0)              // v1 = gid
+        asm_v_cmp_gt_u32_sgpr_vgpr(4, 1)
+        asm_s_and_saveexec_b32_vcc_lo(3)
+        asm_s_cbranch_execz(15)                     // 15 dwords to s_endpgm
+        asm_s_load_b64(1, 0)                        // s[2:3] <- buf
+        asm_s_load_b64_off(2, 0, 0x10)              // s[4:5] <- target
+        asm_s_load_b64_off(3, 0, 0x18)              // s[6:7] <- factor
+        asm_v_lshlrev_b32_imm(4, 3, 1)              // v4 = v1 << 3
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_global_load_b64(0, 4, 2)                // v[0:1] = buf[gid]
+        asm_s_waitcnt_vmcnt_zero()
+        asm_v_add_f64_s_negv(2, 4, 0)               // v[2:3] = s[4:5] - v[0:1]
+        asm_v_fma_f64_s_v_v(0, 6, 2, 0)             // v[0:1] = s[6:7]*v[2:3] + v[0:1]
+        asm_global_store_b64(4, 0, 2)               // buf[gid] = v[0:1]
+        asm_s_endpgm()
+
+        uint64 adp0 = args_desc + 0;    unsafe { *(adp0 as uint64) = 8 }
+        uint64 adp1 = args_desc + 8;    unsafe { *(adp1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        uint64 adp2 = args_desc + 16;   unsafe { *(adp2 as uint64) = 4 }
+        uint64 adp3 = args_desc + 24;   unsafe { *(adp3 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        uint64 adp4 = args_desc + 32;   unsafe { *(adp4 as uint64) = 8 }
+        uint64 adp5 = args_desc + 40;   unsafe { *(adp5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        uint64 adp6 = args_desc + 48;   unsafe { *(adp6 as uint64) = 8 }
+        uint64 adp7 = args_desc + 56;   unsafe { *(adp7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        uint64 adp8 = args_desc + 64;   unsafe { *(adp8 as uint64) = 4 }
+        uint64 adp9 = args_desc + 72;   unsafe { *(adp9 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        kernarg_size = 36
+        sgpr_count   = 18
+        n_args       = 5
+    } else if is_grid_fill_shape != 0 {
         // M1k grid-fill: buf[gid] = value for gid < n. Same kernarg
         // layout as grid-decay (buf, n, value, bdim). Body simpler —
         // no load/fma, just a splat from the f64 kernarg pair into
@@ -2365,6 +2469,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     if is_decay_shape != 0       { vgpr_count_k = 3 }
     if is_grid_decay_shape != 0  { vgpr_count_k = 3 }
     if is_grid_fill_shape != 0   { vgpr_count_k = 3 }
+    if is_grid_relax_shape != 0  { vgpr_count_k = 5 }  // v[0:1] v, v[2:3] diff, v4 byte off
     kt_push(kname_ptr, nl, k_text_buf, k_text_size,
             args_desc, n_args, kernarg_size,
             sgpr_count, vgpr_count_k,
