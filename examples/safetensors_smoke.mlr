@@ -1,0 +1,156 @@
+// Smoke test for std/safetensors.kr — writes a tiny .safetensors file
+// by hand, reads it back through the parser, and verifies the tensor
+// bytes match what we wrote. Exit code 0 on success, non-zero otherwise.
+//
+// The file layout we produce:
+//   [8 bytes LE] uint64 json_len
+//   [json_len ] {"weight_f32":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]},
+//                "weight_i32":{"dtype":"I32","shape":[4],  "data_offsets":[16,32]}}
+//   [16 bytes ] f32 {1.0, 2.0, 3.0, 4.0}
+//   [16 bytes ] i32 {100, 200, 300, 400}
+//
+// Run:
+//   ./build/mlrc examples/safetensors_smoke.mlr -o /tmp/st_smoke
+//   /tmp/st_smoke
+
+import "../std/safetensors.kr"
+import "../std/io.kr"
+import "../std/fmt.kr"
+
+fn write_u64_le(u64 buf, u64 off, u64 v) {
+    u64 i = 0
+    while i < 8 {
+        u64 b = (v >> (i * 8)) & 0xFF
+        u8 bb = b
+        store8(buf + off + i, bb)
+        i = i + 1
+    }
+}
+
+fn write_f32_le(u64 buf, u64 off, f32 v) {
+    u64 dest = buf + off
+    unsafe { *(dest as f32) = v }
+}
+
+fn write_i32_le(u64 buf, u64 off, u64 v) {
+    u64 dest = buf + off
+    unsafe { *(dest as uint32) = v }
+}
+
+fn main() {
+    u64 path = "/tmp/mlrift_st_smoke.safetensors"
+
+    u64 json = "{\"weight_f32\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]},\"weight_i32\":{\"dtype\":\"I32\",\"shape\":[4],\"data_offsets\":[16,32]}}"
+    u64 json_len = str_len(json)
+
+    // 8-byte header + JSON + 16 bytes F32 + 16 bytes I32.
+    u64 total = 8 + json_len + 16 + 16
+    u64 buf = alloc(total)
+
+    write_u64_le(buf, 0, json_len)
+    memcpy(buf + 8, json, json_len)
+
+    u64 data_off = 8 + json_len
+    // `1.0f` forces f32 at the call site — plain `1.0` is f64 and
+    // the truncation at the f32 parameter slot silently drops bits.
+    write_f32_le(buf, data_off + 0,  1.0f)
+    write_f32_le(buf, data_off + 4,  2.0f)
+    write_f32_le(buf, data_off + 8,  3.0f)
+    write_f32_le(buf, data_off + 12, 4.0f)
+    write_i32_le(buf, data_off + 16, 100)
+    write_i32_le(buf, data_off + 20, 200)
+    write_i32_le(buf, data_off + 24, 300)
+    write_i32_le(buf, data_off + 28, 400)
+
+    u64 fd = file_open(path, 1)
+    if is_errno(fd) != 0 {
+        print("[smoke] FAIL: could not open ")
+        println_str(path)
+        exit(1)
+    }
+    file_write(fd, buf, total)
+    file_close(fd)
+
+    // Read back through the parser.
+    SafetensorFile st = safetensors_open(path)
+    if st.file_size == 0 {
+        print("[smoke] FAIL: safetensors_open returned empty\n")
+        exit(1)
+    }
+
+    if st.json_len != json_len {
+        print("[smoke] FAIL: json_len mismatch: got ")
+        print(st.json_len)
+        print(" expected ")
+        println(json_len)
+        exit(1)
+    }
+
+    if safetensors_exists(st, "weight_f32") == 0 {
+        print("[smoke] FAIL: weight_f32 not found\n")
+        exit(1)
+    }
+    if safetensors_exists(st, "weight_i32") == 0 {
+        print("[smoke] FAIL: weight_i32 not found\n")
+        exit(1)
+    }
+    if safetensors_exists(st, "weight_nope") != 0 {
+        print("[smoke] FAIL: weight_nope unexpectedly found\n")
+        exit(1)
+    }
+
+    if safetensors_dtype(st, "weight_f32") != 1 {
+        print("[smoke] FAIL: dtype(weight_f32) != F32 (1), got ")
+        println(safetensors_dtype(st, "weight_f32"))
+        exit(1)
+    }
+    if safetensors_dtype(st, "weight_i32") != 7 {
+        print("[smoke] FAIL: dtype(weight_i32) != I32 (7), got ")
+        println(safetensors_dtype(st, "weight_i32"))
+        exit(1)
+    }
+    if safetensors_dtype_size(1) != 4 {
+        print("[smoke] FAIL: dtype_size(F32) != 4\n")
+        exit(1)
+    }
+
+    SafetensorView v_f32 = safetensors_get(st, "weight_f32")
+    if v_f32.ptr == 0 || v_f32.len != 16 {
+        print("[smoke] FAIL: weight_f32 view bad (len=")
+        print(v_f32.len)
+        print(")\n")
+        exit(1)
+    }
+
+    // Verify 1.0, 2.0, 3.0, 4.0.
+    u64 p = v_f32.ptr
+    f32 a = 0.0; unsafe { *(p as f32) -> a }
+    f32 b = 0.0; unsafe { *((p + 4) as f32) -> b }
+    f32 c = 0.0; unsafe { *((p + 8) as f32) -> c }
+    f32 d = 0.0; unsafe { *((p + 12) as f32) -> d }
+    if a != 1.0 || b != 2.0 || c != 3.0 || d != 4.0 {
+        print("[smoke] FAIL: weight_f32 data mismatch\n")
+        exit(1)
+    }
+
+    SafetensorView v_i32 = safetensors_get(st, "weight_i32")
+    if v_i32.ptr == 0 || v_i32.len != 16 {
+        print("[smoke] FAIL: weight_i32 view bad\n")
+        exit(1)
+    }
+    u64 q = v_i32.ptr
+    u64 i0 = 0; unsafe { *(q as uint32) -> i0 }
+    u64 i1 = 0; unsafe { *((q + 4) as uint32) -> i1 }
+    u64 i2 = 0; unsafe { *((q + 8) as uint32) -> i2 }
+    u64 i3 = 0; unsafe { *((q + 12) as uint32) -> i3 }
+    if i0 != 100 || i1 != 200 || i2 != 300 || i3 != 400 {
+        print("[smoke] FAIL: weight_i32 data mismatch (")
+        print(i0); print(","); print(i1); print(","); print(i2); print(","); print(i3)
+        print(")\n")
+        exit(1)
+    }
+
+    safetensors_free(st)
+    print("[smoke] PASS\n")
+    exit(0)
+}

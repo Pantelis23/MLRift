@@ -1,0 +1,291 @@
+// MLRift Standard Library — Safetensors Parser
+//
+// Zero-copy loader for the Hugging Face Safetensors binary format.
+// Spec:
+//   [8 bytes] little-endian uint64 N — size of the JSON header
+//   [N bytes] JSON describing each tensor's dtype, shape, and data_offsets
+//   [...]    Raw tensor bytes, referenced by [start, end) relative to
+//            `data_start = 8 + N`.
+//
+// The file is mmap'd PROT_READ / MAP_PRIVATE so a multi-gigabyte
+// checkpoint is never copied into the process; only the JSON header
+// is duplicated into a heap buffer (so we can null-terminate it for
+// string search). Each tensor is returned as a `SafetensorView`
+// pointing straight into the mapping.
+//
+// Limitations (v1):
+//   — Tensor lookup is O(header_size) per call via substring search.
+//     For models with thousands of tensors + thousands of lookups,
+//     build an index once (future: safetensors_index() helper).
+//   — Only `safetensors_get` + `safetensors_dtype` are provided.
+//     Shape parsing lives in the caller for now.
+//   — No bounds check on the returned view — the caller must trust
+//     the file. Use on local checkpoints, not untrusted network input.
+
+import "io.kr"
+import "fmt.kr"
+import "mem.kr"
+import "string.kr"
+
+// Opaque handle. The caller reads `file_size` / `json_len` / `json_ptr`
+// for introspection but should treat `base_addr` and `data_ptr` as
+// internal.
+struct SafetensorFile {
+    u64 file_size     // mmap length in bytes
+    u64 base_addr     // mmap base — passed to munmap on free
+    u64 json_len      // byte length of the JSON header (not including the 8-byte size prefix)
+    u64 json_ptr      // null-terminated heap copy of the JSON header
+    u64 data_offset   // absolute byte offset of the raw tensor data (== 8 + json_len)
+    u64 data_ptr      // base_addr + data_offset — shortcut pointer
+}
+
+// A tensor's raw bytes inside the mapped file. `ptr` is valid until
+// `safetensors_free` is called.
+struct SafetensorView {
+    u64 ptr
+    u64 len
+}
+
+// Open a safetensors file. On failure (open, mmap, or malformed header)
+// the returned struct has `file_size == 0` and `base_addr == 0`; the
+// caller is expected to check and bail.
+fn safetensors_open(u64 path) -> SafetensorFile {
+    SafetensorFile st = alloc(48)
+    st.file_size = 0
+    st.base_addr = 0
+    st.json_len = 0
+    st.json_ptr = 0
+    st.data_offset = 0
+    st.data_ptr = 0
+
+    u64 fd = file_open(path, 0)
+    if is_errno(fd) != 0 {
+        print("[safetensors] open failed: ")
+        println_str(path)
+        return st
+    }
+
+    u64 sz = file_size(fd)
+    if sz < 8 {
+        print("[safetensors] file too small (< 8 bytes)\n")
+        file_close(fd)
+        return st
+    }
+
+    // mmap(addr=0, len=sz, prot=PROT_READ(1), flags=MAP_PRIVATE(2), fd, offset=0)
+    u64 base = syscall_raw(9, 0, sz, 1, 2, fd, 0)
+    if is_errno(base) != 0 {
+        print("[safetensors] mmap failed\n")
+        file_close(fd)
+        return st
+    }
+
+    // Once mapped, the fd can be dropped — the kernel holds a reference.
+    file_close(fd)
+
+    // Header length: 8 little-endian bytes at offset 0.
+    u64 json_len = 0
+    u64 i = 0
+    while i < 8 {
+        u64 b = load8(base + i)
+        json_len = json_len | (b << (i * 8))
+        i = i + 1
+    }
+
+    // Sanity: the JSON must fit inside the file.
+    if json_len == 0 || json_len > sz - 8 {
+        print("[safetensors] malformed header (json_len=")
+        print(json_len)
+        print(", file_size=")
+        print(sz)
+        print(")\n")
+        syscall_raw(11, base, sz, 0, 0, 0, 0)   // munmap
+        return st
+    }
+
+    // Copy the JSON out of the mapping so we can null-terminate it —
+    // str_index_of / str_len rely on a trailing NUL. Only the header
+    // is copied; the (potentially GB-sized) tensor data stays mmap'd.
+    u64 json_ptr = alloc(json_len + 1)
+    memcpy(json_ptr, base + 8, json_len)
+    u64 json_tail = json_ptr + json_len
+    u8 zero = 0
+    store8(json_tail, zero)
+
+    st.file_size = sz
+    st.base_addr = base
+    st.json_len = json_len
+    st.json_ptr = json_ptr
+    st.data_offset = 8 + json_len
+    st.data_ptr = base + 8 + json_len
+    return st
+}
+
+// Release the mapping and the JSON heap copy. Views previously
+// returned by `safetensors_get` become invalid after this call.
+fn safetensors_free(SafetensorFile st) {
+    if st.json_ptr != 0 {
+        dealloc(st.json_ptr)
+    }
+    if st.base_addr != 0 && st.file_size != 0 {
+        syscall_raw(11, st.base_addr, st.file_size, 0, 0, 0, 0)  // munmap
+    }
+}
+
+// Parse a contiguous run of ASCII digits (optionally preceded by
+// whitespace) starting at `ptr`. Stops at the first non-digit,
+// non-space byte. Safetensors headers contain small unsigned
+// integers only (tensor offsets < 2^63), so no sign handling.
+fn st_parse_int_at(u64 ptr) -> u64 {
+    u64 res = 0
+    u64 i = 0
+    u64 started = 0
+    while 1 == 1 {
+        u64 c = load8(ptr + i)
+        if c >= 48 && c <= 57 {
+            res = res * 10 + (c - 48)
+            started = 1
+        } else if started == 0 && (c == 32 || c == 9 || c == 10) {
+            // leading whitespace — skip
+        } else {
+            break
+        }
+        i = i + 1
+    }
+    return res
+}
+
+// Find the position of a tensor's entry inside the JSON header.
+// Returns the offset of `"<name>":` or 0xFF...FF if not present.
+// Wrapping the name in quotes + colon avoids false positives like
+// `layers.1` matching inside `layers.10`.
+fn st_find_entry(u64 json_ptr, u64 name) -> u64 {
+    u64 name_len = str_len(name)
+    u64 search = alloc(name_len + 4)
+    u8 q = 34            // '"'
+    u8 col = 58          // ':'
+    store8(search, q)
+    u64 i = 0
+    while i < name_len {
+        u64 c = load8(name + i)
+        u8 cb = c
+        store8(search + 1 + i, cb)
+        i = i + 1
+    }
+    store8(search + 1 + name_len, q)
+    store8(search + 2 + name_len, col)
+    u8 zero = 0
+    store8(search + 3 + name_len, zero)
+
+    u64 pos = str_index_of(json_ptr, search)
+    dealloc(search)
+    return pos
+}
+
+// Look up a tensor by name and return a view over its raw bytes.
+// A missing tensor returns a zero view (`ptr == 0`, `len == 0`).
+fn safetensors_get(SafetensorFile st, u64 name) -> SafetensorView {
+    SafetensorView view = alloc(16)
+    view.ptr = 0
+    view.len = 0
+    if st.json_ptr == 0 { return view }
+
+    u64 pos = st_find_entry(st.json_ptr, name)
+    if pos == 0xFFFFFFFFFFFFFFFF { return view }
+
+    // "data_offsets":[<start>, <end>]
+    u64 scan = st.json_ptr + pos
+    u64 off_rel = str_index_of(scan, "\"data_offsets\":")
+    if off_rel == 0xFFFFFFFFFFFFFFFF { return view }
+    u64 after_key = scan + off_rel
+
+    u64 br_rel = str_index_of(after_key, "[")
+    if br_rel == 0xFFFFFFFFFFFFFFFF { return view }
+    u64 after_br = after_key + br_rel + 1
+
+    u64 start_off = st_parse_int_at(after_br)
+
+    u64 comma_rel = str_index_of(after_br, ",")
+    if comma_rel == 0xFFFFFFFFFFFFFFFF { return view }
+    u64 after_comma = after_br + comma_rel + 1
+
+    u64 end_off = st_parse_int_at(after_comma)
+
+    view.ptr = st.data_ptr + start_off
+    view.len = end_off - start_off
+    return view
+}
+
+// Convenience — 1 if the tensor is present, 0 otherwise. Avoids
+// parsing the data_offsets when the caller only needs existence.
+fn safetensors_exists(SafetensorFile st, u64 name) -> u64 {
+    if st.json_ptr == 0 { return 0 }
+    u64 pos = st_find_entry(st.json_ptr, name)
+    if pos == 0xFFFFFFFFFFFFFFFF { return 0 }
+    return 1
+}
+
+// Standard safetensors dtype codes. Returned by `safetensors_dtype`.
+// Match the tag strings in the HuggingFace reference implementation.
+//   1 F32   2 F16   3 BF16   4 F64
+//   5 I8    6 I16   7 I32    8 I64
+//   9 U8   10 U16  11 U32   12 U64
+//  13 BOOL
+// 0 means "tensor not found or unrecognised dtype".
+fn safetensors_dtype(SafetensorFile st, u64 name) -> u64 {
+    if st.json_ptr == 0 { return 0 }
+    u64 pos = st_find_entry(st.json_ptr, name)
+    if pos == 0xFFFFFFFFFFFFFFFF { return 0 }
+    u64 scan = st.json_ptr + pos
+    u64 dty_rel = str_index_of(scan, "\"dtype\":")
+    if dty_rel == 0xFFFFFFFFFFFFFFFF { return 0 }
+    u64 after_key = scan + dty_rel + 8   // len("\"dtype\":")
+
+    // Skip whitespace + opening quote.
+    u64 j = 0
+    while 1 == 1 {
+        u64 c = load8(after_key + j)
+        if c == 34 { j = j + 1; break }    // '"' -> advance past quote and stop
+        if c == 32 || c == 9 { j = j + 1 } // space / tab
+        else { break }
+    }
+    u64 tag = after_key + j
+
+    // First-byte fast path + length disambiguation for F16 vs F32 vs F64 etc.
+    u64 c0 = load8(tag + 0)
+    u64 c1 = load8(tag + 1)
+    u64 c2 = load8(tag + 2)
+    if c0 == 70 && c1 == 51 && c2 == 50 { return 1 }   // "F32"
+    if c0 == 70 && c1 == 49 && c2 == 54 { return 2 }   // "F16"
+    if c0 == 66 && c1 == 70 && c2 == 49 { return 3 }   // "BF16"
+    if c0 == 70 && c1 == 54 && c2 == 52 { return 4 }   // "F64"
+    if c0 == 73 && c1 == 56 { return 5 }               // "I8"
+    if c0 == 73 && c1 == 49 && c2 == 54 { return 6 }   // "I16"
+    if c0 == 73 && c1 == 51 && c2 == 50 { return 7 }   // "I32"
+    if c0 == 73 && c1 == 54 && c2 == 52 { return 8 }   // "I64"
+    if c0 == 85 && c1 == 56 { return 9 }               // "U8"
+    if c0 == 85 && c1 == 49 && c2 == 54 { return 10 }  // "U16"
+    if c0 == 85 && c1 == 51 && c2 == 50 { return 11 }  // "U32"
+    if c0 == 85 && c1 == 54 && c2 == 52 { return 12 }  // "U64"
+    if c0 == 66 && c1 == 79 { return 13 }              // "BOOL"
+    return 0
+}
+
+// Element size in bytes for a dtype code returned by `safetensors_dtype`.
+// 0 for unknown / not found.
+fn safetensors_dtype_size(u64 dtype_code) -> u64 {
+    if dtype_code == 1 { return 4 }    // F32
+    if dtype_code == 2 { return 2 }    // F16
+    if dtype_code == 3 { return 2 }    // BF16
+    if dtype_code == 4 { return 8 }    // F64
+    if dtype_code == 5 { return 1 }    // I8
+    if dtype_code == 6 { return 2 }    // I16
+    if dtype_code == 7 { return 4 }    // I32
+    if dtype_code == 8 { return 8 }    // I64
+    if dtype_code == 9 { return 1 }    // U8
+    if dtype_code == 10 { return 2 }   // U16
+    if dtype_code == 11 { return 4 }   // U32
+    if dtype_code == 12 { return 8 }   // U64
+    if dtype_code == 13 { return 1 }   // BOOL
+    return 0
+}
