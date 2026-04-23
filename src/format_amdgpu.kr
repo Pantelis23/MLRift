@@ -689,6 +689,63 @@ fn asm_s_waitcnt_vmcnt_zero() { asm_sopp(0x09, 0x03F7) }
 // predicate. Caller passes the dword count directly.
 fn asm_s_cbranch_execz(uint64 simm16_dwords) { asm_sopp(0x25, simm16_dwords & 0xFFFF) }
 
+// ── Scalar control flow (M1m — building blocks for the CSR kernel
+// while loops that M1n will actually wire up). All three are SOPP;
+// simm16 is a SIGNED dword offset added to PC+4 — negative values
+// encode as the two's-complement 16-bit pattern for backward
+// branches.
+
+// s_branch <simm16>          — unconditional scalar branch.
+//   Clang reference: s_branch 0x8 → 0xBFA00008  (op 0x20)
+fn asm_s_branch(uint64 simm16_dwords) { asm_sopp(0x20, simm16_dwords & 0xFFFF) }
+
+// s_cbranch_scc0 <simm16>    — branch if SCC == 0 (last SALU
+// compare was false).  Op 0x21 on gfx11 (clang: 0xBFA10008).
+fn asm_s_cbranch_scc0(uint64 simm16_dwords) { asm_sopp(0x21, simm16_dwords & 0xFFFF) }
+
+// s_cbranch_scc1 <simm16>    — branch if SCC == 1 (compare true).
+// Op 0x22 on gfx11 (clang: 0xBFA20008).
+fn asm_s_cbranch_scc1(uint64 simm16_dwords) { asm_sopp(0x22, simm16_dwords & 0xFFFF) }
+
+// ── Scalar arithmetic / compare (M1m).
+
+// s_add_u32 sdst, ssrc0, imm8  (SOP2 op 0x00).
+//   SOP2 word = [31:30]=10 | [29:23]=op | [22:16]=sdst | [15:8]=ssrc1 | [7:0]=ssrc0.
+//   For a small literal imm (0..64), ssrc1 encodes as 0x80+imm.
+//   Clang reference: s_add_u32 s2, s2, 1 → 0x80028102.
+fn asm_s_add_u32_imm(uint64 sdst, uint64 ssrc0_sgpr, uint64 imm) {
+    uint64 ssrc1_enc = 0x80 + (imm & 0x3F)               // inline const
+    uint64 word = (0x2 << 30)                             // SOP2 prefix
+                  | (0x00 << 23)                          // op
+                  | ((sdst & 0x7F) << 16)
+                  | ((ssrc1_enc & 0xFF) << 8)
+                  | (ssrc0_sgpr & 0xFF)
+    asm_u32(word)
+}
+
+// s_cmp_lt_u32 ssrc0, ssrc1  (SOPC op 0x0A).
+//   Sets SCC = (ssrc0 < ssrc1). Format:
+//   [31:24] = 0xBF prefix | [23:16] = op | [15:8] = ssrc1 | [7:0] = ssrc0
+//   Clang reference: s_cmp_lt_u32 s2, s3 → 0xBF0A0302.
+fn asm_s_cmp_lt_u32(uint64 ssrc0, uint64 ssrc1) {
+    uint64 word = (0xBF << 24)
+                  | (0x0A << 16)
+                  | ((ssrc1 & 0xFF) << 8)
+                  | (ssrc0 & 0xFF)
+    asm_u32(word)
+}
+
+// s_mov_b32 sdst, 0  (SOP1 op 0x00 with inline-0 src).
+//   Format: [31:23]=0x17D | [22:16]=sdst | [15:8]=op | [7:0]=ssrc0
+//   Clang reference: s_mov_b32 s2, 0 → 0xBE820080.
+fn asm_s_mov_b32_imm0(uint64 sdst) {
+    uint64 word = (0x17D << 23)
+                  | ((sdst & 0x7F) << 16)
+                  | (0x00 << 8)
+                  | 0x80                                  // inline constant 0
+    asm_u32(word)
+}
+
 // ── SMEM format (64-bit instruction) ───────────────────────────────
 // Word 1 (gfx11):
 //   [31:26] = 0x3D   (SMEM prefix)
@@ -1831,6 +1888,121 @@ fn emit_amdgpu_sentinel_blob(uint64 out_path) -> uint64 {
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
         write(2, "emit_amdgpu_sentinel_blob: cannot open output\n", 46)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// M1m loop-demo: hand-crafted kernel that exercises the SALU while-
+// loop primitives (s_add_u32, s_cmp_lt_u32, s_cbranch_scc0,
+// s_branch backward) before any AST-lowerer shape wires them in.
+//
+// Kernel (one thread, writes to out[0]):
+//     acc = 0
+//     i = 0
+//     while i < count:   // count comes from kernarg
+//         acc += i
+//         i += 1
+//     out[0] = acc       // = count*(count-1)/2
+//
+// Instruction sequence (15 instructions, SALU scalar loop — single
+// thread, no VALU predication needed):
+//
+//   s_load_b32 s2, s[0:1], 0x8         ; s2 = count
+//   s_load_b64 s[4:5], s[0:1], null    ; s[4:5] = out ptr
+//   s_mov_b32 s6, 0                    ; s6 = i
+//   s_mov_b32 s7, 0                    ; s7 = acc
+//   s_waitcnt lgkmcnt(0)
+// loop_top:
+//   s_cmp_lt_u32 s6, s2                ; SCC = (i < count)
+//   s_cbranch_scc0 loop_end            ; exit if !lt
+//   s_add_u32 s7, s7, s6               ; acc += i    (2-reg form)
+//   s_add_u32 s6, s6, 1                ; i += 1
+//   s_branch loop_top                  ; back to compare
+// loop_end:
+//   v_mov_b32 v0, 0                    ; byte offset
+//   v_mov_b32 v1, s7                   ; acc → VGPR for store
+//   global_store_b32 v0, v1, s[4:5]
+//   s_endpgm
+@export
+fn emit_amdgpu_loop_demo_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "loop_demo"
+    uint64 klen  = 9
+
+    asm_init()
+    asm_s_load_b32(1, 0, 0x8)                      // s2 = count (sdata_pair=1 → s2)
+    asm_s_load_b64(2, 0)                           // s[4:5] = out ptr
+    asm_s_mov_b32_imm0(6)                          // s6 = 0 (i)
+    asm_s_mov_b32_imm0(7)                          // s7 = 0 (acc)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // loop_top @ offset 5 dwords from text start:
+    uint64 loop_top_dword = 5
+    asm_s_cmp_lt_u32(6, 2)                         // SCC = (s6 < s2)
+    // s_cbranch_scc0 to loop_end: 3 instructions ahead
+    //   (s_cbranch itself) + s_add + s_add + s_branch = 4 dwords after
+    //   the cbranch → simm16 = 3 (skips 3 dwords to land on
+    //   v_mov_b32 at loop_end).
+    asm_s_cbranch_scc0(3)
+    // s_add_u32 s7, s7, s6 — need a 2-sgpr SOP2 form. Existing
+    // asm_s_add_u32_imm only handles imm src1. Emit manually:
+    //   SOP2 s_add_u32: [31:23]=0x100, [22:16]=sdst, [15:8]=ssrc1, [7:0]=ssrc0
+    uint64 add_word = (0x2 << 30) | (0x00 << 23) | ((7 & 0x7F) << 16) | ((6 & 0xFF) << 8) | (7 & 0xFF)
+    asm_u32(add_word)
+    asm_s_add_u32_imm(6, 6, 1)                     // s6 += 1
+    // s_branch back to loop_top. Current dword offset = 5 + 4 = 9
+    // (after cmp, cbranch, add, add). s_branch itself is at dword 9.
+    // Target = loop_top_dword = 5. simm16 = target - (current+1) = 5-10 = -5.
+    // Encode as two's-complement 16-bit: 0xFFFB.
+    asm_s_branch(0xFFFB)
+
+    // loop_end @ dword 10:
+    // v_mov_b32 v0, 0  (VOP1 op 0x01, prefix 0x3F at [31:25], vdst at
+    // [16:9], src0 at [8:0])
+    //   Reference llvm-mc: v_mov_b32 v0, 0 → encoding 7E000280
+    //   0x7E000280 = (0x3F<<25) | (0x01<<17) | (0<<9) | 0x80
+    asm_u32(0x7E000280)
+    // v_mov_b32 v1, s7 (VOP1 op 0x01, vdst=1, src0=SGPR 7 = 0x007)
+    //   llvm-mc: 7E020207
+    uint64 v_mov_word = (0x3F << 25) | (0x01 << 17) | ((1 & 0xFF) << 9) | (7 & 0x1FF)
+    asm_u32(v_mov_word)
+    asm_global_store_b32(0, 1, 4)                  // *(s[4:5]) = v1  (saddr=4, raw SGPR index)
+    asm_s_endpgm()
+
+    uint64[2] args_desc
+    uint64 adp0 = args_desc + 0;  unsafe { *(adp0 as uint64) = 8 }
+    uint64 adp1 = args_desc + 8;  unsafe { *(adp1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    // Second arg would be u32 count but for simplicity we reuse the
+    // pointer-only desc: the caller still passes 8 bytes for the ptr.
+    // For M1m demo we only need one declared arg and count comes
+    // from the next 4 bytes of the kernarg segment — declare it
+    // inline-by-hand instead. Use a larger args_desc.
+    uint64[4] args_desc2
+    uint64 a0 = args_desc2 + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc2 + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc2 + 16;  unsafe { *(a2 as uint64) = 4 }
+    uint64 a3 = args_desc2 + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    uint64 rsrc1 = 0xE0AF0000
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           12,      // kernarg_size (ptr + u32)
+                                           8,
+                                           8,       // sgpr_count (s0..s7 used)
+                                           2,       // vgpr_count
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc2, 2)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_loop_demo_blob: cannot open output\n", 47)
         return 1
     }
     file_write(fd, amd_buf, size)

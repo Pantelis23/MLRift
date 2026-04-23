@@ -4519,6 +4519,24 @@ fn main() {
                 emit_mode = 3
             } else if str_starts_with(arg, "--targets=", 10) != 0 {
                 parse_targets_arg(arg + 10)
+            } else if str_starts_with(arg, "--emit-amdgpu-loop-demo=", 24) != 0 {
+                // Stage-1 M1m smoke: hand-crafted kernel using the
+                // scalar while-loop primitives (s_cmp_lt_u32,
+                // s_cbranch_scc0, s_branch back, s_add_u32). Writes
+                // count*(count-1)/2 to out[0] — a known arithmetic
+                // series that verifies the loop terminates correctly
+                // and accumulates the right value.
+                uint64 ld_path = arg + 24
+                uint64 ld_rc = emit_amdgpu_loop_demo_blob(ld_path)
+                if ld_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-loop-demo failed\n", 37)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 lpl = str_len(ld_path)
+                write(1, ld_path, lpl)
+                write(1, " (amdgpu loop-demo code object)\n", 33)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-sentinel=", 23) != 0 {
                 // Stage-1 M1b: emit a single-kernel blob named
                 // `write_sentinel` that writes 0xDEADBEEF to *out,
