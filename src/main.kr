@@ -4519,6 +4519,22 @@ fn main() {
                 emit_mode = 3
             } else if str_starts_with(arg, "--targets=", 10) != 0 {
                 parse_targets_arg(arg + 10)
+            } else if str_starts_with(arg, "--emit-amdgpu-per-lane-loop=", 28) != 0 {
+                // Stage-1 M1n smoke: hand-crafted kernel using the
+                // VALU divergent-loop primitives (v_cmp_lt_u32 per
+                // lane, s_and_b32 on EXEC, save/restore EXEC). Each
+                // lane iterates a different count based on its tid.
+                uint64 pl_path = arg + 28
+                uint64 pl_rc = emit_amdgpu_per_lane_loop_blob(pl_path)
+                if pl_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-per-lane-loop failed\n", 41)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 ppl = str_len(pl_path)
+                write(1, pl_path, ppl)
+                write(1, " (amdgpu per-lane-loop code object)\n", 37)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-loop-demo=", 24) != 0 {
                 // Stage-1 M1m smoke: hand-crafted kernel using the
                 // scalar while-loop primitives (s_cmp_lt_u32,

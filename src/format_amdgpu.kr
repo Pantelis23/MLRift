@@ -746,6 +746,82 @@ fn asm_s_mov_b32_imm0(uint64 sdst) {
     asm_u32(word)
 }
 
+// Generalised s_mov_b32 sdst, ssrc0 — any SGPR/exec_lo (0x7E)/
+// vcc_lo (0x6A) encoded in either slot. Used to save/restore
+// EXEC around per-lane divergent loops.
+//   s_mov_b32 s4, exec_lo → 0xBE84007E
+//   s_mov_b32 exec_lo, s4 → 0xBEFE0004
+fn asm_s_mov_b32(uint64 sdst, uint64 ssrc0) {
+    uint64 word = (0x17D << 23)
+                  | ((sdst & 0x7F) << 16)
+                  | (0x00 << 8)
+                  | (ssrc0 & 0xFF)
+    asm_u32(word)
+}
+
+// ── VALU divergent-loop primitives (M1n).
+//
+// v_cmp_lt_u32_e32 vcc_lo, v_src0, v_src1  — VOPC op 0x49.
+//   Sets VCC[lane] = (src0 < src1) per active lane. Used to gate
+//   each iteration of a while loop where the bound differs per
+//   lane.
+//   Clang reference: v_cmp_lt_u32_e32 vcc_lo, v0, v1 → 0x7C920300.
+fn asm_v_cmp_lt_u32_vv(uint64 vsrc0, uint64 vsrc1) {
+    uint64 src0_enc = 0x100 | (vsrc0 & 0xFF)
+    uint64 word = (0x3E << 25)
+                  | (0x49 << 17)
+                  | ((vsrc1 & 0xFF) << 9)
+                  | (src0_enc & 0x1FF)
+    asm_u32(word)
+}
+
+// s_and_b32 exec_lo, exec_lo, vcc_lo  — SOP2 op 0x0B.
+//   Reduces EXEC to the intersection of current EXEC and VCC:
+//   lanes where vcmp was false drop out of the active set.
+//   Hard-wired to the exec_lo & vcc_lo operand shape since that's
+//   the only one any of our loop patterns need.
+//   Clang reference: → 0x8B7E6A7E.
+fn asm_s_and_b32_exec_vcc_lo() {
+    // (0x2<<30) SOP2 prefix | (0x16<<23) op (s_and_b32 on gfx11)
+    // | (0x7E<<16) sdst=exec_lo | (0x6A<<8) ssrc1=vcc_lo
+    // | 0x7E ssrc0=exec_lo
+    uint64 word = (0x2 << 30)
+                  | (0x16 << 23)
+                  | (0x7E << 16)
+                  | (0x6A << 8)
+                  | 0x7E
+    asm_u32(word)
+}
+
+// v_add_nc_u32_e32 vdst, vsrc0, vsrc1  — VOP2 op 0x25, no-carry
+// 32-bit vector integer add.
+//   Clang reference: v_add_nc_u32_e32 v2, v0, v2 → 0x4A040500.
+fn asm_v_add_nc_u32_vv(uint64 vdst, uint64 vsrc0, uint64 vsrc1) {
+    uint64 src0_enc = 0x100 | (vsrc0 & 0xFF)
+    uint64 word = (0x25 << 25)
+                  | ((vdst & 0xFF) << 17)
+                  | ((vsrc1 & 0xFF) << 9)
+                  | (src0_enc & 0x1FF)
+    asm_u32(word)
+}
+
+// v_add_nc_u32_e32 vdst, imm, vsrc1 — same op but with an inline
+// constant (0..64 encode as 0x80+K) in the src0 slot.
+//   Clang reference: v_add_nc_u32_e32 v0, 1, v0 → 0x4A000081.
+fn asm_v_add_nc_u32_imm(uint64 vdst, uint64 imm, uint64 vsrc1) {
+    uint64 src0_enc = 0x80 + (imm & 0x3F)
+    uint64 word = (0x25 << 25)
+                  | ((vdst & 0xFF) << 17)
+                  | ((vsrc1 & 0xFF) << 9)
+                  | (src0_enc & 0x1FF)
+    asm_u32(word)
+}
+
+// s_cbranch_execnz <simm16>  — SOPP op 0x26. Branches if EXEC != 0
+// (at least one lane still active). Used to loop back while any
+// lane still has work.
+fn asm_s_cbranch_execnz(uint64 simm16_dwords) { asm_sopp(0x26, simm16_dwords & 0xFFFF) }
+
 // ── SMEM format (64-bit instruction) ───────────────────────────────
 // Word 1 (gfx11):
 //   [31:26] = 0x3D   (SMEM prefix)
@@ -1888,6 +1964,124 @@ fn emit_amdgpu_sentinel_blob(uint64 out_path) -> uint64 {
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
         write(2, "emit_amdgpu_sentinel_blob: cannot open output\n", 46)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// M1n per-lane loop demo: hand-crafted kernel that exercises the
+// VALU divergent while-loop primitives (v_cmp, s_and_b32 on EXEC,
+// s_cbranch_execz, s_branch, EXEC save/restore). Each lane runs a
+// different number of iterations based on its tid.
+//
+// Kernel (one workgroup, multiple threads):
+//     gid = tid_x()
+//     if gid < n:
+//         acc = 0; i = 0
+//         while i < gid:
+//             acc += i
+//             i += 1
+//         out[gid] = acc          // = gid*(gid-1)/2 (Gauss)
+//
+// 18-instruction lowering:
+//
+//   s_load_b32 s2, s[0:1], 0x8                ; n
+//   s_load_b64 s[4:5], s[0:1], null           ; out ptr
+//   s_waitcnt lgkmcnt(0)
+//   v_cmp_gt_u32 vcc_lo, s2, v0               ; (n > gid)
+//   s_and_saveexec_b32 s2, vcc_lo
+//   s_cbranch_execz tail                      ; all lanes out
+//   v_mov_b32 v1, 0                            ; i = 0
+//   v_mov_b32 v2, 0                            ; acc = 0
+//   s_mov_b32 s3, exec_lo                      ; save outer EXEC
+// loop_head:
+//   v_cmp_lt_u32_e32 vcc_lo, v1, v0           ; (i < gid) per lane
+//   s_and_b32 exec_lo, exec_lo, vcc_lo         ; drop done lanes
+//   s_cbranch_execz loop_exit                  ; if all done, break
+//   v_add_nc_u32 v2, v1, v2                   ; acc += i
+//   v_add_nc_u32 v1, 1, v1                    ; i += 1
+//   s_branch loop_head                         ; back
+// loop_exit:
+//   s_mov_b32 exec_lo, s3                      ; restore outer EXEC
+//   v_lshlrev_b32 v0, 2, v0                    ; v0 = gid*4 (byte off)
+//   global_store_b32 v0, v2, s[4:5]
+// tail:
+//   s_endpgm
+@export
+fn emit_amdgpu_per_lane_loop_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "per_lane_loop"
+    uint64 klen  = 13
+
+    asm_init()
+    asm_s_load_b32(1, 0, 0x8)                   // s2 = n
+    asm_s_load_b64(2, 0)                        // s[4:5] = out
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_v_cmp_gt_u32_sgpr_vgpr(2, 0)            // vcc = (s2 > v0)
+    asm_s_and_saveexec_b32_vcc_lo(2)            // save + restrict
+    // cbranch_execz skip distance: if all lanes out, jump over the
+    // guarded body + loop to s_endpgm. Dwords from cbranch to
+    // s_endpgm:
+    //   v_mov, v_mov, s_mov, v_cmp, s_and, cbranch, v_add, v_add,
+    //   s_branch, s_mov, v_lshl, global_store (2), = 14 dwords.
+    asm_s_cbranch_execz(14)
+    // v_mov_b32 v1, 0 → 0x7E020280
+    asm_u32(0x7E020280)
+    // v_mov_b32 v2, 0 → 0x7E040280
+    asm_u32(0x7E040280)
+    asm_s_mov_b32(3, 0x7E)                      // s3 = exec_lo
+
+    // loop_head starts here — capture dword offset (relative to .text start)
+    // so we can compute the backward branch.
+    uint64 loop_head_off = asm_text_len / 4      // in dwords
+
+    asm_v_cmp_lt_u32_vv(1, 0)                   // vcc = (v1 < v0)
+    asm_s_and_b32_exec_vcc_lo()
+    // cbranch_execz to loop_exit: 3 dwords ahead (v_add, v_add, s_branch)
+    // then loop_exit is the 4th dword.
+    asm_s_cbranch_execz(3)
+    asm_v_add_nc_u32_vv(2, 1, 2)                // v2 += v1
+    asm_v_add_nc_u32_imm(1, 1, 1)               // v1 += 1
+    // s_branch backward to loop_head. After s_branch, PC advances to
+    // (current dword + 1). Target = loop_head_off. simm16 = target - (current+1).
+    uint64 s_branch_at_dword = asm_text_len / 4
+    uint64 delta = loop_head_off - (s_branch_at_dword + 1)
+    asm_s_branch(delta & 0xFFFF)
+
+    // loop_exit:
+    asm_s_mov_b32(0x7E, 3)                      // exec_lo = s3
+    // v_lshlrev_b32 v0, 2, v0 → use existing helper
+    asm_v_lshlrev_b32_imm(0, 2, 0)
+    asm_global_store_b32(0, 2, 4)               // *(s[4:5] + v0) = v2  (saddr raw SGPR=4)
+
+    // tail:
+    asm_s_endpgm()
+
+    uint64[4] args_desc
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 4 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    uint64 rsrc1 = 0xE0AF0000
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           12,
+                                           8,
+                                           6,           // sgpr s0..s5
+                                           3,           // vgpr v0..v2
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 2)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_per_lane_loop_blob: cannot open output\n", 51)
         return 1
     }
     file_write(fd, amd_buf, size)
