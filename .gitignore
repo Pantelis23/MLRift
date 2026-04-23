@@ -6,16 +6,29 @@
 
 # Compiled output
 *.krbo
+*.mlrbo
 *.elf
 *.o
 *.a
 a.out
 
-# Test artifacts (root-level only — build/krc2 is the committed bootstrap)
+# Test artifacts (root-level only — build/mlrc is the committed bootstrap)
+/test_input.mlr
 /test_input.kr
+/mlrc2
+/mlrc3
+/mlrc4
 /krc2
 /krc3
 /krc4
+
+# HIP / hipcc intermediate artifacts (regenerated per compile)
+*-hip-amdgcn-amd-amdhsa-gfx*.bc
+*-hip-amdgcn-amd-amdhsa-gfx*.hipi
+*-hip-amdgcn-amd-amdhsa-gfx*.s
+*-hip-amdgcn-amd-amdhsa-gfx*.o
+*-hip-amdgcn-amd-amdhsa-gfx*.out
+*-hip-amdgcn-amd-amdhsa-gfx*.out.resolution.txt
 
 # IDE
 /.idea
