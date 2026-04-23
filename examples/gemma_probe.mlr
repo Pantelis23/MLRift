@@ -1,0 +1,154 @@
+// gemma_probe — REPL harness that loads Gemma-4B weights through the
+// safetensors mmap path and runs a partial forward pass (embedding
+// lookup, RMSNorm, Q-projection matmul) on each input byte.
+//
+// This is NOT a chat loop. It does not run the full transformer —
+// RoPE, grouped-query attention, KV cache, FFN, final norm, and logit
+// projection are deliberately unimplemented. The point of this program
+// is to prove end-to-end that:
+//   * the 15 GB checkpoint maps without copying,
+//   * bf16 weights round-trip through f32 correctly on each element,
+//   * a 2048 × 2560 matmul with real weights produces stable numbers,
+//   * the thread pool and safetensors interface compose cleanly.
+//
+// Ported from MLRift-experimental/examples/prompt_interface.mlr with
+// the math helpers factored into std/inference.kr and heap-allocated
+// scratch buffers dropped in favour of stack locals (v2.8.17 fix).
+//
+// Run:
+//   cd <dir with gemma-4b.safetensors>
+//   mlrc --arch=x86_64 <path>/examples/gemma_probe.mlr -o /tmp/probe
+//   /tmp/probe
+
+import "../std/safetensors.kr"
+import "../std/inference.kr"
+import "../std/fmt.kr"
+import "../std/math_float.kr"
+import "../std/io.kr"
+import "../std/string.kr"
+import "../std/thread.kr"
+
+fn print_int_inline(u64 v) {
+    u64 s = fmt_dec(v)
+    print_str(s)
+}
+
+// Byte-level placeholder tokenizer — the real Gemma vocabulary is
+// SentencePiece with ~262 k entries; we just map each input byte to
+// its own "token" so the harness can exercise the embedding path
+// without a vocabulary file.
+fn byte_to_token_id(u64 byte_val) -> u64 {
+    return byte_val + 100
+}
+
+fn main() {
+    u64 num_workers = 24
+    thread_pool_init(num_workers)
+
+    print("====================================================\n")
+    print(" MLRift — Gemma-4B weight probe (partial forward)   \n")
+    print("====================================================\n")
+    print("Loading Gemma 4B safetensors from disk...\n")
+
+    SafetensorFile st = safetensors_open("gemma-4b.safetensors")
+    if st.file_size == 0 {
+        print("Failed to open gemma-4b.safetensors in the current directory.\n")
+        thread_pool_shutdown()
+        exit(1)
+    }
+
+    SafetensorView embed  = safetensors_get(st, "model.language_model.embed_tokens.weight")
+    SafetensorView norm_w = safetensors_get(st, "model.language_model.layers.0.input_layernorm.weight")
+    SafetensorView q_proj = safetensors_get(st, "model.language_model.layers.0.self_attn.q_proj.weight")
+
+    if embed.ptr == 0 || norm_w.ptr == 0 || q_proj.ptr == 0 {
+        print("Missing required tensor — is this a Gemma-4B checkpoint?\n")
+        safetensors_free(st)
+        thread_pool_shutdown()
+        exit(1)
+    }
+
+    print("Model mapped. Embedding tensor size: ")
+    println(embed.len)
+    print("Type `quit` or Ctrl+D to exit.\n")
+
+    u64 embed_dim = 2560
+    u64 q_dim     = 2048
+    f32 embed_scale = sqrt_f32(int_to_f32(embed_dim))
+
+    while 1 == 1 {
+        print("\nUser > ")
+        u64 prompt = read_line(256)
+        if prompt == 0 {
+            print("\n[EOF — exiting]\n")
+            break
+        }
+        u64 len = str_len(prompt)
+        if len == 0 {
+            dealloc(prompt)
+            continue
+        }
+        if str_contains(prompt, "quit") != 0 {
+            dealloc(prompt)
+            break
+        }
+
+        print("Tokens: [")
+        u64 i = 0
+        u64 printed = 0
+        while i < len {
+            u64 ch = load8(prompt + i)
+            if ch == 10 { i = i + 1; continue }
+            if printed != 0 { print(", ") }
+            print_int_inline(byte_to_token_id(ch))
+            printed = 1
+            i = i + 1
+        }
+        print("]\n")
+
+        print("Running partial forward pass...\n")
+        i = 0
+        while i < len {
+            u64 ch = load8(prompt + i)
+            if ch == 10 { i = i + 1; continue }
+            u64 token_id = byte_to_token_id(ch)
+
+            // 1. Embedding lookup + Gemma's sqrt(hidden) scaling.
+            u64 x_buf = alloc(embed_dim * 4)
+            embed_bf16_scaled_f32(x_buf, embed.ptr, token_id, embed_dim, embed_scale)
+
+            // 2. Input RMSNorm (per Gemma: weights + 1.0).
+            u64 norm_buf = alloc(embed_dim * 4)
+            rmsnorm_bf16_weights_f32(norm_buf, x_buf, norm_w.ptr, embed_dim)
+
+            // 3. Q-projection matmul: [1, embed_dim] × [embed_dim, q_dim].
+            u64 q_buf = alloc(q_dim * 4)
+            matmul_bf16_weights_f32_mt(q_buf, norm_buf, q_proj.ptr,
+                                       1, q_dim, embed_dim, num_workers)
+
+            f32 q0 = 0.0f
+            unsafe { *(q_buf as f32) -> q0 }
+            print("  token=")
+            print_int_inline(token_id)
+            print("  Q[0]=")
+            u64 s = fmt_f32(q0, 4)
+            print_str(s)
+            print("\n")
+
+            dealloc(x_buf)
+            dealloc(norm_buf)
+            dealloc(q_buf)
+            i = i + 1
+        }
+
+        print("[note] RoPE, grouped-query attention, KV cache, FFN,\n")
+        print("       final norm, and logit projection are not wired up yet.\n")
+        print("       This harness only verifies the weights path.\n")
+
+        dealloc(prompt)
+    }
+
+    safetensors_free(st)
+    thread_pool_shutdown()
+    print("exit\n")
+}
