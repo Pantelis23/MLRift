@@ -514,7 +514,7 @@ fn gguf_deq_f16(u64 dst_f32, u64 src, u64 n_elements) {
         u64 lo = load8(src + i * 2)
         u64 hi = load8(src + i * 2 + 1)
         u64 bits16 = lo | (hi << 8)
-        f32 v = f16_to_f32(bits16)
+        f32 v = gguf_f16_to_f32_exact(bits16)
         unsafe { *((dst_f32 + i * 4) as f32) = v }
         i = i + 1
     }
@@ -553,7 +553,7 @@ fn gguf_deq_q8_0(u64 dst_f32, u64 src, u64 n_elements) {
         u64 lo = load8(block)
         u64 hi = load8(block + 1)
         u64 dbits = lo | (hi << 8)
-        f32 d = f16_to_f32(dbits)
+        f32 d = gguf_f16_to_f32_exact(dbits)
         u64 qs = block + 2
         u64 j = 0
         while j < 32 {
@@ -581,6 +581,200 @@ fn int_to_f32_gguf(u64 v) -> f32 {
     return f
 }
 
+// Correct IEEE-754 binary16 → binary32 conversion. The compiler's built-in
+// f16_to_f32 currently treats subnormal halves (exp field == 0, mant != 0)
+// as if they were normal numbers, which gives the wrong magnitude by up to
+// 2× — Q6_K blocks with very small `d` scales hit this routinely. Use this
+// helper instead inside the K-quant paths.
+fn gguf_f16_to_f32_exact(u64 bits) -> f32 {
+    u64 sign = (bits >> 15) & 1
+    u64 exp  = (bits >> 10) & 0x1F
+    u64 mant = bits & 0x3FF
+
+    f32 result = 0.0f
+    if exp == 0 {
+        // Zero or subnormal: value = mant × 2^-24.
+        // Compute via int→f32 / 2^24 — f32 can represent any f16-subnormal
+        // exactly (f16 has 24 bits of dynamic range, f32 has 127).
+        f32 m_f = int_to_f32_gguf(mant)
+        f32 den = int_to_f32_gguf(16777216)
+        result = m_f / den
+    } else if exp == 31 {
+        // Inf / NaN — map to 0 so downstream arithmetic stays finite. Real
+        // model weights shouldn't hit this; if they do it's data corruption.
+        result = 0.0f
+    } else {
+        // Normal: widen the f16 bit pattern directly into an f32 one.
+        //   f32 exp = f16 exp + (127 - 15) = f16 exp + 112
+        //   f32 mant = f16 mant << 13
+        uint64[1] tmp
+        u64 tp = tmp
+        u64 f32_bits = ((exp + 112) << 23) | (mant << 13)
+        u32 bits32 = f32_bits
+        unsafe { *(tp as uint32) = bits32 }
+        unsafe { *(tp as f32) -> result }
+    }
+    if sign != 0 {
+        f32 neg = 0.0f - result
+        result = neg
+    }
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Phase C — K-quant dequantization (Q4_K, Q6_K)
+//
+// Both are super-block quants over 256 elements (QK_K = 256).
+//
+// Q4_K (144 bytes per super-block):
+//   [0..1]    d       f16 super-block scale
+//   [2..3]    dmin    f16 super-block min
+//   [4..15]   scales  12 bytes — packed 8×(6-bit scale, 6-bit min)
+//   [16..143] qs      128 bytes — 256 × 4-bit, two per byte
+//
+// Q6_K (210 bytes per super-block):
+//   [0..127]   ql     128 bytes — 256 × low 4 bits
+//   [128..191] qh     64 bytes  — 256 × high 2 bits
+//   [192..207] scales 16 × int8
+//   [208..209] d      f16 super-block scale
+//
+// The scale/min unpack for Q4_K and the ql/qh layout for Q6_K follow the
+// llama.cpp reference (see gguf-py's Q4_K.get_scale_min + Q*_K.dequantize_blocks).
+// ---------------------------------------------------------------------------
+
+// Unpack Q4_K's 12 packed bytes into 8 six-bit scales (sc[0..7]) and 8 six-bit
+// mins (m[0..7]). The encoding is:
+//   bytes[0..3]  = high-2-bits-of-sc[4..7] : low-6-bits-of-sc[0..3]
+//   bytes[4..7]  = high-2-bits-of-m[4..7]  : low-6-bits-of-m[0..3]
+//   bytes[8..11] = high-4-bits-of-m[4..7]  : low-4-bits-of-sc[4..7]
+// Matches gguf-py/Q4_K.get_scale_min.
+fn gguf_q4k_unpack_scales(u64 scales_ptr, u64 sc_out, u64 m_out) {
+    u64 j = 0
+    while j < 4 {
+        u64 b_d   = load8(scales_ptr + j)         // byte 0..3
+        u64 b_m   = load8(scales_ptr + 4 + j)     // byte 4..7
+        u64 b_md  = load8(scales_ptr + 8 + j)     // byte 8..11
+        unsafe { *((sc_out + j * 8) as u64) = (b_d & 0x3F) }
+        unsafe { *((m_out  + j * 8) as u64) = (b_m & 0x3F) }
+        unsafe { *((sc_out + (j + 4) * 8) as u64) = ((b_md & 0x0F) | ((b_d >> 2) & 0x30)) }
+        unsafe { *((m_out  + (j + 4) * 8) as u64) = ((b_md >> 4) | ((b_m >> 2) & 0x30)) }
+        j = j + 1
+    }
+}
+
+// Q4_K dequantization: super-block-at-a-time into dst_f32.
+// n_elements must be a multiple of 256 (QK_K).
+fn gguf_deq_q4_k(u64 dst_f32, u64 src, u64 n_elements) {
+    u64 n_blocks = n_elements / 256
+    u64[8] sc
+    u64[8] m
+
+    u64 bi = 0
+    while bi < n_blocks {
+        u64 block = src + bi * 144
+        u64 d_bits   = load8(block + 0) | (load8(block + 1) << 8)
+        u64 dm_bits  = load8(block + 2) | (load8(block + 3) << 8)
+        f32 d_f32    = gguf_f16_to_f32_exact(d_bits)
+        f32 dmin_f32 = gguf_f16_to_f32_exact(dm_bits)
+
+        u64 sc_p = sc
+        u64 m_p  = m
+        gguf_q4k_unpack_scales(block + 4, sc_p, m_p)
+
+        u64 qs = block + 16
+        u64 sub = 0
+        while sub < 8 {
+            // Sub-block j in [0..7] draws from qs:
+            //   byte group index = j/2  (so sub-blocks 0+1 share qs[0..31],
+            //                              2+3 share qs[32..63], etc.)
+            //   shift = (j%2) * 4         (0 = low nibble, 4 = high nibble)
+            u64 qs_base  = (sub / 2) * 32
+            u64 qs_shift = (sub & 1) * 4
+
+            u64 sc_j = 0; unsafe { *((sc_p + sub * 8) as u64) -> sc_j }
+            u64 m_j  = 0; unsafe { *((m_p  + sub * 8) as u64) -> m_j }
+            f32 d_sc = d_f32 * int_to_f32_gguf(sc_j)
+            f32 dm_m = dmin_f32 * int_to_f32_gguf(m_j)
+
+            u64 i = 0
+            while i < 32 {
+                u64 nib = (load8(qs + qs_base + i) >> qs_shift) & 0x0F
+                f32 q   = int_to_f32_gguf(nib)
+                f32 out_v = d_sc * q - dm_m
+                u64 out_off = (bi * 256 + sub * 32 + i) * 4
+                unsafe { *((dst_f32 + out_off) as f32) = out_v }
+                i = i + 1
+            }
+            sub = sub + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// Q6_K dequantization.
+// Element layout: the 256 elements are partitioned into 8 sub-blocks of 32,
+// sourced from ql[0..127] and qh[0..63] as follows (matches the reshape chain
+// in gguf-py/Q6_K.dequantize_blocks):
+//   sub j in [0..7]:
+//     ql_base  = (j/4)*64 + (j%2)*32    ← which 32-byte slice of ql
+//     ql_shift = ((j/2)%2) * 4          ← 0 (low nibble) or 4 (high nibble)
+//     qh_base  = (j/4)*32               ← which 32-byte slice of qh
+//     qh_shift = (j%4) * 2              ← 0, 2, 4, or 6
+// Then each pair of 16 elements within a sub-block uses one of the 16 int8
+// scales (scales[(j*32 + i) / 16] = scales[2j + i/16]).
+fn gguf_deq_q6_k(u64 dst_f32, u64 src, u64 n_elements) {
+    u64 n_blocks = n_elements / 256
+
+    u64 bi = 0
+    while bi < n_blocks {
+        u64 block = src + bi * 210
+        u64 ql = block
+        u64 qh = block + 128
+        u64 sc_bytes = block + 192
+        u64 d_bits = load8(block + 208) | (load8(block + 209) << 8)
+        f32 d_f32 = gguf_f16_to_f32_exact(d_bits)
+
+        u64 sub = 0
+        while sub < 8 {
+            u64 ql_base  = (sub / 4) * 64 + (sub & 1) * 32
+            u64 ql_shift = ((sub / 2) & 1) * 4
+            u64 qh_base  = (sub / 4) * 32
+            u64 qh_shift = (sub & 3) * 2
+
+            u64 i = 0
+            while i < 32 {
+                u64 ql_v = (load8(ql + ql_base + i) >> ql_shift) & 0x0F
+                u64 qh_v = (load8(qh + qh_base + i) >> qh_shift) & 0x03
+                u64 raw  = ql_v | (qh_v << 4)   // 0..63
+                // int8 centre at 32:  q = raw - 32  (already in [-32, +31] range as int8)
+                u64 raw_i = 0
+                f32 q
+                if raw >= 32 {
+                    q = int_to_f32_gguf(raw - 32)
+                } else {
+                    f32 pos = int_to_f32_gguf(32 - raw)
+                    q = 0.0f - pos
+                }
+                u64 scale_idx = (sub * 32 + i) / 16          // 0..15
+                u64 sc_byte = load8(sc_bytes + scale_idx)
+                f32 sc_val
+                if sc_byte >= 128 {
+                    f32 spos = int_to_f32_gguf(256 - sc_byte)
+                    sc_val = 0.0f - spos
+                } else {
+                    sc_val = int_to_f32_gguf(sc_byte)
+                }
+                f32 out_v = d_f32 * sc_val * q
+                u64 out_off = (bi * 256 + sub * 32 + i) * 4
+                unsafe { *((dst_f32 + out_off) as f32) = out_v }
+                i = i + 1
+            }
+            sub = sub + 1
+        }
+        bi = bi + 1
+    }
+}
+
 // Dispatch wrapper — picks the right dequant kernel by ggml_type. Returns
 // 0 on success, 1 if the type isn't supported yet.
 fn gguf_dequant(u64 dst_f32, GGUFTensor t) -> u64 {
@@ -588,6 +782,8 @@ fn gguf_dequant(u64 dst_f32, GGUFTensor t) -> u64 {
     if t.gtype == 1 { gguf_deq_f16(dst_f32, t.ptr, t.n_elements); return 0 }
     if t.gtype == 30 { gguf_deq_bf16(dst_f32, t.ptr, t.n_elements); return 0 }
     if t.gtype == 8 { gguf_deq_q8_0(dst_f32, t.ptr, t.n_elements); return 0 }
+    if t.gtype == 12 { gguf_deq_q4_k(dst_f32, t.ptr, t.n_elements); return 0 }
+    if t.gtype == 14 { gguf_deq_q6_k(dst_f32, t.ptr, t.n_elements); return 0 }
     return 1
 }
 

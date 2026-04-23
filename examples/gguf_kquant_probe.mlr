@@ -1,0 +1,55 @@
+import "../std/gguf.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/math_float.mlr"
+
+fn dump_first(u64 buf, u64 count) {
+    u64 i = 0
+    while i < count {
+        if i != 0 { print(" ") }
+        f32 v = 0.0f
+        unsafe { *((buf + i * 4) as f32) -> v }
+        u64 s = fmt_f32(v, 6)
+        print_str(s)
+        i = i + 1
+    }
+    print("\n")
+}
+
+fn main() {
+    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3.5-9B-Q4_K_M.gguf"
+    print("opening Q4_K_M\n")
+    GGUFFile gf = gguf_open(path)
+    if gf.file_size == 0 { print("open fail\n"); exit(1) }
+    print("tensor_count=")
+    u64 s = fmt_dec(gf.tensor_count); print_str(s); print("\n")
+
+    // Q4_K: token_embd.weight (type 12)
+    GGUFTensor t4 = gguf_get(gf, "token_embd.weight")
+    print("token_embd.weight type=")
+    u64 ts = fmt_dec(t4.gtype); print_str(ts)
+    print(" elements=")
+    u64 es = fmt_dec(t4.n_elements); print_str(es); print("\n")
+
+    u64 buf4 = alloc(256 * 4)
+    gguf_deq_q4_k(buf4, t4.ptr, 256)
+    print("Q4_K first 16: ")
+    dump_first(buf4, 16)
+    dealloc(buf4)
+
+    // Q6_K: output.weight (type 14)
+    GGUFTensor t6 = gguf_get(gf, "output.weight")
+    print("output.weight type=")
+    u64 t6s = fmt_dec(t6.gtype); print_str(t6s)
+    print(" elements=")
+    u64 e6s = fmt_dec(t6.n_elements); print_str(e6s); print("\n")
+
+    u64 buf6 = alloc(256 * 4)
+    gguf_deq_q6_k(buf6, t6.ptr, 256)
+    print("Q6_K first 16: ")
+    dump_first(buf6, 16)
+    dealloc(buf6)
+
+    gguf_free(gf)
+    exit(0)
+}
