@@ -16,9 +16,9 @@ run_test() {
     TOTAL=$((TOTAL + 1))
 
     local REPO_ROOT="$DIR/.."
-    printf '%s\n' "$input" > "$REPO_ROOT/test_tmp_$$.kr"
-    if $KRC $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_test_$$ > /dev/null 2>&1; then
-        rm -f "$REPO_ROOT/test_tmp_$$.kr"
+    printf '%s\n' "$input" > "$REPO_ROOT/test_tmp_$$.mlr"
+    if $KRC $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_test_$$ > /dev/null 2>&1; then
+        rm -f "$REPO_ROOT/test_tmp_$$.mlr"
         chmod +x /tmp/krc_test_$$
         local got=0
         /tmp/krc_test_$$ > /dev/null 2>&1 && got=0 || got=$?
@@ -30,10 +30,10 @@ run_test() {
         fi
     else
         echo "FAIL: $name (compilation failed)"
-        $KRC $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_test_$$ 2>&1 | head -3
+        $KRC $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_test_$$ 2>&1 | head -3
         FAIL=$((FAIL + 1))
     fi
-    rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_test_$$
+    rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_test_$$
 }
 
 run_test_output() {
@@ -44,9 +44,9 @@ run_test_output() {
     TOTAL=$((TOTAL + 1))
 
     local REPO_ROOT="$DIR/.."
-    printf '%s\n' "$input" > "$REPO_ROOT/test_tmp_$$.kr"
-    if $KRC $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_test_$$ > /dev/null 2>&1; then
-        rm -f "$REPO_ROOT/test_tmp_$$.kr"
+    printf '%s\n' "$input" > "$REPO_ROOT/test_tmp_$$.mlr"
+    if $KRC $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_test_$$ > /dev/null 2>&1; then
+        rm -f "$REPO_ROOT/test_tmp_$$.mlr"
         chmod +x /tmp/krc_test_$$
         local got_output
         got_output=$(/tmp/krc_test_$$ 2>/dev/null)
@@ -65,7 +65,7 @@ run_test_output() {
         echo "FAIL: $name (compilation failed)"
         FAIL=$((FAIL + 1))
     fi
-    rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_test_$$
+    rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_test_$$
 }
 
 echo "=== KernRift Self-Hosted Compiler Test Suite ==="
@@ -342,61 +342,61 @@ run_test "str_eq_prefix" 'fn main() { uint64 a = "foo"; uint64 b = "foobar"; exi
 run_test "str_eq_empty" 'fn main() { uint64 a = ""; uint64 b = ""; exit(str_eq(a, b)) }' 1
 
 # --- std/string.kr additions (v2.8.11) ---
-run_test "str_index_of_hit" 'import "std/string.kr"
+run_test "str_index_of_hit" 'import "std/string.mlr"
 fn main() { exit(str_index_of("hello world", "world")) }' 6
-run_test "str_index_of_miss" 'import "std/string.kr"
+run_test "str_index_of_miss" 'import "std/string.mlr"
 fn main() {
     uint64 n = str_index_of("hello", "xyz")
     if n == 0xFFFFFFFFFFFFFFFF { exit(0) }
     exit(1)
 }' 0
-run_test "str_compare_eq" 'import "std/string.kr"
+run_test "str_compare_eq" 'import "std/string.mlr"
 fn main() { exit(str_compare("abc", "abc")) }' 0
-run_test "str_compare_lt" 'import "std/string.kr"
+run_test "str_compare_lt" 'import "std/string.mlr"
 fn main() {
     uint64 r = str_compare("abc", "abd")
     if signed_lt(r, 0) { exit(1) }
     exit(0)
 }' 1
-run_test "str_compare_prefix" 'import "std/string.kr"
+run_test "str_compare_prefix" 'import "std/string.mlr"
 fn main() {
     uint64 r = str_compare("abc", "abcd")
     if signed_lt(r, 0) { exit(1) }
     exit(0)
 }' 1
-run_test_output "str_lower_basic" 'import "std/string.kr"
+run_test_output "str_lower_basic" 'import "std/string.mlr"
 fn main() { println_str(str_lower("HeLLo 123")) }' "hello 123"
-run_test_output "str_upper_basic" 'import "std/string.kr"
+run_test_output "str_upper_basic" 'import "std/string.mlr"
 fn main() { println_str(str_upper("HeLLo 123")) }' "HELLO 123"
-run_test_output "str_replace_basic" 'import "std/string.kr"
+run_test_output "str_replace_basic" 'import "std/string.mlr"
 fn main() { println_str(str_replace("a.b.c.d", ".", "-")) }' "a-b-c-d"
-run_test_output "str_replace_longer" 'import "std/string.kr"
+run_test_output "str_replace_longer" 'import "std/string.mlr"
 fn main() { println_str(str_replace("hi world hi", "hi", "HELLO")) }' "HELLO world HELLO"
-run_test_output "str_replace_noop" 'import "std/string.kr"
+run_test_output "str_replace_noop" 'import "std/string.mlr"
 fn main() { println_str(str_replace("abc", "zz", "QQ")) }' "abc"
-run_test "str_split_count" 'import "std/string.kr"
+run_test "str_split_count" 'import "std/string.mlr"
 fn main() {
     uint64[8] parts
     exit(str_split("a,b,c,,d", 44, parts, 8))
 }' 5
-run_test_output "str_join_basic" 'import "std/string.kr"
+run_test_output "str_join_basic" 'import "std/string.mlr"
 fn main() {
     uint64[4] parts
     uint64 n = str_split("a,b,c", 44, parts, 4)
     println_str(str_join(parts, n, "|"))
 }' "a|b|c"
-run_test "str_to_float_int" 'import "std/string.kr"
+run_test "str_to_float_int" 'import "std/string.mlr"
 fn main() {
     f64 v = str_to_float("42")
     exit(f64_to_int(v))
 }' 42
-run_test "str_to_float_frac" 'import "std/string.kr"
+run_test "str_to_float_frac" 'import "std/string.mlr"
 fn main() {
     f64 v = str_to_float("1.5")
     f64 two = int_to_f64(2)
     exit(f64_to_int(v * two))
 }' 3
-run_test "str_to_float_exp" 'import "std/string.kr"
+run_test "str_to_float_exp" 'import "std/string.mlr"
 fn main() {
     f64 v = str_to_float("-3e1")
     exit(f64_to_int(int_to_f64(0) - v))
@@ -431,7 +431,7 @@ fn main() {
     f64 s = arr[0] + arr[1] + arr[2] + arr[3]
     exit(f64_to_int(s))
 }' 12
-run_test "utf8_decode_ascii" 'import "std/string.kr"
+run_test "utf8_decode_ascii" 'import "std/string.mlr"
 fn main() {
     uint64[1] w
     uint64 wp = w
@@ -441,7 +441,7 @@ fn main() {
     if cp == 65 && ww == 1 { exit(0) }
     exit(1)
 }' 0
-run_test "utf8_decode_two_byte" 'import "std/string.kr"
+run_test "utf8_decode_two_byte" 'import "std/string.mlr"
 fn main() {
     uint64[1] w
     uint64 wp = w
@@ -451,48 +451,48 @@ fn main() {
     if cp == 233 && ww == 2 { exit(0) }
     exit(1)
 }' 0
-run_test "str_codepoint_count_mixed" 'import "std/string.kr"
+run_test "str_codepoint_count_mixed" 'import "std/string.mlr"
 fn main() { exit(str_codepoint_count("héllo")) }' 5
-run_test "utf8_lower_codepoint_ascii" 'import "std/string.kr"
+run_test "utf8_lower_codepoint_ascii" 'import "std/string.mlr"
 fn main() { exit(utf8_lower_codepoint(65)) }' 97
-run_test "utf8_upper_codepoint_latin1" 'import "std/string.kr"
+run_test "utf8_upper_codepoint_latin1" 'import "std/string.mlr"
 fn main() { exit(utf8_upper_codepoint(0xE9)) }' 201
-run_test_output "str_lower_utf8_latin1" 'import "std/string.kr"
+run_test_output "str_lower_utf8_latin1" 'import "std/string.mlr"
 fn main() { println_str(str_lower_utf8("CaFÉ")) }' "café"
-run_test_output "str_upper_utf8_latin1" 'import "std/string.kr"
+run_test_output "str_upper_utf8_latin1" 'import "std/string.mlr"
 fn main() { println_str(str_upper_utf8("café")) }' "CAFÉ"
-run_test "utf8_is_combining_yes" 'import "std/string.kr"
+run_test "utf8_is_combining_yes" 'import "std/string.mlr"
 fn main() { exit(utf8_is_combining(0x0301)) }' 1
-run_test "utf8_is_combining_no" 'import "std/string.kr"
+run_test "utf8_is_combining_no" 'import "std/string.mlr"
 fn main() { exit(utf8_is_combining(65)) }' 0
 
 # --- Greek case folding (v2.8.13) ---
-run_test_output "greek_lower_sentence" 'import "std/string.kr"
+run_test_output "greek_lower_sentence" 'import "std/string.mlr"
 fn main() { println_str(str_lower_utf8("Γειά σου Κόσμε")) }' "γειά σου κόσμε"
-run_test_output "greek_upper_sentence" 'import "std/string.kr"
+run_test_output "greek_upper_sentence" 'import "std/string.mlr"
 fn main() { println_str(str_upper_utf8("γειά σου κόσμε")) }' "ΓΕΙΆ ΣΟΥ ΚΌΣΜΕ"
-run_test_output "greek_upper_final_sigma" 'import "std/string.kr"
+run_test_output "greek_upper_final_sigma" 'import "std/string.mlr"
 fn main() { println_str(str_upper_utf8("ελληνικός")) }' "ΕΛΛΗΝΙΚΌΣ"
-run_test_output "greek_mixed_latin1" 'import "std/string.kr"
+run_test_output "greek_mixed_latin1" 'import "std/string.mlr"
 fn main() { println_str(str_upper_utf8("café Ωραία")) }' "CAFÉ ΩΡΑΊΑ"
-run_test "greek_lower_alpha" 'import "std/string.kr"
+run_test "greek_lower_alpha" 'import "std/string.mlr"
 fn main() {
     if utf8_lower_codepoint(0x0391) == 0x03B1 { exit(1) }
     exit(0)
 }' 1
-run_test "greek_upper_omega" 'import "std/string.kr"
+run_test "greek_upper_omega" 'import "std/string.mlr"
 fn main() {
     if utf8_upper_codepoint(0x03C9) == 0x03A9 { exit(1) }
     exit(0)
 }' 1
-run_test "greek_final_sigma_to_sigma" 'import "std/string.kr"
+run_test "greek_final_sigma_to_sigma" 'import "std/string.mlr"
 fn main() {
     if utf8_upper_codepoint(0x03C2) == 0x03A3 { exit(1) }
     exit(0)
 }' 1
 
 # --- String builder (v2.8.11) ---
-run_test_output "sb_basic" 'import "std/string.kr"
+run_test_output "sb_basic" 'import "std/string.mlr"
 fn main() {
     uint64 sb = sb_new(16)
     sb = sb_append_str(sb, "x = ")
@@ -501,8 +501,8 @@ fn main() {
     println_str(r)
     sb_free(sb)
 }' "x = 42"
-run_test_output "sb_mixed" 'import "std/string.kr"
-import "std/math_float.kr"
+run_test_output "sb_mixed" 'import "std/string.mlr"
+import "std/math_float.mlr"
 fn main() {
     uint64 sb = sb_new(16)
     sb = sb_append_str(sb, "hex=")
@@ -515,31 +515,31 @@ fn main() {
     println_str(r)
     sb_free(sb)
 }' "hex=0xdead, bool=false, f=1.50"
-run_test "sb_grows" 'import "std/string.kr"
+run_test "sb_grows" 'import "std/string.mlr"
 fn main() {
     uint64 sb = sb_new(4)     // deliberately tiny
     sb = sb_append_str(sb, "0123456789ABCDEFGHIJ")   // force grow
     exit(sb_len(sb))
 }' 20
-run_test_output "str_from_bool_true" 'import "std/string.kr"
+run_test_output "str_from_bool_true" 'import "std/string.mlr"
 fn main() { println_str(str_from_bool(1)) }' "true"
-run_test_output "str_from_bool_false" 'import "std/string.kr"
+run_test_output "str_from_bool_false" 'import "std/string.mlr"
 fn main() { println_str(str_from_bool(0)) }' "false"
-run_test_output "str_from_codepoint_latin1" 'import "std/string.kr"
+run_test_output "str_from_codepoint_latin1" 'import "std/string.mlr"
 fn main() { println_str(str_from_codepoint(0xE9)) }' "é"
 
 # --- Error-handling helpers (v2.8.14) ---
-run_test "opt_some_unwrap" 'import "std/string.kr"
+run_test "opt_some_unwrap" 'import "std/string.mlr"
 fn main() { exit(opt_unwrap(opt_some(42))) }' 42
-run_test "opt_is_some_yes" 'import "std/string.kr"
+run_test "opt_is_some_yes" 'import "std/string.mlr"
 fn main() { exit(opt_is_some(opt_some(0))) }' 1
-run_test "opt_is_some_no" 'import "std/string.kr"
+run_test "opt_is_some_no" 'import "std/string.mlr"
 fn main() { exit(opt_is_some(opt_none())) }' 0
-run_test "is_errno_yes" 'import "std/io.kr"
+run_test "is_errno_yes" 'import "std/io.mlr"
 fn main() { exit(is_errno(0xFFFFFFFFFFFFFFFE)) }' 1
-run_test "is_errno_no" 'import "std/io.kr"
+run_test "is_errno_no" 'import "std/io.mlr"
 fn main() { exit(is_errno(42)) }' 0
-run_test "get_errno_val" 'import "std/io.kr"
+run_test "get_errno_val" 'import "std/io.mlr"
 fn main() { exit(get_errno(0xFFFFFFFFFFFFFFFE)) }' 2
 
 # --- isb() / alloc_aligned() (v2.8.14) ---
@@ -558,7 +558,7 @@ run_test "icache_invalidate_basic" 'fn main() {
     icache_invalidate(p)
     exit(0)
 }' 0
-run_test "memmove_forward" 'import "std/mem.kr"
+run_test "memmove_forward" 'import "std/mem.mlr"
 fn main() {
     u64 p = alloc(64)
     store64(p, 0xAABBCCDD)
@@ -567,7 +567,7 @@ fn main() {
     if v == 0xAABBCCDD { exit(11) }
     exit(1)
 }' 11
-run_test "memmove_backward_overlap" 'import "std/mem.kr"
+run_test "memmove_backward_overlap" 'import "std/mem.mlr"
 fn main() {
     // Layout: bytes 0..=7 = 1..8. Shift right by 4, so bytes 4..=11
     // become 1..8. memcpy would corrupt this; memmove must not.
@@ -581,7 +581,7 @@ fn main() {
     while i < 12 { sum = sum + load8(p + i); i = i + 1 }
     exit(sum)
 }' 36
-run_test "memmove_forward_overlap" 'import "std/mem.kr"
+run_test "memmove_forward_overlap" 'import "std/mem.mlr"
 fn main() {
     u64 p = alloc(32)
     u64 i = 0
@@ -593,7 +593,7 @@ fn main() {
     while i < 8 { sum = sum + load8(p + i); i = i + 1 }
     exit(sum)
 }' 36
-run_test "memmove_zero_len" 'import "std/mem.kr"
+run_test "memmove_zero_len" 'import "std/mem.mlr"
 fn main() {
     // Must be a no-op regardless of pointer values.
     memmove(0, 0, 0)
@@ -607,9 +607,9 @@ run_bchk_test() {
     local expected="$3"
     TOTAL=$((TOTAL + 1))
     local REPO_ROOT="$DIR/.."
-    printf '%s\n' "$input" > "$REPO_ROOT/test_tmp_$$.kr"
-    if $KRC --debug $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_bchk_$$ > /dev/null 2>&1; then
-        rm -f "$REPO_ROOT/test_tmp_$$.kr"
+    printf '%s\n' "$input" > "$REPO_ROOT/test_tmp_$$.mlr"
+    if $KRC --debug $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_bchk_$$ > /dev/null 2>&1; then
+        rm -f "$REPO_ROOT/test_tmp_$$.mlr"
         chmod +x /tmp/krc_bchk_$$
         local got=0
         /tmp/krc_bchk_$$ > /dev/null 2>&1 && got=0 || got=$?
@@ -621,7 +621,7 @@ run_bchk_test() {
     else
         echo "FAIL: $name (compilation failed)"; FAIL=$((FAIL + 1))
     fi
-    rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_bchk_$$
+    rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_bchk_$$
 }
 run_bchk_test "bchk_stack_in_range"    'fn main() { u64[4] a; a[0] = 1; a[3] = 4; exit(a[3]) }' 4
 run_bchk_test "bchk_stack_oob_write"   'fn main() { u64[4] a; a[4] = 99; exit(0) }' 1
@@ -631,104 +631,104 @@ run_bchk_test "bchk_static_oob_write"  'static u64[8] s; fn main() { s[8] = 1; e
 
 # --- Literal-overflow warning ---
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { u8 b = 300; exit(b) }\n' > "$DIR/../test_tmp_trunc_$$.kr"
-trunc_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_trunc_$$.kr" -o /tmp/krc_trunc_$$ 2>&1)
+printf 'fn main() { u8 b = 300; exit(b) }\n' > "$DIR/../test_tmp_trunc_$$.mlr"
+trunc_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_trunc_$$.mlr" -o /tmp/krc_trunc_$$ 2>&1)
 if echo "$trunc_out" | grep -q "literal initializer does not fit"; then
     PASS=$((PASS + 1))
 else
     echo "FAIL: literal_overflow_warns (no warning emitted)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$DIR/../test_tmp_trunc_$$.kr" /tmp/krc_trunc_$$
+rm -f "$DIR/../test_tmp_trunc_$$.mlr" /tmp/krc_trunc_$$
 
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { u8 b = 200; exit(b) }\n' > "$DIR/../test_tmp_okw_$$.kr"
-okw_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_okw_$$.kr" -o /tmp/krc_okw_$$ 2>&1)
+printf 'fn main() { u8 b = 200; exit(b) }\n' > "$DIR/../test_tmp_okw_$$.mlr"
+okw_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_okw_$$.mlr" -o /tmp/krc_okw_$$ 2>&1)
 if echo "$okw_out" | grep -q "literal initializer"; then
     echo "FAIL: literal_in_range_silent (false warning)"; FAIL=$((FAIL + 1))
 else
     PASS=$((PASS + 1))
 fi
-rm -f "$DIR/../test_tmp_okw_$$.kr" /tmp/krc_okw_$$
+rm -f "$DIR/../test_tmp_okw_$$.mlr" /tmp/krc_okw_$$
 
 # --- Unused-variable warning ---
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { u64 stale = 5; exit(0) }\n' > "$DIR/../test_tmp_uv_$$.kr"
-uv_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_uv_$$.kr" -o /tmp/krc_uv_$$ 2>&1)
+printf 'fn main() { u64 stale = 5; exit(0) }\n' > "$DIR/../test_tmp_uv_$$.mlr"
+uv_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_uv_$$.mlr" -o /tmp/krc_uv_$$ 2>&1)
 if echo "$uv_out" | grep -q "unused variable.*stale"; then
     PASS=$((PASS + 1))
 else
     echo "FAIL: unused_var_warns (no warning)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$DIR/../test_tmp_uv_$$.kr" /tmp/krc_uv_$$
+rm -f "$DIR/../test_tmp_uv_$$.mlr" /tmp/krc_uv_$$
 
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { u64 _skip = 5; exit(0) }\n' > "$DIR/../test_tmp_uvs_$$.kr"
-uvs_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_uvs_$$.kr" -o /tmp/krc_uvs_$$ 2>&1)
+printf 'fn main() { u64 _skip = 5; exit(0) }\n' > "$DIR/../test_tmp_uvs_$$.mlr"
+uvs_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_uvs_$$.mlr" -o /tmp/krc_uvs_$$ 2>&1)
 if echo "$uvs_out" | grep -q "unused variable"; then
     echo "FAIL: unused_underscore_silent (false warning)"; FAIL=$((FAIL + 1))
 else
     PASS=$((PASS + 1))
 fi
-rm -f "$DIR/../test_tmp_uvs_$$.kr" /tmp/krc_uvs_$$
+rm -f "$DIR/../test_tmp_uvs_$$.mlr" /tmp/krc_uvs_$$
 
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { u64 x = 5; exit(x) }\n' > "$DIR/../test_tmp_uvu_$$.kr"
-uvu_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_uvu_$$.kr" -o /tmp/krc_uvu_$$ 2>&1)
+printf 'fn main() { u64 x = 5; exit(x) }\n' > "$DIR/../test_tmp_uvu_$$.mlr"
+uvu_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_uvu_$$.mlr" -o /tmp/krc_uvu_$$ 2>&1)
 if echo "$uvu_out" | grep -q "unused variable"; then
     echo "FAIL: used_var_silent (false warning)"; FAIL=$((FAIL + 1))
 else
     PASS=$((PASS + 1))
 fi
-rm -f "$DIR/../test_tmp_uvu_$$.kr" /tmp/krc_uvu_$$
+rm -f "$DIR/../test_tmp_uvu_$$.mlr" /tmp/krc_uvu_$$
 
 # --- Uninitialized-read warning ---
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { u64 stale; exit(stale) }\n' > "$DIR/../test_tmp_ur_$$.kr"
-ur_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_ur_$$.kr" -o /tmp/krc_ur_$$ 2>&1)
+printf 'fn main() { u64 stale; exit(stale) }\n' > "$DIR/../test_tmp_ur_$$.mlr"
+ur_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_ur_$$.mlr" -o /tmp/krc_ur_$$ 2>&1)
 if echo "$ur_out" | grep -q "used before initialization.*stale"; then
     PASS=$((PASS + 1))
 else
     echo "FAIL: uninit_read_warns (no warning)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$DIR/../test_tmp_ur_$$.kr" /tmp/krc_ur_$$
+rm -f "$DIR/../test_tmp_ur_$$.mlr" /tmp/krc_ur_$$
 
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { u64 x = 0; exit(x) }\n' > "$DIR/../test_tmp_urs_$$.kr"
-urs_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_urs_$$.kr" -o /tmp/krc_urs_$$ 2>&1)
+printf 'fn main() { u64 x = 0; exit(x) }\n' > "$DIR/../test_tmp_urs_$$.mlr"
+urs_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_urs_$$.mlr" -o /tmp/krc_urs_$$ 2>&1)
 if echo "$urs_out" | grep -q "used before initialization"; then
     echo "FAIL: init_read_silent (false warning)"; FAIL=$((FAIL + 1))
 else
     PASS=$((PASS + 1))
 fi
-rm -f "$DIR/../test_tmp_urs_$$.kr" /tmp/krc_urs_$$
+rm -f "$DIR/../test_tmp_urs_$$.mlr" /tmp/krc_urs_$$
 
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { u64 _x; exit(_x) }\n' > "$DIR/../test_tmp_urus_$$.kr"
-urus_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_urus_$$.kr" -o /tmp/krc_urus_$$ 2>&1)
+printf 'fn main() { u64 _x; exit(_x) }\n' > "$DIR/../test_tmp_urus_$$.mlr"
+urus_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_urus_$$.mlr" -o /tmp/krc_urus_$$ 2>&1)
 if echo "$urus_out" | grep -q "used before initialization"; then
     echo "FAIL: underscore_uninit_silent (false warning)"; FAIL=$((FAIL + 1))
 else
     PASS=$((PASS + 1))
 fi
-rm -f "$DIR/../test_tmp_urus_$$.kr" /tmp/krc_urus_$$
+rm -f "$DIR/../test_tmp_urus_$$.mlr" /tmp/krc_urus_$$
 
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { u8 b = 10; b = 300; exit(b) }\n' > "$DIR/../test_tmp_tas_$$.kr"
-tas_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_tas_$$.kr" -o /tmp/krc_tas_$$ 2>&1)
+printf 'fn main() { u8 b = 10; b = 300; exit(b) }\n' > "$DIR/../test_tmp_tas_$$.mlr"
+tas_out=$($KRC $KRC_FLAGS "$DIR/../test_tmp_tas_$$.mlr" -o /tmp/krc_tas_$$ 2>&1)
 if echo "$tas_out" | grep -q "literal assignment does not fit"; then
     PASS=$((PASS + 1))
 else
     echo "FAIL: literal_assign_warns (no warning emitted)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$DIR/../test_tmp_tas_$$.kr" /tmp/krc_tas_$$
-run_test "alloc_aligned_64" 'import "std/mem.kr"
+rm -f "$DIR/../test_tmp_tas_$$.mlr" /tmp/krc_tas_$$
+run_test "alloc_aligned_64" 'import "std/mem.mlr"
 fn main() {
     uint64 buf = alloc_aligned(100, 64)
     if (buf & 63) != 0 { exit(1) }
     alloc_aligned_free(buf)
     exit(0)
 }' 0
-run_test "alloc_aligned_256" 'import "std/mem.kr"
+run_test "alloc_aligned_256" 'import "std/mem.mlr"
 fn main() {
     uint64 buf = alloc_aligned(1000, 256)
     if (buf & 255) != 0 { exit(1) }
@@ -1042,8 +1042,8 @@ run_test "volatile_uint8" 'fn main() {
 if [ "$ARCH" != "aarch64" ]; then
     # x86: rdmsr/wrmsr are ring-0 only; just verify the asm block compiles
     TOTAL=$((TOTAL + 1))
-    printf 'fn main() { exit(42) }\n@naked fn msr_test() { asm("rdmsr") }\n' > /tmp/krc_test_$$.kr
-    if $KRC $KRC_FLAGS /tmp/krc_test_$$.kr -o /tmp/krc_test_$$ > /dev/null 2>&1; then
+    printf 'fn main() { exit(42) }\n@naked fn msr_test() { asm("rdmsr") }\n' > /tmp/krc_test_$$.mlr
+    if $KRC $KRC_FLAGS /tmp/krc_test_$$.mlr -o /tmp/krc_test_$$ > /dev/null 2>&1; then
         chmod +x /tmp/krc_test_$$
         /tmp/krc_test_$$ > /dev/null 2>&1; got=$?
         if [ "$got" = "42" ]; then
@@ -1056,11 +1056,11 @@ if [ "$ARCH" != "aarch64" ]; then
         echo "FAIL: msr_compile (compilation failed)"
         FAIL=$((FAIL + 1))
     fi
-    rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_test_$$
+    rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_test_$$
 
     TOTAL=$((TOTAL + 1))
-    printf 'fn main() { exit(42) }\n@naked fn msr_test() { asm("wrmsr") }\n' > /tmp/krc_test_$$.kr
-    if $KRC $KRC_FLAGS /tmp/krc_test_$$.kr -o /tmp/krc_test_$$ > /dev/null 2>&1; then
+    printf 'fn main() { exit(42) }\n@naked fn msr_test() { asm("wrmsr") }\n' > /tmp/krc_test_$$.mlr
+    if $KRC $KRC_FLAGS /tmp/krc_test_$$.mlr -o /tmp/krc_test_$$ > /dev/null 2>&1; then
         chmod +x /tmp/krc_test_$$
         /tmp/krc_test_$$ > /dev/null 2>&1; got=$?
         if [ "$got" = "42" ]; then
@@ -1073,7 +1073,7 @@ if [ "$ARCH" != "aarch64" ]; then
         echo "FAIL: msr_wrmsr_compile (compilation failed)"
         FAIL=$((FAIL + 1))
     fi
-    rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_test_$$
+    rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_test_$$
 else
     echo "  msr_compile: SKIP (x86-only)"; PASS=$((PASS+1)); TOTAL=$((TOTAL+1))
     echo "  msr_wrmsr_compile: SKIP (x86-only)"; PASS=$((PASS+1)); TOTAL=$((TOTAL+1))
@@ -1085,7 +1085,7 @@ echo "--- DCE test ---"
 TOTAL=$((TOTAL + 1))
 
 # Program with an unused function — DCE should eliminate it
-cat > /tmp/krc_dce_unused_$$.kr << 'KRSRC'
+cat > /tmp/krc_dce_unused_$$.mlr << 'KRSRC'
 fn unused_big() -> uint64 {
     uint64 a = 1
     uint64 b = 2
@@ -1129,7 +1129,7 @@ fn main() { exit(42) }
 KRSRC
 
 # Same program but all functions are called
-cat > /tmp/krc_dce_used_$$.kr << 'KRSRC'
+cat > /tmp/krc_dce_used_$$.mlr << 'KRSRC'
 fn used_big() -> uint64 {
     uint64 a = 1
     uint64 b = 2
@@ -1175,8 +1175,8 @@ fn main() {
 }
 KRSRC
 
-if $KRC $KRC_FLAGS /tmp/krc_dce_unused_$$.kr -o /tmp/krc_dce_small_$$ > /dev/null 2>&1 && \
-   $KRC $KRC_FLAGS /tmp/krc_dce_used_$$.kr -o /tmp/krc_dce_large_$$ > /dev/null 2>&1; then
+if $KRC $KRC_FLAGS /tmp/krc_dce_unused_$$.mlr -o /tmp/krc_dce_small_$$ > /dev/null 2>&1 && \
+   $KRC $KRC_FLAGS /tmp/krc_dce_used_$$.mlr -o /tmp/krc_dce_large_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_dce_small_$$ /tmp/krc_dce_large_$$
     small_size=$(wc -c < /tmp/krc_dce_small_$$)
     large_size=$(wc -c < /tmp/krc_dce_large_$$)
@@ -1194,14 +1194,14 @@ else
     echo "  dce_eliminates_unused: FAIL (compilation failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f /tmp/krc_dce_unused_$$.kr /tmp/krc_dce_used_$$.kr /tmp/krc_dce_small_$$ /tmp/krc_dce_large_$$
+rm -f /tmp/krc_dce_unused_$$.mlr /tmp/krc_dce_used_$$.mlr /tmp/krc_dce_small_$$ /tmp/krc_dce_large_$$
 
 # --- ELF relocatable (.o) test ---
 echo ""
 echo "--- ELF relocatable (.o) test ---"
 TOTAL=$((TOTAL + 1))
-printf 'fn add(uint64 a, uint64 b) -> uint64 { return a + b }\nfn main() { exit(add(30, 12)) }\n' > /tmp/krc_obj_$$.kr
-if $KRC $KRC_FLAGS --emit=obj /tmp/krc_obj_$$.kr -o /tmp/krc_obj_$$.o > /dev/null 2>&1; then
+printf 'fn add(uint64 a, uint64 b) -> uint64 { return a + b }\nfn main() { exit(add(30, 12)) }\n' > /tmp/krc_obj_$$.mlr
+if $KRC $KRC_FLAGS --emit=obj /tmp/krc_obj_$$.mlr -o /tmp/krc_obj_$$.o > /dev/null 2>&1; then
     # Check first 18 bytes: ELF magic (4) + class(1) + data(1) + version(1) + osabi(1) + padding(8) + e_type LE (2)
     # e_type at offset 16-17 should be 01 00 (ET_REL = 1, little-endian)
     magic=$(xxd -l 4 -p /tmp/krc_obj_$$.o 2>/dev/null)
@@ -1220,7 +1220,7 @@ fi
 
 # Also test -c flag produces same result
 TOTAL=$((TOTAL + 1))
-if $KRC $KRC_FLAGS -c /tmp/krc_obj_$$.kr -o /tmp/krc_obj_c_$$.o > /dev/null 2>&1; then
+if $KRC $KRC_FLAGS -c /tmp/krc_obj_$$.mlr -o /tmp/krc_obj_c_$$.o > /dev/null 2>&1; then
     c_magic=$(xxd -l 4 -p /tmp/krc_obj_c_$$.o 2>/dev/null)
     c_etype=$(xxd -s 16 -l 2 -p /tmp/krc_obj_c_$$.o 2>/dev/null)
     if [ "$c_magic" = "7f454c46" ] && [ "$c_etype" = "0100" ]; then
@@ -1261,7 +1261,7 @@ else
     PASS=$((PASS + 1))
     echo "  emit_obj_readelf: SKIP (readelf not found or .o missing)"
 fi
-rm -f /tmp/krc_obj_$$.kr /tmp/krc_obj_$$.o /tmp/krc_obj_c_$$.o
+rm -f /tmp/krc_obj_$$.mlr /tmp/krc_obj_$$.o /tmp/krc_obj_c_$$.o
 
 # --- Generics (monomorphization) ---
 run_test "generic_fn_single" 'fn max_gen<T>(T a, T b) -> T {
@@ -1316,8 +1316,8 @@ echo "--- Error detection tests ---"
 
 # Wrong argument count
 TOTAL=$((TOTAL + 1))
-printf 'fn add(uint64 a, uint64 b) -> uint64 { return a + b }\nfn main() { exit(add(1, 2, 3)) }\n' > /tmp/krc_err_$$.kr
-if $KRC $KRC_FLAGS /tmp/krc_err_$$.kr -o /tmp/krc_err_$$ 2>/tmp/krc_stderr_$$ ; then
+printf 'fn add(uint64 a, uint64 b) -> uint64 { return a + b }\nfn main() { exit(add(1, 2, 3)) }\n' > /tmp/krc_err_$$.mlr
+if $KRC $KRC_FLAGS /tmp/krc_err_$$.mlr -o /tmp/krc_err_$$ 2>/tmp/krc_stderr_$$ ; then
     echo "FAIL: wrong_arg_count (should not compile)"
     FAIL=$((FAIL + 1))
 else
@@ -1329,12 +1329,12 @@ else
         FAIL=$((FAIL + 1))
     fi
 fi
-rm -f /tmp/krc_err_$$.kr /tmp/krc_err_$$ /tmp/krc_stderr_$$
+rm -f /tmp/krc_err_$$.mlr /tmp/krc_err_$$ /tmp/krc_stderr_$$
 
 # Missing return in non-void function
 TOTAL=$((TOTAL + 1))
-printf 'fn get_val() -> uint64 { uint64 x = 42 }\nfn main() { exit(get_val()) }\n' > /tmp/krc_err_$$.kr
-if $KRC $KRC_FLAGS /tmp/krc_err_$$.kr -o /tmp/krc_err_$$ 2>/tmp/krc_stderr_$$ ; then
+printf 'fn get_val() -> uint64 { uint64 x = 42 }\nfn main() { exit(get_val()) }\n' > /tmp/krc_err_$$.mlr
+if $KRC $KRC_FLAGS /tmp/krc_err_$$.mlr -o /tmp/krc_err_$$ 2>/tmp/krc_stderr_$$ ; then
     echo "FAIL: missing_return (should not compile)"
     FAIL=$((FAIL + 1))
 else
@@ -1346,12 +1346,12 @@ else
         FAIL=$((FAIL + 1))
     fi
 fi
-rm -f /tmp/krc_err_$$.kr /tmp/krc_err_$$ /tmp/krc_stderr_$$
+rm -f /tmp/krc_err_$$.mlr /tmp/krc_err_$$ /tmp/krc_stderr_$$
 
 # Duplicate function definition
 TOTAL=$((TOTAL + 1))
-printf 'fn foo() { exit(1) }\nfn foo() { exit(2) }\nfn main() { foo() }\n' > /tmp/krc_err_$$.kr
-if $KRC $KRC_FLAGS /tmp/krc_err_$$.kr -o /tmp/krc_err_$$ 2>/tmp/krc_stderr_$$ ; then
+printf 'fn foo() { exit(1) }\nfn foo() { exit(2) }\nfn main() { foo() }\n' > /tmp/krc_err_$$.mlr
+if $KRC $KRC_FLAGS /tmp/krc_err_$$.mlr -o /tmp/krc_err_$$ 2>/tmp/krc_stderr_$$ ; then
     echo "FAIL: duplicate_fn (should not compile)"
     FAIL=$((FAIL + 1))
 else
@@ -1363,14 +1363,14 @@ else
         FAIL=$((FAIL + 1))
     fi
 fi
-rm -f /tmp/krc_err_$$.kr /tmp/krc_err_$$ /tmp/krc_stderr_$$
+rm -f /tmp/krc_err_$$.mlr /tmp/krc_err_$$ /tmp/krc_stderr_$$
 
 # --- Android emit test ---
 echo ""
 echo "--- Android emit test ---"
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { exit(42) }\n' > /tmp/krc_android_$$.kr
-if $KRC $KRC_FLAGS --emit=android /tmp/krc_android_$$.kr -o /tmp/krc_android_$$ > /dev/null 2>&1; then
+printf 'fn main() { exit(42) }\n' > /tmp/krc_android_$$.mlr
+if $KRC $KRC_FLAGS --emit=android /tmp/krc_android_$$.mlr -o /tmp/krc_android_$$ > /dev/null 2>&1; then
     magic=$(xxd -l 4 -p /tmp/krc_android_$$ 2>/dev/null)
     etype=$(xxd -s 16 -l 2 -p /tmp/krc_android_$$ 2>/dev/null)
     if [ "$magic" = "7f454c46" ] && [ "$etype" = "0300" ]; then
@@ -1384,14 +1384,14 @@ else
     FAIL=$((FAIL + 1))
     echo "  android_emit: FAIL (compilation failed)"
 fi
-rm -f /tmp/krc_android_$$.kr /tmp/krc_android_$$
+rm -f /tmp/krc_android_$$.mlr /tmp/krc_android_$$
 
 # --- Android x86_64 emit test ---
 echo ""
 echo "--- Android x86_64 emit test ---"
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { exit(42) }\n' > /tmp/krc_androidx_$$.kr
-if $KRC --arch=x86_64 --emit=android /tmp/krc_androidx_$$.kr -o /tmp/krc_androidx_$$ > /dev/null 2>&1; then
+printf 'fn main() { exit(42) }\n' > /tmp/krc_androidx_$$.mlr
+if $KRC --arch=x86_64 --emit=android /tmp/krc_androidx_$$.mlr -o /tmp/krc_androidx_$$ > /dev/null 2>&1; then
     magic=$(xxd -l 4 -p /tmp/krc_androidx_$$ 2>/dev/null)
     etype=$(xxd -s 16 -l 2 -p /tmp/krc_androidx_$$ 2>/dev/null)
     emach=$(xxd -s 18 -l 2 -p /tmp/krc_androidx_$$ 2>/dev/null)
@@ -1420,7 +1420,7 @@ else
     FAIL=$((FAIL + 1))
     echo "  android_emit_x86_64: FAIL (compilation failed)"
 fi
-rm -f /tmp/krc_androidx_$$.kr /tmp/krc_androidx_$$
+rm -f /tmp/krc_androidx_$$.mlr /tmp/krc_androidx_$$
 
 # --- 2-tuple return and destructure ---
 run_test "tuple_basic" 'fn divmod(uint64 x, uint64 y) -> uint64 { return (x / y, x % y) }
@@ -1481,8 +1481,8 @@ if [ "${ANDROID_EMULATOR:-0}" = "1" ] && command -v adb > /dev/null 2>&1; then
         _adb_run() {
             local name="$1" src="$2" expected="$3"
             TOTAL=$((TOTAL + 1))
-            printf '%s\n' "$src" > /tmp/krc_adb_$$.kr
-            if $KRC --arch=x86_64 --emit=android /tmp/krc_adb_$$.kr -o /tmp/krc_adb_$$ > /dev/null 2>&1; then
+            printf '%s\n' "$src" > /tmp/krc_adb_$$.mlr
+            if $KRC --arch=x86_64 --emit=android /tmp/krc_adb_$$.mlr -o /tmp/krc_adb_$$ > /dev/null 2>&1; then
                 adb push /tmp/krc_adb_$$ /data/local/tmp/krc_adb_$$ > /dev/null 2>&1
                 adb shell chmod 755 /data/local/tmp/krc_adb_$$ > /dev/null 2>&1
                 got=$(adb shell "/data/local/tmp/krc_adb_$$ > /dev/null 2>&1; echo \$?" | tr -d '\r')
@@ -1498,7 +1498,7 @@ if [ "${ANDROID_EMULATOR:-0}" = "1" ] && command -v adb > /dev/null 2>&1; then
                 FAIL=$((FAIL + 1))
                 echo "  adb_$name: FAIL (compile)"
             fi
-            rm -f /tmp/krc_adb_$$.kr /tmp/krc_adb_$$
+            rm -f /tmp/krc_adb_$$.mlr /tmp/krc_adb_$$
         }
         _adb_run "exit42"   'fn main() { exit(42) }' 42
         _adb_run "add"      'fn main() { exit(2 + 3) }' 5
@@ -1590,19 +1590,19 @@ fn main() { P p; p.x = 10; p.x += 5; p.x *= 2; exit(p.x) }' 30
 run_test "compound_index_assign" 'fn main() { u64[4] a; a[0] = 10; a[0] += 3; a[0] *= 4; exit(a[0]) }' 52
 
 # --- Char predicates (std/string.kr) ---
-run_test "char_pred_digit"   'import "std/string.kr"
+run_test "char_pred_digit"   'import "std/string.mlr"
 fn main() { if is_digit(53) == 1 && is_digit(97) == 0 { exit(1) }; exit(0) }' 1
-run_test "char_pred_alpha"   'import "std/string.kr"
+run_test "char_pred_alpha"   'import "std/string.mlr"
 fn main() { if is_alpha(97) == 1 && is_alpha(48) == 0 { exit(1) }; exit(0) }' 1
-run_test "char_pred_space"   'import "std/string.kr"
+run_test "char_pred_space"   'import "std/string.mlr"
 fn main() { if is_space(32) == 1 && is_space(10) == 1 && is_space(65) == 0 { exit(1) }; exit(0) }' 1
-run_test "char_pred_hex"     'import "std/string.kr"
+run_test "char_pred_hex"     'import "std/string.mlr"
 fn main() { if is_hex_digit(70) == 1 && is_hex_digit(103) == 0 { exit(1) }; exit(0) }' 1
-run_test "char_to_upper"     'import "std/string.kr"
+run_test "char_to_upper"     'import "std/string.mlr"
 fn main() { exit(to_upper_ch(97)) }' 65
-run_test "char_to_lower"     'import "std/string.kr"
+run_test "char_to_lower"     'import "std/string.mlr"
 fn main() { exit(to_lower_ch(90)) }' 122
-run_test "char_hex_val"      'import "std/string.kr"
+run_test "char_hex_val"      'import "std/string.mlr"
 fn main() { exit(hex_digit_val(70)) }' 15
 run_test "loop_nested_break" 'fn main() {
     u64 total = 0
@@ -1636,24 +1636,24 @@ fn main() { inner(); exit(v) }' 42
 
 # --- @section annotation capture ---
 TOTAL=$((TOTAL + 1))
-printf '@section(".text.init")\nfn boot() -> u64 { return 0 }\nfn main() { exit(boot()) }\n' > "$DIR/../test_tmp_sect_$$.kr"
-$KRC --emit=asm $KRC_FLAGS "$DIR/../test_tmp_sect_$$.kr" -o /tmp/krc_sect_$$.s > /dev/null 2>&1
+printf '@section(".text.init")\nfn boot() -> u64 { return 0 }\nfn main() { exit(boot()) }\n' > "$DIR/../test_tmp_sect_$$.mlr"
+$KRC --emit=asm $KRC_FLAGS "$DIR/../test_tmp_sect_$$.mlr" -o /tmp/krc_sect_$$.s > /dev/null 2>&1
 if grep -q "^\\.section \\.text\\.init" /tmp/krc_sect_$$.s 2>/dev/null; then
     PASS=$((PASS + 1))
 else
     echo "FAIL: section_asm_directive (no .section emitted)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$DIR/../test_tmp_sect_$$.kr" /tmp/krc_sect_$$.s
+rm -f "$DIR/../test_tmp_sect_$$.mlr" /tmp/krc_sect_$$.s
 
 TOTAL=$((TOTAL + 1))
-printf 'fn boot() -> u64 { return 0 }\nfn main() { exit(boot()) }\n' > "$DIR/../test_tmp_nosect_$$.kr"
-$KRC --emit=asm $KRC_FLAGS "$DIR/../test_tmp_nosect_$$.kr" -o /tmp/krc_nosect_$$.s > /dev/null 2>&1
+printf 'fn boot() -> u64 { return 0 }\nfn main() { exit(boot()) }\n' > "$DIR/../test_tmp_nosect_$$.mlr"
+$KRC --emit=asm $KRC_FLAGS "$DIR/../test_tmp_nosect_$$.mlr" -o /tmp/krc_nosect_$$.s > /dev/null 2>&1
 if grep -q "^\\.section" /tmp/krc_nosect_$$.s 2>/dev/null; then
     echo "FAIL: no_section_no_directive (spurious .section)"; FAIL=$((FAIL + 1))
 else
     PASS=$((PASS + 1))
 fi
-rm -f "$DIR/../test_tmp_nosect_$$.kr" /tmp/krc_nosect_$$.s
+rm -f "$DIR/../test_tmp_nosect_$$.mlr" /tmp/krc_nosect_$$.s
 
 # --- Many-parameter functions ---
 run_test "fn_7args" 'fn sum7(uint64 a, uint64 b, uint64 c, uint64 d, uint64 e, uint64 f, uint64 g) -> uint64 { return a + b + c + d + e + f + g }
@@ -1670,8 +1670,8 @@ fn main() { exit(Color.Blue) }' 2
 echo ""
 echo "--- ASM emit test ---"
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { exit(42) }\n' > /tmp/krc_asm_$$.kr
-if $KRC $KRC_FLAGS --emit=asm /tmp/krc_asm_$$.kr -o /tmp/krc_asm_$$.s > /dev/null 2>&1; then
+printf 'fn main() { exit(42) }\n' > /tmp/krc_asm_$$.mlr
+if $KRC $KRC_FLAGS --emit=asm /tmp/krc_asm_$$.mlr -o /tmp/krc_asm_$$.s > /dev/null 2>&1; then
     if file /tmp/krc_asm_$$.s | grep -qi 'text\|ascii' && grep -q 'main' /tmp/krc_asm_$$.s; then
         PASS=$((PASS + 1))
         echo "  emit_asm: PASS (text output with function labels)"
@@ -1683,7 +1683,7 @@ else
     FAIL=$((FAIL + 1))
     echo "  emit_asm: FAIL (compilation with --emit=asm failed)"
 fi
-rm -f /tmp/krc_asm_$$.kr /tmp/krc_asm_$$.s
+rm -f /tmp/krc_asm_$$.mlr /tmp/krc_asm_$$.s
 
 # --- emit=asm content tests ---
 echo ""
@@ -1692,8 +1692,8 @@ echo "--- emit=asm content tests ---"
 # Test asm output has function labels and mnemonics
 TOTAL=$((TOTAL + 1))
 echo 'fn add(uint64 a, uint64 b) -> uint64 { return a + b }
-fn main() { exit(add(1, 2)) }' > /tmp/krc_asm_test_$$.kr
-if $KRC $KRC_FLAGS --emit=asm /tmp/krc_asm_test_$$.kr -o /tmp/krc_asm_test_$$.s > /dev/null 2>&1; then
+fn main() { exit(add(1, 2)) }' > /tmp/krc_asm_test_$$.mlr
+if $KRC $KRC_FLAGS --emit=asm /tmp/krc_asm_test_$$.mlr -o /tmp/krc_asm_test_$$.s > /dev/null 2>&1; then
     if grep -q "add:" /tmp/krc_asm_test_$$.s && grep -q "main:" /tmp/krc_asm_test_$$.s && grep -q "ret" /tmp/krc_asm_test_$$.s; then
         echo "  emit_asm_content: PASS"
         PASS=$((PASS + 1))
@@ -1709,15 +1709,15 @@ rm -f /tmp/krc_asm_test_$$.*
 
 # Test that --emit=xyz gives an error
 TOTAL=$((TOTAL + 1))
-echo 'fn main() { exit(0) }' > /tmp/krc_asm_err_$$.kr
-if $KRC --emit=xyz /tmp/krc_asm_err_$$.kr -o /tmp/krc_asm_err_$$ 2>&1 | grep -q "unknown emit format"; then
+echo 'fn main() { exit(0) }' > /tmp/krc_asm_err_$$.mlr
+if $KRC --emit=xyz /tmp/krc_asm_err_$$.mlr -o /tmp/krc_asm_err_$$ 2>&1 | grep -q "unknown emit format"; then
     echo "  emit_unknown_error: PASS"
     PASS=$((PASS + 1))
 else
     echo "  emit_unknown_error: FAIL"
     FAIL=$((FAIL + 1))
 fi
-rm -f /tmp/krc_asm_err_$$.kr /tmp/krc_asm_err_$$
+rm -f /tmp/krc_asm_err_$$.mlr /tmp/krc_asm_err_$$
 
 # --- String escapes ---
 run_test_output "str_escape_newline" 'fn main() { print("a\nb"); exit(0) }' "a
@@ -1741,8 +1741,8 @@ if [ -n "$QEMU_A64" ] && [ "$ARCH" = "x86_64" ]; then
         local expected="$3"
         TOTAL=$((TOTAL + 1))
 
-        printf '%s\n' "$input" > /tmp/krc_a64_$$.kr
-        if $KRC --arch=arm64 /tmp/krc_a64_$$.kr -o /tmp/krc_a64_$$ > /dev/null 2>&1; then
+        printf '%s\n' "$input" > /tmp/krc_a64_$$.mlr
+        if $KRC --arch=arm64 /tmp/krc_a64_$$.mlr -o /tmp/krc_a64_$$ > /dev/null 2>&1; then
             chmod +x /tmp/krc_a64_$$
             local got=0
             $QEMU_A64 /tmp/krc_a64_$$ > /dev/null 2>&1 && got=0 || got=$?
@@ -1756,7 +1756,7 @@ if [ -n "$QEMU_A64" ] && [ "$ARCH" = "x86_64" ]; then
             echo "FAIL: $name (cross-compilation failed)"
             FAIL=$((FAIL + 1))
         fi
-        rm -f /tmp/krc_a64_$$.kr /tmp/krc_a64_$$
+        rm -f /tmp/krc_a64_$$.mlr /tmp/krc_a64_$$
     }
 
     run_test_a64 "a64_exit" 'fn main() { exit(42) }' 42
@@ -2004,7 +2004,7 @@ rm -f /tmp/krc_prop_$$.txt
 
 # --fix --dry-run on a legacy file should show a migration
 TOTAL=$((TOTAL + 1))
-cat > /tmp/krc_mig_$$.kr <<'KREOF'
+cat > /tmp/krc_mig_$$.mlr <<'KREOF'
 fn main() {
     u64 buf = alloc(16)
     u64 v = 0
@@ -2012,7 +2012,7 @@ fn main() {
     exit(v)
 }
 KREOF
-if $KRC lc --fix --dry-run /tmp/krc_mig_$$.kr > /tmp/krc_mig_out_$$.txt 2>&1; then
+if $KRC lc --fix --dry-run /tmp/krc_mig_$$.mlr > /tmp/krc_mig_out_$$.txt 2>&1; then
     if grep -q "1 migration site(s) rewritten" /tmp/krc_mig_out_$$.txt && grep -q "load32" /tmp/krc_mig_out_$$.txt; then
         PASS=$((PASS + 1))
     else
@@ -2023,11 +2023,11 @@ else
     echo "FAIL: migration_dry_run (command failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f /tmp/krc_mig_$$.kr /tmp/krc_mig_out_$$.txt
+rm -f /tmp/krc_mig_$$.mlr /tmp/krc_mig_out_$$.txt
 
 # --fix (actual) on a legacy file should rewrite and the result should compile
 TOTAL=$((TOTAL + 1))
-cat > /tmp/krc_mig2_$$.kr <<'KREOF'
+cat > /tmp/krc_mig2_$$.mlr <<'KREOF'
 fn main() {
     u64 buf = alloc(16)
     u64 v = 0
@@ -2036,10 +2036,10 @@ fn main() {
     exit(v)
 }
 KREOF
-if $KRC lc --fix /tmp/krc_mig2_$$.kr > /dev/null 2>&1; then
-    if grep -q "v = load32(buf)" /tmp/krc_mig2_$$.kr; then
+if $KRC lc --fix /tmp/krc_mig2_$$.mlr > /dev/null 2>&1; then
+    if grep -q "v = load32(buf)" /tmp/krc_mig2_$$.mlr; then
         # Now verify the rewritten file still compiles and runs
-        if $KRC $KRC_FLAGS /tmp/krc_mig2_$$.kr -o /tmp/krc_mig2_bin_$$ > /dev/null 2>&1; then
+        if $KRC $KRC_FLAGS /tmp/krc_mig2_$$.mlr -o /tmp/krc_mig2_bin_$$ > /dev/null 2>&1; then
             chmod +x /tmp/krc_mig2_bin_$$
             /tmp/krc_mig2_bin_$$ > /dev/null 2>&1
             if [ "$?" = "42" ]; then
@@ -2060,11 +2060,11 @@ else
     echo "FAIL: migration_apply (command failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f /tmp/krc_mig2_$$.kr /tmp/krc_mig2_bin_$$
+rm -f /tmp/krc_mig2_$$.mlr /tmp/krc_mig2_bin_$$
 
 # krc lc on a file with unsafe ops should report legacy_ptr_ops
 TOTAL=$((TOTAL + 1))
-cat > /tmp/krc_lc_$$.kr <<'KREOF'
+cat > /tmp/krc_lc_$$.mlr <<'KREOF'
 fn main() {
     u64 buf = alloc(16)
     u64 v = 0
@@ -2072,7 +2072,7 @@ fn main() {
     exit(v)
 }
 KREOF
-if $KRC lc /tmp/krc_lc_$$.kr > /tmp/krc_lc_out_$$.txt 2>&1; then
+if $KRC lc /tmp/krc_lc_$$.mlr > /tmp/krc_lc_out_$$.txt 2>&1; then
     if grep -q "legacy_ptr_ops" /tmp/krc_lc_out_$$.txt && grep -q "auto-fix available" /tmp/krc_lc_out_$$.txt; then
         PASS=$((PASS + 1))
     else
@@ -2083,7 +2083,7 @@ else
     echo "FAIL: lc_reports_legacy (command failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f /tmp/krc_lc_$$.kr /tmp/krc_lc_out_$$.txt
+rm -f /tmp/krc_lc_$$.mlr /tmp/krc_lc_out_$$.txt
 
 # Governance: promote + list round-trip
 TOTAL=$((TOTAL + 1))
@@ -2111,7 +2111,7 @@ rm -rf "$GOV_DIR" /tmp/krc_gov_promote_$$.txt
 
 # Migration: long-form types → short aliases
 TOTAL=$((TOTAL + 1))
-cat > /tmp/krc_migtypes_$$.kr <<'KREOF'
+cat > /tmp/krc_migtypes_$$.mlr <<'KREOF'
 fn main() {
     uint64 x = 42
     uint32 y = 1
@@ -2119,10 +2119,10 @@ fn main() {
     exit(x)
 }
 KREOF
-if $KRC lc --fix /tmp/krc_migtypes_$$.kr > /dev/null 2>&1; then
-    if grep -q "u64 x" /tmp/krc_migtypes_$$.kr && \
-       grep -q "u32 y" /tmp/krc_migtypes_$$.kr && \
-       grep -q "u16 z" /tmp/krc_migtypes_$$.kr; then
+if $KRC lc --fix /tmp/krc_migtypes_$$.mlr > /dev/null 2>&1; then
+    if grep -q "u64 x" /tmp/krc_migtypes_$$.mlr && \
+       grep -q "u32 y" /tmp/krc_migtypes_$$.mlr && \
+       grep -q "u16 z" /tmp/krc_migtypes_$$.mlr; then
         PASS=$((PASS + 1))
     else
         echo "FAIL: migration_types (file was not rewritten)"
@@ -2132,25 +2132,25 @@ else
     echo "FAIL: migration_types (command failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f /tmp/krc_migtypes_$$.kr
+rm -f /tmp/krc_migtypes_$$.mlr
 
 # --- Bootstrap test ---
 echo ""
 echo "--- Bootstrap test ---"
 TOTAL=$((TOTAL + 1))
-if [ -f "$DIR/../build/krc.kr" ]; then
+if [ -f "$DIR/../build/mlrc.mlr" ]; then
     # Use the host arch so the compiled krc can run on the runner.
     HOST_ARCH=$(uname -m)
     case "$HOST_ARCH" in
         aarch64|arm64) BS_ARCH=arm64 ;;
         *)             BS_ARCH=x86_64 ;;
     esac
-    cp "$DIR/../build/krc.kr" /tmp/krc_bootstrap_$$.kr
-    $KRC $KRC_FLAGS /tmp/krc_bootstrap_$$.kr -o /tmp/krc2_$$ > /dev/null 2>&1
+    cp "$DIR/../build/mlrc.mlr" /tmp/krc_bootstrap_$$.mlr
+    $KRC $KRC_FLAGS /tmp/krc_bootstrap_$$.mlr -o /tmp/krc2_$$ > /dev/null 2>&1
     chmod +x /tmp/krc2_$$ 2>/dev/null
-    /tmp/krc2_$$ --arch=$BS_ARCH /tmp/krc_bootstrap_$$.kr -o /tmp/krc3_$$ > /dev/null 2>&1
+    /tmp/krc2_$$ --arch=$BS_ARCH /tmp/krc_bootstrap_$$.mlr -o /tmp/krc3_$$ > /dev/null 2>&1
     chmod +x /tmp/krc3_$$ 2>/dev/null
-    /tmp/krc3_$$ --arch=$BS_ARCH /tmp/krc_bootstrap_$$.kr -o /tmp/krc4_$$ > /dev/null 2>&1
+    /tmp/krc3_$$ --arch=$BS_ARCH /tmp/krc_bootstrap_$$.mlr -o /tmp/krc4_$$ > /dev/null 2>&1
     if diff /tmp/krc3_$$ /tmp/krc4_$$ > /dev/null 2>&1; then
         PASS=$((PASS + 1))
         echo "  bootstrap: PASS (fixed point at $(wc -c < /tmp/krc3_$$) bytes)"
@@ -2158,9 +2158,9 @@ if [ -f "$DIR/../build/krc.kr" ]; then
         FAIL=$((FAIL + 1))
         echo "  bootstrap: FAIL (krc3 != krc4)"
     fi
-    rm -f /tmp/krc_bootstrap_$$.kr /tmp/krc2_$$ /tmp/krc3_$$ /tmp/krc4_$$
+    rm -f /tmp/krc_bootstrap_$$.mlr /tmp/krc2_$$ /tmp/krc3_$$ /tmp/krc4_$$
 else
-    echo "  bootstrap: SKIP (no build/krc.kr)"
+    echo "  bootstrap: SKIP (no build/mlrc.mlr)"
     PASS=$((PASS + 1))
 fi
 
@@ -2242,12 +2242,12 @@ run_test "const_neg"    'const i64 X = -42; fn main() { exit(0 - X) }' 42
 echo ""
 echo "--- import after comment (regression) ---"
 TOTAL=$((TOTAL + 1))
-cat > /tmp/imp_test_$$.kr <<'KREOF'
+cat > /tmp/imp_test_$$.mlr <<'KREOF'
 // leading comment should not break imports
-import "std/io.kr"
+import "std/io.mlr"
 fn main() { println("imp_ok"); exit(0) }
 KREOF
-if $KRC $KRC_FLAGS /tmp/imp_test_$$.kr -o /tmp/imp_test_bin_$$ > /dev/null 2>&1; then
+if $KRC $KRC_FLAGS /tmp/imp_test_$$.mlr -o /tmp/imp_test_bin_$$ > /dev/null 2>&1; then
     got=$(/tmp/imp_test_bin_$$ 2>/dev/null)
     if [ "$got" = "imp_ok" ]; then
         PASS=$((PASS + 1))
@@ -2260,7 +2260,7 @@ else
     FAIL=$((FAIL + 1))
     echo "  import_after_comment: FAIL (compile)"
 fi
-rm -f /tmp/imp_test_$$.kr /tmp/imp_test_bin_$$
+rm -f /tmp/imp_test_$$.mlr /tmp/imp_test_bin_$$
 
 echo ""
 echo "--- char literals ---"
@@ -2275,10 +2275,10 @@ run_test "char_cmp"  "fn main() { u64 c = 97; if c == 'a' { exit(1) } exit(0) }"
 echo ""
 echo "--- emit=obj non-extern path (regression) ---"
 TOTAL=$((TOTAL + 1))
-cat > /tmp/krc_noext_$$.kr <<'KREOF'
+cat > /tmp/krc_noext_$$.mlr <<'KREOF'
 fn main() { exit(42) }
 KREOF
-if $KRC --emit=obj /tmp/krc_noext_$$.kr -o /tmp/krc_noext_$$.o > /dev/null 2>&1; then
+if $KRC --emit=obj /tmp/krc_noext_$$.mlr -o /tmp/krc_noext_$$.o > /dev/null 2>&1; then
     # File must be long enough for section headers: shoff + shnum*64 <= filesize
     if command -v python3 > /dev/null 2>&1; then
         if python3 -c "
@@ -2304,7 +2304,7 @@ else
     FAIL=$((FAIL + 1))
     echo "  emit_obj_no_extern: FAIL (compile)"
 fi
-rm -f /tmp/krc_noext_$$.kr /tmp/krc_noext_$$.o
+rm -f /tmp/krc_noext_$$.mlr /tmp/krc_noext_$$.o
 
 # --- real LZ4 compression in .krbo fat binaries (regression) ---
 # Before this, the "compressor" wrote uncompressed LZ4 frames (bit 31 set
@@ -2320,7 +2320,7 @@ echo ""
 echo "--- fat binary real LZ4 compression (regression) ---"
 TOTAL=$((TOTAL + 1))
 KRCBIN="$DIR/../build/mlrc"
-cat > /tmp/krc_lz4_$$.kr <<'KREOF'
+cat > /tmp/krc_lz4_$$.mlr <<'KREOF'
 fn main() {
     u64 i = 0
     u64 sum = 0
@@ -2329,11 +2329,11 @@ fn main() {
     exit(0)
 }
 KREOF
-if "$KRCBIN" /tmp/krc_lz4_$$.kr -o /tmp/krc_lz4_$$.krbo > /dev/null 2>&1; then
+if "$KRCBIN" /tmp/krc_lz4_$$.mlr -o /tmp/krc_lz4_$$.mlrbo > /dev/null 2>&1; then
     if command -v python3 > /dev/null 2>&1; then
         if python3 -c "
 import struct, sys
-d = open('/tmp/krc_lz4_$$.krbo', 'rb').read()
+d = open('/tmp/krc_lz4_$$.mlrbo', 'rb').read()
 assert d[:8] == b'KRBOFAT\\x00'
 n = struct.unpack_from('<I', d, 12)[0]
 # With pair blobs, csize covers two slices and cannot be compared to
@@ -2371,7 +2371,7 @@ else
     FAIL=$((FAIL + 1))
     echo "  lz4_real_compression: FAIL (compile)"
 fi
-rm -f /tmp/krc_lz4_$$.kr /tmp/krc_lz4_$$.krbo
+rm -f /tmp/krc_lz4_$$.mlr /tmp/krc_lz4_$$.mlrbo
 
 # --- .krbo round-trip via kr runner (real-compression end-to-end) ---
 # Builds a .krbo, a kr runner binary, and runs the .krbo through it.
@@ -2380,18 +2380,18 @@ rm -f /tmp/krc_lz4_$$.kr /tmp/krc_lz4_$$.krbo
 echo ""
 echo "--- fat binary round-trip via kr runner (regression) ---"
 TOTAL=$((TOTAL + 1))
-cat > /tmp/krc_rt_$$.kr <<'KREOF'
+cat > /tmp/krc_rt_$$.mlr <<'KREOF'
 fn main() {
     println("roundtrip-ok")
     exit(123)
 }
 KREOF
 KRCBIN="$DIR/../build/mlrc"
-cat "$DIR/../src/bcj.kr" "$DIR/../src/runner.kr" > /tmp/krc_rt_kr_$$.kr
-if "$KRCBIN" /tmp/krc_rt_$$.kr -o /tmp/krc_rt_$$.krbo > /dev/null 2>&1 \
-   && "$KRCBIN" --arch=$ARCH /tmp/krc_rt_kr_$$.kr -o /tmp/krc_rt_kr_$$ > /dev/null 2>&1; then
+cat "$DIR/../src/bcj.mlr" "$DIR/../src/runner.mlr" > /tmp/krc_rt_kr_$$.mlr
+if "$KRCBIN" /tmp/krc_rt_$$.mlr -o /tmp/krc_rt_$$.mlrbo > /dev/null 2>&1 \
+   && "$KRCBIN" --arch=$ARCH /tmp/krc_rt_kr_$$.mlr -o /tmp/krc_rt_kr_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_rt_kr_$$
-    out=$(/tmp/krc_rt_kr_$$ /tmp/krc_rt_$$.krbo 2>&1)
+    out=$(/tmp/krc_rt_kr_$$ /tmp/krc_rt_$$.mlrbo 2>&1)
     code=$?
     if [ "$out" = "roundtrip-ok" ] && [ "$code" = "123" ]; then
         PASS=$((PASS + 1))
@@ -2404,7 +2404,7 @@ else
     PASS=$((PASS + 1))
     echo "  krbo_roundtrip: SKIP (runner build)"
 fi
-rm -f /tmp/krc_rt_$$.kr /tmp/krc_rt_kr_$$.kr /tmp/krc_rt_$$.krbo /tmp/krc_rt_kr_$$
+rm -f /tmp/krc_rt_$$.mlr /tmp/krc_rt_kr_$$.mlr /tmp/krc_rt_$$.mlrbo /tmp/krc_rt_kr_$$
 
 echo ""
 echo "--- float types ---"
@@ -2466,7 +2466,7 @@ run_test "dealloc_basic" 'fn main() { u64 p = alloc(64); store64(p, 99); dealloc
 
 echo ""
 echo "--- allocators (arena) ---"
-run_test "arena_basic" 'import "std/alloc.kr"
+run_test "arena_basic" 'import "std/alloc.mlr"
 fn main() {
     u64 a = arena_new(4096)
     u64 p1 = arena_alloc(a, 64)
@@ -2476,7 +2476,7 @@ fn main() {
     exit(v)
 }' 42
 
-run_test "arena_reset" 'import "std/alloc.kr"
+run_test "arena_reset" 'import "std/alloc.mlr"
 fn main() {
     u64 a = arena_new(4096)
     u64 p1 = arena_alloc(a, 100)
@@ -2485,7 +2485,7 @@ fn main() {
     if p1 == p2 { exit(1) } exit(0)
 }' 1
 
-run_test "arena_stats" 'import "std/alloc.kr"
+run_test "arena_stats" 'import "std/alloc.mlr"
 fn main() {
     u64 a = arena_new(4096)
     arena_alloc(a, 32)
@@ -2498,7 +2498,7 @@ fn main() {
 
 echo ""
 echo "--- allocators (pool) ---"
-run_test "pool_basic" 'import "std/alloc.kr"
+run_test "pool_basic" 'import "std/alloc.mlr"
 fn main() {
     u64 p = pool_new(64, 8)
     u64 o1 = pool_alloc(p)
@@ -2509,7 +2509,7 @@ fn main() {
     exit(v)
 }' 99
 
-run_test "pool_reuse" 'import "std/alloc.kr"
+run_test "pool_reuse" 'import "std/alloc.mlr"
 fn main() {
     u64 p = pool_new(16, 4)
     u64 a = pool_alloc(p)
@@ -2519,7 +2519,7 @@ fn main() {
     if a == c { exit(1) } exit(0)
 }' 1
 
-run_test "pool_stats" 'import "std/alloc.kr"
+run_test "pool_stats" 'import "std/alloc.mlr"
 fn main() {
     u64 p = pool_new(32, 10)
     pool_alloc(p)
@@ -2532,7 +2532,7 @@ fn main() {
 
 echo ""
 echo "--- allocators (heap) ---"
-run_test "heap_basic" 'import "std/alloc.kr"
+run_test "heap_basic" 'import "std/alloc.mlr"
 fn main() {
     u64 h = heap_new(4096)
     u64 p = heap_alloc(h, 64)
@@ -2543,7 +2543,7 @@ fn main() {
     exit(v)
 }' 77
 
-run_test "heap_multi" 'import "std/alloc.kr"
+run_test "heap_multi" 'import "std/alloc.mlr"
 fn main() {
     u64 h = heap_new(4096)
     u64 a = heap_alloc(h, 32)
@@ -2559,7 +2559,7 @@ fn main() {
     exit(0)
 }' 0
 
-run_test "heap_stats" 'import "std/alloc.kr"
+run_test "heap_stats" 'import "std/alloc.mlr"
 fn main() {
     u64 h = heap_new(4096)
     u64 a = heap_alloc(h, 32)
@@ -2584,7 +2584,7 @@ if [ "$HOST_M" != "x86_64" ] && [ "$HOST_M" != "amd64" ]; then
     echo "  extern_libc_strlen_write: SKIP (non-x86_64 host toolchain)"
 elif command -v gcc > /dev/null 2>&1; then
     TOTAL=$((TOTAL + 1))
-    cat > /tmp/krc_ext_$$.kr <<'KREOF'
+    cat > /tmp/krc_ext_$$.mlr <<'KREOF'
 extern fn write(u64 fd, u64 buf, u64 len) -> u64
 
 fn main() {
@@ -2592,7 +2592,7 @@ fn main() {
     exit(0)
 }
 KREOF
-    if $KRC --emit=obj /tmp/krc_ext_$$.kr -o /tmp/krc_ext_$$.o > /dev/null 2>&1 \
+    if $KRC --emit=obj /tmp/krc_ext_$$.mlr -o /tmp/krc_ext_$$.o > /dev/null 2>&1 \
        && gcc /tmp/krc_ext_$$.o -o /tmp/krc_ext_linked_$$ -no-pie > /dev/null 2>&1; then
         got=$(/tmp/krc_ext_linked_$$ 2>/dev/null)
         if [ "$got" = "extern_ok" ]; then
@@ -2606,10 +2606,10 @@ KREOF
         FAIL=$((FAIL + 1))
         echo "  extern_libc_write: FAIL (compile/link failed)"
     fi
-    rm -f /tmp/krc_ext_$$.kr /tmp/krc_ext_$$.o /tmp/krc_ext_linked_$$
+    rm -f /tmp/krc_ext_$$.mlr /tmp/krc_ext_$$.o /tmp/krc_ext_linked_$$
 
     TOTAL=$((TOTAL + 1))
-    cat > /tmp/krc_ext2_$$.kr <<'KREOF'
+    cat > /tmp/krc_ext2_$$.mlr <<'KREOF'
 extern fn strlen(u64 s) -> u64
 extern fn write(u64 fd, u64 buf, u64 len) -> u64
 
@@ -2620,7 +2620,7 @@ fn main() {
     exit(0)
 }
 KREOF
-    if $KRC --emit=obj /tmp/krc_ext2_$$.kr -o /tmp/krc_ext2_$$.o > /dev/null 2>&1 \
+    if $KRC --emit=obj /tmp/krc_ext2_$$.mlr -o /tmp/krc_ext2_$$.o > /dev/null 2>&1 \
        && gcc /tmp/krc_ext2_$$.o -o /tmp/krc_ext2_linked_$$ -no-pie > /dev/null 2>&1; then
         got=$(/tmp/krc_ext2_linked_$$ 2>/dev/null)
         if [ "$got" = "two_externs" ]; then
@@ -2634,7 +2634,7 @@ KREOF
         FAIL=$((FAIL + 1))
         echo "  extern_libc_strlen_write: FAIL (compile/link failed)"
     fi
-    rm -f /tmp/krc_ext2_$$.kr /tmp/krc_ext2_$$.o /tmp/krc_ext2_linked_$$
+    rm -f /tmp/krc_ext2_$$.mlr /tmp/krc_ext2_$$.o /tmp/krc_ext2_linked_$$
 else
     echo "  extern_libc_write: SKIP (gcc not available)"
     echo "  extern_libc_strlen_write: SKIP (gcc not available)"
@@ -2871,8 +2871,8 @@ run_error_check() {
     local expected_msg="$3"
     TOTAL=$((TOTAL + 1))
     local REPO_ROOT="$DIR/.."
-    printf '%s\n' "$input" > "$REPO_ROOT/test_tmp_$$.kr"
-    if $KRC $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_test_$$ > /dev/null 2>/tmp/krc_diag_$$; then
+    printf '%s\n' "$input" > "$REPO_ROOT/test_tmp_$$.mlr"
+    if $KRC $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_test_$$ > /dev/null 2>/tmp/krc_diag_$$; then
         echo "FAIL: $name (should not compile)"
         FAIL=$((FAIL + 1))
     else
@@ -2884,7 +2884,7 @@ run_error_check() {
             FAIL=$((FAIL + 1))
         fi
     fi
-    rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_test_$$ /tmp/krc_diag_$$
+    rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_test_$$ /tmp/krc_diag_$$
 }
 
 # Helper: check that compilation SUCCEEDS but emits expected warning
@@ -2894,8 +2894,8 @@ run_warning_check() {
     local expected_msg="$3"
     TOTAL=$((TOTAL + 1))
     local REPO_ROOT="$DIR/.."
-    printf '%s\n' "$input" > "$REPO_ROOT/test_tmp_$$.kr"
-    $KRC $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_test_$$ > /dev/null 2>/tmp/krc_diag_$$
+    printf '%s\n' "$input" > "$REPO_ROOT/test_tmp_$$.mlr"
+    $KRC $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_test_$$ > /dev/null 2>/tmp/krc_diag_$$
     if grep -q "$expected_msg" /tmp/krc_diag_$$; then
         PASS=$((PASS + 1))
         echo "  $name: PASS"
@@ -2903,7 +2903,7 @@ run_warning_check() {
         echo "FAIL: $name (expected warning '$expected_msg')"
         FAIL=$((FAIL + 1))
     fi
-    rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_test_$$ /tmp/krc_diag_$$
+    rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_test_$$ /tmp/krc_diag_$$
 }
 
 echo ""
@@ -2918,8 +2918,8 @@ echo ""
 echo "--- Runtime debug checks (--debug) ---"
 TOTAL=$((TOTAL + 1))
 REPO_ROOT="$DIR/.."
-printf 'fn main() { uint64 a = 10; uint64 b = 0; uint64 c = a / b; exit(c) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
-if $KRC $KRC_FLAGS --debug "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_test_$$ > /dev/null 2>&1; then
+printf 'fn main() { uint64 a = 10; uint64 b = 0; uint64 c = a / b; exit(c) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
+if $KRC $KRC_FLAGS --debug "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_test_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_test_$$
     /tmp/krc_test_$$ > /dev/null 2>&1
     actual=$?
@@ -2934,12 +2934,12 @@ else
     echo "FAIL: debug_divzero (compilation failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_test_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_test_$$
 
 # Overflow test
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { uint64 a = 9223372036854775807; uint64 b = a + a; exit(b) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
-if $KRC $KRC_FLAGS --debug "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_test_$$ > /dev/null 2>&1; then
+printf 'fn main() { uint64 a = 9223372036854775807; uint64 b = a + a; exit(b) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
+if $KRC $KRC_FLAGS --debug "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_test_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_test_$$
     /tmp/krc_test_$$ > /dev/null 2>&1
     actual=$?
@@ -2954,12 +2954,12 @@ else
     echo "FAIL: debug_overflow (compilation failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_test_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_test_$$
 
 # Null pointer test
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { uint64 p = 0; uint64 v = load64(p); exit(v) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
-if $KRC $KRC_FLAGS --debug "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_test_$$ > /dev/null 2>&1; then
+printf 'fn main() { uint64 p = 0; uint64 v = load64(p); exit(v) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
+if $KRC $KRC_FLAGS --debug "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_test_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_test_$$
     /tmp/krc_test_$$ > /dev/null 2>&1
     actual=$?
@@ -2974,7 +2974,7 @@ else
     echo "FAIL: debug_null_ptr (compilation failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_test_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_test_$$
 
 echo ""
 echo "--- Debug info (-g) ---"
@@ -2983,8 +2983,8 @@ if [ "$ARCH" = "x86_64" ] && command -v readelf > /dev/null 2>&1; then
 # Test: -g produces .debug_line section
 TOTAL=$((TOTAL + 1))
 REPO_ROOT="$DIR/.."
-printf 'fn main() { exit(42) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
-if $KRC $KRC_FLAGS -g "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_g_$$ > /dev/null 2>&1; then
+printf 'fn main() { exit(42) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
+if $KRC $KRC_FLAGS -g "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_g_$$ > /dev/null 2>&1; then
     if readelf -S /tmp/krc_g_$$ 2>/dev/null | grep -q "debug_line"; then
         PASS=$((PASS + 1))
         echo "  debug_line_exists: PASS"
@@ -3012,7 +3012,7 @@ fi
 
 # Test: without -g, no debug section
 TOTAL=$((TOTAL + 1))
-$KRC $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_nog_$$ > /dev/null 2>&1
+$KRC $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_nog_$$ > /dev/null 2>&1
 if readelf -S /tmp/krc_nog_$$ 2>/dev/null | grep -q "debug_line"; then
     echo "FAIL: debug_no_flag (.debug_line should not exist)"
     FAIL=$((FAIL + 1))
@@ -3041,7 +3041,7 @@ else
     FAIL=$((FAIL + 1))
 fi
 
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_g_$$ /tmp/krc_nog_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_g_$$ /tmp/krc_nog_$$
 
 fi  # end x86_64 + readelf gate
 
@@ -3050,8 +3050,8 @@ echo ""
 echo "--- IR backend test ---"
 TOTAL=$((TOTAL + 1))
 REPO_ROOT="$DIR/.."
-printf 'fn main() { exit(42) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
-if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
+printf 'fn main() { exit(42) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
+if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_ir_$$
     /tmp/krc_ir_$$ > /dev/null 2>&1
     actual=$?
@@ -3066,12 +3066,12 @@ else
     echo "FAIL: ir_exit_42 (compilation failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_ir_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_ir_$$
 
 # -- IR while loop --
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { uint64 i = 0; uint64 s = 0; while i < 10 { s = s + i; i = i + 1 } exit(s) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
-if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
+printf 'fn main() { uint64 i = 0; uint64 s = 0; while i < 10 { s = s + i; i = i + 1 } exit(s) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
+if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_ir_$$
     timeout 2 /tmp/krc_ir_$$ > /dev/null 2>&1
     actual=$?
@@ -3086,12 +3086,12 @@ else
     echo "FAIL: ir_while_loop (compilation failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_ir_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_ir_$$
 
 # -- IR division --
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { exit(10 / 3) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
-if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
+printf 'fn main() { exit(10 / 3) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
+if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_ir_$$
     /tmp/krc_ir_$$ > /dev/null 2>&1
     actual=$?
@@ -3106,12 +3106,12 @@ else
     echo "FAIL: ir_division (compilation failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_ir_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_ir_$$
 
 # -- IR if/else --
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { uint64 x = 10; if x > 5 { exit(1) } else { exit(0) } }\n' > "$REPO_ROOT/test_tmp_$$.kr"
-if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
+printf 'fn main() { uint64 x = 10; if x > 5 { exit(1) } else { exit(0) } }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
+if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_ir_$$
     /tmp/krc_ir_$$ > /dev/null 2>&1
     actual=$?
@@ -3126,12 +3126,12 @@ else
     echo "FAIL: ir_if_else (compilation failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_ir_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_ir_$$
 
 # -- IR alloc/store64/load64/dealloc --
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { uint64 p = alloc(64); store64(p, 42); uint64 v = load64(p); dealloc(p); exit(v) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
-if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
+printf 'fn main() { uint64 p = alloc(64); store64(p, 42); uint64 v = load64(p); dealloc(p); exit(v) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
+if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_ir_$$
     /tmp/krc_ir_$$ > /dev/null 2>&1
     actual=$?
@@ -3146,12 +3146,12 @@ else
     echo "FAIL: ir_alloc_store_load (compilation failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_ir_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_ir_$$
 
 # -- IR store8/load8 --
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { uint64 p = alloc(16); store8(p, 65); uint64 v = load8(p); dealloc(p); exit(v) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
-if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
+printf 'fn main() { uint64 p = alloc(16); store8(p, 65); uint64 v = load8(p); dealloc(p); exit(v) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
+if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_ir_$$
     /tmp/krc_ir_$$ > /dev/null 2>&1
     actual=$?
@@ -3166,12 +3166,12 @@ else
     echo "FAIL: ir_store8_load8 (compilation failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_ir_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_ir_$$
 
 # -- IR multi-alloc --
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { uint64 a = alloc(64); uint64 b = alloc(64); store64(a, 10); store64(b, 32); uint64 r = load64(a) + load64(b); dealloc(a); dealloc(b); exit(r) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
-if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
+printf 'fn main() { uint64 a = alloc(64); uint64 b = alloc(64); store64(a, 10); store64(b, 32); uint64 r = load64(a) + load64(b); dealloc(a); dealloc(b); exit(r) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
+if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_ir_$$
     /tmp/krc_ir_$$ > /dev/null 2>&1
     actual=$?
@@ -3186,13 +3186,13 @@ else
     echo "FAIL: ir_multi_alloc (compilation failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_ir_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_ir_$$
 
 # --- ir_break ---
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'IREOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'IREOF'
 fn main() { uint64 i = 0; while i < 100 { if i == 5 { break }; i = i + 1 }; exit(i) }
 IREOF
-if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ 2>/dev/null; then
+if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_ir_$$ 2>/dev/null; then
     chmod +x /tmp/krc_ir_$$; /tmp/krc_ir_$$; actual=$?
     if [ "$actual" -eq 5 ]; then
         echo "  ir_break: PASS"
@@ -3202,13 +3202,13 @@ if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_
 else
     echo "FAIL: ir_break (compilation failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_ir_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_ir_$$
 
 # --- ir_continue ---
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'IREOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'IREOF'
 fn main() { uint64 i = 0; uint64 s = 0; while i < 10 { i = i + 1; if i == 5 { continue }; s = s + 1 }; exit(s) }
 IREOF
-if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ 2>/dev/null; then
+if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_ir_$$ 2>/dev/null; then
     chmod +x /tmp/krc_ir_$$; /tmp/krc_ir_$$; actual=$?
     if [ "$actual" -eq 9 ]; then
         echo "  ir_continue: PASS"
@@ -3218,14 +3218,14 @@ if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_
 else
     echo "FAIL: ir_continue (compilation failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_ir_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_ir_$$
 
 # --- ir_fn_call ---
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'IREOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'IREOF'
 fn add(uint64 a, uint64 b) -> uint64 { return a + b }
 fn main() { exit(add(20, 22)) }
 IREOF
-if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ 2>/dev/null; then
+if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_ir_$$ 2>/dev/null; then
     chmod +x /tmp/krc_ir_$$; /tmp/krc_ir_$$; actual=$?
     if [ "$actual" -eq 42 ]; then
         echo "  ir_fn_call: PASS"
@@ -3235,14 +3235,14 @@ if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_
 else
     echo "FAIL: ir_fn_call (compilation failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_ir_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_ir_$$
 
 # --- ir_recursion ---
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'IREOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'IREOF'
 fn fib(uint64 n) -> uint64 { if n <= 1 { return n }; return fib(n - 1) + fib(n - 2) }
 fn main() { exit(fib(10)) }
 IREOF
-if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ 2>/dev/null; then
+if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_ir_$$ 2>/dev/null; then
     chmod +x /tmp/krc_ir_$$; /tmp/krc_ir_$$; actual=$?
     if [ "$actual" -eq 55 ]; then
         echo "  ir_recursion: PASS"
@@ -3252,13 +3252,13 @@ if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_
 else
     echo "FAIL: ir_recursion (compilation failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_ir_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_ir_$$
 
 # --- ir_match ---
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'IREOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'IREOF'
 fn main() { uint64 x = 2; uint64 r = 0; match x { 1 => { r = 10 } 2 => { r = 42 } 3 => { r = 30 } }; exit(r) }
 IREOF
-if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ 2>/dev/null; then
+if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_ir_$$ 2>/dev/null; then
     chmod +x /tmp/krc_ir_$$; /tmp/krc_ir_$$; actual=$?
     if [ "$actual" -eq 42 ]; then
         echo "  ir_match: PASS"
@@ -3268,11 +3268,11 @@ if timeout 10 "$KRC" $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_
 else
     echo "FAIL: ir_match (compilation failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_ir_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_ir_$$
 
 # -- IR memset liveness (memset return must not clobber live vregs) --
 TOTAL=$((TOTAL + 1))
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'IREOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'IREOF'
 fn main() {
     uint64 src = alloc(100)
     memset(src, 0xAB, 100)
@@ -3286,7 +3286,7 @@ fn main() {
     exit(v)
 }
 IREOF
-if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
+if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_ir_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_ir_$$
     /tmp/krc_ir_$$ > /dev/null 2>&1
     actual=$?
@@ -3299,7 +3299,7 @@ if $KRC $KRC_FLAGS --ir "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_ir_$$ > /dev/nul
 else
     echo "FAIL: ir_memset_liveness (compilation failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_ir_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_ir_$$
 
 # --- bool type ---
 echo ""
@@ -3307,34 +3307,34 @@ echo "--- bool type ---"
 
 TOTAL=$((TOTAL + 1))
 REPO_ROOT="$DIR/.."
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'BOOLEOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'BOOLEOF'
 fn main() {
     bool b = true
     if b { exit(1) }
     exit(0)
 }
 BOOLEOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_bool_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_bool_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_bool_$$
     timeout 3 /tmp/krc_bool_$$ > /dev/null 2>&1
     if [ $? = 1 ]; then PASS=$((PASS + 1)); echo "  bool_true_false: PASS"
     else echo "FAIL: bool_true_false"; FAIL=$((FAIL + 1)); fi
 else echo "FAIL: bool_true_false (compile)"; FAIL=$((FAIL + 1)); fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_bool_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_bool_$$
 
 TOTAL=$((TOTAL + 1))
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'BOOLEOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'BOOLEOF'
 fn main() {
     uint64 x = true
     exit(0)
 }
 BOOLEOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_bool_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_bool_$$ > /dev/null 2>&1; then
     echo "FAIL: bool_reject_assign_int (should have failed to compile)"; FAIL=$((FAIL + 1))
 else
     PASS=$((PASS + 1)); echo "  bool_reject_assign_int: PASS"
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_bool_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_bool_$$
 
 # --- char type ---
 echo ""
@@ -3342,30 +3342,30 @@ echo "--- char type ---"
 
 TOTAL=$((TOTAL + 1))
 REPO_ROOT="$DIR/.."
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'CHAREOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'CHAREOF'
 fn main() {
     exit('A')
 }
 CHAREOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_char_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_char_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_char_$$
     timeout 3 /tmp/krc_char_$$ > /dev/null 2>&1
     if [ $? = 65 ]; then PASS=$((PASS + 1)); echo "  char_literal: PASS"
     else echo "FAIL: char_literal"; FAIL=$((FAIL + 1)); fi
 else echo "FAIL: char_literal (compile)"; FAIL=$((FAIL + 1)); fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_char_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_char_$$
 
 TOTAL=$((TOTAL + 1))
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'CHAREOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'CHAREOF'
 fn main() {
     uint64 x = 'A'
     exit(0)
 }
 CHAREOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_char_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_char_$$ > /dev/null 2>&1; then
     echo "FAIL: char_reject_assign_int"; FAIL=$((FAIL + 1))
 else PASS=$((PASS + 1)); echo "  char_reject_assign_int: PASS"; fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_char_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_char_$$
 
 # --- typed println pipeline ---
 echo ""
@@ -3411,90 +3411,90 @@ echo ""
 echo "--- variadic print ---"
 
 TOTAL=$((TOTAL + 1))
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'VEOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'VEOF'
 fn main() {
     print("Here is a number,", 42)
     exit(0)
 }
 VEOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_v_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_v_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_v_$$
     got=$(timeout 3 /tmp/krc_v_$$)
     if [ "$got" = "Here is a number, 42" ]; then PASS=$((PASS + 1)); echo "  print_multi_int: PASS"
     else echo "FAIL: print_multi_int (got '$got')"; FAIL=$((FAIL + 1)); fi
 else echo "FAIL: print_multi_int (compile)"; FAIL=$((FAIL + 1)); fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_v_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_v_$$
 
 TOTAL=$((TOTAL + 1))
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'VEOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'VEOF'
 fn main() {
     println("n=", 5, "ok=", true)
     exit(0)
 }
 VEOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_v_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_v_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_v_$$
     got=$(timeout 3 /tmp/krc_v_$$)
     if [ "$got" = "n= 5 ok= true" ]; then PASS=$((PASS + 1)); echo "  println_multi_mixed: PASS"
     else echo "FAIL: println_multi_mixed (got '$got')"; FAIL=$((FAIL + 1)); fi
 else echo "FAIL: println_multi_mixed (compile)"; FAIL=$((FAIL + 1)); fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_v_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_v_$$
 
 # --- negative float literal ---
 echo ""
 echo "--- negative float ---"
 
 TOTAL=$((TOTAL + 1))
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'NFEOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'NFEOF'
 fn main() { f64 x = -3.14; println(x); exit(0) }
 NFEOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_nf_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_nf_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_nf_$$
     got=$(timeout 3 /tmp/krc_nf_$$)
     if [ "$got" = "-3.140000" ]; then PASS=$((PASS + 1)); echo "  float_print_negative: PASS"
     else echo "FAIL: float_print_negative (got '$got')"; FAIL=$((FAIL + 1)); fi
 else echo "FAIL: float_print_negative (compile)"; FAIL=$((FAIL + 1)); fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_nf_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_nf_$$
 
 # --- f-strings ---
 echo ""
 echo "--- f-strings ---"
 
 TOTAL=$((TOTAL + 1))
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'FEOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'FEOF'
 fn main() { println(f"x = {10 + 5}"); exit(0) }
 FEOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_f_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_f_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_f_$$
     got=$(timeout 3 /tmp/krc_f_$$)
     if [ "$got" = "x = 15" ]; then PASS=$((PASS + 1)); echo "  fstring_int: PASS"
     else echo "FAIL: fstring_int (got '$got')"; FAIL=$((FAIL + 1)); fi
 else echo "FAIL: fstring_int (compile)"; FAIL=$((FAIL + 1)); fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_f_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_f_$$
 
 TOTAL=$((TOTAL + 1))
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'FEOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'FEOF'
 fn main() { f64 pi = 3.14; println(f"pi = {pi}"); exit(0) }
 FEOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_f_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_f_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_f_$$
     got=$(timeout 3 /tmp/krc_f_$$)
     if [ "$got" = "pi = 3.140000" ]; then PASS=$((PASS + 1)); echo "  fstring_float: PASS"
     else echo "FAIL: fstring_float (got '$got')"; FAIL=$((FAIL + 1)); fi
 else echo "FAIL: fstring_float (compile)"; FAIL=$((FAIL + 1)); fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_f_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_f_$$
 
 TOTAL=$((TOTAL + 1))
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'FEOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'FEOF'
 fn main() { println(f"flag = {true}"); exit(0) }
 FEOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_f_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_f_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_f_$$
     got=$(timeout 3 /tmp/krc_f_$$)
     if [ "$got" = "flag = true" ]; then PASS=$((PASS + 1)); echo "  fstring_bool: PASS"
     else echo "FAIL: fstring_bool (got '$got')"; FAIL=$((FAIL + 1)); fi
 else echo "FAIL: fstring_bool (compile)"; FAIL=$((FAIL + 1)); fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_f_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_f_$$
 
 # --- IR optimizer tests ---
 echo ""
@@ -3503,14 +3503,14 @@ echo "--- IR optimizer tests ---"
 # Constant folding: literal arithmetic evaluated at compile time.
 TOTAL=$((TOTAL + 1))
 REPO_ROOT="$DIR/.."
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'OPTEOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'OPTEOF'
 fn main() {
     uint64 x = 3 + 4
     uint64 y = x * 2
     exit(y)
 }
 OPTEOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_opt_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_opt_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_opt_$$
     timeout 3 /tmp/krc_opt_$$ > /dev/null 2>&1
     actual=$?
@@ -3523,12 +3523,12 @@ if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_opt_$$ >
 else
     echo "FAIL: const_fold (compilation failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_opt_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_opt_$$
 
 # --O0 disables optimization, program still runs correctly.
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { exit(6 * 7) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
-if timeout 10 "$KRC" $KRC_FLAGS --O0 "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_opt_$$ > /dev/null 2>&1; then
+printf 'fn main() { exit(6 * 7) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
+if timeout 10 "$KRC" $KRC_FLAGS --O0 "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_opt_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_opt_$$
     timeout 3 /tmp/krc_opt_$$ > /dev/null 2>&1
     actual=$?
@@ -3541,11 +3541,11 @@ if timeout 10 "$KRC" $KRC_FLAGS --O0 "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_opt
 else
     echo "FAIL: O0_flag (compilation failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_opt_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_opt_$$
 
 # Loop counter: const-fold must NOT fold loop-carried vregs to their init value.
 TOTAL=$((TOTAL + 1))
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'OPTEOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'OPTEOF'
 fn main() {
     uint64 i = 0
     uint64 s = 0
@@ -3556,7 +3556,7 @@ fn main() {
     exit(s)
 }
 OPTEOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_opt_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_opt_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_opt_$$
     timeout 3 /tmp/krc_opt_$$ > /dev/null 2>&1
     actual=$?
@@ -3569,17 +3569,17 @@ if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_opt_$$ >
 else
     echo "FAIL: loop_counter (compilation failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_opt_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_opt_$$
 
 # Branch simplification: constant conditions fold to unconditional branches.
 TOTAL=$((TOTAL + 1))
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'OPTEOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'OPTEOF'
 fn main() {
     if 0 == 1 { exit(5) } else { exit(7) }
     exit(9)
 }
 OPTEOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_opt_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_opt_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_opt_$$
     timeout 3 /tmp/krc_opt_$$ > /dev/null 2>&1
     actual=$?
@@ -3592,11 +3592,11 @@ if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_opt_$$ >
 else
     echo "FAIL: branch_fold (compilation failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_opt_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_opt_$$
 
 # CSE: redundant expressions inside a function still produce the right value.
 TOTAL=$((TOTAL + 1))
-cat > "$REPO_ROOT/test_tmp_$$.kr" << 'OPTEOF'
+cat > "$REPO_ROOT/test_tmp_$$.mlr" << 'OPTEOF'
 fn work(uint64 x) -> uint64 {
     uint64 a = x + 100
     uint64 b = x + 100
@@ -3604,7 +3604,7 @@ fn work(uint64 x) -> uint64 {
 }
 fn main() { exit(work(5)) }
 OPTEOF
-if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_opt_$$ > /dev/null 2>&1; then
+if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_opt_$$ > /dev/null 2>&1; then
     chmod +x /tmp/krc_opt_$$
     timeout 3 /tmp/krc_opt_$$ > /dev/null 2>&1
     actual=$?
@@ -3617,20 +3617,20 @@ if timeout 10 "$KRC" $KRC_FLAGS "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_opt_$$ >
 else
     echo "FAIL: cse_redundant (compilation failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_opt_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_opt_$$
 
 # --- Custom fat binary targets ---
 echo ""
 echo "--- custom fat binary ---"
 TOTAL=$((TOTAL + 1))
 REPO_ROOT="$DIR/.."
-printf 'fn main() { exit(77) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
+printf 'fn main() { exit(77) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
 HOST_ARCH=$(uname -m)
 HOST_TGT="linux-x64"
 if [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ]; then
     HOST_TGT="linux-arm64"
 fi
-if timeout 30 "$KRC" --targets="$HOST_TGT" "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_fat_$$ > /dev/null 2>&1; then
+if timeout 30 "$KRC" --targets="$HOST_TGT" "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_fat_$$ > /dev/null 2>&1; then
     KR_BIN="$REPO_ROOT/dist/kr"
     [ -x "$KR_BIN" ] || KR_BIN="$REPO_ROOT/dist/kr-android-$HOST_ARCH"
     if [ -x "$KR_BIN" ]; then
@@ -3649,14 +3649,14 @@ if timeout 30 "$KRC" --targets="$HOST_TGT" "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/k
 else
     echo "FAIL: custom_fat_single (compilation failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_fat_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_fat_$$
 
 # Custom 2-slice is smaller than custom 8-slice (same single-slice code path).
 TOTAL=$((TOTAL + 1))
-printf 'fn main() { exit(0) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
+printf 'fn main() { exit(0) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
 ALL="linux-x64,linux-arm64,win-x64,win-arm64,macos-x64,macos-arm64,android-x64,android-arm64"
-if timeout 30 "$KRC" --targets="$ALL" "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_fat_all_$$ > /dev/null 2>&1 && \
-   timeout 30 "$KRC" --targets=linux-x64,macos-arm64 "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_fat_two_$$ > /dev/null 2>&1; then
+if timeout 30 "$KRC" --targets="$ALL" "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_fat_all_$$ > /dev/null 2>&1 && \
+   timeout 30 "$KRC" --targets=linux-x64,macos-arm64 "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/krc_fat_two_$$ > /dev/null 2>&1; then
     all_sz=$(wc -c < /tmp/krc_fat_all_$$)
     two_sz=$(wc -c < /tmp/krc_fat_two_$$)
     if [ "$two_sz" -lt "$all_sz" ]; then
@@ -3668,15 +3668,15 @@ if timeout 30 "$KRC" --targets="$ALL" "$REPO_ROOT/test_tmp_$$.kr" -o /tmp/krc_fa
 else
     echo "FAIL: custom_fat_smaller (compilation failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr" /tmp/krc_fat_all_$$ /tmp/krc_fat_two_$$
+rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/krc_fat_all_$$ /tmp/krc_fat_two_$$
 
 # --- IR dump test ---
 echo ""
 echo "--- IR dump test ---"
 TOTAL=$((TOTAL + 1))
 REPO_ROOT="$DIR/.."
-printf 'fn main() { exit(42) }\n' > "$REPO_ROOT/test_tmp_$$.kr"
-IR_OUT=$($KRC --emit=ir "$REPO_ROOT/test_tmp_$$.kr" 2>/dev/null)
+printf 'fn main() { exit(42) }\n' > "$REPO_ROOT/test_tmp_$$.mlr"
+IR_OUT=$($KRC --emit=ir "$REPO_ROOT/test_tmp_$$.mlr" 2>/dev/null)
 if echo "$IR_OUT" | grep -q "const"; then
     PASS=$((PASS + 1))
     echo "  ir_dump: PASS"
@@ -3684,7 +3684,7 @@ else
     echo "FAIL: ir_dump (no const in IR output)"
     FAIL=$((FAIL + 1))
 fi
-rm -f "$REPO_ROOT/test_tmp_$$.kr"
+rm -f "$REPO_ROOT/test_tmp_$$.mlr"
 
 # --- Summary ---
 echo ""

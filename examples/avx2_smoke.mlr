@@ -1,0 +1,59 @@
+// AVX2 smoke test — vec_f64_decay_inplace_avx2 vs scalar reference.
+// Small buffer to make any off-by-one or encoding bug obvious.
+
+import "../std/vec_f64.mlr"
+import "../std/vec_f64_avx2.mlr"
+
+fn main() {
+    uint64 N = 17              // deliberately not a multiple of 4, to
+                               // exercise the scalar tail too
+    f64 factor = 0.25
+
+    uint64 buf_a = alloc(N * 8)
+    uint64 buf_b = alloc(N * 8)
+
+    // Fill both with the same pattern.
+    uint64 i = 0
+    while i < N {
+        f64 v = int_to_f64(i) + 1.0
+        uint64 pa = buf_a + i * 8
+        uint64 pb = buf_b + i * 8
+        unsafe { *(pa as f64) = v }
+        unsafe { *(pb as f64) = v }
+        i = i + 1
+    }
+
+    vec_f64_decay_inplace(buf_a, N, factor)
+    vec_f64_decay_inplace_avx2(buf_b, N, factor)
+
+    uint64 ok = 1
+    uint64 k = 0
+    while k < N {
+        f64 a = 0.0
+        f64 b = 0.0
+        uint64 pa = buf_a + k * 8
+        uint64 pb = buf_b + k * 8
+        unsafe { *(pa as f64) -> a }
+        unsafe { *(pb as f64) -> b }
+        uint64 ai = f64_to_int(a * 1000000.0)
+        uint64 bi = f64_to_int(b * 1000000.0)
+        if ai != bi {
+            print("mismatch at i=")
+            print(k)
+            print("  scalar=")
+            print(ai)
+            print("  avx2=")
+            println(bi)
+            ok = 0
+        }
+        k = k + 1
+    }
+
+    if ok == 1 {
+        println("PASS: AVX2 decay matches scalar for N=17 (incl. scalar tail)")
+        exit(0)
+    } else {
+        println("FAIL")
+        exit(1)
+    }
+}

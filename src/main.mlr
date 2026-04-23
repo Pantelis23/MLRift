@@ -1,17 +1,17 @@
-import "lexer.kr"
-import "ast.kr"
-import "parser.kr"
-import "codegen.kr"
-import "codegen_aarch64.kr"
-import "format_macho.kr"
-import "format_pe.kr"
-import "format_archive.kr"
-import "format_android.kr"
-import "bcj.kr"
-import "analysis.kr"
-import "living.kr"
-import "runtime.kr"
-import "formatter.kr"
+import "lexer.mlr"
+import "ast.mlr"
+import "parser.mlr"
+import "codegen.mlr"
+import "codegen_aarch64.mlr"
+import "format_macho.mlr"
+import "format_pe.mlr"
+import "format_archive.mlr"
+import "format_android.mlr"
+import "bcj.mlr"
+import "analysis.mlr"
+import "living.mlr"
+import "runtime.mlr"
+import "formatter.mlr"
 // formatter.kr is included via cat command, not import
 
 // MLRift — built on KernRift — main
@@ -4519,6 +4519,41 @@ fn main() {
                 emit_mode = 3
             } else if str_starts_with(arg, "--targets=", 10) != 0 {
                 parse_targets_arg(arg + 10)
+            } else if str_starts_with(arg, "--emit-amdgpu-atomic-demo=", 26) != 0 {
+                // Stage-1 M1o smoke: hand-crafted single-thread kernel
+                // that exercises global_atomic_cmpswap_b64 by swapping
+                // *out from 0 to 7. Proves the atomic encoder + GLC
+                // flag work end-to-end before the CSR f64-add CAS
+                // loops (M1p) can be composed.
+                uint64 ad_path = arg + 26
+                uint64 ad_rc = emit_amdgpu_atomic_demo_blob(ad_path)
+                if ad_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-atomic-demo failed\n", 39)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 apl = str_len(ad_path)
+                write(1, ad_path, apl)
+                write(1, " (amdgpu atomic-demo code object)\n", 34)
+                exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-f64-atomic-add=", 29) != 0 {
+                // Stage-1 M1p smoke: f64-atomic-add CAS loop. Composes
+                // the M1o cmpswap_b64 encoder with v_add_f64 + a
+                // vcc-tested backward branch. Every CSR scatter kernel
+                // (csr_e_deliver_delayed, csr_i_deliver) is basically
+                // this idiom, so passing M1p unlocks the remaining
+                // neuron-sim kernels.
+                uint64 fa_path = arg + 29
+                uint64 fa_rc = emit_amdgpu_f64_atomic_add_blob(fa_path)
+                if fa_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-f64-atomic-add failed\n", 42)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 fpl = str_len(fa_path)
+                write(1, fa_path, fpl)
+                write(1, " (amdgpu f64-atomic-add code object)\n", 37)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-per-lane-loop=", 28) != 0 {
                 // Stage-1 M1n smoke: hand-crafted kernel using the
                 // VALU divergent-loop primitives (v_cmp_lt_u32 per

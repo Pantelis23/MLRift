@@ -2,7 +2,7 @@
 // factor=0.25 starting from v = i*0.1. After one step,
 // expected buf[i] = v + (1.0 - v)*0.25. Compare within 8 ULP.
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

@@ -1,0 +1,41 @@
+// std/rng.kr — splitmix64, a seekable 64-bit counter-based RNG.
+//
+// Unlike xorshift32 (whose nth draw depends on the full chain of
+// n-1 previous draws), splitmix64 treats the sequence as a pure
+// function of (seed, counter):
+//
+//     rng(seed, n)  =  splitmix64(seed + n * GAMMA)
+//
+// with GAMMA = 0x9E3779B97F4A7C15 (the 64-bit "golden-ratio step").
+// This means `rng(seed, n)` can be computed in O(1) for any n, which
+// is exactly what we need for parallel build phases: each worker can
+// draw its own range of numbers without walking the prefix.
+//
+// Algorithm (Steele, Lea & Flood, 2014 — Java's SplittableRandom):
+//
+//     z = seed + n * GAMMA
+//     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+//     z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+//     z = z ^ (z >> 31)
+//     return z
+//
+// All ops wrap mod 2^64 by virtue of uint64. Constants are the
+// published "avalanche" multipliers for splitmix64.
+
+static uint64 SPLITMIX64_GAMMA = 0x9E3779B97F4A7C15
+
+// Core: compute the nth draw of the splitmix64 stream seeded by `seed`.
+fn splitmix64_at(uint64 seed, uint64 n) -> uint64 {
+    uint64 z = seed + n * SPLITMIX64_GAMMA
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+    z = z ^ (z >> 31)
+    return z
+}
+
+// Stream helper — takes (seed_state, counter) where seed_state is the
+// user's chosen stream id and counter is the monotonic draw index.
+// Equivalent to splitmix64_at; exposed for readability at call sites.
+fn rng_at(uint64 seed, uint64 n) -> uint64 {
+    return splitmix64_at(seed, n)
+}

@@ -2,7 +2,7 @@
 // module-load path resolves both symbols and that each kernel
 // runs its own body against its own arg convention.
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

@@ -1,7 +1,7 @@
 # KernRift Formal Grammar
 
-EBNF grammar for the KernRift language as implemented by `src/parser.kr` and
-`src/lexer.kr`. The parser is a hand-written recursive-descent parser with
+EBNF grammar for the KernRift language as implemented by `src/parser.mlr` and
+`src/lexer.mlr`. The parser is a hand-written recursive-descent parser with
 Pratt precedence for expressions. Anywhere this document and the parser
 disagree, the parser is authoritative — file an issue.
 
@@ -264,7 +264,7 @@ dmb dsb isb  dcache_flush icache_invalidate
 time_ns  rdrand  cpuid
 ```
 
-The stdlib (`std/*.kr`) layers additional helpers (`str_len`, `opt_some`,
+The stdlib (`std/*.mlr`) layers additional helpers (`str_len`, `opt_some`,
 `realloc`, `alloc_aligned`, …) on top of these.
 
 ## Grammar notes and foot-guns

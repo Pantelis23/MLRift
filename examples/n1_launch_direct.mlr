@@ -1,0 +1,236 @@
+// MLRift — Noesis N1 diagnostic launcher (direct hipModuleLaunchKernel).
+//
+// Same kernel + same kernel-params arena as n1_launch.mlr, but replaces
+// the pre-instantiated HIP graph with a per-step hipModuleLaunchKernel
+// call. Used to isolate whether the graph-replay pattern in n1_launch.mlr
+// is the reason its output only contains step=0 firings.
+//
+// Expected vs observed:
+//   n1_reference.py output: 10,200 lines (300 driven neurons × 34 fires each)
+//   n1_launch.mlr   output: 300 lines (only step=0 fires recorded)
+//   n1_launch_direct:      should match reference if direct launch reads the
+//                           mutated `step` slot correctly.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=hip-amd examples/noesis/n1.mlr -o /tmp/noesis_n1
+//   ./build/mlrc --arch=x86_64                 examples/n1_launch_direct.mlr -o /tmp/noesis_n1_direct
+
+import "../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+
+static uint64 N        = 1500
+static uint64 GROUP_SZ = 300
+static uint64 N_STEPS  = 100
+
+static f64    V_rest    = -65.0
+static f64    V_thresh  = -47.97608125209808
+static f64    V_reset   = -70.0
+static f64    R_m       = 10.0
+static uint64 ref_steps = 2
+static f64    signal_pA = 1800.0
+
+static uint64 alpha_bits_hi = 0x3FEE0ED8
+static uint64 alpha_bits_lo = 0x1142CAFC
+
+fn load_alpha() -> f64 {
+    uint64 slot = alloc(8)
+    uint64 bits = (alpha_bits_hi << 32) | alpha_bits_lo
+    unsafe { *(slot as uint64) = bits }
+    f64 a = 0.0
+    unsafe { *(slot as f64) -> a }
+    return a
+}
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 {
+        uint8 zero = 48
+        unsafe { *(buf as uint8) = zero }
+        return 1
+    }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 {
+        n = n + 1
+        tmp = tmp / 10
+    }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_spike(uint64 neuron, uint64 step) {
+    uint64 buf = alloc(32)
+    uint64 n1 = u64_to_ascii_decimal(neuron, buf)
+    uint64 sp_p = buf + n1
+    uint8 sp = 32
+    unsafe { *(sp_p as uint8) = sp }
+    uint64 n2 = u64_to_ascii_decimal(step, buf + n1 + 1)
+    uint64 nl_p = buf + n1 + 1 + n2
+    uint8 nl = 10
+    unsafe { *(nl_p as uint8) = nl }
+    write(1, buf, n1 + 1 + n2 + 1)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    exit(1)
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    uint64 co_path = "/tmp/noesis_n1.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("open .co", 1) }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData", err) }
+    uint64 mod = 0
+    unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fn_slot = alloc(8)
+    uint64 kname = "noesis_n1_step"
+    err = hipModuleGetFunction(fn_slot, mod, kname)
+    if err != 0 { die("hipModuleGetFunction", err) }
+    uint64 fn_handle = 0
+    unsafe { *(fn_slot as uint64) -> fn_handle }
+
+    f64 alpha = load_alpha()
+
+    uint64 bytes_f = N * 8
+    uint64 bytes_u = N * 8
+    uint64 bytes_h = N_STEPS * N
+
+    uint64 h_V   = alloc(bytes_f)
+    uint64 h_ref = alloc(bytes_u)
+    uint64 h_I   = alloc(bytes_f)
+    uint64 h_h   = alloc(bytes_h)
+
+    uint64 i = 0
+    while i < N {
+        uint64 V_i   = h_V   + i * 8
+        uint64 ref_i = h_ref + i * 8
+        uint64 I_i   = h_I   + i * 8
+        f64 vr = V_rest
+        unsafe { *(V_i as f64) = vr }
+        uint64 zero = 0
+        unsafe { *(ref_i as uint64) = zero }
+        f64 ie = 0.0
+        if i < GROUP_SZ { ie = signal_pA }
+        unsafe { *(I_i as f64) = ie }
+        i = i + 1
+    }
+
+    uint64 zi = 0
+    while zi < bytes_h {
+        uint64 p = h_h + zi
+        uint8 z = 0
+        unsafe { *(p as uint8) = z }
+        zi = zi + 1
+    }
+
+    uint64 d_V = 0
+    uint64 slot = alloc(8)
+    err = hipMalloc(slot, bytes_f); if err != 0 { die("malloc V", err) }
+    unsafe { *(slot as uint64) -> d_V }
+    err = hipMemcpy(d_V, h_V, bytes_f, 1)
+
+    uint64 d_ref = 0
+    slot = alloc(8)
+    err = hipMalloc(slot, bytes_u); if err != 0 { die("malloc ref", err) }
+    unsafe { *(slot as uint64) -> d_ref }
+    err = hipMemcpy(d_ref, h_ref, bytes_u, 1)
+
+    uint64 d_I = 0
+    slot = alloc(8)
+    err = hipMalloc(slot, bytes_f); if err != 0 { die("malloc I", err) }
+    unsafe { *(slot as uint64) -> d_I }
+    err = hipMemcpy(d_I, h_I, bytes_f, 1)
+
+    uint64 d_h = 0
+    slot = alloc(8)
+    err = hipMalloc(slot, bytes_h); if err != 0 { die("malloc h", err) }
+    unsafe { *(slot as uint64) -> d_h }
+    err = hipMemcpy(d_h, h_h, bytes_h, 1)
+
+    uint64 a_V    = alloc(8); unsafe { *(a_V   as uint64) = d_V }
+    uint64 a_ref  = alloc(8); unsafe { *(a_ref as uint64) = d_ref }
+    uint64 a_I    = alloc(8); unsafe { *(a_I   as uint64) = d_I }
+    uint64 a_h    = alloc(8); unsafe { *(a_h   as uint64) = d_h }
+    uint64 a_n    = alloc(8); uint64 nv  = N;         unsafe { *(a_n   as uint64) = nv }
+    uint64 a_step = alloc(8)
+    uint64 a_vr   = alloc(8); f64 vrv = V_rest;       unsafe { *(a_vr  as f64)    = vrv }
+    uint64 a_vt   = alloc(8); f64 vtv = V_thresh;     unsafe { *(a_vt  as f64)    = vtv }
+    uint64 a_vrs  = alloc(8); f64 vrsv = V_reset;     unsafe { *(a_vrs as f64)    = vrsv }
+    uint64 a_rm   = alloc(8); f64 rmv = R_m;          unsafe { *(a_rm  as f64)    = rmv }
+    uint64 a_al   = alloc(8);                         unsafe { *(a_al  as f64)    = alpha }
+    uint64 a_rs   = alloc(8); uint64 rsv = ref_steps; unsafe { *(a_rs  as uint64) = rsv }
+
+    uint64 kp = alloc(12 * 8)
+    unsafe { *((kp +  0) as uint64) = a_V }
+    unsafe { *((kp +  8) as uint64) = a_ref }
+    unsafe { *((kp + 16) as uint64) = a_I }
+    unsafe { *((kp + 24) as uint64) = a_h }
+    unsafe { *((kp + 32) as uint64) = a_n }
+    unsafe { *((kp + 40) as uint64) = a_step }
+    unsafe { *((kp + 48) as uint64) = a_vr }
+    unsafe { *((kp + 56) as uint64) = a_vt }
+    unsafe { *((kp + 64) as uint64) = a_vrs }
+    unsafe { *((kp + 72) as uint64) = a_rm }
+    unsafe { *((kp + 80) as uint64) = a_al }
+    unsafe { *((kp + 88) as uint64) = a_rs }
+
+    uint32 block_x = 64
+    uint64 grid_x_u = (N + 63) / 64
+    uint32 grid_x = grid_x_u
+
+    uint64 step = 0
+    while step < N_STEPS {
+        unsafe { *(a_step as uint64) = step }
+        err = hipModuleLaunchKernel(fn_handle, grid_x, 1, 1, block_x, 1, 1, 0, 0, kp, 0)
+        if err != 0 { die("launch", err) }
+        step = step + 1
+    }
+    err = hipDeviceSynchronize()
+    if err != 0 { die("sync", err) }
+
+    err = hipMemcpy(h_h, d_h, bytes_h, 2)
+    if err != 0 { die("D2H", err) }
+
+    uint64 s = 0
+    while s < N_STEPS {
+        uint64 k = 0
+        while k < N {
+            uint64 idx = s * N + k
+            uint64 p = h_h + idx
+            uint64 flag = 0
+            unsafe { *(p as uint8) -> flag }
+            if flag != 0 { print_spike(k, s) }
+            k = k + 1
+        }
+        s = s + 1
+    }
+
+    hipFree(d_V)
+    hipFree(d_ref)
+    hipFree(d_I)
+    hipFree(d_h)
+    exit(0)
+}

@@ -9,7 +9,7 @@
 // sums (should be within f64 precision — not bit-identical because
 // the unrolled version may reorder add-operations subtly).
 
-import "../std/vec_f64.kr"
+import "../std/vec_f64.mlr"
 
 fn main() {
     uint64 N = 65536

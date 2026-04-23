@@ -55,9 +55,9 @@ minor releases. The current opcode catalog is documented in
 If you need a stable target-independent format, compile to object files
 (`--emit=obj`) instead.
 
-### 4. stdlib (`std/*.kr`)
+### 4. stdlib (`std/*.mlr`)
 
-Functions exported by `std/io.kr`, `std/mem.kr`, `std/string.kr`, etc.
+Functions exported by `std/io.mlr`, `std/mem.mlr`, `std/string.mlr`, etc.
 
 **Additive changes** (new functions) — any release.
 
@@ -146,9 +146,9 @@ If a KernRift program calls into C (or vice versa) and the ABI appears
 violated, that is a bug. Reproduce with:
 
 ```
-$ kernriftc --emit=asm file.kr -o file.s
+$ kernriftc --emit=asm file.mlr -o file.s
 $ # compare the generated prologue / epilogue against the ABI spec
 ```
 
-File at https://github.com/Pantelis23/KernRift with both the `.kr` source,
+File at https://github.com/Pantelis23/KernRift with both the `.mlr` source,
 the `.s` output, and the target triple.

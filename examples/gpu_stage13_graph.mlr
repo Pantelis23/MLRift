@@ -19,7 +19,7 @@
 // ~2-5× on launch-bound workloads; the 200k workload is more
 // compute-heavy so savings may be smaller.
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

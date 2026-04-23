@@ -4,7 +4,7 @@
 // s_branch backward, s_add_u32) emit code that runs correctly
 // on gfx1100.
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

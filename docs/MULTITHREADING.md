@@ -57,7 +57,7 @@ per barrier — that's what killed the naive fork-join model.
 
 ## New primitives needed
 
-In `src/codegen.kr` or a new `src/thread_runtime.kr`:
+In `src/codegen.mlr` or a new `src/thread_runtime.mlr`:
 
 ### Syscalls
 
@@ -123,7 +123,7 @@ stack. Simplest pattern: inline a small asm blob that does
 ```
 
 ~30 bytes of x86 machine code. Write as an extern assembly block or
-as an emit_byte sequence in codegen.kr.
+as an emit_byte sequence in codegen.mlr.
 
 ## Futex barrier
 
@@ -198,9 +198,9 @@ OUTSIDE the per-step hot loop and not parallelised in M2/M3.
 
 ## Related work already shipped
 
-- `src/codegen.kr` `emit_win_call_iat`, `exec_process_argv` — patterns
+- `src/codegen.mlr` `emit_win_call_iat`, `exec_process_argv` — patterns
   for emitting carefully-packed syscall sequences by hand
-- `std/vec_f64.kr` — the helpers this effort extends (vec_f64_decay_inplace
+- `std/vec_f64.mlr` — the helpers this effort extends (vec_f64_decay_inplace
   gets an `_mt` counterpart)
 - `docs/GPU_BACKEND.md` — sister doc; GPU track runs in parallel with
   this one
@@ -208,11 +208,11 @@ OUTSIDE the per-step hot loop and not parallelised in M2/M3.
 ## Kickoff actions for the next session
 
 1. Read this doc end-to-end
-2. Write `examples/clone_hello.kr` that uses raw clone()+futex() to
+2. Write `examples/clone_hello.mlr` that uses raw clone()+futex() to
    spawn one worker, have it write to a shared counter, main reads it.
    This is M0 — gate before any IR or stdlib work.
-3. Decide where the new primitives live (new file `std/thread.kr`? new
-   section in `std/mem.kr`? builtin in codegen.kr?).
+3. Decide where the new primitives live (new file `std/thread.mlr`? new
+   section in `std/mem.mlr`? builtin in codegen.mlr?).
 4. Begin M1.
 
 End of spec.

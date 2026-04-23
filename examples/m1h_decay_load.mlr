@@ -2,7 +2,7 @@
 // kernel against 128 f64 values. Primer = i * 0.5, factor = 0.1,
 // expected after decay:  v - v*factor = v * 0.9 = i * 0.45.
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

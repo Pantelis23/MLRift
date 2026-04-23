@@ -6,24 +6,24 @@ The KernRift compiler (`krc`) is a self-hosting compiler written entirely in Ker
 
 ```
 src/
-├── lexer.kr           Tokenizer (90+ token kinds)
-├── ast.kr             Arena-based flat AST (32-byte nodes, 1-indexed)
-├── parser.kr          Recursive descent + Pratt precedence climbing
-├── analysis.kr        Safety passes (ctx, eff, lock, caps, critical)
-├── ir.kr              SSA IR + x86_64 emitter (Linux/macOS/Windows/Android)
-├── ir_aarch64.kr      AArch64 emitter from the same IR
-├── codegen.kr         Legacy direct x86_64 codegen (SysV ABI)
-├── codegen_aarch64.kr Legacy direct AArch64 codegen (AAPCS64)
-├── format_macho.kr    macOS Mach-O header emission
-├── format_pe.kr       Windows PE/COFF headers + import table
-├── format_android.kr  Android ELF quirks (DT_FLAGS_1, soname)
-├── format_archive.kr  AR archives, KRBO objects, KrboFat v2 (BCJ + LZ-Rift)
-├── bcj.kr             Branch/call/jump filter for better compression
-├── living.kr          Pattern detection + fitness scoring
-├── formatter.kr       Source-level auto-formatter
-├── runner.kr          `kr` — fat-binary slice extractor / launcher
-├── runtime.kr         fmt_uint helper
-└── main.kr            CLI, compile(), compile_fat()
+├── lexer.mlr           Tokenizer (90+ token kinds)
+├── ast.mlr             Arena-based flat AST (32-byte nodes, 1-indexed)
+├── parser.mlr          Recursive descent + Pratt precedence climbing
+├── analysis.mlr        Safety passes (ctx, eff, lock, caps, critical)
+├── ir.mlr              SSA IR + x86_64 emitter (Linux/macOS/Windows/Android)
+├── ir_aarch64.mlr      AArch64 emitter from the same IR
+├── codegen.mlr         Legacy direct x86_64 codegen (SysV ABI)
+├── codegen_aarch64.mlr Legacy direct AArch64 codegen (AAPCS64)
+├── format_macho.mlr    macOS Mach-O header emission
+├── format_pe.mlr       Windows PE/COFF headers + import table
+├── format_android.mlr  Android ELF quirks (DT_FLAGS_1, soname)
+├── format_archive.mlr  AR archives, KRBO objects, KrboFat v2 (BCJ + LZ-Rift)
+├── bcj.mlr             Branch/call/jump filter for better compression
+├── living.mlr          Pattern detection + fitness scoring
+├── formatter.mlr       Source-level auto-formatter
+├── runner.mlr          `kr` — fat-binary slice extractor / launcher
+├── runtime.mlr         fmt_uint helper
+└── main.mlr            CLI, compile(), compile_fat()
 ```
 
 ## Compilation Pipeline
@@ -34,7 +34,7 @@ src/
 4. **Lower to IR** — AST → SSA IR instructions with virtual registers
 5. **Liveness** — per-opcode live-in/live-out sets for all virtual registers
 6. **Register allocation** — Chaitin-style graph coloring onto physical registers
-7. **Emit** — per-target emitter (`ir.kr` for x86_64, `ir_aarch64.kr` for ARM64) writes raw machine bytes
+7. **Emit** — per-target emitter (`ir.mlr` for x86_64, `ir_aarch64.mlr` for ARM64) writes raw machine bytes
 8. **Fixup** — patch call displacements, RIP-relative / ADRP offsets, string addresses
 9. **Write** — ELF / Mach-O / PE headers + code + data + strings straight to the output file
 
@@ -58,11 +58,11 @@ Not every target defaults to IR. The release recipe is:
 
 Inside `compile_fat` itself (building the 8-slice `.krbo`), every ARM64 slice dispatches to `gen_function_a64` (legacy) regardless of `emit_ir_mode`, so the arm64 slice users pull out of `krc.krbo` is also legacy-built. `--ir` (emit_ir_mode ≥ 2) forces the IR path through those slices for backend testing.
 
-User-invoked `krc --arch=arm64 myprog.kr -o myprog` still defaults to IR — the miscompile is specific to the `compile_fat` function's shape.
+User-invoked `krc --arch=arm64 myprog.mlr -o myprog` still defaults to IR — the miscompile is specific to the `compile_fat` function's shape.
 
 ## Android fat-binary runner
 
-`src/runner.kr` (the `kr` tool) on Android prefers a filesystem-free exec path:
+`src/runner.mlr` (the `kr` tool) on Android prefers a filesystem-free exec path:
 
 1. `memfd_create("kr", MFD_CLOEXEC)` — anonymous in-kernel fd
 2. `write(fd, slice, slice_size)` — copy the BCJ-decoded slice into it

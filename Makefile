@@ -10,11 +10,11 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 DIST_DIR = dist
 
-SRCS = src/lexer.kr src/ast.kr src/parser.kr src/codegen.kr \
-       src/codegen_aarch64.kr src/ir.kr src/ir_aarch64.kr src/ir_hip.kr \
-       src/format_macho.kr src/format_pe.kr src/format_hip.kr src/format_amdgpu.kr src/format_elf_dyn.kr src/dyn_sym_registry.kr \
-       src/format_archive.kr src/format_android.kr src/bcj.kr src/analysis.kr src/living.kr \
-       src/runtime.kr src/formatter.kr src/main.kr
+SRCS = src/lexer.mlr src/ast.mlr src/parser.mlr src/codegen.mlr \
+       src/codegen_aarch64.mlr src/ir.mlr src/ir_aarch64.mlr src/ir_hip.mlr \
+       src/format_macho.mlr src/format_pe.mlr src/format_hip.mlr src/format_amdgpu.mlr src/format_elf_dyn.mlr src/dyn_sym_registry.mlr \
+       src/format_archive.mlr src/format_android.mlr src/bcj.mlr src/analysis.mlr src/living.mlr \
+       src/runtime.mlr src/formatter.mlr src/main.mlr
 
 .PHONY: all build test install dist clean bootstrap
 
@@ -22,17 +22,17 @@ all: build
 
 build: build/mlrc
 
-build/mlrc.kr: $(SRCS)
+build/mlrc.mlr: $(SRCS)
 	@mkdir -p build
-	cat $(SRCS) > build/mlrc.kr
+	cat $(SRCS) > build/mlrc.mlr
 
 # Self-compile. build/mlrc is committed as the bootstrap.
-build/mlrc: build/mlrc.kr
+build/mlrc: build/mlrc.mlr
 	@if [ ! -x build/mlrc ]; then \
 		echo "build/mlrc not found — clone must include the committed bootstrap."; \
 		exit 1; \
 	fi
-	./build/mlrc --arch=x86_64 build/mlrc.kr -o build/mlrc.new
+	./build/mlrc --arch=x86_64 build/mlrc.mlr -o build/mlrc.new
 	mv build/mlrc.new build/mlrc
 	chmod +x build/mlrc
 
@@ -45,16 +45,16 @@ test: build/mlrc
 # Verify self-host fixed point (stage3 == stage4)
 bootstrap: build/mlrc
 	@echo "=== Bootstrap verification ==="
-	@cp build/mlrc.kr /tmp/mlrc_bs_src.kr
-	@./build/mlrc --arch=x86_64 /tmp/mlrc_bs_src.kr -o /tmp/mlrc3_bs 2>/dev/null
+	@cp build/mlrc.mlr /tmp/mlrc_bs_src.mlr
+	@./build/mlrc --arch=x86_64 /tmp/mlrc_bs_src.mlr -o /tmp/mlrc3_bs 2>/dev/null
 	@chmod +x /tmp/mlrc3_bs
-	@/tmp/mlrc3_bs --arch=x86_64 /tmp/mlrc_bs_src.kr -o /tmp/mlrc4_bs 2>/dev/null
+	@/tmp/mlrc3_bs --arch=x86_64 /tmp/mlrc_bs_src.mlr -o /tmp/mlrc4_bs 2>/dev/null
 	@if diff /tmp/mlrc3_bs /tmp/mlrc4_bs >/dev/null 2>&1; then \
 		echo "PASS: fixed point at $$(wc -c < /tmp/mlrc3_bs) bytes"; \
 	else \
 		echo "FAIL: stage3 != stage4"; exit 1; \
 	fi
-	@rm -f /tmp/mlrc_bs_src.kr /tmp/mlrc3_bs /tmp/mlrc4_bs
+	@rm -f /tmp/mlrc_bs_src.mlr /tmp/mlrc3_bs /tmp/mlrc4_bs
 
 # Install as "mlrc" in INSTALL_DIR
 install: build/mlrc
@@ -71,24 +71,24 @@ dist: build/mlrc
 	cp build/mlrc $(DIST_DIR)/mlrc-linux-x86_64
 	chmod +x $(DIST_DIR)/mlrc-linux-x86_64
 	@echo "  mlrc-linux-x86_64"
-	./build/mlrc --arch=arm64 build/mlrc.kr -o $(DIST_DIR)/mlrc-linux-arm64 2>/dev/null
+	./build/mlrc --arch=arm64 build/mlrc.mlr -o $(DIST_DIR)/mlrc-linux-arm64 2>/dev/null
 	chmod +x $(DIST_DIR)/mlrc-linux-arm64
 	@echo "  mlrc-linux-arm64"
-	./build/mlrc --arch=x86_64 --emit=pe build/mlrc.kr -o $(DIST_DIR)/mlrc-windows-x86_64.exe 2>/dev/null
+	./build/mlrc --arch=x86_64 --emit=pe build/mlrc.mlr -o $(DIST_DIR)/mlrc-windows-x86_64.exe 2>/dev/null
 	@echo "  mlrc-windows-x86_64.exe"
-	./build/mlrc --arch=arm64 --emit=pe build/mlrc.kr -o $(DIST_DIR)/mlrc-windows-arm64.exe 2>/dev/null
+	./build/mlrc --arch=arm64 --emit=pe build/mlrc.mlr -o $(DIST_DIR)/mlrc-windows-arm64.exe 2>/dev/null
 	@echo "  mlrc-windows-arm64.exe"
-	./build/mlrc build/mlrc.kr -o $(DIST_DIR)/mlrc.krbo 2>/dev/null
-	@echo "  mlrc.krbo (fat binary, 8 slices)"
-	cp build/mlrc.kr $(DIST_DIR)/mlrc-source.kr
-	@echo "  mlrc-source.kr"
+	./build/mlrc build/mlrc.mlr -o $(DIST_DIR)/mlrc.mlrbo 2>/dev/null
+	@echo "  mlrc.mlrbo (fat binary, 8 slices)"
+	cp build/mlrc.mlr $(DIST_DIR)/mlrc-source.mlr
+	@echo "  mlrc-source.mlr"
 	@echo ""
 	@ls -la $(DIST_DIR)/
 	@echo "=== Distribution complete ==="
 
 clean:
-	rm -f build/mlrc.new build/mlrc.kr
+	rm -f build/mlrc.new build/mlrc.mlr
 	rm -rf $(DIST_DIR)
-	rm -f a.out output.elf test_input.kr
+	rm -f a.out output.elf test_input.mlr
 	rm -f *.elf *.out
 	@echo "Cleaned (build/mlrc preserved — committed bootstrap)."

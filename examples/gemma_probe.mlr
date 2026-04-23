@@ -20,13 +20,13 @@
 //   mlrc --arch=x86_64 <path>/examples/gemma_probe.mlr -o /tmp/probe
 //   /tmp/probe
 
-import "../std/safetensors.kr"
-import "../std/inference.kr"
-import "../std/fmt.kr"
-import "../std/math_float.kr"
-import "../std/io.kr"
-import "../std/string.kr"
-import "../std/thread.kr"
+import "../std/safetensors.mlr"
+import "../std/inference.mlr"
+import "../std/fmt.mlr"
+import "../std/math_float.mlr"
+import "../std/io.mlr"
+import "../std/string.mlr"
+import "../std/thread.mlr"
 
 fn print_int_inline(u64 v) {
     u64 s = fmt_dec(v)

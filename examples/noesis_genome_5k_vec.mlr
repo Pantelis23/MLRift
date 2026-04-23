@@ -40,7 +40,7 @@
 //
 // Matches examples/noesis_genome_5k_vec_reference.py byte-for-byte.
 
-import "../std/vec_f64.kr"
+import "../std/vec_f64.mlr"
 
 static f64 dt = 0.1
 static f64 V_rest = -65.0

@@ -50,8 +50,8 @@ MLRift binary itself ships as a self-contained ELF.
                         ┌─────────────────────────┼────────┐
                         │                         │        │
                   ┌─────▼─────┐          ┌────────▼───┐    │
-                  │ ir.kr     │          │ format_hip │    │
-                  │ x86/arm   │          │ .kr (new)  │    │
+                  │ ir.mlr     │          │ format_hip │    │
+                  │ x86/arm   │          │ .mlr (new)  │    │
                   │ (CPU)     │          │            │    │
                   └─────┬─────┘          └────┬───────┘    │
                         │                     │            │
@@ -72,20 +72,20 @@ MLRift binary itself ships as a self-contained ELF.
                                               │
                                     ┌─────────▼─────────┐
                                     │  MLRift host bin  │
-                                    │  + hip_runtime.kr │
+                                    │  + hip_runtime.mlr │
                                     │  (dlopen HIP)     │
                                     └───────────────────┘
 ```
 
 Host code runs from a regular MLRift ELF. When it hits a GPU kernel
-launch, it calls into `hip_runtime.kr`, which has dlopen'd
+launch, it calls into `hip_runtime.mlr`, which has dlopen'd
 `libamdhip64.so` at startup. The kernel binary (compiled from the
 emitted `.hip` source at MLRift-build-time) is embedded in the host
 binary as a data blob and loaded via `hipModuleLoadData`.
 
 ## New IR ops
 
-Proposed additions to `src/ir.kr` (opcode numbers tentative — pick
+Proposed additions to `src/ir.mlr` (opcode numbers tentative — pick
 whatever slot is free):
 
 | op              | description                                          |
@@ -101,10 +101,10 @@ whatever slot is free):
 | IR_GPU_BARRIER  | __syncthreads() inside a kernel                      |
 
 Kernel body IR is a restricted subset: no heap alloc, no stdout,
-no recursion. The `format_hip.kr` emitter rejects any kernel that
+no recursion. The `format_hip.mlr` emitter rejects any kernel that
 tries to use unsupported ops.
 
-## Runtime interface (`src/hip_runtime.kr`)
+## Runtime interface (`src/hip_runtime.mlr`)
 
 At process start (in main's prologue or first GPU op), dlopen
 `libamdhip64.so.6` (or versioned variant). Bind these functions by
@@ -130,7 +130,7 @@ mlrc: GPU runtime not available
   install ROCm ≥ 6.0 or run with --target=cpu
 ```
 
-Host-side coordination code emitted by `format_hip.kr` calls into
+Host-side coordination code emitted by `format_hip.mlr` calls into
 these bindings through normal KernRift extern-call machinery.
 
 ## Build pipeline
@@ -139,7 +139,7 @@ New `mlrc` flag: `--target=hip-amd`. When set:
 
 1. Frontend parses `.mlr` source → IR (unchanged).
 2. IR passes run (unchanged where possible).
-3. `format_hip.kr` walks IR and emits two artefacts:
+3. `format_hip.mlr` walks IR and emits two artefacts:
    - `out.hip` — GPU kernel source
    - `out.hip.hostlib.c` — small C shim that calls into hip_runtime
      (simpler than emitting both sides ourselves)
@@ -162,12 +162,12 @@ embedded blob in phase 1.5.
   launches, copies down, prints. Run on 7800XT. Confirms ROCm stack
   is alive and you have a working kernel-launch recipe to copy.
 
-**M1 — format_hip.kr emits a trivial kernel (3-5 days)**
+**M1 — format_hip.mlr emits a trivial kernel (3-5 days)**
   Single IR pattern: an MLRift fn marked `@kernel` that operates on
-  two device arrays. format_hip.kr emits matching `.hip` source.
+  two device arrays. format_hip.mlr emits matching `.hip` source.
   MLRift invokes hipcc. Host side still hand-written C.
 
-**M2 — hip_runtime.kr in MLRift (5-7 days)**
+**M2 — hip_runtime.mlr in MLRift (5-7 days)**
   dlopen + dlsym binding for hipMalloc, hipFree, hipMemcpy,
   hipModuleLoad, hipModuleLaunchKernel, hipDeviceSynchronize.
   Port the M1 hello kernel's host side to MLRift. End-to-end MLRift
@@ -271,12 +271,12 @@ These become revisitable after phase 2.
 
 ## Related work in the repo
 
-- CPU codegen for reference: `src/ir.kr` (x86_64), `src/ir_aarch64.kr`
-- Static-data emission (analogous to embedded GPU blob): `codegen.kr
+- CPU codegen for reference: `src/ir.mlr` (x86_64), `src/ir_aarch64.mlr`
+- Static-data emission (analogous to embedded GPU blob): `codegen.mlr
   emit_static_data()`
 - Extern-call machinery (analogous to hip runtime dlopen): see how
-  PE IAT calls are lowered in `src/format_pe.kr` + the Windows path
-  in `src/codegen.kr` around `emit_win_call_iat`
+  PE IAT calls are lowered in `src/format_pe.mlr` + the Windows path
+  in `src/codegen.mlr` around `emit_win_call_iat`
 - BSS optimisation (task #86 in conversation history) should land
   before M5 — GPU binaries will embed ~100 MB of kernel blobs, and
   the current output-buffer path will put those in .text. BSS fixes
@@ -286,11 +286,11 @@ These become revisitable after phase 2.
 
 1. On the 7800XT box: install ROCm, verify `hipconfig --check`, write
    and run `hello_hip.hip`. Send output.
-2. Read this document end-to-end, then read `src/format_pe.kr` as the
+2. Read this document end-to-end, then read `src/format_pe.mlr` as the
    template for "emit a binary format one byte at a time" and
-   `src/ir.kr` for IR emission patterns.
+   `src/ir.mlr` for IR emission patterns.
 3. Propose the IR opcode numbers for the new GPU ops (pick free slots).
-4. Stub `src/format_hip.kr` with a no-op function signature that
+4. Stub `src/format_hip.mlr` with a no-op function signature that
    compiles into the MLRift build.
 5. Begin M1 (trivial @kernel → .hip emission).
 

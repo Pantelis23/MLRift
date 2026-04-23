@@ -1,7 +1,7 @@
 # Contributing to MLRift
 
 MLRift is a systems language for machine learning and artificial biology, built
-on top of KernRift. The compiler's own source is written in KernRift (`.kr`
+on top of KernRift. The compiler's own source is written in KernRift (`.mlr`
 files in `src/`), reuses KernRift's backend, and extends its IR with
 ML-specific primitives. MLRift user programs (when the frontend lands) will
 use the `.mlr` extension.
@@ -14,7 +14,7 @@ no external toolchain required — a clean clone self-hosts on Linux x86_64.
 ## Build
 
 ```sh
-make build       # build/mlrc compiles build/mlrc.kr → build/mlrc (in place)
+make build       # build/mlrc compiles build/mlrc.mlr → build/mlrc (in place)
 ```
 
 ## Test
@@ -36,17 +36,17 @@ All compiler source is in `src/` (written in KernRift):
 
 | File | Purpose |
 |------|---------|
-| `lexer.kr` | Tokenizer |
-| `parser.kr` | Parser (recursive descent + Pratt) |
-| `ast.kr` | AST node definitions |
-| `analysis.kr` | Safety passes |
-| `ir.kr` | SSA IR + x86_64 codegen |
-| `ir_aarch64.kr` | AArch64 IR codegen |
-| `codegen.kr` | x86_64 legacy code generation |
-| `codegen_aarch64.kr` | AArch64 legacy code generation |
-| `format_*.kr` | Output formats (ELF, Mach-O, PE, AR, KRBO) |
-| `runtime.kr`, `living.kr`, `formatter.kr` | Supporting infrastructure |
-| `main.kr` | CLI and compilation driver |
+| `lexer.mlr` | Tokenizer |
+| `parser.mlr` | Parser (recursive descent + Pratt) |
+| `ast.mlr` | AST node definitions |
+| `analysis.mlr` | Safety passes |
+| `ir.mlr` | SSA IR + x86_64 codegen |
+| `ir_aarch64.mlr` | AArch64 IR codegen |
+| `codegen.mlr` | x86_64 legacy code generation |
+| `codegen_aarch64.mlr` | AArch64 legacy code generation |
+| `format_*.mlr` | Output formats (ELF, Mach-O, PE, AR, KRBO) |
+| `runtime.mlr`, `living.mlr`, `formatter.mlr` | Supporting infrastructure |
+| `main.mlr` | CLI and compilation driver |
 
 Standard library modules in `std/` are inherited from KernRift.
 

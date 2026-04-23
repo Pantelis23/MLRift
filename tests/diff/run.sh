@@ -54,8 +54,8 @@ run_bin() {
 }
 
 if [ "$MODE" = "backend" ]; then
-    for src in "$DIR"/corpus/*.kr; do
-        name="$(basename "$src" .kr)"
+    for src in "$DIR"/corpus/*.mlr; do
+        name="$(basename "$src" .mlr)"
         leg_bin="$(mktemp /tmp/krc_diff_${name}_leg_XXXX)"; rm -f "$leg_bin"
         ir_bin="$(mktemp /tmp/krc_diff_${name}_ir_XXXX)"; rm -f "$ir_bin"
         leg_log="$(mktemp)"; ir_log="$(mktemp)"
@@ -104,8 +104,8 @@ elif [ "$MODE" = "crossarch" ]; then
     # crossarch walks BOTH corpus/ (legacy-compatible) and ir-only/
     # (features that only the IR backend supports); both are expected
     # to behave identically across x86_64 and arm64 IR.
-    for src in "$DIR"/corpus/*.kr "$DIR"/ir-only/*.kr; do
-        name="$(basename "$src" .kr)"
+    for src in "$DIR"/corpus/*.mlr "$DIR"/ir-only/*.mlr; do
+        name="$(basename "$src" .mlr)"
         x64_bin="$(mktemp /tmp/krc_diff_${name}_x64_XXXX)"; rm -f "$x64_bin"
         a64_bin="$(mktemp /tmp/krc_diff_${name}_a64_XXXX)"; rm -f "$a64_bin"
         blog="$(mktemp)"

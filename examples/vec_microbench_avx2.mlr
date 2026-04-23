@@ -1,0 +1,151 @@
+// Four-way comparison on vec_f64_decay:
+//   (A) inline scalar loop
+//   (B) vec_f64_decay_inplace       — 4-way scalar unroll
+//   (C) vec_f64_decay_inplace_avx2  — AVX2 VFNMADD231PD, 4 lanes f64
+//   (D) vec_f64_decay_inplace_mt    — 4-way unroll × N worker threads
+
+import "../std/vec_f64.mlr"
+import "../std/vec_f64_avx2.mlr"
+import "../std/vec_f64_mt.mlr"
+import "../std/thread.mlr"
+
+fn main() {
+    uint64 N = 1048576
+    uint64 ROUNDS = 100
+    uint64 NW = 4
+    f64 factor = 0.005
+
+    uint64 buf_a = alloc(N * 8)
+    uint64 buf_b = alloc(N * 8)
+    uint64 buf_c = alloc(N * 8)
+    uint64 buf_d = alloc(N * 8)
+
+    uint64 i = 0
+    while i < N {
+        f64 v = int_to_f64(i) * 0.001 + 1.0
+        uint64 pa = buf_a + i * 8
+        uint64 pb = buf_b + i * 8
+        uint64 pc = buf_c + i * 8
+        uint64 pd = buf_d + i * 8
+        unsafe { *(pa as f64) = v }
+        unsafe { *(pb as f64) = v }
+        unsafe { *(pc as f64) = v }
+        unsafe { *(pd as f64) = v }
+        i = i + 1
+    }
+
+    thread_pool_init(NW)
+
+    // (A) inline scalar
+    uint64 t0 = time_ns()
+    uint64 r = 0
+    while r < ROUNDS {
+        uint64 k = 0
+        while k < N {
+            uint64 pk = buf_a + k * 8
+            f64 x = 0.0
+            unsafe { *(pk as f64) -> x }
+            x = x - x * factor
+            unsafe { *(pk as f64) = x }
+            k = k + 1
+        }
+        r = r + 1
+    }
+    uint64 t1 = time_ns()
+    uint64 inline_ns = t1 - t0
+
+    // (B) scalar unroll helper
+    uint64 t2 = time_ns()
+    uint64 r2 = 0
+    while r2 < ROUNDS {
+        vec_f64_decay_inplace(buf_b, N, factor)
+        r2 = r2 + 1
+    }
+    uint64 t3 = time_ns()
+    uint64 helper_ns = t3 - t2
+
+    // (C) AVX2
+    uint64 t4 = time_ns()
+    uint64 r3 = 0
+    while r3 < ROUNDS {
+        vec_f64_decay_inplace_avx2(buf_c, N, factor)
+        r3 = r3 + 1
+    }
+    uint64 t5 = time_ns()
+    uint64 avx2_ns = t5 - t4
+
+    // (D) MT scalar-helper
+    uint64 t6 = time_ns()
+    uint64 r4 = 0
+    while r4 < ROUNDS {
+        vec_f64_decay_inplace_mt(buf_d, N, factor)
+        r4 = r4 + 1
+    }
+    uint64 t7 = time_ns()
+    uint64 mt_ns = t7 - t6
+
+    // (E) MT + AVX2 combo — reuse buf_d with a fresh fill, time again.
+    uint64 i2 = 0
+    while i2 < N {
+        f64 v = int_to_f64(i2) * 0.001 + 1.0
+        uint64 pd = buf_d + i2 * 8
+        unsafe { *(pd as f64) = v }
+        i2 = i2 + 1
+    }
+    uint64 t8 = time_ns()
+    uint64 r5 = 0
+    while r5 < ROUNDS {
+        vec_f64_decay_inplace_mt_avx2(buf_d, N, factor)
+        r5 = r5 + 1
+    }
+    uint64 t9 = time_ns()
+    uint64 mt_avx2_ns = t9 - t8
+    f64 sum_e = vec_f64_sum(buf_d, N)
+
+    thread_pool_shutdown()
+
+    f64 sum_a = vec_f64_sum(buf_a, N)
+    f64 sum_b = vec_f64_sum(buf_b, N)
+    f64 sum_c = vec_f64_sum(buf_c, N)
+    f64 sum_d = 0.0   // overwritten by variant E
+
+    print("# inline_us=")
+    println(inline_ns / 1000)
+    print("# helper_us=")
+    println(helper_ns / 1000)
+    print("# avx2_us=")
+    println(avx2_ns / 1000)
+    print("# mt_us=")
+    println(mt_ns / 1000)
+    print("# mt_avx2_us=")
+    println(mt_avx2_ns / 1000)
+
+    f64 sa = sum_a * 1000.0
+    f64 sb = sum_b * 1000.0
+    f64 sc = sum_c * 1000.0
+    f64 se = sum_e * 1000.0
+    print("# sum_a_milli=")
+    println(f64_to_int(sa))
+    print("# sum_b_milli=")
+    println(f64_to_int(sb))
+    print("# sum_c_milli=")
+    println(f64_to_int(sc))
+    print("# sum_e_milli=")
+    println(f64_to_int(se))
+
+    print("# helper_vs_inline_x100=")
+    println((inline_ns * 100) / helper_ns)
+    print("# avx2_vs_inline_x100=")
+    println((inline_ns * 100) / avx2_ns)
+    print("# avx2_vs_helper_x100=")
+    println((helper_ns * 100) / avx2_ns)
+    print("# mt_vs_inline_x100=")
+    println((inline_ns * 100) / mt_ns)
+    print("# mt_vs_avx2_x100=")
+    println((avx2_ns * 100) / mt_ns)
+    print("# mt_avx2_vs_inline_x100=")
+    println((inline_ns * 100) / mt_avx2_ns)
+    print("# mt_avx2_vs_avx2_x100=")
+    println((avx2_ns * 100) / mt_avx2_ns)
+    exit(0)
+}

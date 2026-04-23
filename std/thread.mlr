@@ -1,0 +1,248 @@
+// std/thread.kr — MLRift thread pool, Linux x86_64 only.
+//
+// Phase-1 of the multi-threading track. Built on raw clone() + futex()
+// syscalls — no libc, no libpthread, no dynamic linker. See
+// docs/MULTITHREADING.md for the design.
+//
+// Public API:
+//   thread_pool_init(n)                                 — spawn n workers
+//   thread_pool_submit(wid, fn_ptr, a0, a1, a2)          — enqueue work
+//   thread_pool_wait()                                   — barrier on all
+//   thread_pool_shutdown()                               — exit all workers
+//
+// The submitted function is called as `fn(a0, a1, a2)` inside the worker
+// thread. Chunk split into [start, end) ranges is a caller convention.
+
+// Hard cap (fixed-size arrays; bump if needed).
+static uint64 TP_MAX = 32
+
+// 2 MB per worker, matches glibc default.
+static uint64 TP_STACK_SIZE = 0x200000
+
+// Per-worker scratch and state arrays are heap-allocated at
+// thread_pool_init rather than declared as static uint64[32], because
+// the kr static allocator doesn't reliably 8-byte-align static arrays
+// — and the Linux futex syscall returns EINVAL on a misaligned uaddr.
+// alloc() returns page-aligned memory (4K from mmap), which trivially
+// satisfies the 4-byte requirement.
+//
+// tp_tid / tp_stk_base  — diagnostic / shutdown
+// tp_fn / tp_a0 / tp_a1 / tp_a2 — job descriptor (main writes, worker reads)
+// tp_state — worker state word (0=idle, 1=has_job, 2=done, 3=shutdown).
+//            Futex looks at the low 32 bits; LE x86_64 makes that
+//            coincide with the uint64's low byte.
+static uint64 tp_tid = 0
+static uint64 tp_stk_base = 0
+static uint64 tp_fn = 0
+static uint64 tp_a0 = 0
+static uint64 tp_a1 = 0
+static uint64 tp_a2 = 0
+static uint64 tp_state = 0
+
+static uint64 tp_n = 0
+
+// ---------------------------------------------------------------------
+// Futex wrappers (syscall 202). FUTEX_*_PRIVATE = op | 128.
+
+fn futex_wait(uint64 uaddr, uint64 expected) -> int64 {
+    // FUTEX_WAIT_PRIVATE = 0 | 128 = 128
+    return syscall_raw(202, uaddr, 128, expected, 0, 0, 0)
+}
+
+fn futex_wake(uint64 uaddr, uint64 n) -> int64 {
+    // FUTEX_WAKE_PRIVATE = 1 | 128 = 129
+    return syscall_raw(202, uaddr, 129, n, 0, 0, 0)
+}
+
+// ---------------------------------------------------------------------
+// Raw clone() thread spawn. Returns child TID to the parent; the child
+// never returns — it runs worker_fn(ctx_ptr) on its own stack, then
+// exits via syscall(60).
+//
+// The register plan avoids stomping the kr compiler's own register
+// allocation. kr pins/spills params into rbx/r12/r13/r14, so we target
+// r11/r9/rsi/r15 — none of which the allocator assigns to this function's
+// vregs — to keep the `in(...)` load sequence hazard-free.
+
+fn tp_spawn_raw(uint64 worker_fn, uint64 ctx_ptr, uint64 stack_top) -> uint64 {
+    // CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM
+    //  = 0x50F00
+    uint64 flags = 0x50F00
+    uint64 tid = 0
+    asm {
+        // mov [rsi - 8], r11        ; stash worker_fn on child stack
+        "0x4C 0x89 0x5E 0xF8"
+        // mov [rsi - 16], r9        ; stash ctx_ptr
+        "0x4C 0x89 0x4E 0xF0"
+        // sub rsi, 16               ; child rsp := stack_top - 16
+        "0x48 0x83 0xEE 0x10"
+        // mov rdi, r15              ; clone flags
+        "0x4C 0x89 0xFF"
+        // xor edx, edx              ; ptid = NULL
+        "0x31 0xD2"
+        // xor r10d, r10d            ; ctid = NULL
+        "0x45 0x31 0xD2"
+        // xor r8d, r8d              ; new_tls = 0
+        "0x45 0x31 0xC0"
+        // mov eax, 56               ; SYS_clone
+        "0xB8 0x38 0x00 0x00 0x00"
+        // syscall
+        "0x0F 0x05"
+        // test rax, rax             ; 0 → child; > 0 → parent (child TID)
+        "0x48 0x85 0xC0"
+        // jnz +13                   ; parent skips the 13-byte child body
+        "0x75 0x0D"
+        // ---- child path (13 bytes) ----
+        // pop rdi                   ; rdi = ctx_ptr (wid)
+        "0x5F"
+        // pop rax                   ; rax = worker_fn
+        "0x58"
+        // call rax                  ; tp_worker_loop(wid)
+        "0xFF 0xD0"
+        // mov eax, 60               ; SYS_exit — fallback if worker returns
+        "0xB8 0x3C 0x00 0x00 0x00"
+        // xor edi, edi
+        "0x31 0xFF"
+        // syscall
+        "0x0F 0x05"
+        // parent falls through; `out(rax -> tid)` captures the child TID
+    } in(worker_fn -> r11, ctx_ptr -> r9, stack_top -> rsi, flags -> r15) out(rax -> tid) clobbers(rdi, rdx, rcx, r10, r8)
+    return tid
+}
+
+// ---------------------------------------------------------------------
+// Worker main loop. Each worker thread runs this forever; `wid` arrives
+// via the clone-child entry stub (popped into rdi).
+
+fn tp_worker_loop(uint64 wid) {
+    uint64 st_addr = tp_state + wid * 8
+    while 1 {
+        // Worker wakes only on state ∈ {1=has_job, 3=shutdown}. States
+        // 0 (idle) and 2 (done, awaiting reset by main) both sleep the
+        // thread — otherwise a worker that finished before main's
+        // thread_pool_wait resets its state would spin in the outer
+        // loop burning CPU.
+        uint64 s = atomic_load(st_addr)
+        while s != 1 && s != 3 {
+            futex_wait(st_addr, s)
+            s = atomic_load(st_addr)
+        }
+
+        if s == 3 {
+            // Shutdown — exit this thread only (not the process).
+            syscall_raw(60, 0, 0, 0, 0, 0, 0)
+        }
+
+        if s == 1 {
+            // Load the job descriptor (main wrote these before flipping
+            // state to 1; the xchg in atomic_store is a full barrier so
+            // the reads below see the committed values).
+            uint64 fp_slot = tp_fn + wid * 8
+            uint64 fn_ptr = 0
+            unsafe { *(fp_slot as uint64) -> fn_ptr }
+            uint64 a0p = tp_a0 + wid * 8
+            uint64 a0 = 0
+            unsafe { *(a0p as uint64) -> a0 }
+            uint64 a1p = tp_a1 + wid * 8
+            uint64 a1 = 0
+            unsafe { *(a1p as uint64) -> a1 }
+            uint64 a2p = tp_a2 + wid * 8
+            uint64 a2 = 0
+            unsafe { *(a2p as uint64) -> a2 }
+
+            call_ptr(fn_ptr, a0, a1, a2)
+
+            // Signal completion and wake main.
+            atomic_store(st_addr, 2)
+            futex_wake(st_addr, 1)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Public API.
+
+fn thread_pool_init(uint64 n) {
+    if n > TP_MAX { n = TP_MAX }
+    // First call: allocate the seven TP_MAX-sized slot arrays on the
+    // heap. alloc() hands back page-aligned memory, which is the
+    // trivial fix for futex-uaddr alignment (see note above).
+    if tp_state == 0 {
+        tp_tid      = alloc(TP_MAX * 8)
+        tp_stk_base = alloc(TP_MAX * 8)
+        tp_fn       = alloc(TP_MAX * 8)
+        tp_a0       = alloc(TP_MAX * 8)
+        tp_a1       = alloc(TP_MAX * 8)
+        tp_a2       = alloc(TP_MAX * 8)
+        tp_state    = alloc(TP_MAX * 8)
+    }
+    uint64 worker_entry = fn_addr("tp_worker_loop")
+    uint64 i = 0
+    while i < n {
+        uint64 stk = alloc(TP_STACK_SIZE)
+        uint64 stk_slot = tp_stk_base + i * 8
+        unsafe { *(stk_slot as uint64) = stk }
+        uint64 stk_top = stk + TP_STACK_SIZE
+
+        // Ensure state is 0 before the worker starts. BSS zero-init
+        // already guarantees this, but atomic_store is safer against
+        // future changes.
+        uint64 st_addr = tp_state + i * 8
+        atomic_store(st_addr, 0)
+
+        uint64 tid = tp_spawn_raw(worker_entry, i, stk_top)
+        uint64 tid_slot = tp_tid + i * 8
+        unsafe { *(tid_slot as uint64) = tid }
+        i = i + 1
+    }
+    tp_n = n
+}
+
+fn thread_pool_submit(uint64 wid, uint64 fn_ptr, uint64 a0, uint64 a1, uint64 a2) {
+    uint64 fp_slot = tp_fn + wid * 8
+    unsafe { *(fp_slot as uint64) = fn_ptr }
+    uint64 a0p = tp_a0 + wid * 8
+    unsafe { *(a0p as uint64) = a0 }
+    uint64 a1p = tp_a1 + wid * 8
+    unsafe { *(a1p as uint64) = a1 }
+    uint64 a2p = tp_a2 + wid * 8
+    unsafe { *(a2p as uint64) = a2 }
+
+    uint64 st_addr = tp_state + wid * 8
+    atomic_store(st_addr, 1)
+    futex_wake(st_addr, 1)
+}
+
+fn thread_pool_wait() {
+    uint64 i = 0
+    while i < tp_n {
+        uint64 st_addr = tp_state + i * 8
+        uint64 s = atomic_load(st_addr)
+        // Worker with state == 0 was never submitted to this round
+        // (main used fewer workers than the pool size). Skip it —
+        // otherwise main blocks forever in futex_wait(state, 0) since
+        // no one will flip that state to 2.
+        if s == 0 {
+            i = i + 1
+            continue
+        }
+        while s != 2 {
+            futex_wait(st_addr, s)
+            s = atomic_load(st_addr)
+        }
+        // Reset for the next submit cycle.
+        atomic_store(st_addr, 0)
+        i = i + 1
+    }
+}
+
+fn thread_pool_shutdown() {
+    uint64 i = 0
+    while i < tp_n {
+        uint64 st_addr = tp_state + i * 8
+        atomic_store(st_addr, 3)
+        futex_wake(st_addr, 1)
+        i = i + 1
+    }
+    tp_n = 0
+}

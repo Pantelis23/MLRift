@@ -16,7 +16,7 @@
 // All three patterns differ so a misbehaving slot_base arithmetic
 // would show up as cross-contamination between patterns.
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

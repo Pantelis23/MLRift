@@ -17,7 +17,7 @@
 //   + I population with cell_type gating
 //   + x_pre/x_post postsynaptic-fire traces
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

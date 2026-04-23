@@ -1,0 +1,70 @@
+// MLRift MT M1 — thread-pool primitive smoke test.
+//
+// Spins up a 4-worker pool via std/thread.kr. Each worker increments a
+// shared atomic counter N/4 times per round. Main dispatches R rounds,
+// waits on each, and verifies the final count == N*R.
+//
+// Gate for M2 (parallel vec_f64_decay_inplace_mt).
+
+import "../std/thread.mlr"
+
+// Single-element array so that the bare identifier `shared_counter`
+// evaluates to the slot address (needed by atomic_add and worker ctx).
+static uint64[1] shared_counter
+
+// Worker job: increments `counter_addr` once per index in [start, end).
+fn bump_counter(uint64 start, uint64 end, uint64 counter_addr) {
+    uint64 i = start
+    while i < end {
+        atomic_add(counter_addr, 1)
+        i = i + 1
+    }
+}
+
+fn main() {
+    uint64 n_workers = 6
+    uint64 per_worker = 100              // each worker bumps 100/round
+    uint64 n_increments = per_worker * n_workers
+    uint64 n_rounds = 10
+
+    println("=== MT M1 — thread pool smoke test ===")
+    print("spawning ")
+    print(n_workers)
+    println(" workers...")
+
+    thread_pool_init(n_workers)
+
+    uint64 counter_addr = shared_counter
+    uint64 job_fn = fn_addr("bump_counter")
+
+    uint64 round = 0
+    while round < n_rounds {
+        uint64 w = 0
+        while w < n_workers {
+            uint64 s = w * per_worker
+            uint64 e = s + per_worker
+            thread_pool_submit(w, job_fn, s, e, counter_addr)
+            w = w + 1
+        }
+        thread_pool_wait()
+        round = round + 1
+    }
+
+    thread_pool_shutdown()
+
+    uint64 final = atomic_load(counter_addr)
+    uint64 expected = n_increments * n_rounds
+
+    print("counter=")
+    print(final)
+    print("  expected=")
+    println(expected)
+
+    if final == expected {
+        println("PASS")
+        exit(0)
+    } else {
+        println("FAIL")
+        exit(1)
+    }
+}

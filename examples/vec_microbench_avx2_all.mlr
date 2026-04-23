@@ -1,0 +1,126 @@
+// Benchmarks for the full std/vec_f64_avx2.kr kernel set —
+// relax / fill / sum, each vs its scalar-unroll helper.
+
+import "../std/vec_f64.mlr"
+import "../std/vec_f64_avx2.mlr"
+
+fn fill_pattern(uint64 buf, uint64 n) {
+    uint64 i = 0
+    while i < n {
+        f64 v = int_to_f64(i) * 0.001 + 1.0
+        uint64 p = buf + i * 8
+        unsafe { *(p as f64) = v }
+        i = i + 1
+    }
+}
+
+fn main() {
+    uint64 N = 1048576
+    uint64 ROUNDS = 100
+
+    uint64 bs = alloc(N * 8)     // for scalar helper
+    uint64 ba = alloc(N * 8)     // for avx2
+
+    // ---- relax ----
+    fill_pattern(bs, N)
+    fill_pattern(ba, N)
+    uint64 t0 = time_ns()
+    uint64 r = 0
+    while r < ROUNDS {
+        vec_f64_relax_inplace(bs, N, 0.5, 0.005)
+        r = r + 1
+    }
+    uint64 t1 = time_ns()
+    uint64 relax_helper_ns = t1 - t0
+
+    t0 = time_ns()
+    r = 0
+    while r < ROUNDS {
+        vec_f64_relax_inplace_avx2(ba, N, 0.5, 0.005)
+        r = r + 1
+    }
+    t1 = time_ns()
+    uint64 relax_avx2_ns = t1 - t0
+
+    f64 s_r_s = vec_f64_sum(bs, N)
+    f64 s_r_a = vec_f64_sum(ba, N)
+
+    // ---- fill ----
+    t0 = time_ns()
+    r = 0
+    while r < ROUNDS {
+        vec_f64_fill(bs, N, 3.14)
+        r = r + 1
+    }
+    t1 = time_ns()
+    uint64 fill_helper_ns = t1 - t0
+
+    t0 = time_ns()
+    r = 0
+    while r < ROUNDS {
+        vec_f64_fill_avx2(ba, N, 3.14)
+        r = r + 1
+    }
+    t1 = time_ns()
+    uint64 fill_avx2_ns = t1 - t0
+
+    f64 s_f_s = vec_f64_sum(bs, N)
+    f64 s_f_a = vec_f64_sum(ba, N)
+
+    // ---- sum ----
+    fill_pattern(bs, N)
+    fill_pattern(ba, N)
+    t0 = time_ns()
+    r = 0
+    f64 total_s = 0.0
+    while r < ROUNDS {
+        total_s = total_s + vec_f64_sum(bs, N)
+        r = r + 1
+    }
+    t1 = time_ns()
+    uint64 sum_helper_ns = t1 - t0
+
+    t0 = time_ns()
+    r = 0
+    f64 total_a = 0.0
+    while r < ROUNDS {
+        total_a = total_a + vec_f64_sum_avx2(ba, N)
+        r = r + 1
+    }
+    t1 = time_ns()
+    uint64 sum_avx2_ns = t1 - t0
+
+    print("# relax_helper_us=")
+    println(relax_helper_ns / 1000)
+    print("# relax_avx2_us=")
+    println(relax_avx2_ns / 1000)
+    print("# relax_avx2_vs_helper_x100=")
+    println((relax_helper_ns * 100) / relax_avx2_ns)
+    print("# relax_sum_s_milli=")
+    println(f64_to_int(s_r_s * 1000.0))
+    print("# relax_sum_a_milli=")
+    println(f64_to_int(s_r_a * 1000.0))
+
+    print("# fill_helper_us=")
+    println(fill_helper_ns / 1000)
+    print("# fill_avx2_us=")
+    println(fill_avx2_ns / 1000)
+    print("# fill_avx2_vs_helper_x100=")
+    println((fill_helper_ns * 100) / fill_avx2_ns)
+    print("# fill_sum_s_milli=")
+    println(f64_to_int(s_f_s * 1000.0))
+    print("# fill_sum_a_milli=")
+    println(f64_to_int(s_f_a * 1000.0))
+
+    print("# sum_helper_us=")
+    println(sum_helper_ns / 1000)
+    print("# sum_avx2_us=")
+    println(sum_avx2_ns / 1000)
+    print("# sum_avx2_vs_helper_x100=")
+    println((sum_helper_ns * 100) / sum_avx2_ns)
+    print("# sum_total_s_milli=")
+    println(f64_to_int(total_s * 1000.0))
+    print("# sum_total_a_milli=")
+    println(f64_to_int(total_a * 1000.0))
+    exit(0)
+}

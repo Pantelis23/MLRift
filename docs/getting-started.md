@@ -36,7 +36,7 @@ kr --version
 
 ## Your first program
 
-Save this as `hello.kr`:
+Save this as `hello.mlr`:
 
 ```kr
 fn main() {
@@ -48,14 +48,14 @@ fn main() {
 Compile and run:
 
 ```sh
-krc hello.kr --arch=x86_64 -o hello
+krc hello.mlr --arch=x86_64 -o hello
 ./hello
 ```
 
 Or build a cross-platform fat binary and run it through `kr`:
 
 ```sh
-krc hello.kr -o hello.krbo
+krc hello.mlr -o hello.krbo
 kr hello.krbo
 ```
 
@@ -119,7 +119,7 @@ println(f"pi ≈ {3.14159}, answer = {answer}")
 
 // For a string that lives in a variable (e.g. a heap-allocated
 // buffer or the result of fmt_hex/fmt_dec), use print_str / println_str:
-import "std/fmt.kr"
+import "std/fmt.mlr"
 u64 s = fmt_dec(x)
 print_str("x = ")
 println_str(s)
@@ -293,9 +293,9 @@ fn main() {
 ### Imports
 
 ```kr
-import "std/io.kr"
-import "std/string.kr"
-import "utils.kr"
+import "std/io.mlr"
+import "std/string.mlr"
+import "utils.mlr"
 ```
 
 Paths are resolved relative to the importing file, then under
@@ -321,14 +321,14 @@ won't sneak in behind your back, even as the language evolves. See the
 
 | Tool | What it does |
 |------|--------------|
-| `krc <file.kr>` | Compile a source file (to a fat binary by default). |
-| `krc --arch=x86_64 <file.kr>` | Compile for a single architecture — native ELF. |
-| `krc --emit=asm <file.kr>` | Emit a disassembled listing with function labels. |
-| `krc check <file.kr>` | Run semantic analysis only. |
-| `krc fmt <file.kr>` | Auto-format the file in place. |
-| `krc lc <file.kr>` | Living compiler report: fitness score, pattern detection, proposal triggers. |
-| `krc lc --fix <file.kr>` | Apply auto-fixes in place (e.g. `unsafe{}` pointer ops → `load/store` builtins). |
-| `krc lc --fix --dry-run <file.kr>` | Preview auto-fixes without writing. |
+| `krc <file.mlr>` | Compile a source file (to a fat binary by default). |
+| `krc --arch=x86_64 <file.mlr>` | Compile for a single architecture — native ELF. |
+| `krc --emit=asm <file.mlr>` | Emit a disassembled listing with function labels. |
+| `krc check <file.mlr>` | Run semantic analysis only. |
+| `krc fmt <file.mlr>` | Auto-format the file in place. |
+| `krc lc <file.mlr>` | Living compiler report: fitness score, pattern detection, proposal triggers. |
+| `krc lc --fix <file.mlr>` | Apply auto-fixes in place (e.g. `unsafe{}` pointer ops → `load/store` builtins). |
+| `krc lc --fix --dry-run <file.mlr>` | Preview auto-fixes without writing. |
 | `krc lc --list-proposals` | Print the proposal registry with lifecycle states. |
 | `kr <file.krbo>` | Run a fat binary on the current platform. |
 
@@ -348,13 +348,13 @@ won't sneak in behind your back, even as the language evolves. See the
 ## Standard library
 
 KernRift ships with a standard library in `std/`. Import any module with
-`import "std/module.kr"`. Highlights:
+`import "std/module.mlr"`. Highlights:
 
 ```kr
-import "std/string.kr"
-import "std/io.kr"
-import "std/math.kr"
-import "std/vec.kr"
+import "std/string.mlr"
+import "std/io.mlr"
+import "std/math.mlr"
+import "std/vec.mlr"
 
 fn main() {
     // String operations
@@ -386,38 +386,38 @@ Available modules:
 
 | Module | Highlights |
 |--------|-----------|
-| `std/string.kr` | `str_cat(a,b)`, `str_copy(s)`, `str_sub(s,start,len)`, `str_to_int(s)`, `int_to_str(v)`, `str_trim(s)` — all return newly allocated strings |
-| `std/io.kr` | `read_file`, `write_file`, `read_line`, `scan_int`, `scan_str`, `print_kv`, `print_indent` |
-| `std/math.kr` | `min`, `max`, `abs`, `clamp`, `pow`, `sqrt_int`, `gcd`, `is_prime` |
-| `std/fmt.kr` | `fmt_hex`, `fmt_bin`, `pad_left`, `pad_right` |
-| `std/mem.kr` | `realloc`, `memcmp`, `memzero`, `arena_init`, `arena_alloc`, `arena_reset` |
-| `std/vec.kr` | `vec_new`, `vec_push`, `vec_get`, `vec_set`, `vec_pop`, `vec_len` |
-| `std/map.kr` | `map_new`, `map_set`, `map_get`, `map_has`, `map_len` |
-| `std/time.kr` | `time_now`, `time_sleep_ns`, `time_sleep_ms`, `time_elapsed` |
-| `std/log.kr` | `log_set_level`, `log_debug`, `log_info`, `log_warn`, `log_error` |
-| `std/net.kr` | `net_socket`, `net_bind`, `net_listen`, `net_accept`, `net_connect`, `net_send`, `net_recv` |
-| `std/fb.kr` | Framebuffer: `fb_init(addr,w,h,stride,bpp)`, `fb_pixel`, `fb_rect`, `fb_line`, `fb_blit` |
-| `std/font.kr` | 8x16 bitmap font: `font_init`, `fb_char`, `fb_text` |
-| `std/widget.kr` | UI widgets: `panel_new`, `label_new`, `button_new`, `progress_new`, `textfield_new` |
-| `std/color.kr` | `rgb`, `rgba`, `color_r/g/b/a`, `alpha_blend`, `color_lerp`, `color_darken`, `color_lighten` |
-| `std/fixedpoint.kr` | 16.16 fixed-point math: `fp_from_int`, `fp_mul`, `fp_div`, `fp_sqrt`, `fp_lerp` |
+| `std/string.mlr` | `str_cat(a,b)`, `str_copy(s)`, `str_sub(s,start,len)`, `str_to_int(s)`, `int_to_str(v)`, `str_trim(s)` — all return newly allocated strings |
+| `std/io.mlr` | `read_file`, `write_file`, `read_line`, `scan_int`, `scan_str`, `print_kv`, `print_indent` |
+| `std/math.mlr` | `min`, `max`, `abs`, `clamp`, `pow`, `sqrt_int`, `gcd`, `is_prime` |
+| `std/fmt.mlr` | `fmt_hex`, `fmt_bin`, `pad_left`, `pad_right` |
+| `std/mem.mlr` | `realloc`, `memcmp`, `memzero`, `arena_init`, `arena_alloc`, `arena_reset` |
+| `std/vec.mlr` | `vec_new`, `vec_push`, `vec_get`, `vec_set`, `vec_pop`, `vec_len` |
+| `std/map.mlr` | `map_new`, `map_set`, `map_get`, `map_has`, `map_len` |
+| `std/time.mlr` | `time_now`, `time_sleep_ns`, `time_sleep_ms`, `time_elapsed` |
+| `std/log.mlr` | `log_set_level`, `log_debug`, `log_info`, `log_warn`, `log_error` |
+| `std/net.mlr` | `net_socket`, `net_bind`, `net_listen`, `net_accept`, `net_connect`, `net_send`, `net_recv` |
+| `std/fb.mlr` | Framebuffer: `fb_init(addr,w,h,stride,bpp)`, `fb_pixel`, `fb_rect`, `fb_line`, `fb_blit` |
+| `std/font.mlr` | 8x16 bitmap font: `font_init`, `fb_char`, `fb_text` |
+| `std/widget.mlr` | UI widgets: `panel_new`, `label_new`, `button_new`, `progress_new`, `textfield_new` |
+| `std/color.mlr` | `rgb`, `rgba`, `color_r/g/b/a`, `alpha_blend`, `color_lerp`, `color_darken`, `color_lighten` |
+| `std/fixedpoint.mlr` | 16.16 fixed-point math: `fp_from_int`, `fp_mul`, `fp_div`, `fp_sqrt`, `fp_lerp` |
 
 ## Examples
 
 Every runnable example lives in the top-level [`examples/`](../examples/)
 directory. Start with:
 
-- **`hello.kr`** — smallest possible program
-- **`fib.kr`** — recursive Fibonacci
-- **`fizzbuzz.kr`** — control flow
-- **`count_chars.kr`** — byte-level string iteration
-- **`linked_list.kr`** — heap-allocated structs (canonical data-structures pattern)
-- **`pointers.kr`** — pointer builtins
-- **`slices.kr`** — slice parameters
-- **`struct_arrays.kr`** — fixed arrays of structs
-- **`mmio_driver.kr`** — device blocks (embedded-style MMIO)
-- **`echo.kr`** — stdin / stdout
-- **`extern_libc.kr`** — linking against libc via `extern fn`
+- **`hello.mlr`** — smallest possible program
+- **`fib.mlr`** — recursive Fibonacci
+- **`fizzbuzz.mlr`** — control flow
+- **`count_chars.mlr`** — byte-level string iteration
+- **`linked_list.mlr`** — heap-allocated structs (canonical data-structures pattern)
+- **`pointers.mlr`** — pointer builtins
+- **`slices.mlr`** — slice parameters
+- **`struct_arrays.mlr`** — fixed arrays of structs
+- **`mmio_driver.mlr`** — device blocks (embedded-style MMIO)
+- **`echo.mlr`** — stdin / stdout
+- **`extern_libc.mlr`** — linking against libc via `extern fn`
 
 ## Editor setup
 
@@ -430,7 +430,7 @@ provides:
 - LSP diagnostics (via `krc check`)
 - Completions, hover docs, and go-to-definition
 
-The extension activates automatically for `.kr` files.
+The extension activates automatically for `.mlr` files.
 
 ## Next steps
 

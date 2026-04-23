@@ -18,9 +18,9 @@
 // responsible for `thread_pool_init(n)` before the first matmul and
 // `thread_pool_shutdown()` once done.
 
-import "safetensors.kr"
-import "thread.kr"
-import "math_float.kr"
+import "safetensors.mlr"
+import "thread.mlr"
+import "math_float.mlr"
 
 // int-to-f32 helper: the compiler has int_to_f64 + f64_to_f32 as
 // built-ins but a named wrapper makes callsites readable.

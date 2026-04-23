@@ -968,7 +968,7 @@ fn sb_append_hex(u64 sb, u64 n) -> u64 {
 }
 
 // Append an `f64` with `decimals` fractional digits. Requires
-// `import "std/math_float.kr"` in the caller for `fmt_f64`.
+// `import "std/math_float.mlr"` in the caller for `fmt_f64`.
 fn sb_append_float(u64 sb, f64 v, u64 decimals) -> u64 {
     u64 s = fmt_f64(v, decimals)
     sb = sb_append_str(sb, s)
@@ -1034,7 +1034,7 @@ fn sb_free(u64 sb) {
 // ---------------------------------------------------------------------------
 
 // Format `v` as "[-]INT.FRAC" with `decimals` fractional digits.
-// Requires `import "std/math_float.kr"` in the caller.
+// Requires `import "std/math_float.mlr"` in the caller.
 fn str_from_float(f64 v, u64 decimals) -> u64 {
     return fmt_f64(v, decimals)
 }

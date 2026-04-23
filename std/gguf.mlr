@@ -27,9 +27,9 @@
 // BF16, Q8_0, Q4_K, Q6_K) lives in the same std/gguf.kr section below
 // but is exposed through separate entry points.
 
-import "io.kr"
-import "string.kr"
-import "fmt.kr"
+import "io.mlr"
+import "string.mlr"
+import "fmt.mlr"
 
 // ---------------------------------------------------------------------------
 // GGUF metadata value types

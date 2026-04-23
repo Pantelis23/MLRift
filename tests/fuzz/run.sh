@@ -7,7 +7,7 @@
 # 3. Run both binaries (with 15s timeout each) and compare stdout+exit
 #    to the Python oracle.
 # 4. A program whose three sources (oracle, legacy, IR) disagree is a
-#    miscompile witness. The .kr + .expected pair gets copied into
+#    miscompile witness. The .mlr + .expected pair gets copied into
 #    tests/fuzz/regressions/ so it becomes a permanent test case on
 #    every future fuzz run — the regression DB.
 #
@@ -51,11 +51,11 @@ FAIL_LIST=""
 record_regression() {
     local src_kr="$1"
     local src_exp="$2"
-    local base="$(basename "$src_kr" .kr)"
+    local base="$(basename "$src_kr" .mlr)"
     local dst="$DIR/regressions/seed${FUZZ_SEED}_${base}"
-    cp "$src_kr" "${dst}.kr"
+    cp "$src_kr" "${dst}.mlr"
     cp "$src_exp" "${dst}.expected"
-    echo "  regression recorded: ${dst}.kr"
+    echo "  regression recorded: ${dst}.mlr"
 }
 
 # Run one <name>.kr, compare legacy / IR / oracle three ways.
@@ -64,7 +64,7 @@ record_regression() {
 #   $3 = source category (for reporting only)
 run_one() {
     local src="$1" expected="$2" category="$3"
-    local name="$(basename "$src" .kr)"
+    local name="$(basename "$src" .mlr)"
     local leg_bin="$(mktemp /tmp/krc_fuzz_${name}_leg_XXXX)"; rm -f "$leg_bin"
     local ir_bin="$(mktemp /tmp/krc_fuzz_${name}_ir_XXXX)"; rm -f "$ir_bin"
     local blog="$(mktemp)"
@@ -124,10 +124,10 @@ run_one() {
 
 # --- Permanent regressions first ---
 reg_count=0
-for reg_kr in "$DIR"/regressions/*.kr; do
+for reg_kr in "$DIR"/regressions/*.mlr; do
     [ -e "$reg_kr" ] || continue
     reg_count=$((reg_count + 1))
-    run_one "$reg_kr" "${reg_kr%.kr}.expected" "reg"
+    run_one "$reg_kr" "${reg_kr%.mlr}.expected" "reg"
 done
 if [ "$reg_count" -gt 0 ]; then
     echo "--- replayed $reg_count regression cases ---"
@@ -142,9 +142,9 @@ if ! python3 "$DIR/generate.py" --out "$FUZZ_TMP" --count "$FUZZ_COUNT" --seed "
 fi
 # Skip the loop entirely if nothing was generated, to avoid the bash
 # glob expanding to the literal "*" and producing a misleading FAIL.
-if compgen -G "$FUZZ_TMP/*.kr" > /dev/null; then
-    for src in "$FUZZ_TMP"/*.kr; do
-        run_one "$src" "${src%.kr}.expected" "fuzz"
+if compgen -G "$FUZZ_TMP/*.mlr" > /dev/null; then
+    for src in "$FUZZ_TMP"/*.mlr; do
+        run_one "$src" "${src%.mlr}.expected" "fuzz"
     done
 fi
 rm -rf "$FUZZ_TMP"

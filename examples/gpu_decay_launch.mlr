@@ -18,7 +18,7 @@
 // port ONLY the decay sweep to GPU, keep everything else (integrate,
 // CSR delivery, STDP) on CPU. Full-stage-13 offload is M4.
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

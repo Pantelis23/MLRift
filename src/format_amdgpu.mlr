@@ -683,6 +683,29 @@ fn asm_s_waitcnt_lgkmcnt_zero() { asm_sopp(0x09, 0xFC07) }
 // exactly 0x03F7 for that.
 fn asm_s_waitcnt_vmcnt_zero() { asm_sopp(0x09, 0x03F7) }
 
+// s_delay_alu <simm16> — SOPP op 0x07 (gfx11+). The simm16 encodes
+// how far back the current instruction should wait for a VALU
+// dependency. simm16 values this helper takes directly:
+//   0x01 = instid0(VALU_DEP_1)
+//   0x02 = instid0(VALU_DEP_2)
+//   0x03 = instid0(VALU_DEP_3)
+//   0x04 = instid0(VALU_DEP_4)
+// Used to satisfy VGPR RAW hazards between a multi-cycle VALU (e.g.
+// v_add_f64) and a consumer (e.g. an atomic that reads the result
+// in its data quad). The CAS-loop in the M1p demo relies on this
+// to guarantee v[6:7] is settled before the cmpswap reads the quad.
+fn asm_s_delay_alu(uint64 simm16) { asm_sopp(0x07, simm16 & 0xFFFF) }
+
+// s_waitcnt_vscnt null, 0 — gfx10/11 split the VMEM counter into
+// vmcnt (reads + atomics-with-return) and vscnt (pure stores and
+// no-return atomics). This helper drains vscnt to 0. After any
+// write-heavy kernel or atomic sequence that may produce stores,
+// emit this in addition to vmcnt(0) before s_endpgm to ensure the
+// memory system is quiesced before the dispatch completes.
+// Verified against llvm-mc: encoding [0x00,0x00,0x7c,0xbc]
+// → word 0xBC7C0000 (SOPK-family, op 0x3E, sdst=null=0x7D, simm=0).
+fn asm_s_waitcnt_vscnt_zero() { asm_u32(0xBC7C0000) }
+
 // s_cbranch_execz <simm16> — SOPP op 0x25. Branches forward by
 // simm16 dwords if EXEC == 0 (no lanes active). Used right after
 // s_and_saveexec to skip the guarded body when no lane passed the
@@ -702,6 +725,16 @@ fn asm_s_branch(uint64 simm16_dwords) { asm_sopp(0x20, simm16_dwords & 0xFFFF) }
 // s_cbranch_scc0 <simm16>    — branch if SCC == 0 (last SALU
 // compare was false).  Op 0x21 on gfx11 (clang: 0xBFA10008).
 fn asm_s_cbranch_scc0(uint64 simm16_dwords) { asm_sopp(0x21, simm16_dwords & 0xFFFF) }
+
+// s_cbranch_vccz <simm16> — SOPP op 0x23. Branches if VCC == 0
+// (all lanes' vcmp was false / equal).
+fn asm_s_cbranch_vccz(uint64 simm16_dwords) { asm_sopp(0x23, simm16_dwords & 0xFFFF) }
+
+// s_cbranch_vccnz <simm16> — SOPP op 0x24. Branches if VCC != 0
+// (some lane's vcmp was true / mismatch). Used by the CAS retry
+// loop: when cmpswap's returned prev differs from the expected pair,
+// vcc_lo becomes nonzero and we branch back to the loop head.
+fn asm_s_cbranch_vccnz(uint64 simm16_dwords) { asm_sopp(0x24, simm16_dwords & 0xFFFF) }
 
 // s_cbranch_scc1 <simm16>    — branch if SCC == 1 (compare true).
 // Op 0x22 on gfx11 (clang: 0xBFA20008).
@@ -771,6 +804,22 @@ fn asm_v_cmp_lt_u32_vv(uint64 vsrc0, uint64 vsrc1) {
     uint64 word = (0x3E << 25)
                   | (0x49 << 17)
                   | ((vsrc1 & 0xFF) << 9)
+                  | (src0_enc & 0x1FF)
+    asm_u32(word)
+}
+
+// v_cmp_ne_u64_e32 vcc_lo, v[src0:+1], v[src1:+1]  — VOPC op 0x5D (64-bit).
+//   Sets VCC[lane] = (u64(src0) != u64(src1)) per active lane. Both
+//   operands are VGPR pairs. Used by the atomic-CAS retry loop: after
+//   cmpswap, compare the returned "prev" against the "expected" pair;
+//   if any lane saw a mismatch, vcc is nonzero and the loop retries.
+//   Verified against llvm-mc: `v_cmp_ne_u64_e32 vcc_lo, v[0:1], v[4:5]`
+//   → 0x7CBA0900.
+fn asm_v_cmp_ne_u64_vv(uint64 vsrc0_pair, uint64 vsrc1_pair) {
+    uint64 src0_enc = 0x100 | (vsrc0_pair & 0xFF)
+    uint64 word = (0x3E << 25)
+                  | (0x5D << 17)
+                  | ((vsrc1_pair & 0xFF) << 9)
                   | (src0_enc & 0x1FF)
     asm_u32(word)
 }
@@ -884,6 +933,27 @@ fn asm_s_load_b32(uint64 sdata_pair, uint64 sbase_pair, uint64 imm_offset) {
     asm_u32(word1)
     uint64 word2 = (0x7C << 25) | (imm_offset & 0x1FFFFFF)
     asm_u32(word2)
+}
+
+// ── VOP1: single-source vector op in 32 bits. Layout (gfx11):
+//   [31:25] = 0x3F  (VOP1 prefix)
+//   [24:17] = vdst  (8-bit VGPR destination)
+//   [16:9]  = op    (8-bit opcode)
+//   [8:0]   = src0  (9-bit: SGPR=raw, VGPR=0x100|N, inline=0x80..0xC0 for 0..64)
+// Verified against llvm-mc: `v_mov_b32 v6, 7` → 0x7E0C0287.
+fn asm_v_mov_b32(uint64 vdst_vgpr, uint64 src0) {
+    uint64 word = (0x3F << 25)
+                  | ((vdst_vgpr & 0xFF) << 17)
+                  | (0x01 << 9)
+                  | (src0 & 0x1FF)
+    asm_u32(word)
+}
+
+// v_mov_b32 vdst, <inline imm 0..64>  — the common case.
+// inline_u 0→0x80, 1→0x81, …, 64→0xC0. For negatives use 0xC1..0xD0 directly
+// via asm_v_mov_b32.
+fn asm_v_mov_b32_inline_u(uint64 vdst_vgpr, uint64 inline_u) {
+    asm_v_mov_b32(vdst_vgpr, 0x80 + inline_u)
 }
 
 // ── VOPD: dual-issue VOP1/VOP2 pair in one 64-bit instruction (gfx11+).
@@ -1059,14 +1129,49 @@ fn asm_global_load_b64(uint64 vdst_pair, uint64 v_addr, uint64 saddr_pair) {
 
 // global_store_b64 v_addr, v[vdata_pair:+1], s[saddr_pair:+1]  (op 0x1B)
 // Stores the VGPR pair starting at vdata_pair to (s[saddr]+v_addr).
+// Verified against llvm-mc:
+//   v0, v[6:7], s[0:1] → word2 0x00000600   (vdata at [15:8])
+//   v0, v[0:1], s[0:1] → word2 0x00000000
+//   v2, v[0:1], s[2:3] → word2 0x00020002
+// NOTE: the store layout is asymmetric with loads. For loads, vdst
+// is at [31:24]; for stores, vdata is at [15:8]. Older callers all
+// happened to store v[0:1] (vdata=0), which masked this asymmetry.
 fn asm_global_store_b64(uint64 v_addr, uint64 vdata_pair, uint64 saddr_pair) {
     asm_u32(0xDC6E0000)
-    // Reference for v2/v[0:1]/s[2:3]: 0x00020002
-    //   [31:24]=vdata=0x00, [23:16]=saddr=0x02, [15:8]=?,
-    //   [7:0]=vaddr=0x02. vdata at [31:24].
-    uint64 word2 = ((vdata_pair & 0xFF) << 24)
-                   | ((saddr_pair & 0x7F) << 16)
+    uint64 word2 = ((saddr_pair & 0x7F) << 16)
+                   | ((vdata_pair & 0xFF) << 8)
                    | (v_addr & 0xFF)
+    asm_u32(word2)
+}
+
+// global_atomic_cmpswap_b64 v[vdst_pair:+1], v_addr, v[vdata_quad:+3], s[saddr_pair:+1] glc
+// 8-byte atomic compare-and-swap on (s[saddr_pair]+v_addr).
+// VGPR quad layout per AMD ISA (cross-checked against clang's HIP lowering
+// of atomicCAS(addr, cmp, val)):
+//   v[vdata_quad:+1]   = NEW value  (what to write if cmp matches)
+//   v[vdata_quad+2:+3] = COMPARE value (what memory must currently hold)
+// With GLC=1, v[vdst_pair:+1] receives the old memory value.
+//
+// IMPORTANT (gfx11): when operands for cmp/new are produced by VALU
+// instructions (e.g. v_add_f64 to compute new = current + delta), the
+// atomic is only reliable when vdst_pair overlaps vdata_quad's low half
+// (i.e. vdst_pair == vdata_quad). Non-overlapping layouts seem to work
+// for simple hand-written tests where the data_quad is set via inline
+// constants (M1o) but silently fail to swap when the data_quad VGPRs
+// were written by multi-cycle VALU ops just before the atomic (M1p).
+// hipcc always emits the overlapping form.
+//
+// Verified against llvm-mc:
+//   v[0:1], v2, v[4:7], s[0:1] glc → 0xDD0A4000 0x00000402
+//   v[8:9], v2, v[4:7], s[2:3] glc → 0xDD0A4000 0x08000402
+//   v[0:1], v10,v[4:7], s[0:1] glc → 0xDD0A4000 0x0000040A
+fn asm_global_atomic_cmpswap_b64_glc(uint64 vdst_pair, uint64 v_addr,
+                                      uint64 vdata_quad, uint64 saddr_pair) {
+    asm_u32(0xDD0A4000)
+    uint64 word2 = ((vdst_pair  & 0xFF) << 24)
+                   | ((saddr_pair & 0x7F) << 16)
+                   | ((vdata_quad & 0xFF) << 8)
+                   | (v_addr      & 0xFF)
     asm_u32(word2)
 }
 
@@ -1121,6 +1226,24 @@ fn asm_v_add_f64_s_negv(uint64 vdst_pair, uint64 s_src_pair,
     uint64 neg = 0x2                                     // neg[1] = 1 → -src1
     uint64 word2 = (neg << 29)
                    | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word2)
+}
+
+// v_add_f64 vdst_pair, v_src0_pair, v_src1_pair  (VOP3 op 0x127, no neg)
+//
+// The pure VGPR+VGPR form. Used by the f64-atomic-add CAS loop body
+// to compute new = current + delta, where both operands are already
+// sitting in VGPR pairs (current from a global_load, delta from a
+// pair of SGPR-sourced v_mov_b32s).
+// Verified against llvm-mc: `v_add_f64 v[4:5], v[0:1], v[2:3]`
+// → 0xD7270004 0x00020500.
+fn asm_v_add_f64_vv(uint64 vdst_pair, uint64 v_src0_pair, uint64 v_src1_pair) {
+    uint64 word1 = (0x6B << 25) | (0x127 << 16) | (vdst_pair & 0xFF)
+    asm_u32(word1)
+    uint64 src0_enc = 0x100 | (v_src0_pair & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1_pair & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9)
                    | (src0_enc & 0x1FF)
     asm_u32(word2)
 }
@@ -2082,6 +2205,186 @@ fn emit_amdgpu_per_lane_loop_blob(uint64 out_path) -> uint64 {
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
         write(2, "emit_amdgpu_per_lane_loop_blob: cannot open output\n", 51)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// M1o atomic-CAS demo: hand-crafted kernel that exercises the
+// global_atomic_cmpswap_b64 encoder. Single-kernarg (u64 *out).
+// Launched with block_x=1 so only lane 0 is active, no contention.
+//
+//   *out = atomicCAS((uint64_t*)out, 0, 7)
+//   after kernel: *out == 7  (memory held 0, compare matches, swap succeeds)
+//
+// Assembly (12 dwords, 48 bytes). Note the AMD data-quad ordering:
+// v[4:5] holds the NEW value (to be written on match), v[6:7] holds
+// the COMPARE value — mirrors HIP's `atomicCAS(addr, cmp, val)` which
+// clang lowers with val in the low pair and cmp in the high pair.
+//
+//   s_load_b64 s[0:1], s[0:1], null                          ; kernarg ptr
+//   s_waitcnt lgkmcnt(0)
+//   v_mov_b32 v2, 0                                          ; v_addr (byte offset)
+//   v_mov_b32 v4, 7                                          ; new_lo = 7
+//   v_mov_b32 v5, 0                                          ; new_hi
+//   v_mov_b32 v6, 0                                          ; cmp_lo
+//   v_mov_b32 v7, 0                                          ; cmp_hi
+//   global_atomic_cmpswap_b64 v[0:1], v2, v[4:7], s[0:1] glc ; atomic swap
+//   s_waitcnt vmcnt(0)
+//   s_waitcnt_vscnt null, 0
+//   s_endpgm
+@export
+fn emit_amdgpu_atomic_demo_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "atomic_cas_demo"
+    uint64 klen  = 15
+
+    asm_init()
+    asm_s_load_b64(0, 0)                                   // s[0:1] <- [s[0:1]]
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_v_mov_b32_inline_u(2, 0)                           // v2 = 0  (byte offset)
+    asm_v_mov_b32_inline_u(4, 7)                           // v4 = new_lo = 7
+    asm_v_mov_b32_inline_u(5, 0)                           // v5 = new_hi
+    asm_v_mov_b32_inline_u(6, 0)                           // v6 = cmp_lo
+    asm_v_mov_b32_inline_u(7, 0)                           // v7 = cmp_hi
+    asm_global_atomic_cmpswap_b64_glc(0, 2, 4, 0)          // v[0:1] = atomicCAS(*s[0:1], v[6:7]=0, v[4:5]=7)
+    asm_s_waitcnt_vmcnt_zero()                             // drain return-value path
+    asm_s_waitcnt_vscnt_zero()                             // drain the store path (gfx10+)
+    asm_s_endpgm()
+
+    uint64 rsrc1 = 0xE0AF0000
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    uint64[2] args_desc
+    uint64 adp0 = args_desc + 0;  unsafe { *(adp0 as uint64) = 8 }
+    uint64 adp1 = args_desc + 8;  unsafe { *(adp1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           8,       // kernarg_size (one 8-byte ptr)
+                                           8,       // kernarg_align
+                                           2,       // sgpr_count  (s0, s1)
+                                           8,       // vgpr_count  (v0..v7)
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 1)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_atomic_demo_blob: cannot open output\n", 49)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// M1p f64-atomic-add demo: the CAS-loop idiom composed from the M1o
+// atomic_cmpswap_b64 encoder + f64 arithmetic. Single-thread kernel
+// that atomically adds `delta` to *out (f64). This is the primitive
+// the CSR scatter kernels need — every E/I synapse delivery does
+// exactly this step (atomic += conductance into the post-synaptic
+// neuron's state).
+//
+// Kernargs (16 bytes, 8-byte aligned):
+//   [0..7]   = out ptr  (u64)
+//   [8..15]  = delta    (f64)
+//
+// VGPR map (matches hipcc — vdst MUST overlap data_quad low half
+// for gfx11 atomic-with-return reliability when the data comes from
+// VALU ops):
+//   v[0:1]  = data_quad[0:1] = NEW pre-CAS, PREV post-CAS (= vdst)
+//   v[2:3]  = data_quad[2:3] = COMPARE / assumed
+//   v[4:5]  = delta, copied from s[2:3]
+//   v6      = v_addr byte offset (= 0)
+//
+// Assembly (~18 dwords):
+//   s_load_b64 s[2:3], s[0:1], 0x8       ; delta (load BEFORE overwriting s[0:1])
+//   s_load_b64 s[0:1], s[0:1], null      ; out ptr
+//   s_waitcnt  lgkmcnt(0)
+//   v_mov_b32  v6, 0                     ; v_addr offset
+//   global_load_b64 v[2:3], v6, s[0:1]   ; assumed = *out
+//   s_waitcnt  vmcnt(0)
+//   v_mov_b32  v4, s2                    ; delta_lo
+//   v_mov_b32  v5, s3                    ; delta_hi
+// loop_head:
+//   v_add_f64  v[0:1], v[2:3], v[4:5]    ; new = assumed + delta
+//   s_delay_alu instid0(VALU_DEP_1)      ; let v_add_f64 settle
+//   global_atomic_cmpswap_b64 v[0:1], v6, v[0:3], s[0:1] glc  ; v[0:1] = prev after CAS
+//   s_waitcnt  vmcnt(0); s_waitcnt_vscnt null, 0
+//   v_cmp_ne_u64_e32 vcc_lo, v[2:3], v[0:1]   ; vcc=1 if CAS lost race
+//   v_mov_b32  v2, v0                    ; assumed := prev
+//   v_mov_b32  v3, v1
+//   s_cbranch_vccnz loop_head
+//   s_endpgm
+@export
+fn emit_amdgpu_f64_atomic_add_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "f64_atomic_add_demo"
+    uint64 klen  = 19
+
+    // VGPR layout (mirrors hipcc exactly — vdst must overlap
+    // data_quad low half for atomic-with-return per AMD ISA):
+    //   v[0:1] = NEW pre-CAS, PREV post-CAS (data_quad[0:1] / vdst)
+    //   v[2:3] = CMP / assumed             (data_quad[2:3])
+    //   v[4:5] = delta                      (from s[2:3] via v_mov)
+    //   v6     = v_addr byte offset (= 0)
+    asm_init()
+    asm_s_load_b64_off(1, 0, 0x8)                    // s[2:3] <- kernarg[8..15] = delta bits
+    asm_s_load_b64(0, 0)                             // s[0:1] <- kernarg[0..7]  = out ptr
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_v_mov_b32_inline_u(6, 0)                     // v6 = 0 (v_addr offset)
+    asm_global_load_b64(2, 6, 0)                     // v[2:3] = *s[0:1] (expected/cmp)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_v_mov_b32(4, 2)                              // v4 = s2   (delta_lo)
+    asm_v_mov_b32(5, 3)                              // v5 = s3   (delta_hi)
+
+    // loop_head:
+    uint64 loop_head_off = asm_text_len / 4
+
+    asm_v_add_f64_vv(0, 2, 4)                        // v[0:1] = v[2:3] + v[4:5]  (new)
+    asm_s_delay_alu(0x01)                            // let v_add_f64 settle
+    asm_global_atomic_cmpswap_b64_glc(0, 6, 0, 0)    // v[0:1] = CAS(*s[0:1]+v6, cmp=v[2:3], new=v[0:1]); vdst overlaps
+    asm_s_waitcnt_vmcnt_zero()
+    asm_s_waitcnt_vscnt_zero()
+    asm_v_cmp_ne_u64_vv(2, 0)                        // vcc = (v[2:3] != v[0:1] = prev)
+    asm_v_mov_b32(2, 0x100 | 0)                      // v2 = v0  (assumed <- prev for next iter)
+    asm_v_mov_b32(3, 0x100 | 1)                      // v3 = v1
+
+    // Backward branch to loop_head.
+    uint64 cbranch_off = asm_text_len / 4
+    uint64 delta = loop_head_off - (cbranch_off + 1)
+    asm_s_cbranch_vccnz(delta & 0xFFFF)
+
+    asm_s_endpgm()
+
+    uint64 rsrc1 = 0xE0AF0000
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    // Two kernargs: out ptr (8 B, GLOBAL_BUFFER) + delta (8 B, BY_VALUE).
+    uint64[4] args_desc
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           16,      // kernarg_size (ptr + f64)
+                                           8,       // kernarg_align
+                                           4,       // sgpr_count (s0..s3)
+                                           7,       // vgpr_count (v0..v6)
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 2)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_f64_atomic_add_blob: cannot open output\n", 52)
         return 1
     }
     file_write(fd, amd_buf, size)

@@ -20,7 +20,7 @@
 //
 // See examples/noesis/README.md for the stage gate.
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64

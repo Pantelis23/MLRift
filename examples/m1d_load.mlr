@@ -16,7 +16,7 @@
 //     → out[0] bits: 3735928559     (0xDEADBEEF)
 //     → M1d gate: GREEN
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

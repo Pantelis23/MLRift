@@ -1,0 +1,369 @@
+// std/vec_f64_mt.kr — multi-threaded vec_f64 helpers.
+//
+// These dispatch the scalar-unroll bodies from std/vec_f64.kr across
+// the thread pool in std/thread.kr. Each helper splits [0, n) into
+// `tp_n` contiguous chunks and blocks on the pool barrier before
+// returning, so semantics are identical to the single-threaded variants
+// modulo float reduction order (vec_f64_sum_mt only).
+//
+// Call `thread_pool_init(nw)` once at startup before using these; if
+// the pool isn't initialised (`tp_n == 0`) or `n` is too small to
+// amortise the dispatch overhead, the helpers fall back to the scalar
+// kernel in-line.
+
+import "thread.mlr"
+import "vec_f64.mlr"
+import "vec_f64_avx2.mlr"
+import "vec_f64_dispatch.mlr"
+
+// ---------------------------------------------------------------------
+// atomic_add_f64(ptr, delta, scratch) — f64 atomic fetch-add via CAS loop.
+//
+// MLRift ships `atomic_add` for uint64 only. For the delivery phase's
+// scatter-adds (s_exc[tgt] += w * rel from multiple sources concurrently)
+// we need f64 variants. Implemented on top of `atomic_cas` which does
+// a `lock cmpxchg` on 64-bit words — f64 and u64 share the same 8-byte
+// footprint, so we CAS on the raw bit pattern and bitcast the f64 math
+// through a caller-supplied 8-byte `scratch` slot.
+//
+// Why an explicit scratch: kr turns every local `uint64[1]` declaration
+// into an `alloc(8)` — roughly 2 μs per call, which dwarfs the ~30 ns
+// of actual atomic work. The caller should allocate one scratch slot
+// per thread (via a local `uint64[1] scratch; uint64 sp = scratch`)
+// and reuse it across the whole job. No two threads may share a slot.
+fn atomic_add_f64(uint64 ptr, f64 delta, uint64 scratch) {
+    while 1 {
+        uint64 old_bits = atomic_load(ptr)
+        unsafe { *(scratch as uint64) = old_bits }
+        f64 old = 0.0
+        unsafe { *(scratch as f64) -> old }
+        f64 new_val = old + delta
+        unsafe { *(scratch as f64) = new_val }
+        uint64 new_bits = 0
+        unsafe { *(scratch as uint64) -> new_bits }
+        if atomic_cas(ptr, old_bits, new_bits) != 0 { return }
+    }
+}
+
+// Threshold below which MT dispatch loses to scalar/single-AVX2.
+// Empirical: on a 6-core Zen 4 with AVX2 workers, crossover vs single-
+// thread AVX2 is near N=500k for a single call; below that, dispatch
+// overhead (futex wake + barrier wait) dominates the ~1 ns/element
+// AVX2 throughput. Set conservatively — callers doing many tiny ops
+// per step (e.g., stage 12 at N=5k) would otherwise pay 10-50× the
+// scalar cost purely in syscalls.
+static uint64 VEC_MT_THRESHOLD = 500000
+
+// Shared params for the current dispatch. Main writes these before
+// thread_pool_submit; the `lock xchg` inside atomic_store (used by
+// the submit path) is a full memory barrier, so workers observe the
+// committed values when they read state == 1.
+static uint64 vec_mt_buf = 0
+static f64    vec_mt_factor = 0.0
+static f64    vec_mt_target = 0.0
+static f64    vec_mt_value = 0.0
+
+// ---------------------------------------------------------------------
+// Worker entry points. Each takes (start, end, _ctx); the buffer and
+// any scalar parameters come from vec_mt_* statics.
+
+fn vec_mt_decay_worker(uint64 start, uint64 end, uint64 _ctx) {
+    uint64 buf = vec_mt_buf
+    f64 factor = vec_mt_factor
+    uint64 chunk_ptr = buf + start * 8
+    uint64 chunk_n = end - start
+    vec_f64_decay_inplace(chunk_ptr, chunk_n, factor)
+}
+
+// AVX2 worker variants — same chunk split, but each runs the AVX2
+// kernel inside its thread. Stacks multiplicatively with the MT
+// dispatch on memory-bound workloads if DRAM bandwidth isn't already
+// saturated by a single-core AVX2 stream.
+//
+// Note: the `_avx2` kernels use shared static broadcast slots for
+// scalar params (factor, target, value). For `_mt` we only call with
+// one set of params per dispatch and all workers broadcast the same
+// value — safe as long as callers don't overlap dispatches.
+
+fn vec_mt_decay_avx2_worker(uint64 start, uint64 end, uint64 _ctx) {
+    uint64 buf = vec_mt_buf
+    f64 factor = vec_mt_factor
+    uint64 chunk_ptr = buf + start * 8
+    uint64 chunk_n = end - start
+    vec_f64_decay_inplace_avx2(chunk_ptr, chunk_n, factor)
+}
+
+fn vec_mt_relax_avx2_worker(uint64 start, uint64 end, uint64 _ctx) {
+    uint64 buf = vec_mt_buf
+    f64 target = vec_mt_target
+    f64 factor = vec_mt_factor
+    uint64 chunk_ptr = buf + start * 8
+    uint64 chunk_n = end - start
+    vec_f64_relax_inplace_avx2(chunk_ptr, chunk_n, target, factor)
+}
+
+fn vec_mt_fill_avx2_worker(uint64 start, uint64 end, uint64 _ctx) {
+    uint64 buf = vec_mt_buf
+    f64 value = vec_mt_value
+    uint64 chunk_ptr = buf + start * 8
+    uint64 chunk_n = end - start
+    vec_f64_fill_avx2(chunk_ptr, chunk_n, value)
+}
+
+// Sum uses per-worker partial slots (summed on the main side) to
+// avoid racing on the single static slot inside vec_f64_sum_avx2.
+static f64[32] vec_mt_sum_partials
+
+fn vec_mt_sum_avx2_worker(uint64 start, uint64 end, uint64 wid) {
+    uint64 buf = vec_mt_buf
+    uint64 chunk_ptr = buf + start * 8
+    uint64 chunk_n = end - start
+    uint64 slot = vec_mt_sum_partials + wid * 8
+    vec_f64_sum_avx2_into(chunk_ptr, chunk_n, slot)
+}
+
+fn vec_mt_relax_worker(uint64 start, uint64 end, uint64 _ctx) {
+    uint64 buf = vec_mt_buf
+    f64 target = vec_mt_target
+    f64 factor = vec_mt_factor
+    uint64 chunk_ptr = buf + start * 8
+    uint64 chunk_n = end - start
+    vec_f64_relax_inplace(chunk_ptr, chunk_n, target, factor)
+}
+
+fn vec_mt_fill_worker(uint64 start, uint64 end, uint64 _ctx) {
+    uint64 buf = vec_mt_buf
+    f64 value = vec_mt_value
+    uint64 chunk_ptr = buf + start * 8
+    uint64 chunk_n = end - start
+    vec_f64_fill(chunk_ptr, chunk_n, value)
+}
+
+// ---------------------------------------------------------------------
+// Chunk splitter. Returns the end index for worker `w` out of `nw`.
+// Rounds each boundary down to a multiple of 4 so every chunk stays
+// in the unroll-friendly zone; the last worker absorbs the remainder.
+fn vec_mt_chunk_end(uint64 w, uint64 nw, uint64 n) -> uint64 {
+    if w == nw - 1 { return n }
+    uint64 chunk = n / nw
+    chunk = chunk & 0xFFFFFFFFFFFFFFFC
+    return (w + 1) * chunk
+}
+
+fn vec_mt_chunk_start(uint64 w, uint64 nw, uint64 n) -> uint64 {
+    if w == 0 { return 0 }
+    uint64 chunk = n / nw
+    chunk = chunk & 0xFFFFFFFFFFFFFFFC
+    return w * chunk
+}
+
+// ---------------------------------------------------------------------
+// Public API.
+
+fn vec_f64_decay_inplace_mt(uint64 buf, uint64 n, f64 factor) {
+    uint64 nw = tp_n
+    if nw == 0 || n < VEC_MT_THRESHOLD {
+        // Single-thread fallback via the CPUID dispatcher.
+        v_decay(buf, n, factor)
+        return
+    }
+    if vec_f64_dispatch_done == 0 { vec_f64_dispatch_init() }
+    vec_mt_buf = buf
+    vec_mt_factor = factor
+    uint64 job = 0
+    if vec_f64_has_avx2 != 0 {
+        job = fn_addr("vec_mt_decay_avx2_worker")
+    } else {
+        job = fn_addr("vec_mt_decay_worker")
+    }
+    uint64 w = 0
+    while w < nw {
+        uint64 s = vec_mt_chunk_start(w, nw, n)
+        uint64 e = vec_mt_chunk_end(w, nw, n)
+        thread_pool_submit(w, job, s, e, 0)
+        w = w + 1
+    }
+    thread_pool_wait()
+}
+
+// MT + AVX2 combo. Each worker runs the AVX2 kernel on its chunk.
+fn vec_f64_decay_inplace_mt_avx2(uint64 buf, uint64 n, f64 factor) {
+    uint64 nw = tp_n
+    if nw == 0 || n < VEC_MT_THRESHOLD {
+        vec_f64_decay_inplace_avx2(buf, n, factor)
+        return
+    }
+    vec_mt_buf = buf
+    vec_mt_factor = factor
+    uint64 job = fn_addr("vec_mt_decay_avx2_worker")
+    uint64 w = 0
+    while w < nw {
+        uint64 s = vec_mt_chunk_start(w, nw, n)
+        uint64 e = vec_mt_chunk_end(w, nw, n)
+        thread_pool_submit(w, job, s, e, 0)
+        w = w + 1
+    }
+    thread_pool_wait()
+}
+
+fn vec_f64_relax_inplace_mt_avx2(uint64 buf, uint64 n, f64 target, f64 factor) {
+    uint64 nw = tp_n
+    if nw == 0 || n < VEC_MT_THRESHOLD {
+        vec_f64_relax_inplace_avx2(buf, n, target, factor)
+        return
+    }
+    vec_mt_buf = buf
+    vec_mt_target = target
+    vec_mt_factor = factor
+    uint64 job = fn_addr("vec_mt_relax_avx2_worker")
+    uint64 w = 0
+    while w < nw {
+        uint64 s = vec_mt_chunk_start(w, nw, n)
+        uint64 e = vec_mt_chunk_end(w, nw, n)
+        thread_pool_submit(w, job, s, e, 0)
+        w = w + 1
+    }
+    thread_pool_wait()
+}
+
+fn vec_f64_fill_mt_avx2(uint64 buf, uint64 n, f64 value) {
+    uint64 nw = tp_n
+    if nw == 0 || n < VEC_MT_THRESHOLD {
+        vec_f64_fill_avx2(buf, n, value)
+        return
+    }
+    vec_mt_buf = buf
+    vec_mt_value = value
+    uint64 job = fn_addr("vec_mt_fill_avx2_worker")
+    uint64 w = 0
+    while w < nw {
+        uint64 s = vec_mt_chunk_start(w, nw, n)
+        uint64 e = vec_mt_chunk_end(w, nw, n)
+        thread_pool_submit(w, job, s, e, 0)
+        w = w + 1
+    }
+    thread_pool_wait()
+}
+
+fn vec_f64_sum_mt_avx2(uint64 buf, uint64 n) -> f64 {
+    uint64 nw = tp_n
+    if nw == 0 || n < VEC_MT_THRESHOLD {
+        return vec_f64_sum_avx2(buf, n)
+    }
+    vec_mt_buf = buf
+    uint64 job = fn_addr("vec_mt_sum_avx2_worker")
+    uint64 w = 0
+    while w < nw {
+        uint64 s = vec_mt_chunk_start(w, nw, n)
+        uint64 e = vec_mt_chunk_end(w, nw, n)
+        thread_pool_submit(w, job, s, e, w)
+        w = w + 1
+    }
+    thread_pool_wait()
+
+    f64 total = 0.0
+    uint64 wi = 0
+    while wi < nw {
+        uint64 slot = vec_mt_sum_partials + wi * 8
+        f64 partial = 0.0
+        unsafe { *(slot as f64) -> partial }
+        total = total + partial
+        wi = wi + 1
+    }
+    return total
+}
+
+fn vec_f64_relax_inplace_mt(uint64 buf, uint64 n, f64 target, f64 factor) {
+    uint64 nw = tp_n
+    if nw == 0 || n < VEC_MT_THRESHOLD {
+        v_relax(buf, n, target, factor)
+        return
+    }
+    if vec_f64_dispatch_done == 0 { vec_f64_dispatch_init() }
+    vec_mt_buf = buf
+    vec_mt_target = target
+    vec_mt_factor = factor
+    uint64 job = 0
+    if vec_f64_has_avx2 != 0 {
+        job = fn_addr("vec_mt_relax_avx2_worker")
+    } else {
+        job = fn_addr("vec_mt_relax_worker")
+    }
+    uint64 w = 0
+    while w < nw {
+        uint64 s = vec_mt_chunk_start(w, nw, n)
+        uint64 e = vec_mt_chunk_end(w, nw, n)
+        thread_pool_submit(w, job, s, e, 0)
+        w = w + 1
+    }
+    thread_pool_wait()
+}
+
+fn vec_f64_fill_mt(uint64 buf, uint64 n, f64 value) {
+    uint64 nw = tp_n
+    if nw == 0 || n < VEC_MT_THRESHOLD {
+        v_fill(buf, n, value)
+        return
+    }
+    if vec_f64_dispatch_done == 0 { vec_f64_dispatch_init() }
+    vec_mt_buf = buf
+    vec_mt_value = value
+    uint64 job = 0
+    if vec_f64_has_avx2 != 0 {
+        job = fn_addr("vec_mt_fill_avx2_worker")
+    } else {
+        job = fn_addr("vec_mt_fill_worker")
+    }
+    uint64 w = 0
+    while w < nw {
+        uint64 s = vec_mt_chunk_start(w, nw, n)
+        uint64 e = vec_mt_chunk_end(w, nw, n)
+        thread_pool_submit(w, job, s, e, 0)
+        w = w + 1
+    }
+    thread_pool_wait()
+}
+
+// Sum uses per-worker partial slots + main-side reduction, regardless
+// of AVX2 availability. AVX2 worker calls vec_f64_sum_avx2_into;
+// scalar worker calls the `_into` variant of the scalar helper.
+fn vec_mt_sum_worker(uint64 start, uint64 end, uint64 wid) {
+    uint64 buf = vec_mt_buf
+    uint64 chunk_ptr = buf + start * 8
+    uint64 chunk_n = end - start
+    uint64 slot = vec_mt_sum_partials + wid * 8
+    vec_f64_sum_into(chunk_ptr, chunk_n, slot)
+}
+
+fn vec_f64_sum_mt(uint64 buf, uint64 n) -> f64 {
+    uint64 nw = tp_n
+    if nw == 0 || n < VEC_MT_THRESHOLD {
+        return v_sum(buf, n)
+    }
+    if vec_f64_dispatch_done == 0 { vec_f64_dispatch_init() }
+    vec_mt_buf = buf
+    uint64 job = 0
+    if vec_f64_has_avx2 != 0 {
+        job = fn_addr("vec_mt_sum_avx2_worker")
+    } else {
+        job = fn_addr("vec_mt_sum_worker")
+    }
+    uint64 w = 0
+    while w < nw {
+        uint64 s = vec_mt_chunk_start(w, nw, n)
+        uint64 e = vec_mt_chunk_end(w, nw, n)
+        thread_pool_submit(w, job, s, e, w)
+        w = w + 1
+    }
+    thread_pool_wait()
+    f64 total = 0.0
+    uint64 wi = 0
+    while wi < nw {
+        uint64 slot = vec_mt_sum_partials + wi * 8
+        f64 partial = 0.0
+        unsafe { *(slot as f64) -> partial }
+        total = total + partial
+        wi = wi + 1
+    }
+    return total
+}

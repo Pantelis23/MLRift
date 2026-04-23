@@ -17,9 +17,9 @@
 // *decodings* but not HF-bit-identical *encodings*. Sufficient for running
 // a forward pass; insufficient for reproducing public token-ID traces.
 
-import "io.kr"
-import "string.kr"
-import "fmt.kr"
+import "io.mlr"
+import "string.mlr"
+import "fmt.mlr"
 
 // ---------------------------------------------------------------------------
 // Tokenizer handle

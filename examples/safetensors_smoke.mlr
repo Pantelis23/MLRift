@@ -13,9 +13,9 @@
 //   ./build/mlrc examples/safetensors_smoke.mlr -o /tmp/st_smoke
 //   /tmp/st_smoke
 
-import "../std/safetensors.kr"
-import "../std/io.kr"
-import "../std/fmt.kr"
+import "../std/safetensors.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
 
 fn write_u64_le(u64 buf, u64 off, u64 v) {
     u64 i = 0

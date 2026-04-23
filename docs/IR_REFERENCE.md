@@ -1,8 +1,8 @@
 # IR Opcode Reference
 
 KernRift's intermediate representation is a flat SSA form produced by
-`src/ir.kr` (AST → IR lowering) and consumed by `src/ir.kr` (x86_64 emitter)
-and `src/ir_aarch64.kr` (AArch64 emitter). Each instruction is a 32-byte
+`src/ir.mlr` (AST → IR lowering) and consumed by `src/ir.mlr` (x86_64 emitter)
+and `src/ir_aarch64.mlr` (AArch64 emitter). Each instruction is a 32-byte
 record with fields `{opcode, dest, src1, src2, imm, bb}`. Virtual
 registers (vregs) are numbered from 1; vreg 0 is reserved for "no value"
 (void returns, stores). Basic blocks are numbered from 0.
@@ -14,7 +14,7 @@ that:
 - Backend ports can check for coverage (every opcode must be emittable).
 
 Opcodes are grouped by category; the numeric values in the table below
-match the constants defined in `src/ir.kr`.
+match the constants defined in `src/ir.mlr`.
 
 ## Conventions used in this document
 
@@ -29,7 +29,7 @@ match the constants defined in `src/ir.kr`.
   `2` = f32). The emitter uses this to pick integer vs SIMD register
   classes.
 - **side effect** — if "yes", DCE must keep this instruction even when
-  its dest is dead. See `ir_opt_is_side_effect()` in src/ir.kr.
+  its dest is dead. See `ir_opt_is_side_effect()` in src/ir.mlr.
 - **trap** — whether the opcode can trap at runtime.
 
 ## Arithmetic (1–13)
@@ -255,7 +255,7 @@ These back the typed `print` / `println` pipeline added in v2.8.3.
 ## Side-effect set (who survives DCE)
 
 DCE removes instructions whose `dest` is dead UNLESS the opcode is in
-the side-effect set, defined in `src/ir.kr:7849-7860`:
+the side-effect set, defined in `src/ir.mlr:7849-7860`:
 
 ```
 STORE, BR, BR_COND, RET, RET_VOID, CALL, ARG, SYSCALL, ALLOC, DEALLOC,
@@ -270,7 +270,7 @@ Each pass runs over the per-function IR arena in `ir_opt_run()` after
 SSA construction and before register allocation. Order matters because
 later passes benefit from earlier constant propagation.
 
-| Pass | Function in `src/ir.kr` | What it does |
+| Pass | Function in `src/ir.mlr` | What it does |
 |------|------------------------|--------------|
 | Constant fold | `ir_opt_const_fold()` | Rewrites pure-arithmetic ops with constant operands into `IR_CONST`. Triggered only on IR_ADD/SUB/MUL/DIV/MOD/AND/OR/XOR/SHL/SHR with both sources `IR_CONST`. |
 | Common subexpression elim | `ir_opt_cse()` | Hashes each pure op by `{opcode, src1, src2, imm}` and collapses duplicates within a basic block. Skips side-effectful ops. |
@@ -317,15 +317,15 @@ ADD xN, sp, xN ; LDR` when the offset exceeds the imm12-scaled limit
 
 When introducing a new `IR_FOO`:
 
-1. Pick an unused number, add `static uint64 IR_FOO = N` to `src/ir.kr`
+1. Pick an unused number, add `static uint64 IR_FOO = N` to `src/ir.mlr`
    in the appropriate category range (arithmetic: 1–29, control: 40–43,
    memory: 30–32/70–78, atomics: 90–93/109–112, …).
 2. Add the opcode-name string to `ir_opcode_name()` (used by
    `--emit=ir`).
 3. Add the lowering path in `ir_lower_expr()` or `ir_lower_stmt()` —
    emit the new IR op from the AST node.
-4. Add the emission branch in **both** `src/ir.kr` (x86_64) AND
-   `src/ir_aarch64.kr` (AArch64). A missing backend will surface as an
+4. Add the emission branch in **both** `src/ir.mlr` (x86_64) AND
+   `src/ir_aarch64.mlr` (AArch64). A missing backend will surface as an
    "unreachable opcode" assertion.
 5. If the op has a side effect, add its number to
    `ir_opt_is_side_effect()` so DCE keeps it.

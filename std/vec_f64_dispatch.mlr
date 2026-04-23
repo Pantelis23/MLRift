@@ -1,0 +1,121 @@
+// std/vec_f64_dispatch.kr — runtime-selected vec_f64 implementations.
+//
+// Public API: `v_decay`, `v_relax`, `v_fill`, `v_sum`. Each routes
+// through a function-pointer set at first call by CPUID detection:
+//   AVX2+FMA3  ->  vec_f64_*_avx2
+//   else       ->  vec_f64_*_inplace  (4-way scalar unroll)
+//
+// AVX2 requires both the AVX2 ISA bit (cpuid leaf 7 subleaf 0 EBX bit 5)
+// and FMA3 (cpuid leaf 1 ECX bit 12). AMD Zen1+ and Intel Haswell+
+// satisfy both; older silicon falls back to scalar.
+//
+// `call_ptr` does not propagate f64 returns, so `v_sum` is wired via
+// an `_into` variant that writes the result to a caller-supplied slot.
+//
+// Single-thread dispatcher only here. `vec_f64_mt.kr` layers MT + AVX2
+// on top using the same `vec_f64_has_avx2` flag.
+
+import "vec_f64.mlr"
+import "vec_f64_avx2.mlr"
+
+// Function-pointer table; 0 until vec_f64_dispatch_init runs.
+static uint64 vec_f64_decay_fn     = 0
+static uint64 vec_f64_relax_fn     = 0
+static uint64 vec_f64_fill_fn      = 0
+static uint64 vec_f64_sum_into_fn  = 0
+
+// Detected AVX2+FMA3 support (exposed for MT dispatcher).
+static uint64 vec_f64_has_avx2      = 0
+static uint64 vec_f64_dispatch_done = 0
+
+// CPUID probe. Writes EBX from cpuid(7,0) to *out_ebx7 and ECX from
+// cpuid(1,0) to *out_ecx1.
+fn vec_f64_cpuid_probe(uint64 out_ebx7, uint64 out_ecx1) {
+    asm {
+        // mov r12, rcx            ; stash out_ebx7 pointer
+        "0x49 0x89 0xCC"
+        // mov r13, rdx            ; stash out_ecx1 pointer
+        "0x49 0x89 0xD5"
+        // --- cpuid(7, 0) → EBX bit 5 = AVX2 ---
+        // mov eax, 7
+        "0xB8 0x07 0x00 0x00 0x00"
+        // xor ecx, ecx
+        "0x31 0xC9"
+        // cpuid
+        "0x0F 0xA2"
+        // mov [r12], rbx          ; *out_ebx7 = EBX
+        "0x49 0x89 0x1C 0x24"
+        // --- cpuid(1, 0) → ECX bit 12 = FMA3 ---
+        // mov eax, 1
+        "0xB8 0x01 0x00 0x00 0x00"
+        // xor ecx, ecx
+        "0x31 0xC9"
+        // cpuid
+        "0x0F 0xA2"
+        // mov [r13], rcx          ; *out_ecx1 = ECX
+        "0x49 0x89 0x4D 0x00"
+    } in(out_ebx7 -> rcx, out_ecx1 -> rdx) clobbers(rax, rbx, rcx, rdx, r12, r13)
+}
+
+fn vec_f64_dispatch_init() {
+    if vec_f64_dispatch_done != 0 { return }
+
+    uint64[2] probe
+    uint64 p0 = probe
+    uint64 p1 = probe + 8
+    unsafe { *(p0 as uint64) = 0 }
+    unsafe { *(p1 as uint64) = 0 }
+    vec_f64_cpuid_probe(p0, p1)
+
+    uint64 ebx7 = 0
+    uint64 ecx1 = 0
+    unsafe { *(p0 as uint64) -> ebx7 }
+    unsafe { *(p1 as uint64) -> ecx1 }
+
+    uint64 avx2_bit = (ebx7 >> 5) & 1
+    uint64 fma3_bit = (ecx1 >> 12) & 1
+    uint64 use_avx2 = 0
+    if avx2_bit != 0 && fma3_bit != 0 { use_avx2 = 1 }
+    vec_f64_has_avx2 = use_avx2
+
+    if use_avx2 != 0 {
+        vec_f64_decay_fn    = fn_addr("vec_f64_decay_inplace_avx2")
+        vec_f64_relax_fn    = fn_addr("vec_f64_relax_inplace_avx2")
+        vec_f64_fill_fn     = fn_addr("vec_f64_fill_avx2")
+        vec_f64_sum_into_fn = fn_addr("vec_f64_sum_avx2_into")
+    } else {
+        vec_f64_decay_fn    = fn_addr("vec_f64_decay_inplace")
+        vec_f64_relax_fn    = fn_addr("vec_f64_relax_inplace")
+        vec_f64_fill_fn     = fn_addr("vec_f64_fill")
+        vec_f64_sum_into_fn = fn_addr("vec_f64_sum_into")
+    }
+
+    vec_f64_dispatch_done = 1
+}
+
+// ---- Public API ---------------------------------------------------
+
+fn v_decay(uint64 buf, uint64 n, f64 factor) {
+    if vec_f64_dispatch_done == 0 { vec_f64_dispatch_init() }
+    call_ptr(vec_f64_decay_fn, buf, n, factor)
+}
+
+fn v_relax(uint64 buf, uint64 n, f64 target, f64 factor) {
+    if vec_f64_dispatch_done == 0 { vec_f64_dispatch_init() }
+    call_ptr(vec_f64_relax_fn, buf, n, target, factor)
+}
+
+fn v_fill(uint64 buf, uint64 n, f64 value) {
+    if vec_f64_dispatch_done == 0 { vec_f64_dispatch_init() }
+    call_ptr(vec_f64_fill_fn, buf, n, value)
+}
+
+fn v_sum(uint64 buf, uint64 n) -> f64 {
+    if vec_f64_dispatch_done == 0 { vec_f64_dispatch_init() }
+    uint64[1] slot
+    uint64 sp = slot
+    call_ptr(vec_f64_sum_into_fn, buf, n, sp)
+    f64 result = 0.0
+    unsafe { *(sp as f64) -> result }
+    return result
+}

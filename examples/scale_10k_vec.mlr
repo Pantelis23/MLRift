@@ -16,7 +16,7 @@
 // Purpose: measure the end-to-end win of the scalar-ILP helpers
 // on a real workload, not just the microbench.
 
-import "../std/vec_f64.kr"
+import "../std/vec_f64.mlr"
 
 static f64 dt = 0.1
 static f64 V_rest = -70.0

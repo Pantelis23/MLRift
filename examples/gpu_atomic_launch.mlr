@@ -11,7 +11,7 @@
 //   /tmp/gpu_atomic_launch
 //     → "atomic sum OK: expected=N*(N-1)/2, got=same"   on success
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

@@ -1,0 +1,401 @@
+// MLRift — 60M-neuron scaling benchmark.
+//
+// At 60M neurons the stage-12 style CSR build (iterate all N² pairs,
+// Bernoulli-sample each) is 3.6 trillion ops — infeasible. Instead:
+// each source draws a fixed K targets uniformly via splitmix64.
+// `rng(ctr)` is O(1) so workers partition sources and draw their range
+// independently; row_ptr is trivially i * K.
+//
+// All arrays are heap-allocated (alloc → mmap) because kr can't
+// compile a static uint64[60000000] — BSS in a fat-binary header has
+// fat-target size limits, and the per-arch slices would balloon past
+// 100 MB each.
+//
+// Purpose: measure how far the MT + splitmix64 primitives scale on
+// the 24-thread 7900X. No Python reference at this size.
+
+import "../std/vec_f64.mlr"
+import "../std/vec_f64_avx2.mlr"
+import "../std/vec_f64_dispatch.mlr"
+import "../std/vec_f64_mt.mlr"
+import "../std/thread.mlr"
+import "../std/rng.mlr"
+
+// ── Scale + biology ──────────────────────────────────────────────────
+static uint64 N_NEURONS = 60000000
+static uint64 N_E       = 48000000      // 80% excitatory
+static uint64 SYN_PER   = 4             // fixed outgoing per source
+static uint64 N_STEPS   = 2000
+static uint64 MT_NW     = 24
+
+static f64 dt         = 0.1
+static f64 V_rest     = -65.0
+static f64 V_reset    = -70.0
+static f64 V_thresh   = -50.0
+static f64 tau_m      = 10.0
+static f64 tau_e      = 10.0
+static f64 tau_i      = 5.0
+static f64 J_E        = 1.0
+static f64 J_I        = 1.0
+static uint64 ref_steps = 20
+static f64 w_ee       = 0.20
+static f64 w_ei       = 0.30
+static f64 w_ie       = 0.30
+
+static uint64 RNG_SEED = 0xDEADBEEF12345678
+
+// ── Heap pointers (populated in main) ────────────────────────────────
+static uint64 p_V      = 0   // f64 × N
+static uint64 p_ref    = 0   // u64 × N
+static uint64 p_RI     = 0   // f64 × N
+static uint64 p_s_exc  = 0   // f64 × N
+static uint64 p_s_inh  = 0   // f64 × N
+static uint64 p_spike  = 0   // u64 × N (spike_count)
+static uint64 p_cell_t = 0   // u64 × N (cell_type)
+static uint64 p_fired  = 0   // u64 × N (fired_list scratch, sized to N as worst case)
+
+static uint64 p_row    = 0   // u64 × (N+1)
+static uint64 p_tgt    = 0   // u64 × n_syn
+static uint64 p_w      = 0   // f64 × n_syn
+static uint64 p_is_inh = 0   // u64 × n_syn
+
+// Per-worker fired-sublist storage. Each worker writes its firings to
+// a private range; main concatenates after the barrier.
+static uint64 MT_FIRED_CAP = 0       // set to N / MT_NW + slack at runtime
+static uint64 p_mt_fired = 0         // u64[MT_NW * MT_FIRED_CAP]
+static uint64[32] mt_n_fired
+
+// ── CSR build worker ─────────────────────────────────────────────────
+// Each source writes SYN_PER synapses at offset [i_s * SYN_PER,
+// (i_s+1) * SYN_PER). Workers partition source ranges; no conflicts.
+fn csr_build_worker(uint64 s_start, uint64 s_end, uint64 _wid) {
+    uint64 i_s = s_start
+    while i_s < s_end {
+        uint64 base = i_s * SYN_PER
+        uint64 src_is_e = 0
+        uint64 ct_slot = p_cell_t + i_s * 8
+        uint64 ct_i = 0
+        unsafe { *(ct_slot as uint64) -> ct_i }
+        if ct_i == 0 { src_is_e = 1 }
+        uint64 k = 0
+        while k < SYN_PER {
+            // Draw uniform target in [0, N).
+            uint64 r = splitmix64_at(RNG_SEED, base + k)
+            uint64 tgt = r % N_NEURONS
+            if tgt == i_s {
+                tgt = tgt + 1
+                if tgt >= N_NEURONS { tgt = 0 }
+            }
+            // Look up tgt's type for weight selection.
+            uint64 tct_slot = p_cell_t + tgt * 8
+            uint64 ct_t = 0
+            unsafe { *(tct_slot as uint64) -> ct_t }
+            uint64 tgt_is_e = 0
+            if ct_t == 0 { tgt_is_e = 1 }
+            f64 w = 0.0
+            uint64 inh = 0
+            if src_is_e == 1 {
+                if tgt_is_e == 1 { w = w_ee } else { w = w_ei }
+            } else {
+                w = w_ie
+                inh = 1
+            }
+            uint64 slot = base + k
+            uint64 tp = p_tgt + slot * 8
+            uint64 wp = p_w + slot * 8
+            uint64 ip = p_is_inh + slot * 8
+            unsafe { *(tp as uint64) = tgt }
+            unsafe { *(wp as f64) = w }
+            unsafe { *(ip as uint64) = inh }
+            k = k + 1
+        }
+        i_s = i_s + 1
+    }
+}
+
+// ── LIF integrate worker ─────────────────────────────────────────────
+// Each worker processes its neuron range, writes firings to its private
+// slot in p_mt_fired. Main concatenates into a global list before
+// delivery.
+fn integrate_worker(uint64 start, uint64 end, uint64 wid) {
+    uint64 fbase = wid * MT_FIRED_CAP
+    uint64 local_n = 0
+    uint64 i = start
+    while i < end {
+        uint64 ref_p = p_ref + i * 8
+        uint64 rc = 0
+        unsafe { *(ref_p as uint64) -> rc }
+        if rc > 0 {
+            uint64 rc_new = rc - 1
+            unsafe { *(ref_p as uint64) = rc_new }
+            uint64 vp = p_V + i * 8
+            unsafe { *(vp as f64) = V_reset }
+        } else {
+            uint64 vp = p_V + i * 8
+            f64 v = 0.0
+            unsafe { *(vp as f64) -> v }
+            uint64 rip = p_RI + i * 8
+            f64 ri = 0.0
+            unsafe { *(rip as f64) -> ri }
+            uint64 sep = p_s_exc + i * 8
+            f64 se = 0.0
+            unsafe { *(sep as f64) -> se }
+            uint64 sip = p_s_inh + i * 8
+            f64 si = 0.0
+            unsafe { *(sip as f64) -> si }
+            f64 drive = ri + se * J_E - si * J_I
+            f64 dv = dt * (V_rest - v + drive) / tau_m
+            f64 v_new = v + dv
+            unsafe { *(vp as f64) = v_new }
+            if v_new >= V_thresh {
+                unsafe { *(vp as f64) = V_reset }
+                unsafe { *(ref_p as uint64) = ref_steps }
+                uint64 sp = p_spike + i * 8
+                uint64 sc = 0
+                unsafe { *(sp as uint64) -> sc }
+                sc = sc + 1
+                unsafe { *(sp as uint64) = sc }
+                if local_n < MT_FIRED_CAP {
+                    uint64 slot = p_mt_fired + (fbase + local_n) * 8
+                    unsafe { *(slot as uint64) = i }
+                    local_n = local_n + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    mt_n_fired[wid] = local_n
+}
+
+// ── Delivery worker (atomic scatter; bit-identity not required at
+//    this scale since we have no Python reference). ────────────────
+static uint64[32] mt_scratch_slots  // one 8-byte scratch per worker
+
+fn atom_add_f64_local(uint64 ptr, f64 delta, uint64 scratch) {
+    while 1 {
+        uint64 old_bits = atomic_load(ptr)
+        unsafe { *(scratch as uint64) = old_bits }
+        f64 old = 0.0
+        unsafe { *(scratch as f64) -> old }
+        f64 new_val = old + delta
+        unsafe { *(scratch as f64) = new_val }
+        uint64 new_bits = 0
+        unsafe { *(scratch as uint64) -> new_bits }
+        if atomic_cas(ptr, old_bits, new_bits) != 0 { return }
+    }
+}
+
+fn delivery_worker(uint64 fa_start, uint64 fa_end, uint64 wid) {
+    uint64 scratch = mt_scratch_slots + wid * 8
+    uint64 fa = fa_start
+    while fa < fa_end {
+        uint64 fs = p_fired + fa * 8
+        uint64 src = 0
+        unsafe { *(fs as uint64) -> src }
+        uint64 base = src * SYN_PER
+        uint64 k = 0
+        while k < SYN_PER {
+            uint64 slot = base + k
+            uint64 tp = p_tgt + slot * 8
+            uint64 tgt = 0
+            unsafe { *(tp as uint64) -> tgt }
+            uint64 wp = p_w + slot * 8
+            f64 w = 0.0
+            unsafe { *(wp as f64) -> w }
+            uint64 ip = p_is_inh + slot * 8
+            uint64 inh = 0
+            unsafe { *(ip as uint64) -> inh }
+            uint64 dst_base = p_s_exc
+            if inh != 0 { dst_base = p_s_inh }
+            uint64 tgt_slot = dst_base + tgt * 8
+            atom_add_f64_local(tgt_slot, w, scratch)
+            k = k + 1
+        }
+        fa = fa + 1
+    }
+}
+
+fn main() {
+    uint64 t_start = time_ns()
+
+    // ── Allocations ──────────────────────────────────────────────────
+    uint64 bytes_n   = N_NEURONS * 8
+    uint64 n_syn     = N_NEURONS * SYN_PER
+    uint64 bytes_syn = n_syn * 8
+
+    p_V      = alloc(bytes_n)
+    p_ref    = alloc(bytes_n)
+    p_RI     = alloc(bytes_n)
+    p_s_exc  = alloc(bytes_n)
+    p_s_inh  = alloc(bytes_n)
+    p_spike  = alloc(bytes_n)
+    p_cell_t = alloc(bytes_n)
+    p_fired  = alloc(bytes_n)
+
+    p_row    = alloc((N_NEURONS + 1) * 8)
+    p_tgt    = alloc(bytes_syn)
+    p_w      = alloc(bytes_syn)
+    p_is_inh = alloc(bytes_syn)
+
+    MT_FIRED_CAP = (N_NEURONS / MT_NW) + 1024
+    p_mt_fired   = alloc(MT_NW * MT_FIRED_CAP * 8)
+
+    uint64 t_alloc = time_ns()
+    print("# alloc_us=")
+    println((t_alloc - t_start) / 1000)
+
+    thread_pool_init(MT_NW)
+
+    // ── Init state (parallel via vec_f64 MT helpers where possible) ─
+    // V = V_rest, ref = 0, s_exc = s_inh = spike = 0
+    vec_f64_fill_mt(p_V, N_NEURONS, V_rest)
+    // Manual zero for u64 arrays (vec_f64_fill is f64-only).
+    uint64 i = 0
+    while i < N_NEURONS {
+        uint64 refp = p_ref + i * 8
+        unsafe { *(refp as uint64) = 0 }
+        uint64 spp = p_spike + i * 8
+        unsafe { *(spp as uint64) = 0 }
+        uint64 sp_s = p_s_exc + i * 8
+        unsafe { *(sp_s as f64) = 0.0 }
+        uint64 sp_i = p_s_inh + i * 8
+        unsafe { *(sp_i as f64) = 0.0 }
+        // Strong drive so neurons fire within the short 100-step window.
+        // V_ss = V_rest + drive = -65 + 50 = -15 (35 mV over threshold);
+        // first spike at ~35 steps, re-fires every ~55 steps.
+        uint64 rip = p_RI + i * 8
+        f64 ri = 45.0 + int_to_f64(i) * (20.0 / int_to_f64(N_NEURONS))
+        unsafe { *(rip as f64) = ri }
+        // cell_type: i < N_E is E (0), else I (1)
+        uint64 ctp = p_cell_t + i * 8
+        uint64 ct = 0
+        if i >= N_E { ct = 1 }
+        unsafe { *(ctp as uint64) = ct }
+        // row_ptr[i] = i * SYN_PER
+        uint64 rpp = p_row + i * 8
+        unsafe { *(rpp as uint64) = i * SYN_PER }
+        i = i + 1
+    }
+    // row_ptr[N] = N * SYN_PER
+    uint64 rpn = p_row + N_NEURONS * 8
+    unsafe { *(rpn as uint64) = N_NEURONS * SYN_PER }
+
+    uint64 t_init = time_ns()
+    print("# init_us=")
+    println((t_init - t_alloc) / 1000)
+
+    // ── Parallel CSR build (fixed K = SYN_PER, splitmix64 seekable) ─
+    uint64 csr_fn = fn_addr("csr_build_worker")
+    uint64 chunk = N_NEURONS / MT_NW
+    uint64 w = 0
+    while w < MT_NW {
+        uint64 s = w * chunk
+        uint64 e = s + chunk
+        if w == MT_NW - 1 { e = N_NEURONS }
+        thread_pool_submit(w, csr_fn, s, e, w)
+        w = w + 1
+    }
+    thread_pool_wait()
+
+    uint64 t_csr = time_ns()
+    print("# csr_build_us=")
+    println((t_csr - t_init) / 1000)
+
+    // ── Simulation loop ──────────────────────────────────────────────
+    uint64 integrate_fn = fn_addr("integrate_worker")
+    uint64 delivery_fn  = fn_addr("delivery_worker")
+    f64 f_e = dt / tau_e
+    f64 f_i = dt / tau_i
+
+    uint64 step = 0
+    while step < N_STEPS {
+        // Decay synaptic conductances (MT+AVX2 auto-dispatches).
+        vec_f64_decay_inplace_mt(p_s_exc, N_NEURONS, f_e)
+        vec_f64_decay_inplace_mt(p_s_inh, N_NEURONS, f_i)
+
+        // Parallel integrate.
+        uint64 iw = 0
+        while iw < MT_NW {
+            uint64 is_start = iw * chunk
+            uint64 is_end = is_start + chunk
+            if iw == MT_NW - 1 { is_end = N_NEURONS }
+            thread_pool_submit(iw, integrate_fn, is_start, is_end, iw)
+            iw = iw + 1
+        }
+        thread_pool_wait()
+
+        // Concatenate per-worker fired sublists into p_fired.
+        uint64 n_fired = 0
+        uint64 wm = 0
+        while wm < MT_NW {
+            uint64 fbase_m = wm * MT_FIRED_CAP
+            uint64 local_n = mt_n_fired[wm]
+            uint64 kk = 0
+            while kk < local_n {
+                uint64 src_slot = p_mt_fired + (fbase_m + kk) * 8
+                uint64 v = 0
+                unsafe { *(src_slot as uint64) -> v }
+                uint64 dst_slot = p_fired + n_fired * 8
+                unsafe { *(dst_slot as uint64) = v }
+                n_fired = n_fired + 1
+                kk = kk + 1
+            }
+            wm = wm + 1
+        }
+
+        // Parallel delivery (atomic scatter).
+        if n_fired > 0 {
+            uint64 d_chunk = n_fired / MT_NW
+            if d_chunk == 0 { d_chunk = 1 }
+            uint64 nw_d = MT_NW
+            if nw_d > n_fired { nw_d = n_fired }
+            uint64 dw = 0
+            while dw < nw_d {
+                uint64 ds = dw * d_chunk
+                uint64 de = ds + d_chunk
+                if dw == nw_d - 1 { de = n_fired }
+                thread_pool_submit(dw, delivery_fn, ds, de, dw)
+                dw = dw + 1
+            }
+            thread_pool_wait()
+        }
+
+        step = step + 1
+    }
+
+    uint64 t_sim = time_ns()
+    print("# sim_us=")
+    println((t_sim - t_csr) / 1000)
+    print("# sim_us_per_step=")
+    println((t_sim - t_csr) / 1000 / N_STEPS)
+
+    thread_pool_shutdown()
+
+    // ── Summary ──────────────────────────────────────────────────────
+    uint64 total_spikes = 0
+    uint64 active = 0
+    i = 0
+    while i < N_NEURONS {
+        uint64 sp = p_spike + i * 8
+        uint64 c = 0
+        unsafe { *(sp as uint64) -> c }
+        total_spikes = total_spikes + c
+        if c > 0 { active = active + 1 }
+        i = i + 1
+    }
+
+    uint64 t_end = time_ns()
+    print("# N=")
+    println(N_NEURONS)
+    print("# n_syn=")
+    println(n_syn)
+    print("# n_steps=")
+    println(N_STEPS)
+    print("# total_spikes=")
+    println(total_spikes)
+    print("# active_neurons=")
+    println(active)
+    print("# total_wall_us=")
+    println((t_end - t_start) / 1000)
+    exit(0)
+}

@@ -42,7 +42,7 @@ something that doesn't work, it's a bug, not a typo in the docs.
 
 ## 1. File structure and comments
 
-KernRift source files use the `.kr` extension. One file is one module. A
+KernRift source files use the `.mlr` extension. One file is one module. A
 program starts execution at `fn main()` (unless you pass `--freestanding`).
 
 ```kr
@@ -89,7 +89,7 @@ Floating-point types keep their declared width (f32 in 32-bit slots, f64 in
 64-bit slots) and are tracked through the IR with a per-vreg "fkind" tag so
 the emitter picks the right load/store/convert instructions.
 
-Full floating-point details (operators, conversions, the `std/math_float.kr`
+Full floating-point details (operators, conversions, the `std/math_float.mlr`
 library) live in §15.
 
 ### `bool` (strict since v2.8.3)
@@ -796,7 +796,7 @@ and/or `clobbers(...)` clauses that describe how registers flow between
 the block and KernRift's local variables.
 
 ```kr
-import "std/fmt.kr"
+import "std/fmt.mlr"
 
 fn rdtsc_ns() -> u64 {
     u64 lo = 0
@@ -912,10 +912,10 @@ NaN follows IEEE 754: `NaN == NaN` is false. Test for NaN with
 | `f32_to_f16(f32) -> f16` | Single to half (storage) |
 | `f16_to_f32(f16) -> f32` | Half to single |
 
-### Math library (`std/math_float.kr`)
+### Math library (`std/math_float.mlr`)
 
 ```kr
-import "std/math_float.kr"
+import "std/math_float.mlr"
 
 f64 r = sqrt(int_to_f64(49))   // 7.0 (hardware)
 f64 s = sin(f64_pi())           // ~0.0
@@ -966,7 +966,7 @@ fn lerp(f64 a, f64 b, f64 t) -> f64 {
 ## 16. Allocators and memory management
 
 ```kr
-import "std/alloc.kr"
+import "std/alloc.mlr"
 ```
 
 KernRift ships three allocators in the standard library. All are backed
@@ -1064,9 +1064,9 @@ Bring functions and declarations from another file into the current
 compilation unit:
 
 ```kr
-import "std/io.kr"
-import "std/string.kr"
-import "utils.kr"
+import "std/io.mlr"
+import "std/string.mlr"
+import "utils.mlr"
 ```
 
 Import paths are resolved:
@@ -1293,11 +1293,11 @@ Parses and records a linker section name. Used with `--emit=obj` output.
 ## 20. Compiler CLI
 
 ```sh
-krc <file.kr>                        # compile to <stem>.krbo (fat binary, all 8 slices)
-krc <file.kr> -o out                 # specify output name
-krc <file.kr> --arch=x86_64 -o out   # single-arch native ELF
-krc <file.kr> --arch=arm64 -o out    # single-arch ARM64 ELF
-krc <file.kr> --targets=linux-x64,macos-arm64 -o out.krbo   # custom fat subset (v2.8.x)
+krc <file.mlr>                        # compile to <stem>.krbo (fat binary, all 8 slices)
+krc <file.mlr> -o out                 # specify output name
+krc <file.mlr> --arch=x86_64 -o out   # single-arch native ELF
+krc <file.mlr> --arch=arm64 -o out    # single-arch ARM64 ELF
+krc <file.mlr> --targets=linux-x64,macos-arm64 -o out.krbo   # custom fat subset (v2.8.x)
 
 # Emit format (aliased since v2.8.4):
 #   linux / linux-x86_64 / linux-arm64 / elfexe / elf   → Linux ELF
@@ -1306,32 +1306,32 @@ krc <file.kr> --targets=linux-x64,macos-arm64 -o out.krbo   # custom fat subset 
 #   android                                             → Android PIE ELF
 #   obj                                                 → ELF relocatable (.o)
 #   asm                                                 → disassembled listing
-krc <file.kr> --emit=pe -o out.exe
-krc <file.kr> --emit=macho -o out
-krc <file.kr> --emit=android -o out
-krc <file.kr> --arch=x86_64 --emit=android -o out
+krc <file.mlr> --emit=pe -o out.exe
+krc <file.mlr> --emit=macho -o out
+krc <file.mlr> --emit=android -o out
+krc <file.mlr> --arch=x86_64 --emit=android -o out
 
 # Codegen backend
-krc <file.kr> --arch=arm64           # default: IR (SSA + optimizer + regalloc)
-krc --legacy --arch=arm64 <file.kr>  # legacy direct-walking codegen
-krc --ir <file.kr>                   # force IR even where the release recipe falls back to legacy (e.g. ARM64 fat slices)
-krc -O0 <file.kr>                    # disable IR optimizer (useful for debugging miscompiles)
-krc --debug <file.kr>                # enable runtime div-by-zero + bounds traps
+krc <file.mlr> --arch=arm64           # default: IR (SSA + optimizer + regalloc)
+krc --legacy --arch=arm64 <file.mlr>  # legacy direct-walking codegen
+krc --ir <file.mlr>                   # force IR even where the release recipe falls back to legacy (e.g. ARM64 fat slices)
+krc -O0 <file.mlr>                    # disable IR optimizer (useful for debugging miscompiles)
+krc --debug <file.mlr>                # enable runtime div-by-zero + bounds traps
 
 # Non-compile modes
-krc --freestanding <file.kr> -o out  # no main trampoline, no auto-exit
-krc check <file.kr>                  # run semantic checks only
-krc fmt   <file.kr>                  # auto-format the file in place
-krc lc <file.kr>                     # living compiler report (section 21)
-krc lc --fix <file.kr>               # apply auto-fixes in place
-krc lc --fix --dry-run <file.kr>     # preview auto-fixes without writing
-krc lc --ci <file.kr>                # CI gate: exit non-zero if patterns fire
-krc lc --min-fitness=N <file.kr>     # filter: only patterns with fitness >= N
+krc --freestanding <file.mlr> -o out  # no main trampoline, no auto-exit
+krc check <file.mlr>                  # run semantic checks only
+krc fmt   <file.mlr>                  # auto-format the file in place
+krc lc <file.mlr>                     # living compiler report (section 21)
+krc lc --fix <file.mlr>               # apply auto-fixes in place
+krc lc --fix --dry-run <file.mlr>     # preview auto-fixes without writing
+krc lc --ci <file.mlr>                # CI gate: exit non-zero if patterns fire
+krc lc --min-fitness=N <file.mlr>     # filter: only patterns with fitness >= N
 krc lc --list-proposals              # print the proposal registry
 krc lc --promote <name>              # promote a proposal to stable
 krc lc --deprecate <name>            # mark a proposal as deprecated
 krc lc --reject <name>               # revert a proposal to experimental
-krc --emit=ir <file.kr>              # dump the SSA IR for a single function
+krc --emit=ir <file.mlr>              # dump the SSA IR for a single function
 krc --version                        # print the compiler version
 krc --help                           # usage info
 ```
@@ -1366,7 +1366,7 @@ evolve without destroying compatibility.
 ### Basic report
 
 ```sh
-krc lc file.kr
+krc lc file.mlr
 ```
 
 Output has three sections: a telemetry summary, a fitness score
@@ -1376,16 +1376,16 @@ Patterns tagged `(auto-fix available)` can be rewritten mechanically.
 ### CI gating
 
 ```sh
-krc lc --min-fitness=60 file.kr     # filter: only patterns with fitness >= 60
-krc lc --ci file.kr                 # exit non-zero if any pattern fires
-krc lc --ci --min-fitness=50 file.kr  # gate only on patterns >= 50
+krc lc --min-fitness=60 file.mlr     # filter: only patterns with fitness >= 60
+krc lc --ci file.mlr                 # exit non-zero if any pattern fires
+krc lc --ci --min-fitness=50 file.mlr  # gate only on patterns >= 50
 ```
 
 ### Migration engine (auto-fix)
 
 ```sh
-krc lc --fix file.kr                # rewrite in place
-krc lc --fix --dry-run file.kr      # preview the rewritten source
+krc lc --fix file.mlr                # rewrite in place
+krc lc --fix --dry-run file.mlr      # preview the rewritten source
 ```
 
 The migration engine currently handles the `legacy_ptr_ops` pattern:
@@ -1495,7 +1495,7 @@ forever, even as new experimental features enter the language.
   entry function.
 
 ```sh
-krc --freestanding --arch=arm64 kernel.kr -o kernel.elf
+krc --freestanding --arch=arm64 kernel.mlr -o kernel.elf
 ```
 
 Use this for kernel entry points, bootloaders, and embedded firmware.
@@ -1554,15 +1554,15 @@ Compile to a relocatable object and link with the platform toolchain:
 
 ```sh
 # Linux
-krc --emit=obj extern_libc.kr -o extern_libc.o
+krc --emit=obj extern_libc.mlr -o extern_libc.o
 gcc extern_libc.o -o extern_libc -no-pie
 
 # macOS
-krc --target=macos --emit=obj extern_libc.kr -o extern_libc.o
+krc --target=macos --emit=obj extern_libc.mlr -o extern_libc.o
 clang extern_libc.o -o extern_libc
 
 # Windows
-krc --target=windows --emit=obj extern_libc.kr -o extern_libc.obj
+krc --target=windows --emit=obj extern_libc.mlr -o extern_libc.obj
 link extern_libc.obj msvcrt.lib /ENTRY:main /SUBSYSTEM:console
 ```
 
@@ -1795,7 +1795,7 @@ x86_64. `extern fn` call sites use relocations
 
 ```sh
 # Linux
-krc --emit=obj prog.kr -o prog.o
+krc --emit=obj prog.mlr -o prog.o
 gcc prog.o -o prog -no-pie
 
 # No more "missing .note.GNU-stack" warning as of v2.6.3 — the compiler

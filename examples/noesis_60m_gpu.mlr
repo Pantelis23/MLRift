@@ -1,0 +1,223 @@
+// MLRift — noesis_60m GPU kernels.
+//
+// Compiled with `mlrc --target=hip-amd` to produce noesis_60m_gpu.co
+// that noesis_60m_gpu_launch.mlr loads via hipModuleLoadData. All
+// kernels here match the CPU version's math bit-for-bit when the
+// same splitmix64 seed is used and the same per-neuron RI variance
+// is set up by the launcher.
+
+fn tid_x() -> uint64 {
+    return 0
+}
+
+fn atomic_add_f64(uint64 ptr, f64 val) -> f64 {
+    f64 old = 0.0
+    unsafe { *(ptr as f64) -> old }
+    f64 nv = old + val
+    unsafe { *(ptr as f64) = nv }
+    return old
+}
+
+fn atomic_add_u64(uint64 ptr, uint64 val) -> uint64 {
+    uint64 old = 0
+    unsafe { *(ptr as uint64) -> old }
+    uint64 nv = old + val
+    unsafe { *(ptr as uint64) = nv }
+    return old
+}
+
+// ── CSR build kernel ────────────────────────────────────────────────
+// Each thread handles one source, drawing SYN_PER targets at counter
+// base = src * SYN_PER. Row offsets are trivial (row_ptr[i] = i * K)
+// so no count pass is needed. Splitmix64 is inlined because format_hip
+// only forwards a small set of known fn calls (tid_x, atomic_add_*).
+@kernel
+fn csr_build(
+    uint64 col_tgt_ptr,
+    uint64 col_w_ptr,
+    uint64 col_is_inh_ptr,
+    uint64 cell_type_ptr,
+    uint64 n,
+    uint64 syn_per,
+    uint64 seed,
+    f64 w_ee,
+    f64 w_ei,
+    f64 w_ie
+) {
+    uint64 src = tid_x()
+    if src < n {
+        uint64 src_ct_p = cell_type_ptr + src * 8
+        uint64 src_ct = 0
+        unsafe { *(src_ct_p as uint64) -> src_ct }
+        uint64 src_e = 0
+        if src_ct == 0 { src_e = 1 }
+        uint64 base = src * syn_per
+        uint64 k = 0
+        while k < syn_per {
+            uint64 ctr = base + k
+            // Inlined splitmix64(seed, ctr)
+            uint64 z = seed + ctr * 0x9E3779B97F4A7C15
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+            z = z ^ (z >> 31)
+            uint64 tgt = z - (z / n) * n
+            if tgt == src {
+                tgt = tgt + 1
+                if tgt >= n { tgt = 0 }
+            }
+            uint64 tgt_ct_p = cell_type_ptr + tgt * 8
+            uint64 tgt_ct = 0
+            unsafe { *(tgt_ct_p as uint64) -> tgt_ct }
+            uint64 tgt_e = 0
+            if tgt_ct == 0 { tgt_e = 1 }
+            f64 w = 0.0
+            uint64 inh = 0
+            if src_e == 1 {
+                if tgt_e == 1 { w = w_ee } else { w = w_ei }
+            } else {
+                w = w_ie
+                inh = 1
+            }
+            uint64 slot = base + k
+            uint64 tp = col_tgt_ptr + slot * 8
+            uint64 wp = col_w_ptr + slot * 8
+            uint64 ip = col_is_inh_ptr + slot * 8
+            unsafe { *(tp as uint64) = tgt }
+            unsafe { *(wp as f64) = w }
+            unsafe { *(ip as uint64) = inh }
+            k = k + 1
+        }
+    }
+}
+
+// Decay: buf[i] -= buf[i] * factor
+@kernel
+fn decay_step(uint64 buf, uint64 n, f64 factor) {
+    uint64 i = tid_x()
+    if i < n {
+        uint64 p = buf + i * 8
+        f64 v = 0.0
+        unsafe { *(p as f64) -> v }
+        v = v - v * factor
+        unsafe { *(p as f64) = v }
+    }
+}
+
+// LIF integrate — writes V, ref_count, spike_count, and a per-neuron
+// fired flag (u8) so the delivery kernel can skip non-firing sources
+// without materialising a fired_list.
+@kernel
+fn lif_step(
+    uint64 V_ptr,
+    uint64 ref_ptr,
+    uint64 RI_ptr,
+    uint64 s_exc_ptr,
+    uint64 s_inh_ptr,
+    uint64 spike_ptr,
+    uint64 fired_ptr,
+    uint64 n,
+    f64 dt,
+    f64 V_rest,
+    f64 V_reset,
+    f64 V_thresh,
+    f64 tau_m,
+    f64 J_E,
+    f64 J_I,
+    uint64 ref_steps
+) {
+    uint64 i = tid_x()
+    if i < n {
+        uint64 V_i = V_ptr + i * 8
+        uint64 ref_i = ref_ptr + i * 8
+        uint64 fp = fired_ptr + i
+        uint8 zero = 0
+        unsafe { *(fp as uint8) = zero }
+
+        uint64 rc = 0
+        unsafe { *(ref_i as uint64) -> rc }
+        if rc > 0 {
+            uint64 rc_new = rc - 1
+            unsafe { *(ref_i as uint64) = rc_new }
+            unsafe { *(V_i as f64) = V_reset }
+        } else {
+            f64 v = 0.0
+            unsafe { *(V_i as f64) -> v }
+            uint64 RI_i = RI_ptr + i * 8
+            f64 ri = 0.0
+            unsafe { *(RI_i as f64) -> ri }
+            uint64 se_i = s_exc_ptr + i * 8
+            f64 se = 0.0
+            unsafe { *(se_i as f64) -> se }
+            uint64 si_i = s_inh_ptr + i * 8
+            f64 si = 0.0
+            unsafe { *(si_i as f64) -> si }
+            f64 drive = ri + se * J_E - si * J_I
+            f64 dv = dt * (V_rest - v + drive) / tau_m
+            f64 v_new = v + dv
+            if v_new >= V_thresh {
+                unsafe { *(V_i as f64) = V_reset }
+                unsafe { *(ref_i as uint64) = ref_steps }
+                uint64 sp_i = spike_ptr + i * 8
+                uint64 sc = 0
+                unsafe { *(sp_i as uint64) -> sc }
+                sc = sc + 1
+                unsafe { *(sp_i as uint64) = sc }
+                uint8 one = 1
+                unsafe { *(fp as uint8) = one }
+            } else {
+                unsafe { *(V_i as f64) = v_new }
+            }
+        }
+    }
+}
+
+// Delivery — one thread per source. If fired[src] == 1, walk the
+// SYN_PER synapses and atomic-scatter weights into s_exc/s_inh.
+@kernel
+fn delivery_step(
+    uint64 fired_ptr,
+    uint64 col_tgt_ptr,
+    uint64 col_w_ptr,
+    uint64 col_is_inh_ptr,
+    uint64 s_exc_ptr,
+    uint64 s_inh_ptr,
+    uint64 n,
+    uint64 syn_per
+) {
+    uint64 src = tid_x()
+    if src < n {
+        uint64 fp = fired_ptr + src
+        uint64 f = 0
+        unsafe { *(fp as uint8) -> f }
+        if f > 0 {
+            uint64 base = src * syn_per
+            uint64 k = 0
+            while k < syn_per {
+                uint64 slot = base + k
+                uint64 tp = col_tgt_ptr + slot * 8
+                uint64 wp = col_w_ptr + slot * 8
+                uint64 ip = col_is_inh_ptr + slot * 8
+                uint64 tgt = 0
+                unsafe { *(tp as uint64) -> tgt }
+                f64 w = 0.0
+                unsafe { *(wp as f64) -> w }
+                uint64 inh = 0
+                unsafe { *(ip as uint64) -> inh }
+                uint64 dst_base = s_exc_ptr
+                if inh > 0 { dst_base = s_inh_ptr }
+                uint64 tgt_slot = dst_base + tgt * 8
+                atomic_add_f64(tgt_slot, w)
+                k = k + 1
+            }
+        }
+    }
+}
+
+// RI is host-initialised (per-neuron variance) and H2D-copied once
+// before the sim loop — no init kernel needed here.
+
+// Stub so mlrc --target=hip-amd is satisfied; not called by the
+// launcher (the kernels are loaded from the emitted .co instead).
+fn main() {
+    exit(0)
+}

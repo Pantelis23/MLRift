@@ -11,7 +11,7 @@
 // splitting the registry out, user programs importing format_elf_dyn
 // don't accidentally drag in unresolved compiler-internal references.
 
-static uint64 DYN_SYM_MAX     = 64
+static uint64 DYN_SYM_MAX     = 256
 static uint64 dyn_sym_tokens  = 0
 static uint64 dyn_sym_count   = 0
 
@@ -26,7 +26,7 @@ fn dyn_sym_init() {
 fn dyn_sym_register(uint64 name_tok) -> uint64 {
     if dyn_sym_tokens == 0 { dyn_sym_init() }
     if dyn_sym_count >= DYN_SYM_MAX {
-        write(2, "dyn_sym_registry: too many @dynamic symbols (>64)\n", 50)
+        write(2, "dyn_sym_registry: too many @dynamic symbols (>256)\n", 51)
         exit(1)
     }
     uint64 slot = dyn_sym_tokens + dyn_sym_count * 4

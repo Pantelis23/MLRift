@@ -1,11 +1,11 @@
 // gguf_probe — dump the container structure of a GGUF file to verify the
 // Phase A parser against llama.cpp's `gguf-dump`.
 
-import "../std/gguf.kr"
-import "../std/io.kr"
-import "../std/fmt.kr"
-import "../std/string.kr"
-import "../std/math_float.kr"
+import "../std/gguf.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/math_float.mlr"
 
 fn print_u(u64 v) { u64 s = fmt_dec(v); print_str(s) }
 

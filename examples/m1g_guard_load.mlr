@@ -3,7 +3,7 @@
 // mask lanes 40..63 so only the first 40 threads write their IDs
 // (and the tail of the buffer stays at the 0xCC primer).
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

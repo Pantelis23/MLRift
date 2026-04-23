@@ -15,7 +15,7 @@
 // Verifies: (a) atomicAdd on s_inh works, (b) E sources contribute
 // zero, (c) the scatter pattern matches CPU.
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

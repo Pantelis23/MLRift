@@ -20,7 +20,7 @@
 // Expected LTD update per is_ee synapse:
 //   w_new = clamp(0.1 + (-0.006) * 0.5, 0, 0.2) = 0.097
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

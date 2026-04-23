@@ -22,10 +22,10 @@
 //   — No bounds check on the returned view — the caller must trust
 //     the file. Use on local checkpoints, not untrusted network input.
 
-import "io.kr"
-import "fmt.kr"
-import "mem.kr"
-import "string.kr"
+import "io.mlr"
+import "fmt.mlr"
+import "mem.mlr"
+import "string.mlr"
 
 // Opaque handle. The caller reads `file_size` / `json_len` / `json_ptr`
 // for introspection but should treat `base_addr` and `data_ptr` as

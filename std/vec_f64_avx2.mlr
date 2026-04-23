@@ -1,0 +1,229 @@
+// std/vec_f64_avx2.kr — AVX2 variants of std/vec_f64.kr helpers.
+//
+// Phase 1 of the SIMD codegen track. See docs/SIMD_CODEGEN.md. Matches
+// the byte sequences from the kickoff doc:
+//   vbroadcastsd ymm1, m64        C4 E2 7D 19 /r
+//   vmovupd      ymm0, [rdi+…]    C5 FD 10 /r
+//   vfnmadd231pd ymm0, ymm1, ymm0 C4 E2 F5 BC /r
+//   vmovupd      [rdi+…], ymm0    C5 FD 11 /r
+//
+// Scalar tail handled in kr for the last n%4 elements.
+
+import "vec_f64.mlr"
+
+// Static scratch slots the asm blocks broadcast scalars out of.
+// Each helper gets its own packed slot: decay uses [factor], relax
+// uses [factor, target], fill uses [value], sum uses [partial_sum].
+// Single-threaded for now; per-worker slots needed when called from
+// multiple threads simultaneously (see vec_f64_mt.kr pattern).
+static uint64[1] avx2_factor_slot
+static uint64[2] avx2_relax_slot
+static uint64[1] avx2_fill_slot
+static uint64[1] avx2_sum_slot
+
+fn vec_f64_decay_inplace_avx2(uint64 buf, uint64 n, f64 factor) {
+    uint64 n4 = n & 0xFFFFFFFFFFFFFFFC
+
+    if n4 > 0 {
+        uint64 fs = avx2_factor_slot
+        unsafe { *(fs as f64) = factor }
+        asm {
+            // vbroadcastsd ymm1, [rcx]        ; ymm1 = [factor x 4]
+            "0xC4 0xE2 0x7D 0x19 0x09"
+            // xor rax, rax                    ; i = 0
+            "0x48 0x31 0xC0"
+            // .loop:
+            // cmp rax, rdx                    ; i vs n4
+            "0x48 0x39 0xD0"
+            // jge +21                         ; done → vzeroupper
+            "0x7D 0x15"
+            // vmovupd ymm0, [rdi + rax*8]     ; load 4 doubles
+            "0xC5 0xFD 0x10 0x04 0xC7"
+            // vfnmadd231pd ymm0, ymm1, ymm0   ; ymm0 = ymm0 - ymm1*ymm0
+            "0xC4 0xE2 0xF5 0xBC 0xC0"
+            // vmovupd [rdi + rax*8], ymm0     ; store 4 doubles
+            "0xC5 0xFD 0x11 0x04 0xC7"
+            // add rax, 4                      ; i += 4
+            "0x48 0x83 0xC0 0x04"
+            // jmp -26                         ; back to cmp
+            "0xEB 0xE6"
+            // vzeroupper                      ; clean AVX → SSE transition
+            "0xC5 0xF8 0x77"
+        } in(buf -> rdi, n4 -> rdx, fs -> rcx) clobbers(rax)
+    }
+
+    // Scalar tail for the last (n - n4) elements.
+    uint64 i = n4
+    while i < n {
+        uint64 p = buf + i * 8
+        f64 v = 0.0
+        unsafe { *(p as f64) -> v }
+        v = v - v * factor
+        unsafe { *(p as f64) = v }
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------------
+// vec_f64_relax_inplace_avx2 — buf[i] += (target - buf[i]) * factor
+//
+// Same loop shape as decay, but two broadcast scalars and an FMA
+// reassociated to a VSUBPD + VFMADD231PD pair. Packs (factor, target)
+// into a single 16-byte slot so we only pass one pointer to the asm.
+
+fn vec_f64_relax_inplace_avx2(uint64 buf, uint64 n, f64 target, f64 factor) {
+    uint64 n4 = n & 0xFFFFFFFFFFFFFFFC
+
+    if n4 > 0 {
+        uint64 p = avx2_relax_slot
+        uint64 p8 = p + 8
+        unsafe { *(p  as f64) = factor }
+        unsafe { *(p8 as f64) = target }
+        asm {
+            // vbroadcastsd ymm1, [rcx]         ; ymm1 = [factor x 4]
+            "0xC4 0xE2 0x7D 0x19 0x09"
+            // vbroadcastsd ymm2, [rcx + 8]     ; ymm2 = [target x 4]
+            "0xC4 0xE2 0x7D 0x19 0x51 0x08"
+            // xor rax, rax
+            "0x48 0x31 0xC0"
+            // .loop:
+            // cmp rax, rdx
+            "0x48 0x39 0xD0"
+            // jge +25
+            "0x7D 0x19"
+            // vmovupd ymm0, [rdi + rax*8]      ; ymm0 = buf chunk
+            "0xC5 0xFD 0x10 0x04 0xC7"
+            // vsubpd ymm3, ymm2, ymm0          ; ymm3 = target - buf
+            "0xC5 0xED 0x5C 0xD8"
+            // vfmadd231pd ymm0, ymm3, ymm1     ; ymm0 = ymm0 + ymm3*ymm1
+            "0xC4 0xE2 0xE5 0xB8 0xC1"
+            // vmovupd [rdi + rax*8], ymm0
+            "0xC5 0xFD 0x11 0x04 0xC7"
+            // add rax, 4
+            "0x48 0x83 0xC0 0x04"
+            // jmp -30
+            "0xEB 0xE2"
+            // vzeroupper
+            "0xC5 0xF8 0x77"
+        } in(buf -> rdi, n4 -> rdx, p -> rcx) clobbers(rax)
+    }
+
+    uint64 i = n4
+    while i < n {
+        uint64 px = buf + i * 8
+        f64 v = 0.0
+        unsafe { *(px as f64) -> v }
+        v = v + (target - v) * factor
+        unsafe { *(px as f64) = v }
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------------
+// vec_f64_fill_avx2 — buf[i] = value
+//
+// Trivial: broadcast value once, then stream VMOVUPD 4 lanes at a time.
+
+fn vec_f64_fill_avx2(uint64 buf, uint64 n, f64 value) {
+    uint64 n4 = n & 0xFFFFFFFFFFFFFFFC
+
+    if n4 > 0 {
+        uint64 p = avx2_fill_slot
+        unsafe { *(p as f64) = value }
+        asm {
+            // vbroadcastsd ymm1, [rcx]         ; ymm1 = [value x 4]
+            "0xC4 0xE2 0x7D 0x19 0x09"
+            // xor rax, rax
+            "0x48 0x31 0xC0"
+            // .loop:
+            // cmp rax, rdx
+            "0x48 0x39 0xD0"
+            // jge +11
+            "0x7D 0x0B"
+            // vmovupd [rdi + rax*8], ymm1      ; store the broadcast
+            "0xC5 0xFD 0x11 0x0C 0xC7"
+            // add rax, 4
+            "0x48 0x83 0xC0 0x04"
+            // jmp -16
+            "0xEB 0xF0"
+            // vzeroupper
+            "0xC5 0xF8 0x77"
+        } in(buf -> rdi, n4 -> rdx, p -> rcx) clobbers(rax)
+    }
+
+    uint64 i = n4
+    while i < n {
+        uint64 px = buf + i * 8
+        unsafe { *(px as f64) = value }
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------------
+// vec_f64_sum_avx2 — horizontal reduction
+//
+// 4 parallel lane accumulators, then vextractf128 + vaddpd + vhaddpd
+// to fold down to a scalar. NOT bit-identical to a straight-line scalar
+// sum (reduction order differs) — matches vec_f64_sum's 4-way helper.
+// Tail is folded into the same accumulator via an extra scalar loop.
+
+// Internal variant that writes the partial sum to a caller-supplied
+// 8-byte slot. `vec_f64_sum_avx2` below wraps this with the shared
+// static; MT workers pass their own per-worker slot so they don't race.
+fn vec_f64_sum_avx2_into(uint64 buf, uint64 n, uint64 out_ptr) {
+    unsafe { *(out_ptr as f64) = 0.0 }
+    uint64 n4 = n & 0xFFFFFFFFFFFFFFFC
+
+    if n4 > 0 {
+        asm {
+            // vxorpd ymm0, ymm0, ymm0          ; accumulator = 0
+            "0xC5 0xFD 0x57 0xC0"
+            // xor rax, rax
+            "0x48 0x31 0xC0"
+            // .loop:
+            // cmp rax, rdx
+            "0x48 0x39 0xD0"
+            // jge +15
+            "0x7D 0x0F"
+            // vmovupd ymm1, [rdi + rax*8]
+            "0xC5 0xFD 0x10 0x0C 0xC7"
+            // vaddpd ymm0, ymm0, ymm1
+            "0xC5 0xFD 0x58 0xC1"
+            // add rax, 4
+            "0x48 0x83 0xC0 0x04"
+            // jmp -20
+            "0xEB 0xEC"
+            // .done:
+            // vextractf128 xmm1, ymm0, 1       ; upper 128 of ymm0 → xmm1
+            "0xC4 0xE3 0x7D 0x19 0xC1 0x01"
+            // vaddpd xmm0, xmm0, xmm1          ; fold upper into lower
+            "0xC5 0xF9 0x58 0xC1"
+            // vhaddpd xmm0, xmm0, xmm0         ; horizontal add within xmm0
+            "0xC5 0xF9 0x7C 0xC0"
+            // vmovq [rcx], xmm0                ; store low 64 bits
+            "0xC5 0xF9 0xD6 0x01"
+            // vzeroupper
+            "0xC5 0xF8 0x77"
+        } in(buf -> rdi, n4 -> rdx, out_ptr -> rcx) clobbers(rax)
+    }
+
+    f64 sum = 0.0
+    unsafe { *(out_ptr as f64) -> sum }
+    uint64 i = n4
+    while i < n {
+        uint64 px = buf + i * 8
+        f64 v = 0.0
+        unsafe { *(px as f64) -> v }
+        sum = sum + v
+        i = i + 1
+    }
+    unsafe { *(out_ptr as f64) = sum }
+}
+
+fn vec_f64_sum_avx2(uint64 buf, uint64 n) -> f64 {
+    uint64 p = avx2_sum_slot
+    vec_f64_sum_avx2_into(buf, n, p)
+    f64 result = 0.0
+    unsafe { *(p as f64) -> result }
+    return result
+}

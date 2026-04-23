@@ -16,7 +16,7 @@
 // M2a.3 (once codegen uses it). For now it lives in src/ but the only
 // caller is this test program, which inlines it via `import`.
 
-import "../src/format_elf_dyn.kr"
+import "../src/format_elf_dyn.mlr"
 
 static uint64 cli_argc = 0
 static uint64 cli_argv = 0

@@ -2,7 +2,7 @@
 // Launch with block_x = 64 threads over a 64-slot buffer.
 // Expected: out[i] = i*(i-1)/2 (Gauss's sum 0..i-1).
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

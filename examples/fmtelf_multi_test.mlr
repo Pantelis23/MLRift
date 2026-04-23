@@ -13,7 +13,7 @@
 //     → two entries: libc.so.6 and libdl.so.2
 //   /tmp/multi_out   # still prints "hello" (via libc's puts)
 
-import "../src/format_elf_dyn.kr"
+import "../src/format_elf_dyn.mlr"
 
 static uint64 cli_argc = 0
 static uint64 cli_argv = 0

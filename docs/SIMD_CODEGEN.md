@@ -5,7 +5,7 @@ doc alongside `GPU_BACKEND.md` and `MULTITHREADING.md`.
 
 ## Goal
 
-Replace the 4-way scalar-unroll bodies of `std/vec_f64.kr` helpers with
+Replace the 4-way scalar-unroll bodies of `std/vec_f64.mlr` helpers with
 native AVX2 (x86_64) / NEON (ARM64) SIMD instructions. Callers don't
 change.
 
@@ -28,7 +28,7 @@ the cheap fallback.
 
 Two candidates:
 
-### Approach A — hand-coded builtins in `src/codegen.kr` (RECOMMENDED)
+### Approach A — hand-coded builtins in `src/codegen.mlr` (RECOMMENDED)
 
 Add special-cased codegen for calls to `vec_f64_decay_inplace`,
 `vec_f64_relax_inplace`, `vec_f64_fill`, `vec_f64_sum`. When the x86_64
@@ -136,7 +136,7 @@ site. Prefer the function-pointer approach for simplicity.
 ## Milestones
 
 **M1 — AVX2 vec_f64_decay_inplace (~1 day)**
-  Emit the ~70-byte AVX2 function in codegen.kr. Install as
+  Emit the ~70-byte AVX2 function in codegen.mlr. Install as
   `vec_f64_decay_inplace_avx2`. CPUID at startup picks between it
   and the scalar version. Microbench and stage 12:
   - target microbench: 3-4× vs scalar (vs 1.59× today)
@@ -172,9 +172,9 @@ Microbench already exists (`examples/vec_microbench.mlr`). Expand:
 
 ## Related work
 
-- `src/codegen.kr` `exec_process_argv` — pattern for inline-asm
+- `src/codegen.mlr` `exec_process_argv` — pattern for inline-asm
   emission at specific builtin call sites
-- `std/vec_f64.kr` — helpers whose bodies become the fallback
+- `std/vec_f64.mlr` — helpers whose bodies become the fallback
 - `docs/MULTITHREADING.md` — stacks multiplicatively with SIMD once
   both ship
 
@@ -185,7 +185,7 @@ Microbench already exists (`examples/vec_microbench.mlr`). Expand:
    bytes for `vbroadcastsd ymm1, xmm0`, verify `objdump -d` disassembles
    to the expected mnemonic. Validates the encoding approach.
 3. Add the `vec_f64_decay_inplace` builtin short-circuit in
-   src/codegen.kr (check is_extern_call == 0 && tok_matches to the
+   src/codegen.mlr (check is_extern_call == 0 && tok_matches to the
    helper name; emit the 70-byte function body directly).
 4. CPUID dispatch at startup; wire into call lowering.
 5. Microbench and measure.

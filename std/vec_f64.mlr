@@ -145,3 +145,10 @@ fn vec_f64_sum(uint64 buf, uint64 n) -> f64 {
     }
     return s
 }
+
+// Write-to-pointer variant so the dispatcher can route through
+// call_ptr (which doesn't propagate f64 returns).
+fn vec_f64_sum_into(uint64 buf, uint64 n, uint64 out_ptr) {
+    f64 s = vec_f64_sum(buf, n)
+    unsafe { *(out_ptr as f64) = s }
+}

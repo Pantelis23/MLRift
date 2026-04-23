@@ -8,7 +8,7 @@
 // -lamdhip64 at build time — only at run time.
 //
 // Usage:
-//   import "../std/hip.kr"     # or absolute path from your source
+//   import "../std/hip.mlr"     # or absolute path from your source
 //
 //   fn main() {
 //       uint64 count = 0

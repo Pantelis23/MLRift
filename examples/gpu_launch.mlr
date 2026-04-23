@@ -16,7 +16,7 @@
 // into *out_ptr. Parallel workloads (threadIdx-parameterised) will land
 // alongside M3's decay-loop port.
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

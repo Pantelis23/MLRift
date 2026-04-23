@@ -1,0 +1,158 @@
+// End-to-end test for the full std/vec_f64_mt.kr + _avx2 combo set.
+// Verifies correctness at a small N (with tail) and benchmarks at a
+// realistic N against the scalar helper.
+
+import "../std/vec_f64.mlr"
+import "../std/vec_f64_avx2.mlr"
+import "../std/vec_f64_mt.mlr"
+import "../std/thread.mlr"
+
+fn fill_pattern(uint64 buf, uint64 n) {
+    uint64 i = 0
+    while i < n {
+        f64 v = int_to_f64(i) * 0.001 + 1.0
+        uint64 p = buf + i * 8
+        unsafe { *(p as f64) = v }
+        i = i + 1
+    }
+}
+
+fn check_same(uint64 a, uint64 b, uint64 n, uint64 tag) -> uint64 {
+    uint64 i = 0
+    while i < n {
+        f64 va = 0.0
+        f64 vb = 0.0
+        uint64 pa = a + i * 8
+        uint64 pb = b + i * 8
+        unsafe { *(pa as f64) -> va }
+        unsafe { *(pb as f64) -> vb }
+        uint64 ia = f64_to_int(va * 1000000.0)
+        uint64 ib = f64_to_int(vb * 1000000.0)
+        if ia != ib {
+            print("  mismatch tag=")
+            print(tag)
+            print(" i=")
+            println(i)
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn main() {
+    uint64 NW = 4
+    thread_pool_init(NW)
+
+    // ---- correctness on small N (exercises the scalar tail) ----
+    uint64 NS = 47
+    uint64 sa = alloc(NS * 8)
+    uint64 sb = alloc(NS * 8)
+    uint64 fail = 0
+
+    fill_pattern(sa, NS); fill_pattern(sb, NS)
+    vec_f64_decay_inplace(sa, NS, 0.25)
+    vec_f64_decay_inplace_mt_avx2(sb, NS, 0.25)
+    if check_same(sa, sb, NS, 1) == 1 { println("decay_mt_avx2 OK") } else { println("decay_mt_avx2 FAIL"); fail = 1 }
+
+    fill_pattern(sa, NS); fill_pattern(sb, NS)
+    vec_f64_relax_inplace(sa, NS, 0.5, 0.1)
+    vec_f64_relax_inplace_mt_avx2(sb, NS, 0.5, 0.1)
+    if check_same(sa, sb, NS, 2) == 1 { println("relax_mt_avx2 OK") } else { println("relax_mt_avx2 FAIL"); fail = 1 }
+
+    vec_f64_fill(sa, NS, 7.25)
+    vec_f64_fill_mt_avx2(sb, NS, 7.25)
+    if check_same(sa, sb, NS, 3) == 1 { println("fill_mt_avx2 OK") } else { println("fill_mt_avx2 FAIL"); fail = 1 }
+
+    fill_pattern(sa, NS)
+    f64 s_scalar = vec_f64_sum(sa, NS)
+    f64 s_mtavx  = vec_f64_sum_mt_avx2(sa, NS)
+    uint64 is_s = f64_to_int(s_scalar * 1000000.0)
+    uint64 is_m = f64_to_int(s_mtavx  * 1000000.0)
+    uint64 diff = 0
+    if is_s > is_m { diff = is_s - is_m } else { diff = is_m - is_s }
+    if diff < 100 {
+        print("sum_mt_avx2 OK (scalar=")
+        print(is_s)
+        print(" mt_avx2=")
+        print(is_m)
+        print(" diff=")
+        print(diff)
+        println(")")
+    } else {
+        print("sum_mt_avx2 FAIL (scalar=")
+        print(is_s)
+        print(" mt_avx2=")
+        print(is_m)
+        println(")")
+        fail = 1
+    }
+
+    if fail != 0 { thread_pool_shutdown(); exit(1) }
+
+    // ---- benchmarks at N=1M ----
+    println("")
+    println("=== benchmarks (N=1M, ROUNDS=100, NW=4) ===")
+    uint64 N = 1048576
+    uint64 ROUNDS = 100
+
+    uint64 bh = alloc(N * 8)
+    uint64 bm = alloc(N * 8)
+
+    // decay
+    fill_pattern(bh, N); fill_pattern(bm, N)
+    uint64 dh0 = time_ns(); uint64 r = 0
+    while r < ROUNDS { vec_f64_decay_inplace(bh, N, 0.005); r = r + 1 }
+    uint64 dh1 = time_ns()
+    uint64 dm0 = time_ns(); r = 0
+    while r < ROUNDS { vec_f64_decay_inplace_mt_avx2(bm, N, 0.005); r = r + 1 }
+    uint64 dm1 = time_ns()
+    print("decay  helper_us=")
+    print((dh1 - dh0) / 1000)
+    print("  mt_avx2_us=")
+    println((dm1 - dm0) / 1000)
+
+    // relax
+    fill_pattern(bh, N); fill_pattern(bm, N)
+    uint64 rh0 = time_ns(); r = 0
+    while r < ROUNDS { vec_f64_relax_inplace(bh, N, 0.5, 0.005); r = r + 1 }
+    uint64 rh1 = time_ns()
+    uint64 rm0 = time_ns(); r = 0
+    while r < ROUNDS { vec_f64_relax_inplace_mt_avx2(bm, N, 0.5, 0.005); r = r + 1 }
+    uint64 rm1 = time_ns()
+    print("relax  helper_us=")
+    print((rh1 - rh0) / 1000)
+    print("  mt_avx2_us=")
+    println((rm1 - rm0) / 1000)
+
+    // fill
+    uint64 fh0 = time_ns(); r = 0
+    while r < ROUNDS { vec_f64_fill(bh, N, 3.14); r = r + 1 }
+    uint64 fh1 = time_ns()
+    uint64 fm0 = time_ns(); r = 0
+    while r < ROUNDS { vec_f64_fill_mt_avx2(bm, N, 3.14); r = r + 1 }
+    uint64 fm1 = time_ns()
+    print("fill   helper_us=")
+    print((fh1 - fh0) / 1000)
+    print("  mt_avx2_us=")
+    println((fm1 - fm0) / 1000)
+
+    // sum
+    fill_pattern(bh, N); fill_pattern(bm, N)
+    uint64 sh0 = time_ns(); r = 0
+    f64 total_s = 0.0
+    while r < ROUNDS { total_s = total_s + vec_f64_sum(bh, N); r = r + 1 }
+    uint64 sh1 = time_ns()
+    uint64 sm0 = time_ns(); r = 0
+    f64 total_m = 0.0
+    while r < ROUNDS { total_m = total_m + vec_f64_sum_mt_avx2(bm, N); r = r + 1 }
+    uint64 sm1 = time_ns()
+    print("sum    helper_us=")
+    print((sh1 - sh0) / 1000)
+    print("  mt_avx2_us=")
+    println((sm1 - sm0) / 1000)
+
+    thread_pool_shutdown()
+    println("PASS")
+    exit(0)
+}

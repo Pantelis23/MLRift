@@ -1,0 +1,81 @@
+// Dispatcher smoke test — verifies v_* calls route correctly and
+// produce the same results as the explicit scalar helpers.
+
+import "../std/vec_f64.mlr"
+import "../std/vec_f64_avx2.mlr"
+import "../std/vec_f64_dispatch.mlr"
+
+fn fill_pattern(uint64 buf, uint64 n) {
+    uint64 i = 0
+    while i < n {
+        f64 v = int_to_f64(i) + 1.0
+        uint64 p = buf + i * 8
+        unsafe { *(p as f64) = v }
+        i = i + 1
+    }
+}
+
+fn check_same(uint64 a, uint64 b, uint64 n) -> uint64 {
+    uint64 i = 0
+    while i < n {
+        f64 va = 0.0; f64 vb = 0.0
+        uint64 pa = a + i * 8
+        uint64 pb = b + i * 8
+        unsafe { *(pa as f64) -> va }
+        unsafe { *(pb as f64) -> vb }
+        if f64_to_int(va * 1000000.0) != f64_to_int(vb * 1000000.0) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn main() {
+    vec_f64_dispatch_init()
+    print("CPUID says AVX2+FMA3 = ")
+    if vec_f64_has_avx2 != 0 { println("YES (using AVX2 path)") }
+    else { println("NO (using scalar path)") }
+
+    uint64 N = 47
+    uint64 sa = alloc(N * 8)
+    uint64 sb = alloc(N * 8)
+    uint64 fail = 0
+
+    fill_pattern(sa, N); fill_pattern(sb, N)
+    vec_f64_decay_inplace(sa, N, 0.25)
+    v_decay(sb, N, 0.25)
+    if check_same(sa, sb, N) == 1 { println("v_decay OK") } else { println("v_decay FAIL"); fail = 1 }
+
+    fill_pattern(sa, N); fill_pattern(sb, N)
+    vec_f64_relax_inplace(sa, N, 0.5, 0.1)
+    v_relax(sb, N, 0.5, 0.1)
+    if check_same(sa, sb, N) == 1 { println("v_relax OK") } else { println("v_relax FAIL"); fail = 1 }
+
+    vec_f64_fill(sa, N, 7.25)
+    v_fill(sb, N, 7.25)
+    if check_same(sa, sb, N) == 1 { println("v_fill  OK") } else { println("v_fill  FAIL"); fail = 1 }
+
+    fill_pattern(sa, N)
+    f64 ss = vec_f64_sum(sa, N)
+    f64 sv = v_sum(sa, N)
+    uint64 iss = f64_to_int(ss * 1000000.0)
+    uint64 isv = f64_to_int(sv * 1000000.0)
+    uint64 diff = 0
+    if iss > isv { diff = iss - isv } else { diff = isv - iss }
+    if diff < 10 {
+        print("v_sum   OK (scalar=")
+        print(iss)
+        print(" dispatch=")
+        print(isv)
+        println(")")
+    } else {
+        print("v_sum   FAIL (scalar=")
+        print(iss)
+        print(" dispatch=")
+        print(isv)
+        println(")")
+        fail = 1
+    }
+
+    if fail == 0 { println("PASS"); exit(0) }
+    else         { println("FAIL"); exit(1) }
+}

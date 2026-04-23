@@ -17,7 +17,7 @@
 //   mlrc --arch=x86_64 examples/gpu_graph_smoke.mlr -o /tmp/gpu_graph_smoke
 //   /tmp/gpu_graph_smoke
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

@@ -1,6 +1,6 @@
-import "../std/tokenizer.kr"
-import "../std/io.kr"
-import "../std/fmt.kr"
+import "../std/tokenizer.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
 
 fn print_id(u64 v) { u64 s = fmt_dec(v); print_str(s) }
 

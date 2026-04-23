@@ -11,7 +11,7 @@
 //     → "hip devices: N"    (2 on the 7800XT host: discrete + iGPU)
 //     → exit 0
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

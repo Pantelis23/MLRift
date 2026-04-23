@@ -1,7 +1,7 @@
 // MLRift Stage-1 M1f tid-shape launcher: launches write_tid with a
 // 64-thread grid and verifies out[i] == i for all i.
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

@@ -1,0 +1,359 @@
+// MLRift — noesis_60m GPU host launcher.
+//
+// Loads /tmp/noesis_60m_gpu.co (compiled from examples/noesis_60m_gpu.mlr
+// via `mlrc --arch=x86_64 --target=hip-amd`), allocates device arrays
+// for the 60M-neuron workload, builds CSR on device, runs 2000 sim
+// steps, and reports wall time + spike total.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=hip-amd examples/noesis_60m_gpu.mlr -o /tmp/noesis_60m_gpu
+//   ./build/mlrc --arch=x86_64                  examples/noesis_60m_gpu_launch.mlr -o /tmp/noesis_60m_gpu_launch
+// Run:
+//   /tmp/noesis_60m_gpu_launch
+
+import "../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+
+static uint64 N         = 60000000
+static uint64 N_E       = 48000000
+static uint64 SYN_PER   = 4
+static uint64 N_STEPS   = 2000
+static uint64 RNG_SEED  = 0xDEADBEEF12345678
+
+static f64 dt        = 0.1
+static f64 V_rest    = -65.0
+static f64 V_reset   = -70.0
+static f64 V_thresh  = -50.0
+static f64 tau_m     = 10.0
+static f64 tau_e     = 10.0
+static f64 tau_i     = 5.0
+static f64 J_E       = 1.0
+static f64 J_I       = 1.0
+static uint64 ref_steps = 20
+static f64 w_ee      = 0.20
+static f64 w_ei      = 0.30
+static f64 w_ie      = 0.30
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 {
+        uint8 zero = 48
+        unsafe { *(buf as uint8) = zero }
+        return 1
+    }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 {
+        n = n + 1
+        tmp = tmp / 10
+    }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58
+    unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 space = 32
+    unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0
+    unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+// hipKernelNodeParams packer — same shape as gpu_stage13_graph.mlr.
+// For a plain-launch build we just use hipModuleLaunchKernel; no
+// graph needed here.
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    // ── Load kernel module ────────────────────────────────────────────
+    uint64 co_path = "/tmp/noesis_60m_gpu.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/noesis_60m_gpu.co — build first:")
+        puts("  mlrc --arch=x86_64 --target=hip-amd examples/noesis_60m_gpu.mlr -o /tmp/noesis_60m_gpu")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData failed", err) }
+    uint64 mod = 0
+    unsafe { *(mod_slot as uint64) -> mod }
+
+    // Resolve kernel handles
+    uint64 fh_csr      = 0
+    uint64 fh_decay    = 0
+    uint64 fh_lif      = 0
+    uint64 fh_delivery = 0
+    uint64 slot = alloc(8)
+    err = hipModuleGetFunction(slot, mod, "csr_build"); if err != 0 { die("getFn csr_build", err) }
+    unsafe { *(slot as uint64) -> fh_csr }
+    slot = alloc(8)
+    err = hipModuleGetFunction(slot, mod, "decay_step"); if err != 0 { die("getFn decay_step", err) }
+    unsafe { *(slot as uint64) -> fh_decay }
+    slot = alloc(8)
+    err = hipModuleGetFunction(slot, mod, "lif_step"); if err != 0 { die("getFn lif_step", err) }
+    unsafe { *(slot as uint64) -> fh_lif }
+    slot = alloc(8)
+    err = hipModuleGetFunction(slot, mod, "delivery_step"); if err != 0 { die("getFn delivery_step", err) }
+    unsafe { *(slot as uint64) -> fh_delivery }
+
+    uint64 t_start = time_ns()
+
+    // ── Allocate device arrays ────────────────────────────────────────
+    uint64 bytes_n   = N * 8
+    uint64 bytes_nu8 = N           // for fired flags (u8 per neuron)
+    uint64 n_syn     = N * SYN_PER
+    uint64 bytes_syn = n_syn * 8
+
+    uint64 d_V = 0;        slot = alloc(8); err = hipMalloc(slot, bytes_n);   if err != 0 { die("m V",      err) }; unsafe { *(slot as uint64) -> d_V }
+    uint64 d_ref = 0;      slot = alloc(8); err = hipMalloc(slot, bytes_n);   if err != 0 { die("m ref",    err) }; unsafe { *(slot as uint64) -> d_ref }
+    uint64 d_RI = 0;       slot = alloc(8); err = hipMalloc(slot, bytes_n);   if err != 0 { die("m RI",     err) }; unsafe { *(slot as uint64) -> d_RI }
+    uint64 d_se = 0;       slot = alloc(8); err = hipMalloc(slot, bytes_n);   if err != 0 { die("m se",     err) }; unsafe { *(slot as uint64) -> d_se }
+    uint64 d_si = 0;       slot = alloc(8); err = hipMalloc(slot, bytes_n);   if err != 0 { die("m si",     err) }; unsafe { *(slot as uint64) -> d_si }
+    uint64 d_spike = 0;    slot = alloc(8); err = hipMalloc(slot, bytes_n);   if err != 0 { die("m spike",  err) }; unsafe { *(slot as uint64) -> d_spike }
+    uint64 d_ct = 0;       slot = alloc(8); err = hipMalloc(slot, bytes_n);   if err != 0 { die("m ct",     err) }; unsafe { *(slot as uint64) -> d_ct }
+    uint64 d_fired = 0;    slot = alloc(8); err = hipMalloc(slot, bytes_nu8); if err != 0 { die("m fired",  err) }; unsafe { *(slot as uint64) -> d_fired }
+    uint64 d_tgt = 0;      slot = alloc(8); err = hipMalloc(slot, bytes_syn); if err != 0 { die("m tgt",    err) }; unsafe { *(slot as uint64) -> d_tgt }
+    uint64 d_w = 0;        slot = alloc(8); err = hipMalloc(slot, bytes_syn); if err != 0 { die("m w",      err) }; unsafe { *(slot as uint64) -> d_w }
+    uint64 d_inh = 0;      slot = alloc(8); err = hipMalloc(slot, bytes_syn); if err != 0 { die("m inh",    err) }; unsafe { *(slot as uint64) -> d_inh }
+
+    uint64 t_alloc = time_ns()
+    print_label_val("alloc_us", 8, (t_alloc - t_start) / 1000)
+
+    // ── Host-init V, ref, s_exc, s_inh, spike, cell_type, RI → H2D ──
+    uint64 h_V     = alloc(bytes_n)
+    uint64 h_ref   = alloc(bytes_n)
+    uint64 h_RI    = alloc(bytes_n)
+    uint64 h_zero  = alloc(bytes_n)
+    uint64 h_ct    = alloc(bytes_n)
+    uint64 i = 0
+    while i < N {
+        uint64 vp = h_V + i * 8
+        f64 vr = V_rest
+        unsafe { *(vp as f64) = vr }
+        uint64 rp = h_ref + i * 8
+        uint64 rz = 0
+        unsafe { *(rp as uint64) = rz }
+        uint64 zp = h_zero + i * 8
+        f64 zf = 0.0
+        unsafe { *(zp as f64) = zf }
+        // Per-neuron RI variance: 45 + i * (20 / N)
+        uint64 rip = h_RI + i * 8
+        f64 ri = 45.0 + int_to_f64(i) * (20.0 / int_to_f64(N))
+        unsafe { *(rip as f64) = ri }
+        // Cell type: i < N_E = E (0), else I (1)
+        uint64 ctp = h_ct + i * 8
+        uint64 ct = 0
+        if i >= N_E { ct = 1 }
+        unsafe { *(ctp as uint64) = ct }
+        i = i + 1
+    }
+    err = hipMemcpy(d_V,     h_V,    bytes_n, 1); if err != 0 { die("H2D V",     err) }
+    err = hipMemcpy(d_ref,   h_ref,  bytes_n, 1); if err != 0 { die("H2D ref",   err) }
+    err = hipMemcpy(d_RI,    h_RI,   bytes_n, 1); if err != 0 { die("H2D RI",    err) }
+    err = hipMemcpy(d_se,    h_zero, bytes_n, 1); if err != 0 { die("H2D se",    err) }
+    err = hipMemcpy(d_si,    h_zero, bytes_n, 1); if err != 0 { die("H2D si",    err) }
+    err = hipMemcpy(d_spike, h_ref,  bytes_n, 1); if err != 0 { die("H2D spike", err) }
+    err = hipMemcpy(d_ct,    h_ct,   bytes_n, 1); if err != 0 { die("H2D ct",    err) }
+
+    uint64 t_init = time_ns()
+    print_label_val("init_us", 7, (t_init - t_alloc) / 1000)
+
+    // ── Build CSR on device ───────────────────────────────────────────
+    // Kernel args: (col_tgt, col_w, col_is_inh, cell_type, n, syn_per, seed, w_ee, w_ei, w_ie)
+    uint64 k1_tgt  = alloc(8); unsafe { *(k1_tgt  as uint64) = d_tgt }
+    uint64 k1_w    = alloc(8); unsafe { *(k1_w    as uint64) = d_w }
+    uint64 k1_inh  = alloc(8); unsafe { *(k1_inh  as uint64) = d_inh }
+    uint64 k1_ct   = alloc(8); unsafe { *(k1_ct   as uint64) = d_ct }
+    uint64 k1_n    = alloc(8); uint64 nv = N;       unsafe { *(k1_n   as uint64) = nv }
+    uint64 k1_sp   = alloc(8); uint64 spv = SYN_PER; unsafe { *(k1_sp as uint64) = spv }
+    uint64 k1_seed = alloc(8); uint64 sdv = RNG_SEED; unsafe { *(k1_seed as uint64) = sdv }
+    uint64 k1_ww   = alloc(8); f64 wee = w_ee; unsafe { *(k1_ww as f64) = wee }
+    uint64 k1_wi   = alloc(8); f64 wei = w_ei; unsafe { *(k1_wi as f64) = wei }
+    uint64 k1_wh   = alloc(8); f64 wie = w_ie; unsafe { *(k1_wh as f64) = wie }
+    uint64 kp_csr  = alloc(10 * 8)
+    unsafe { *(kp_csr        as uint64) = k1_tgt }
+    unsafe { *((kp_csr +  8) as uint64) = k1_w }
+    unsafe { *((kp_csr + 16) as uint64) = k1_inh }
+    unsafe { *((kp_csr + 24) as uint64) = k1_ct }
+    unsafe { *((kp_csr + 32) as uint64) = k1_n }
+    unsafe { *((kp_csr + 40) as uint64) = k1_sp }
+    unsafe { *((kp_csr + 48) as uint64) = k1_seed }
+    unsafe { *((kp_csr + 56) as uint64) = k1_ww }
+    unsafe { *((kp_csr + 64) as uint64) = k1_wi }
+    unsafe { *((kp_csr + 72) as uint64) = k1_wh }
+
+    uint32 block = 256
+    uint64 grid_u = (N + 255) / 256
+    uint32 grid = grid_u
+    err = hipModuleLaunchKernel(fh_csr, grid, 1, 1, block, 1, 1, 0, 0, kp_csr, 0)
+    if err != 0 { die("launch csr_build", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync csr", err) }
+
+    uint64 t_csr = time_ns()
+    print_label_val("csr_build_us", 12, (t_csr - t_init) / 1000)
+
+    // ── Main sim loop ─────────────────────────────────────────────────
+    f64 f_e = dt / tau_e
+    f64 f_i = dt / tau_i
+
+    // Decay params (shared for both decays, only buf + factor differ)
+    uint64 k2_buf  = alloc(8)
+    uint64 k2_n    = alloc(8); unsafe { *(k2_n as uint64) = nv }
+    uint64 k2_f    = alloc(8)
+    uint64 kp_decay = alloc(3 * 8)
+    unsafe { *(kp_decay        as uint64) = k2_buf }
+    unsafe { *((kp_decay +  8) as uint64) = k2_n }
+    unsafe { *((kp_decay + 16) as uint64) = k2_f }
+
+    // LIF params
+    uint64 k3_V     = alloc(8); unsafe { *(k3_V     as uint64) = d_V }
+    uint64 k3_ref   = alloc(8); unsafe { *(k3_ref   as uint64) = d_ref }
+    uint64 k3_RI    = alloc(8); unsafe { *(k3_RI    as uint64) = d_RI }
+    uint64 k3_se    = alloc(8); unsafe { *(k3_se    as uint64) = d_se }
+    uint64 k3_si    = alloc(8); unsafe { *(k3_si    as uint64) = d_si }
+    uint64 k3_spike = alloc(8); unsafe { *(k3_spike as uint64) = d_spike }
+    uint64 k3_fired = alloc(8); unsafe { *(k3_fired as uint64) = d_fired }
+    uint64 k3_n     = alloc(8); unsafe { *(k3_n     as uint64) = nv }
+    uint64 k3_dt    = alloc(8); f64 dv_ = dt; unsafe { *(k3_dt as f64) = dv_ }
+    uint64 k3_vrest = alloc(8); f64 vr_ = V_rest; unsafe { *(k3_vrest as f64) = vr_ }
+    uint64 k3_vres  = alloc(8); f64 vrs_ = V_reset; unsafe { *(k3_vres as f64) = vrs_ }
+    uint64 k3_vth   = alloc(8); f64 vth_ = V_thresh; unsafe { *(k3_vth as f64) = vth_ }
+    uint64 k3_taum  = alloc(8); f64 taum_ = tau_m; unsafe { *(k3_taum as f64) = taum_ }
+    uint64 k3_jE    = alloc(8); f64 jE_ = J_E; unsafe { *(k3_jE as f64) = jE_ }
+    uint64 k3_jI    = alloc(8); f64 jI_ = J_I; unsafe { *(k3_jI as f64) = jI_ }
+    uint64 k3_rs    = alloc(8); uint64 rsv = ref_steps; unsafe { *(k3_rs as uint64) = rsv }
+    uint64 kp_lif   = alloc(16 * 8)
+    unsafe { *(kp_lif         as uint64) = k3_V }
+    unsafe { *((kp_lif +   8) as uint64) = k3_ref }
+    unsafe { *((kp_lif +  16) as uint64) = k3_RI }
+    unsafe { *((kp_lif +  24) as uint64) = k3_se }
+    unsafe { *((kp_lif +  32) as uint64) = k3_si }
+    unsafe { *((kp_lif +  40) as uint64) = k3_spike }
+    unsafe { *((kp_lif +  48) as uint64) = k3_fired }
+    unsafe { *((kp_lif +  56) as uint64) = k3_n }
+    unsafe { *((kp_lif +  64) as uint64) = k3_dt }
+    unsafe { *((kp_lif +  72) as uint64) = k3_vrest }
+    unsafe { *((kp_lif +  80) as uint64) = k3_vres }
+    unsafe { *((kp_lif +  88) as uint64) = k3_vth }
+    unsafe { *((kp_lif +  96) as uint64) = k3_taum }
+    unsafe { *((kp_lif + 104) as uint64) = k3_jE }
+    unsafe { *((kp_lif + 112) as uint64) = k3_jI }
+    unsafe { *((kp_lif + 120) as uint64) = k3_rs }
+
+    // Delivery params
+    uint64 k4_fired = alloc(8); unsafe { *(k4_fired as uint64) = d_fired }
+    uint64 k4_tgt   = alloc(8); unsafe { *(k4_tgt   as uint64) = d_tgt }
+    uint64 k4_w     = alloc(8); unsafe { *(k4_w     as uint64) = d_w }
+    uint64 k4_inh   = alloc(8); unsafe { *(k4_inh   as uint64) = d_inh }
+    uint64 k4_se    = alloc(8); unsafe { *(k4_se    as uint64) = d_se }
+    uint64 k4_si    = alloc(8); unsafe { *(k4_si    as uint64) = d_si }
+    uint64 k4_n     = alloc(8); unsafe { *(k4_n     as uint64) = nv }
+    uint64 k4_sp    = alloc(8); unsafe { *(k4_sp    as uint64) = spv }
+    uint64 kp_deliv = alloc(8 * 8)
+    unsafe { *(kp_deliv        as uint64) = k4_fired }
+    unsafe { *((kp_deliv +  8) as uint64) = k4_tgt }
+    unsafe { *((kp_deliv + 16) as uint64) = k4_w }
+    unsafe { *((kp_deliv + 24) as uint64) = k4_inh }
+    unsafe { *((kp_deliv + 32) as uint64) = k4_se }
+    unsafe { *((kp_deliv + 40) as uint64) = k4_si }
+    unsafe { *((kp_deliv + 48) as uint64) = k4_n }
+    unsafe { *((kp_deliv + 56) as uint64) = k4_sp }
+
+    uint64 step = 0
+    while step < N_STEPS {
+        // Decay s_exc
+        unsafe { *(k2_buf as uint64) = d_se }
+        unsafe { *(k2_f   as f64)    = f_e }
+        err = hipModuleLaunchKernel(fh_decay, grid, 1, 1, block, 1, 1, 0, 0, kp_decay, 0)
+        if err != 0 { die("launch decay s_exc", err) }
+        // Decay s_inh
+        unsafe { *(k2_buf as uint64) = d_si }
+        unsafe { *(k2_f   as f64)    = f_i }
+        err = hipModuleLaunchKernel(fh_decay, grid, 1, 1, block, 1, 1, 0, 0, kp_decay, 0)
+        if err != 0 { die("launch decay s_inh", err) }
+        // LIF integrate
+        err = hipModuleLaunchKernel(fh_lif, grid, 1, 1, block, 1, 1, 0, 0, kp_lif, 0)
+        if err != 0 { die("launch lif", err) }
+        // Delivery (one thread per source; skips non-firers)
+        err = hipModuleLaunchKernel(fh_delivery, grid, 1, 1, block, 1, 1, 0, 0, kp_deliv, 0)
+        if err != 0 { die("launch delivery", err) }
+        step = step + 1
+    }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync sim end", err) }
+
+    uint64 t_sim = time_ns()
+    print_label_val("sim_us", 6, (t_sim - t_csr) / 1000)
+
+    // ── D2H spike_count → tally ──────────────────────────────────────
+    uint64 h_spike = alloc(bytes_n)
+    err = hipMemcpy(h_spike, d_spike, bytes_n, 2); if err != 0 { die("D2H spike", err) }
+
+    uint64 total_spikes = 0
+    uint64 active = 0
+    i = 0
+    while i < N {
+        uint64 sp = h_spike + i * 8
+        uint64 c = 0
+        unsafe { *(sp as uint64) -> c }
+        total_spikes = total_spikes + c
+        if c > 0 { active = active + 1 }
+        i = i + 1
+    }
+    uint64 t_end = time_ns()
+
+    print_label_val("total_spikes",    12, total_spikes)
+    print_label_val("active_neurons",  14, active)
+    print_label_val("N",                1, N)
+    print_label_val("n_syn",            5, n_syn)
+    print_label_val("n_steps",          7, N_STEPS)
+    print_label_val("total_wall_us",   13, (t_end - t_start) / 1000)
+
+    hipFree(d_V); hipFree(d_ref); hipFree(d_RI)
+    hipFree(d_se); hipFree(d_si); hipFree(d_spike)
+    hipFree(d_ct); hipFree(d_fired)
+    hipFree(d_tgt); hipFree(d_w); hipFree(d_inh)
+    exit(0)
+}

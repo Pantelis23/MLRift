@@ -17,7 +17,7 @@
 // step, persistent device arrays, deterministic initial state, exact
 // CPU vs. GPU match.
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

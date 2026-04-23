@@ -1,0 +1,129 @@
+// MLRift MT M0 — raw clone() thread-spawn smoke test.
+//
+// Spawns a single worker thread via the Linux clone() syscall directly
+// (no libpthread, no dynamic linker). The worker writes 1 into a
+// shared uint64 flag and exits via the exit() syscall. The main
+// thread spin-waits on the flag, then reports PASS if it saw the
+// increment within a reasonable bound.
+//
+// Once this runs, the clone+futex approach in docs/MULTITHREADING.md
+// is validated and we can build the thread-pool primitive on top.
+
+import "../std/vec_f64.mlr"
+
+// Per-thread stack size (2 MB; matches glibc default).
+static uint64 stack_size = 0x200000
+
+// Shared flag the worker sets to 1 when done. Plain uint64 — writes
+// are naturally atomic on x86_64 for 8-byte aligned values.
+static uint64 done_flag = 0
+
+// What the worker does. Called by the child's entry stub after clone()
+// with ctx_ptr (unused here) as its single argument.
+fn worker(uint64 ctx_ptr) {
+    done_flag = 1
+}
+
+// Spawn a thread. Returns child TID in parent; in the child, never
+// returns — runs worker_fn(ctx_ptr) then exits via syscall(60).
+//
+// kr's asm block only recognises a small mnemonic table; everything
+// else must be raw hex bytes. Each string below is one logical x86
+// instruction encoded as bytes (comments show the mnemonic).
+//
+// Register plan. The kr codegen pins the first param to rbx and
+// register-spills the next couple of params/locals into r12-r14, so
+// we deliberately pick destinations the compiler does NOT allocate
+// (r11/r9/rsi/r15) to avoid the `in(...)` load sequence stomping on
+// its own source registers:
+//   rsi = stack_top    r9  = ctx_ptr
+//   r11 = worker_fn    r15 = flags
+//
+// Child entry layout (pre-placed by us before the clone syscall):
+//   [stack_top - 16] = ctx_ptr   (child pops into rdi)
+//   [stack_top -  8] = worker_fn (child pops into rax, then call rax)
+fn spawn_thread(uint64 worker_fn, uint64 ctx_ptr, uint64 stack_top) -> uint64 {
+    // CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM
+    //  = 0x0100  | 0x0200  | 0x0400    | 0x0800      | 0x10000     | 0x40000
+    //  = 0x50F00
+    uint64 flags = 0x50F00
+    uint64 tid = 0
+    asm {
+        // mov [rsi - 8], r11        ; stash worker_fn on child stack
+        "0x4C 0x89 0x5E 0xF8"
+        // mov [rsi - 16], r9        ; stash ctx_ptr on child stack
+        "0x4C 0x89 0x4E 0xF0"
+        // sub rsi, 16               ; rsi = child rsp (stack_top - 16)
+        "0x48 0x83 0xEE 0x10"
+        // mov rdi, r15              ; clone flags
+        "0x4C 0x89 0xFF"
+        // xor edx, edx              ; ptid = NULL
+        "0x31 0xD2"
+        // xor r10d, r10d            ; ctid = NULL
+        "0x45 0x31 0xD2"
+        // xor r8d, r8d              ; new_tls = 0
+        "0x45 0x31 0xC0"
+        // mov eax, 56               ; SYS_clone
+        "0xB8 0x38 0x00 0x00 0x00"
+        // syscall
+        "0x0F 0x05"
+        // test rax, rax             ; rax = 0 → child; rax > 0 → parent (tid)
+        "0x48 0x85 0xC0"
+        // jnz +13                   ; parent skips the 13-byte child body
+        "0x75 0x0D"
+        // ---- child path (13 bytes) ----
+        // pop rdi                   ; rdi = ctx_ptr
+        "0x5F"
+        // pop rax                   ; rax = worker_fn
+        "0x58"
+        // call rax                  ; worker(ctx_ptr)
+        "0xFF 0xD0"
+        // mov eax, 60               ; SYS_exit
+        "0xB8 0x3C 0x00 0x00 0x00"
+        // xor edi, edi              ; status = 0
+        "0x31 0xFF"
+        // syscall                   ; exit thread — never returns
+        "0x0F 0x05"
+        // parent falls through; `out(rax -> tid)` captures the child TID
+    } in(worker_fn -> r11, ctx_ptr -> r9, stack_top -> rsi, flags -> r15) out(rax -> tid) clobbers(rdi, rdx, rcx, r10, r8)
+    return tid
+}
+
+fn main() {
+    // Allocate a 2 MB stack for the child. alloc returns a raw pointer.
+    uint64 stk_base = alloc(stack_size)
+    // Top of stack = base + size (grows down). alloc hands back
+    // page-aligned addresses, so the top is 16-aligned too.
+    uint64 stk_top = stk_base + stack_size
+
+    // fn_addr returns the runtime address of the named function.
+    uint64 worker_fn_addr = fn_addr("worker")
+
+    print("spawning thread, worker=")
+    println(worker_fn_addr)
+    print("stack_top=")
+    println(stk_top)
+
+    uint64 tid = spawn_thread(worker_fn_addr, 0, stk_top)
+
+    print("parent got tid=")
+    println(tid)
+
+    // Spin-wait for the worker to set done_flag. Bounded loop so we
+    // don't hang on failure.
+    uint64 spins = 0
+    uint64 max_spins = 100000000
+    while spins < max_spins {
+        if done_flag == 1 { break }
+        spins = spins + 1
+    }
+
+    if done_flag == 1 {
+        print("PASS: worker ran, spins=")
+        println(spins)
+        exit(0)
+    } else {
+        println("FAIL: worker never set done_flag")
+        exit(1)
+    }
+}

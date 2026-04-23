@@ -1,0 +1,206 @@
+// MLRift MT M3 — parallel scatter-add benchmark.
+//
+// Simulates the stage 12 delivery-phase pattern: N spike sources each
+// with K synapses targeting random post neurons, atomic-scatter-adding
+// a weight into s_exc[tgt]. Four variants:
+//   (A) scalar plain:  s[tgt] += w
+//   (B) scalar atomic: atomic_add_f64(s_addr + tgt*8, w)
+//   (C) MT atomic:     4 workers × atomic_add_f64
+//
+// Verifies (B) == (A) bit-identical (single-thread, same order) and
+// (C) sum matches (A) within f64 precision. Reports timing ratios.
+//
+// Gate for wiring the pattern into the real stage 12 kernel.
+
+import "../std/thread.mlr"
+import "../std/vec_f64.mlr"
+import "../std/vec_f64_mt.mlr"
+
+static uint64 N_TGT = 10000
+static uint64 N_SYN = 1048576          // 1 M scatters per round
+static uint64 ROUNDS = 4
+static uint64 NW = 6
+
+// Deterministic xorshift32 — same seed ⇒ same (tgt, w) stream across
+// variants, so sums are comparable.
+static uint64 rng_state = 0x12345678
+
+fn rng_next() -> uint64 {
+    uint64 s = rng_state
+    uint64 t1 = s << 13
+    s = s ^ (t1 & 0xFFFFFFFF)
+    s = s ^ (s >> 17)
+    uint64 t2 = s << 5
+    s = s ^ (t2 & 0xFFFFFFFF)
+    s = s & 0xFFFFFFFF
+    rng_state = s
+    return s
+}
+
+// Pre-built scatter list (tgts and weights) so every variant executes
+// exactly the same (tgt_i, w_i) stream.
+static uint64 tgts = 0
+static uint64 ws   = 0
+
+// Worker: scatters ws[i] into s_exc[tgts[i]] for i in [start, end).
+// The scratch slot is stack-allocated once per worker invocation (not
+// per iteration) — kr turns `uint64[1]` into an alloc, so hoisting it
+// out of the hot loop matters.
+fn scatter_worker(uint64 start, uint64 end, uint64 s_exc_addr) {
+    uint64[1] scratch
+    uint64 sp = scratch
+    uint64 i = start
+    while i < end {
+        uint64 tp = tgts + i * 8
+        uint64 wp = ws   + i * 8
+        uint64 tgt = 0
+        unsafe { *(tp as uint64) -> tgt }
+        f64 w = 0.0
+        unsafe { *(wp as f64) -> w }
+        uint64 slot = s_exc_addr + tgt * 8
+        atomic_add_f64(slot, w, sp)
+        i = i + 1
+    }
+}
+
+fn main() {
+    println("=== MT M3 — parallel scatter-add benchmark ===")
+
+    // Allocate shared scatter inputs and three destination buffers.
+    tgts = alloc(N_SYN * 8)
+    ws   = alloc(N_SYN * 8)
+    uint64 s_a = alloc(N_TGT * 8)
+    uint64 s_b = alloc(N_TGT * 8)
+    uint64 s_c = alloc(N_TGT * 8)
+
+    // Pre-compute the scatter stream (tgt, w). Same RNG seed, one pass.
+    uint64 i = 0
+    while i < N_SYN {
+        uint64 r = rng_next()
+        uint64 tgt = r % N_TGT
+        uint64 tp = tgts + i * 8
+        unsafe { *(tp as uint64) = tgt }
+        // Weight: small varying positive f64.
+        f64 w = 0.001 + int_to_f64(r & 0xFF) * 0.0001
+        uint64 wp = ws + i * 8
+        unsafe { *(wp as f64) = w }
+        i = i + 1
+    }
+
+    thread_pool_init(NW)
+
+    // ---- (A) scalar plain scatter ----
+    uint64 t0 = time_ns()
+    uint64 ra = 0
+    while ra < ROUNDS {
+        vec_f64_fill(s_a, N_TGT, 0.0)
+        uint64 k = 0
+        while k < N_SYN {
+            uint64 tp = tgts + k * 8
+            uint64 wp = ws + k * 8
+            uint64 tgt = 0
+            unsafe { *(tp as uint64) -> tgt }
+            f64 w = 0.0
+            unsafe { *(wp as f64) -> w }
+            uint64 slot = s_a + tgt * 8
+            f64 cur = 0.0
+            unsafe { *(slot as f64) -> cur }
+            cur = cur + w
+            unsafe { *(slot as f64) = cur }
+            k = k + 1
+        }
+        ra = ra + 1
+    }
+    uint64 t1 = time_ns()
+    uint64 plain_ns = t1 - t0
+
+    // ---- (B) scalar atomic scatter (hoist scratch outside the hot loop) ----
+    uint64[1] scratch_b
+    uint64 sp_b = scratch_b
+    uint64 t2 = time_ns()
+    uint64 rb = 0
+    while rb < ROUNDS {
+        vec_f64_fill(s_b, N_TGT, 0.0)
+        uint64 k = 0
+        while k < N_SYN {
+            uint64 tp = tgts + k * 8
+            uint64 wp = ws + k * 8
+            uint64 tgt = 0
+            unsafe { *(tp as uint64) -> tgt }
+            f64 w = 0.0
+            unsafe { *(wp as f64) -> w }
+            uint64 slot = s_b + tgt * 8
+            atomic_add_f64(slot, w, sp_b)
+            k = k + 1
+        }
+        rb = rb + 1
+    }
+    uint64 t3 = time_ns()
+    uint64 atomic_ns = t3 - t2
+
+    // ---- (C) MT atomic scatter ----
+    uint64 scatter_fn = fn_addr("scatter_worker")
+    uint64 t4 = time_ns()
+    uint64 rc = 0
+    while rc < ROUNDS {
+        vec_f64_fill(s_c, N_TGT, 0.0)
+        uint64 chunk = N_SYN / NW
+        uint64 w = 0
+        while w < NW {
+            uint64 s = w * chunk
+            uint64 e = s + chunk
+            if w == NW - 1 { e = N_SYN }
+            thread_pool_submit(w, scatter_fn, s, e, s_c)
+            w = w + 1
+        }
+        thread_pool_wait()
+        rc = rc + 1
+    }
+    uint64 t5 = time_ns()
+    uint64 mt_ns = t5 - t4
+
+    thread_pool_shutdown()
+
+    // Correctness: compare sums.
+    f64 sum_a = vec_f64_sum(s_a, N_TGT)
+    f64 sum_b = vec_f64_sum(s_b, N_TGT)
+    f64 sum_c = vec_f64_sum(s_c, N_TGT)
+
+    print("# plain_us=")
+    println(plain_ns / 1000)
+    print("# atomic_us=")
+    println(atomic_ns / 1000)
+    print("# mt_us=")
+    println(mt_ns / 1000)
+
+    f64 sa_s = sum_a * 1000.0
+    f64 sb_s = sum_b * 1000.0
+    f64 sc_s = sum_c * 1000.0
+    uint64 sa_out = f64_to_int(sa_s)
+    uint64 sb_out = f64_to_int(sb_s)
+    uint64 sc_out = f64_to_int(sc_s)
+    print("# sum_a_milli=")
+    println(sa_out)
+    print("# sum_b_milli=")
+    println(sb_out)
+    print("# sum_c_milli=")
+    println(sc_out)
+
+    uint64 ratio_atomic_x100 = (atomic_ns * 100) / plain_ns
+    uint64 ratio_mt_x100     = (plain_ns * 100) / mt_ns
+    uint64 ratio_mt_atomic_x100 = (atomic_ns * 100) / mt_ns
+    print("# atomic_vs_plain_x100=")
+    println(ratio_atomic_x100)
+    print("# plain_vs_mt_x100=")
+    println(ratio_mt_x100)
+    print("# atomic_vs_mt_x100=")
+    println(ratio_mt_atomic_x100)
+
+    if sa_out == sb_out && sa_out == sc_out {
+        println("PASS: all three variants sum to the same value")
+        exit(0)
+    } else {
+        println("FAIL: sums differ")
+        exit(1)
+    }
+}

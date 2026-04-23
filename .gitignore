@@ -36,3 +36,10 @@ Thumbs.db
 # Internal docs
 /docs/superpowers/
 /docs/reviews/
+
+# Local-only Python Noesis reference code
+/examples/noesis/
+/examples/Noesis/
+
+# Python venv (local-only)
+/venv/

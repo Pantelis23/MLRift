@@ -4,7 +4,7 @@
 
 Milestones landed on the native AMDGPU emitter path (no hipcc,
 no clang; the bytes written to `.co` come from
-`src/format_amdgpu.kr`'s encoder directly). Each is byte-
+`src/format_amdgpu.mlr`'s encoder directly). Each is byte-
 identical to clang's gfx1100 output for the equivalent HIP
 source, verified at commit time with `cmp` against the hipcc-
 produced reference and at runtime with a HIP-launch gate.
@@ -91,7 +91,7 @@ build machines — only ROCm runtime on run machines.
    intrinsics, bounds-checked branches. The existing `format_hip`
    body translator already factors bodies down to these
    primitives — we translate to ISA instead of HIP C++.
-2. **GPU IR lowering.** Today `format_hip.kr` takes an
+2. **GPU IR lowering.** Today `format_hip.mlr` takes an
    `@kernel` AST + calls `hipcc`. Stage 1 adds an IR pass that
    lowers the kernel IR to AMDGPU instructions directly, runs
    register allocation over the VGPR/SGPR files (separate from
@@ -105,7 +105,7 @@ build machines — only ROCm runtime on run machines.
    and `.rela.dyn` / `.hash` so the loader can find them). The
    format is well-specified; `/opt/rocm/include/hsa/amd_hsa_*.h`
    has the struct layouts. Our existing dynamic-ELF emitter in
-   `src/format_elf_dyn.kr` is not applicable — code objects are
+   `src/format_elf_dyn.mlr` is not applicable — code objects are
    a different ELF flavour — but the byte-layout discipline
    carries over.
 4. **Kernel descriptor + resource registers.** Each kernel gets
@@ -186,7 +186,7 @@ for completion — no HIP symbols, no `dlopen`, no `DT_NEEDED`.
 
 **What we need to build.**
 
-1. **KFD ioctl wrappers.** A `src/kfd.kr` that mirrors
+1. **KFD ioctl wrappers.** A `src/kfd.mlr` that mirrors
    `kfd_ioctl.h`: `AMDKFD_IOC_GET_VERSION`,
    `AMDKFD_IOC_CREATE_QUEUE`, `AMDKFD_IOC_ALLOC_MEMORY_OF_GPU`,
    `AMDKFD_IOC_MAP_MEMORY_TO_GPU`, etc. All via direct
@@ -209,7 +209,7 @@ for completion — no HIP symbols, no `dlopen`, no `DT_NEEDED`.
 5. **Static ELF.** Drop `PT_INTERP`. The emitted binary starts
    at `_start`, sets up its own stack / TLS, runs `main`,
    calls `exit` via raw syscall. No glibc, no ld.so. The
-   existing `src/format_elf.kr` (non-dyn) already knows how to
+   existing `src/format_elf.mlr` (non-dyn) already knows how to
    do this for CPU-only binaries; Stage 2 reuses it.
 6. **AQL equivalents of `hipGraph*`.** The AQL spec has
    barrier packets and multiple in-flight packets per queue,
@@ -238,7 +238,7 @@ signal / doorbell paths have surprises. Can be staged:
   with our own code-object loader (easy once Stage 1 lands —
   we already know the ELF). libamdhip64 is now gone.
 - **Stage 2c.** Drop `ld-linux-*`. Emit a fully-static ELF.
-  Touches `src/format_elf.kr`, `src/main.kr` driver, and the
+  Touches `src/format_elf.mlr`, `src/main.mlr` driver, and the
   `@dynamic extern` machinery (unused now). Confirms:
   `ldd binary` → `not a dynamic executable`.
 
@@ -285,7 +285,7 @@ Stage 1 first. Concretely:
    hipcc-produced blob.
 3. Incrementally cover stage-13's full kernel set (decay,
    relax, fill, csr_e_deliver_delayed, csr_i_deliver,
-   lif_full). Delete `hipcc` from `src/main.kr` build path.
+   lif_full). Delete `hipcc` from `src/main.mlr` build path.
 4. Stage 2a: KFD wrappers + AQL writer, replace
    `hipModuleLaunchKernel` on the M3 decay test. Compare
    wall-time per launch against libamdhip64.

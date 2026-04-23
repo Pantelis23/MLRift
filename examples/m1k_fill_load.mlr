@@ -2,7 +2,7 @@
 // 50 000 slots. Every slot should equal the host-supplied f64
 // value (verified via bit-exact compare).
 
-import "../std/hip.kr"
+import "../std/hip.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn exit(uint64 code)

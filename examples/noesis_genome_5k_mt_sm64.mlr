@@ -1,0 +1,762 @@
+// MLRift — stage 15 ported to std/vec_f64 helpers.
+// Same Noesis-genome parameters at 5k neurons; per-step decay sweep
+// replaced with vec_f64 calls. 1-ULP per-op evaluation drift vs
+// stage 15 inline; byte-identical to noesis_genome_5k_vec_reference.py.
+//
+// Original stage 15 header follows.
+// -----------------------------------------------------------------
+// MLRift — stage 15: Noesis-parameterised workload at 5,000 neurons.
+//
+// Runs the stage-14 biology stack (LIF + STP + bidirectional STDP) at
+// 5,000 neurons using parameters directly from Noesis's FormaGenome
+// defaults (src/noesis/evolution/genome.py). Partition is 4,000 E
+// ("cortex") + 1,000 I ("inh") matching Noesis's E/I ratio.
+//
+// Genome-derived parameters
+//   V_thresh = -50    (Noesis default — fires earlier than our -55)
+//   V_rest   = -65    (Noesis default — higher than our -70)
+//   V_reset  = -70
+//   tau_m    = 10 ms  (half our usual 20 ms — sharper neurons)
+//   p_local_ee  = 0.05
+//   p_local_ei  = 0.10   (E→I denser than E→E)
+//   p_local_ie  = 0.10
+//   w_ee_scale  = 0.20
+//   w_ei_scale  = 0.30   (stronger to recruit inhibition)
+//   w_ie_scale  = 0.30
+//   A_plus   = 0.003   (Noesis STDP is smaller-amplitude + symmetric)
+//   A_minus  = -0.003
+//   tau_pre  = tau_post = 20 ms
+//   stp_tau_f = 1500 ms   (very slow facilitation — Noesis WM trace length)
+//   tau_d    = 200 ms
+//   U_baseline = 0.2
+//
+// Scope note: Noesis's actual PlasticPartitionedSim also quantises
+// weights to int8, uses PyTorch tensor reductions whose summation order
+// differs from a scalar loop, and has optional layers (persist_amp,
+// aux areas, dopamine, homeostasis) turned OFF by this minimal genome.
+// Matching all of that bit-for-bit is a separate engineering task.
+// This stage validates that MLRift can express + run the equations
+// correctly at 5k scale with a real Noesis parameter vector.
+//
+// Matches examples/noesis_genome_5k_vec_reference.py byte-for-byte.
+
+import "../std/vec_f64.mlr"
+import "../std/vec_f64_avx2.mlr"
+import "../std/vec_f64_dispatch.mlr"
+import "../std/thread.mlr"
+import "../std/rng.mlr"
+
+// ── MT M3 for stage 12 — parallel LIF integrate ─────────────────────
+//
+// Integrate is the only phase we parallelize while preserving
+// bit-identity to Python. The delivery scatter-add and LTP walks are
+// kept serial because both depend on the exact order of float adds
+// to s_exc/s_inh (f64 addition is non-associative).
+//
+// Worker partition: neurons [w*N/NW, (w+1)*N/NW). Each worker writes
+// its firings into a per-worker fired sublist. Main concatenates them
+// in ascending-worker-id order after the barrier → the global
+// fired_list is identical to the serial version (which walked
+// i=0..N in order).
+static uint64 MT_NW = 12
+static uint64 MT_FIRED_CAP = 512                  // per-worker cap (5000/12=417 + headroom)
+static uint64[32]    mt_n_fired                   // one count per possible worker
+static uint64[16384] mt_fired_lists               // flat 32 × 512 = 16384 slots
+
+// Minimum n_fired to justify parallel delivery/LTP. Each parallel
+// dispatch costs ≈50 µs of wake+barrier syscalls. Below the threshold
+// the serial walk is faster. 5000-neuron Noesis workload fires 5-70
+// neurons per step; MT delivery is a net loss in that range.
+static uint64 MT_DISPATCH_MIN = 200
+
+// Per-worker 8-byte scratch slots for atomic_add_f64 (one per worker).
+// Each worker needs its own slot so the CAS bitcast-via-memory path
+// doesn't race across workers.
+static uint64[32] mt_atom_scratch
+
+// Delivery + LTP run in parallel and update shared event counters.
+// Declared as 1-element arrays so the bare name yields the slot
+// address (atomic_add needs a pointer, and scalar statics aren't
+// addressable by name in kr).
+static uint64[1] mt_ltd_events
+static uint64[1] mt_ltp_events
+
+// CSR build parallelization — phase-1 output, consumed by workers in
+// phase 2. rng_state at the start of each source's (i, j) pass is
+// cached so workers can reproduce the serial rng stream for their
+// assigned source ranges (bit-identical topology).
+static uint32[5001] mt_rng_at_src
+
+// Sim shape — promoted from main-local so worker fns can see them.
+static uint64 NEURONS   = 5000
+static uint64 NEURONS_E = 4000
+static uint64 P_EE_DENOM = 20
+static uint64 P_EI_DENOM = 10
+static uint64 P_IE_DENOM = 10
+
+static f64 dt = 0.1
+static f64 V_rest = -65.0
+static f64 V_reset = -70.0
+static f64 V_thresh = -50.0
+static f64 tau_m = 10.0
+static f64 tau_e = 10.0
+static f64 tau_i = 5.0
+static f64 tau_pre = 20.0
+static f64 tau_post = 20.0
+static f64 tau_f = 1500.0
+static f64 tau_d = 200.0
+static f64 U_baseline = 0.2
+static f64 w_ee_scale = 0.20
+static f64 w_ei_scale = 0.30
+static f64 w_ie_scale = 0.30
+static f64 J_E = 1.0      // scaling into drive; weights already carry magnitude
+static f64 J_I = 1.0
+static f64 A_plus = 0.003
+static f64 A_minus = -0.003
+static f64 w_max = 0.5
+
+// Promoted from main-local to module-level static so the integrate
+// worker (lives outside main's scope) can see it.
+static uint64 ref_steps = 20
+
+static uint64[5000] cell_type
+static f64[5000] V
+static uint64[5000] ref_count
+static f64[5000] RI
+static f64[5000] s_exc
+static f64[5000] s_inh
+static f64[5000] x_pre
+static f64[5000] x_post
+static f64[5000] u_stp
+static f64[5000] x_stp
+static f64[5000] release_factor
+static uint64[5000] spike_count
+static uint64[5000] fired_list
+
+// CSR for ALL synapses (delivery + LTD walk)
+static uint64[5001]   row_ptr
+static uint64[1800000] col_tgt
+static f64[1800000]    col_w
+static uint64[1800000] col_is_inh
+static uint64[1800000] syn_src
+
+// CSC for E→E subset only (LTP walk)
+static uint64[5001]   csc_ptr
+static uint64[1800000] csc_idx
+static uint64[5000]   csc_fill
+
+// Splitmix64 — seekable RNG lets the CSR build workers independently
+// compute their assigned draw range in O(1). See std/rng.kr.
+static uint64 RNG_SEED = 0x12345678
+static uint64 rng_draw_ctr = 0
+static uint32 rng_state = 0    // legacy slot, kept to avoid edits elsewhere
+
+// LIF integrate worker: processes neurons [start, end), appends
+// firings to this worker's private sublist. All scalar constants
+// (V_rest, V_thresh, etc.) are read from the module-level statics.
+fn integrate_worker(uint64 start, uint64 end, uint64 wid) {
+    uint64 base = wid * MT_FIRED_CAP
+    uint64 local_n = 0
+    uint64 i = start
+    while i < end {
+        if ref_count[i] > 0 {
+            ref_count[i] = ref_count[i] - 1
+            V[i] = V_reset
+        } else {
+            f64 v = V[i]
+            f64 ri = RI[i]
+            f64 se = s_exc[i]
+            f64 si = s_inh[i]
+            f64 drive = ri + se * J_E - si * J_I
+            f64 dv = dt * (V_rest - v + drive) / tau_m
+            f64 v_new = v + dv
+            V[i] = v_new
+            if v_new >= V_thresh {
+                V[i] = V_reset
+                ref_count[i] = ref_steps
+                spike_count[i] = spike_count[i] + 1
+                uint64 slot = base + local_n
+                mt_fired_lists[slot] = i
+                local_n = local_n + 1
+                x_pre[i] = x_pre[i] + 1.0
+                x_post[i] = x_post[i] + 1.0
+                f64 uv = u_stp[i]
+                f64 xv = x_stp[i]
+                f64 rel = uv * xv
+                release_factor[i] = rel
+                x_stp[i] = xv - rel
+                u_stp[i] = uv + U_baseline * (1.0 - uv)
+            }
+        }
+        i = i + 1
+    }
+    mt_n_fired[wid] = local_n
+}
+
+// Helper: atomic fetch-add an f64 at *ptr. Uses a caller-supplied
+// 8-byte scratch for the bitcast roundtrip. See std/vec_f64_mt.kr
+// for the equivalent library helper; duplicated here because the
+// library version can't see per-worker scratch slots without wid.
+fn atom_add_f64(uint64 ptr, f64 delta, uint64 scratch) {
+    while 1 {
+        uint64 old_bits = atomic_load(ptr)
+        unsafe { *(scratch as uint64) = old_bits }
+        f64 old = 0.0
+        unsafe { *(scratch as f64) -> old }
+        f64 new_val = old + delta
+        unsafe { *(scratch as f64) = new_val }
+        uint64 new_bits = 0
+        unsafe { *(scratch as uint64) -> new_bits }
+        if atomic_cas(ptr, old_bits, new_bits) != 0 { return }
+    }
+}
+
+// Delivery + LTD worker. Processes fired_list[fa_start..fa_end).
+// Races across workers on s_exc[tgt]/s_inh[tgt] scatter → atomic_add_f64.
+// col_w[syn] writes are disjoint across workers (each syn has unique
+// owning src) → plain store. mt_ltd_events is shared → atomic_add.
+fn delivery_worker(uint64 fa_start, uint64 fa_end, uint64 wid) {
+    uint64 scratch = mt_atom_scratch + wid * 8
+    uint64 fa = fa_start
+    while fa < fa_end {
+        uint64 src = fired_list[fa]
+        f64 rel = release_factor[src]
+        uint64 start = row_ptr[src]
+        uint64 end = row_ptr[src + 1]
+        uint64 syn = start
+        while syn < end {
+            uint64 tgt = col_tgt[syn]
+            f64 w = col_w[syn]
+            uint64 is_inh = col_is_inh[syn]
+            f64 effective = w * rel
+            if is_inh > 0 {
+                uint64 slot = s_inh + tgt * 8
+                atom_add_f64(slot, effective, scratch)
+            } else {
+                uint64 slot = s_exc + tgt * 8
+                atom_add_f64(slot, effective, scratch)
+                if cell_type[tgt] == 0 {
+                    f64 xq = x_post[tgt]
+                    f64 w_new = w + A_minus * xq
+                    if w_new < 0.0 { w_new = 0.0 }
+                    if w_new > w_max { w_new = w_max }
+                    col_w[syn] = w_new
+                    atomic_add(mt_ltd_events, 1)
+                }
+            }
+            syn = syn + 1
+        }
+        fa = fa + 1
+    }
+}
+
+// LTP worker. Processes fired_list[fb_start..fb_end). col_w[syn_i]
+// writes are disjoint across workers because each syn_i appears in
+// exactly one tgt's csc range. mt_ltp_events is shared → atomic_add.
+fn ltp_worker(uint64 fb_start, uint64 fb_end, uint64 wid) {
+    uint64 fb = fb_start
+    while fb < fb_end {
+        uint64 tgt = fired_list[fb]
+        if cell_type[tgt] == 0 {
+            uint64 cstart = csc_ptr[tgt]
+            uint64 cend = csc_ptr[tgt + 1]
+            uint64 ck = cstart
+            while ck < cend {
+                uint64 syn_i = csc_idx[ck]
+                uint64 src = syn_src[syn_i]
+                f64 w = col_w[syn_i]
+                f64 xp = x_pre[src]
+                f64 w_new = w + A_plus * xp
+                if w_new < 0.0 { w_new = 0.0 }
+                if w_new > w_max { w_new = w_max }
+                col_w[syn_i] = w_new
+                atomic_add(mt_ltp_events, 1)
+                ck = ck + 1
+            }
+        }
+        fb = fb + 1
+    }
+}
+
+// CSR build worker (splitmix64 version). Each worker seeks directly
+// to its starting draw counter via closed-form arithmetic:
+//
+//   draw_base(k) = 0                                          if k == 0
+//                = k * (N - 1)                                if k <= n_E
+//                = n_E * (N - 1) + (k - n_E) * n_E            otherwise
+//
+// For each kept (i, j) pair within the worker's source range, the
+// draw counter increments. rng_at(SEED, ctr) gives the byte-exact
+// same number the serial loop would have returned at that position
+// — so output matches the serial / Python reference exactly.
+fn csr_draw_base(uint64 k) -> uint64 {
+    if k == 0 { return 0 }
+    if k <= NEURONS_E { return k * (NEURONS - 1) }
+    return NEURONS_E * (NEURONS - 1) + (k - NEURONS_E) * NEURONS_E
+}
+
+// Pass-1 CSR worker — counts connections per source, writes each
+// source's count into row_ptr[i_s + 1]. Main prefix-sums after.
+fn csr_count_worker(uint64 s_start, uint64 s_end, uint64 _wid) {
+    uint64 ctr = csr_draw_base(s_start)
+    uint64 i_s = s_start
+    while i_s < s_end {
+        uint64 count = 0
+        uint64 src_e = 0
+        if cell_type[i_s] == 0 { src_e = 1 }
+        uint64 j_s = 0
+        while j_s < NEURONS {
+            if i_s != j_s {
+                uint64 tgt_e = 0
+                if cell_type[j_s] == 0 { tgt_e = 1 }
+                uint64 denom = 0
+                if src_e == 1 {
+                    if tgt_e == 1 { denom = P_EE_DENOM }
+                    else { denom = P_EI_DENOM }
+                } else {
+                    if tgt_e == 1 { denom = P_IE_DENOM }
+                }
+                if denom > 0 {
+                    uint64 r = splitmix64_at(RNG_SEED, ctr)
+                    ctr = ctr + 1
+                    if (r % denom) == 0 { count = count + 1 }
+                }
+            }
+            j_s = j_s + 1
+        }
+        row_ptr[i_s + 1] = count
+        i_s = i_s + 1
+    }
+}
+
+// Pass-2 CSR worker — writes synapses using row_ptr[i_s] (set up by
+// main's prefix sum of per-source counts) as the starting slot for
+// each source. Each source's writes are within a disjoint slot range
+// so no cross-worker races.
+fn csr_build_worker(uint64 s_start, uint64 s_end, uint64 _wid) {
+    uint64 ctr = csr_draw_base(s_start)
+    uint64 i_s = s_start
+    while i_s < s_end {
+        uint64 idx = row_ptr[i_s]    // start offset (main prefix-summed counts)
+        uint64 src_e = 0
+        if cell_type[i_s] == 0 { src_e = 1 }
+        uint64 j_s = 0
+        while j_s < NEURONS {
+            if i_s != j_s {
+                uint64 tgt_e = 0
+                if cell_type[j_s] == 0 { tgt_e = 1 }
+                uint64 denom = 0
+                f64 w = 0.0
+                if src_e == 1 {
+                    if tgt_e == 1 { denom = P_EE_DENOM; w = w_ee_scale }
+                    else { denom = P_EI_DENOM; w = w_ei_scale }
+                } else {
+                    if tgt_e == 1 { denom = P_IE_DENOM; w = w_ie_scale }
+                }
+                if denom > 0 {
+                    uint64 r = splitmix64_at(RNG_SEED, ctr)
+                    ctr = ctr + 1
+                    if (r % denom) == 0 {
+                        col_tgt[idx] = j_s
+                        col_w[idx] = w
+                        if cell_type[i_s] == 1 { col_is_inh[idx] = 1 } else { col_is_inh[idx] = 0 }
+                        syn_src[idx] = i_s
+                        idx = idx + 1
+                    }
+                }
+            }
+            j_s = j_s + 1
+        }
+        i_s = i_s + 1
+    }
+}
+
+// Splitmix64-backed serial rng_next — used by the initial serial CSR
+// pre-pass if we ever re-enable it, and kept for API compatibility
+// with the mt_full-era code. Increments rng_draw_ctr so a later
+// serial call picks up where a parallel build worker left off if
+// needed.
+fn rng_next() -> uint64 {
+    uint64 r = splitmix64_at(RNG_SEED, rng_draw_ctr)
+    rng_draw_ctr = rng_draw_ctr + 1
+    return r
+}
+
+fn rng_next_xorshift_legacy() -> uint64 {
+    uint32 s = rng_state
+    uint64 s64 = s
+    uint64 t1 = (s64 << 13) & 0xFFFFFFFF
+    s64 = s64 ^ t1
+    s64 = s64 ^ (s64 >> 17)
+    uint64 t2 = (s64 << 5) & 0xFFFFFFFF
+    s64 = s64 ^ t2
+    s64 = s64 & 0xFFFFFFFF
+    uint32 s2 = s64
+    rng_state = s2
+    return s64
+}
+
+fn main() {
+    uint64 N = 5000
+    uint64 n_E = 4000
+    uint64 n_steps = 2000     // 200 ms sim
+    // ref_steps is a module-level static now (shared with integrate_worker)
+
+    // Spin up the thread pool + cache worker fn pointers.
+    thread_pool_init(MT_NW)
+    uint64 integrate_fn = fn_addr("integrate_worker")
+    uint64 delivery_fn  = fn_addr("delivery_worker")
+    uint64 ltp_fn       = fn_addr("ltp_worker")
+
+    // p_local_ee  = 0.05   → 1/20
+    // p_local_ei  = 0.10   → 1/10
+    // p_local_ie  = 0.10   → 1/10
+    uint64 p_ee_denom = 20
+    uint64 p_ei_denom = 10
+    uint64 p_ie_denom = 10
+
+    rng_state = 305419896
+
+    uint64 j = 0
+    while j < N {
+        V[j] = V_rest
+        ref_count[j] = 0
+        s_exc[j] = 0.0
+        s_inh[j] = 0.0
+        x_pre[j] = 0.0
+        x_post[j] = 0.0
+        u_stp[j] = U_baseline
+        x_stp[j] = 1.0
+        release_factor[j] = 0.0
+        spike_count[j] = 0
+        // Drive: spread across the population with E neurons slightly lower
+        // so I neurons tend to fire a bit without external input too.
+        // Using RI as background current (no sign — adds to V).
+        RI[j] = 15.0 + int_to_f64(j) * 0.002
+        if j < n_E { cell_type[j] = 0 } else { cell_type[j] = 1 }
+        j = j + 1
+    }
+
+    // ── CSR build (two-pass parallel, splitmix64 seekable rng) ───────
+    //   Pass 1: each worker counts connections per source in its range
+    //           → row_ptr[i+1] = per-source count
+    //   Main:   prefix-sum row_ptr[] → row_ptr[i] = start offset
+    //   Pass 2: each worker writes col_* using row_ptr[i] as start slot
+    row_ptr[0] = 0
+    uint64 t_csr0 = time_ns()
+
+    uint64 count_fn = fn_addr("csr_count_worker")
+    uint64 build_fn = fn_addr("csr_build_worker")
+    uint64 csr_chunk = N / MT_NW
+
+    // Pass 1: parallel count
+    uint64 w_csr = 0
+    while w_csr < MT_NW {
+        uint64 cs_start = w_csr * csr_chunk
+        uint64 cs_end = cs_start + csr_chunk
+        if w_csr == MT_NW - 1 { cs_end = N }
+        thread_pool_submit(w_csr, count_fn, cs_start, cs_end, w_csr)
+        w_csr = w_csr + 1
+    }
+    thread_pool_wait()
+
+    // Serial prefix sum over row_ptr[]. After this, row_ptr[i] is the
+    // starting slot offset for source i (standard CSR layout).
+    uint64 rp_acc = 0
+    uint64 rp_k = 0
+    while rp_k < N {
+        uint64 rp_c = row_ptr[rp_k + 1]
+        row_ptr[rp_k + 1] = rp_acc + rp_c
+        rp_acc = rp_acc + rp_c
+        rp_k = rp_k + 1
+    }
+    uint64 n_syn = rp_acc
+
+    // Now slide row_ptr values down by 1 so row_ptr[i] = start offset.
+    // We built it as cumulative end-offsets above (row_ptr[i+1] is
+    // correct); row_ptr[0] = 0 was set earlier. Actually the prefix
+    // sum already gives the correct layout: row_ptr[i] = sum of counts
+    // 0..i-1 = start of source i. No slide needed.
+
+    // Pass 2: parallel write
+    w_csr = 0
+    while w_csr < MT_NW {
+        uint64 cs_start = w_csr * csr_chunk
+        uint64 cs_end = cs_start + csr_chunk
+        if w_csr == MT_NW - 1 { cs_end = N }
+        thread_pool_submit(w_csr, build_fn, cs_start, cs_end, w_csr)
+        w_csr = w_csr + 1
+    }
+    thread_pool_wait()
+
+    uint64 t_csr1 = time_ns()
+    uint64 csr_build_ns = t_csr1 - t_csr0
+
+    // Build CSC for E→E only
+    uint64 tj = 0
+    while tj < N {
+        csc_ptr[tj] = 0
+        csc_fill[tj] = 0
+        tj = tj + 1
+    }
+    csc_ptr[N] = 0
+    uint64 p1 = 0
+    while p1 < n_syn {
+        if col_is_inh[p1] == 0 {
+            uint64 tgt = col_tgt[p1]
+            if cell_type[tgt] == 0 {
+                csc_ptr[tgt + 1] = csc_ptr[tgt + 1] + 1
+            }
+        }
+        p1 = p1 + 1
+    }
+    uint64 acc = 0
+    uint64 pi = 0
+    while pi <= N {
+        uint64 c = csc_ptr[pi]
+        csc_ptr[pi] = acc
+        acc = acc + c
+        pi = pi + 1
+    }
+    uint64 n_ee = acc
+    uint64 p2 = 0
+    while p2 < n_syn {
+        if col_is_inh[p2] == 0 {
+            uint64 tgt = col_tgt[p2]
+            if cell_type[tgt] == 0 {
+                uint64 base = csc_ptr[tgt]
+                uint64 off = csc_fill[tgt]
+                csc_idx[base + off] = p2
+                csc_fill[tgt] = off + 1
+            }
+        }
+        p2 = p2 + 1
+    }
+
+    print("# n_syn=")
+    println(n_syn)
+    print("# n_ee=")
+    println(n_ee)
+
+    f64 f_e = dt / tau_e
+    f64 f_i = dt / tau_i
+    f64 f_pre = dt / tau_pre
+    f64 f_post = dt / tau_post
+    f64 f_u = dt / tau_f
+    f64 f_x = dt / tau_d
+
+    // Event counters live in shared static arrays so the parallel
+    // delivery/LTP workers can atomic_add them. Reset here at the
+    // start of the sim loop.
+    unsafe { *(mt_ltd_events as uint64) = 0 }
+    unsafe { *(mt_ltp_events as uint64) = 0 }
+
+    uint64 step = 0
+    while step < n_steps {
+        v_decay(s_exc, N, f_e)
+        v_decay(s_inh, N, f_i)
+        v_decay(x_pre, N, f_pre)
+        v_decay(x_post, N, f_post)
+        v_relax(u_stp, N, U_baseline, f_u)
+        v_relax(x_stp, N, 1.0, f_x)
+        v_fill(release_factor, N, 0.0)
+
+        // ── Parallel LIF integrate ────────────────────────────────────
+        // NW workers each process a contiguous neuron range. Per-worker
+        // fired sublists are concatenated in ascending-worker order so
+        // the global fired_list matches the serial i=0..N walk.
+        uint64 chunk = N / MT_NW
+        uint64 w_int = 0
+        while w_int < MT_NW {
+            uint64 c_start = w_int * chunk
+            uint64 c_end = c_start + chunk
+            if w_int == MT_NW - 1 { c_end = N }
+            thread_pool_submit(w_int, integrate_fn, c_start, c_end, w_int)
+            w_int = w_int + 1
+        }
+        thread_pool_wait()
+
+        // Concatenate per-worker fired sublists into the global fired_list
+        // (preserves serial ordering).
+        uint64 n_fired = 0
+        uint64 w_merge = 0
+        while w_merge < MT_NW {
+            uint64 base = w_merge * MT_FIRED_CAP
+            uint64 local_n = mt_n_fired[w_merge]
+            uint64 k = 0
+            while k < local_n {
+                uint64 slot = base + k
+                fired_list[n_fired] = mt_fired_lists[slot]
+                n_fired = n_fired + 1
+                k = k + 1
+            }
+            w_merge = w_merge + 1
+        }
+
+        // ── Delivery + LTD (parallel if n_fired ≥ threshold) ──────────
+        if n_fired >= MT_DISPATCH_MIN {
+            uint64 d_chunk = n_fired / MT_NW
+            uint64 w_d = 0
+            while w_d < MT_NW {
+                uint64 dd_start = w_d * d_chunk
+                uint64 dd_end = dd_start + d_chunk
+                if w_d == MT_NW - 1 { dd_end = n_fired }
+                thread_pool_submit(w_d, delivery_fn, dd_start, dd_end, w_d)
+                w_d = w_d + 1
+            }
+            thread_pool_wait()
+        } else {
+            // Serial delivery + LTD (bit-identical to Python).
+            uint64 fa = 0
+            while fa < n_fired {
+                uint64 src = fired_list[fa]
+                f64 rel = release_factor[src]
+                uint64 start = row_ptr[src]
+                uint64 end = row_ptr[src + 1]
+                uint64 syn = start
+                while syn < end {
+                    uint64 tgt = col_tgt[syn]
+                    f64 w = col_w[syn]
+                    uint64 is_inh = col_is_inh[syn]
+                    f64 effective = w * rel
+                    if is_inh > 0 {
+                        f64 cur = s_inh[tgt]
+                        s_inh[tgt] = cur + effective
+                    } else {
+                        f64 cur = s_exc[tgt]
+                        s_exc[tgt] = cur + effective
+                        if cell_type[tgt] == 0 {
+                            f64 xq = x_post[tgt]
+                            f64 w_new = w + A_minus * xq
+                            if w_new < 0.0 { w_new = 0.0 }
+                            if w_new > w_max { w_new = w_max }
+                            col_w[syn] = w_new
+                            uint64 ld = 0
+                            unsafe { *(mt_ltd_events as uint64) -> ld }
+                            ld = ld + 1
+                            unsafe { *(mt_ltd_events as uint64) = ld }
+                        }
+                    }
+                    syn = syn + 1
+                }
+                fa = fa + 1
+            }
+        }
+
+        // ── LTP (parallel if n_fired ≥ threshold) ─────────────────────
+        if n_fired >= MT_DISPATCH_MIN {
+            uint64 l_chunk = n_fired / MT_NW
+            uint64 w_l = 0
+            while w_l < MT_NW {
+                uint64 ll_start = w_l * l_chunk
+                uint64 ll_end = ll_start + l_chunk
+                if w_l == MT_NW - 1 { ll_end = n_fired }
+                thread_pool_submit(w_l, ltp_fn, ll_start, ll_end, w_l)
+                w_l = w_l + 1
+            }
+            thread_pool_wait()
+        } else {
+            // Serial LTP.
+            uint64 fb = 0
+            while fb < n_fired {
+                uint64 tgt = fired_list[fb]
+                if cell_type[tgt] == 0 {
+                    uint64 cstart = csc_ptr[tgt]
+                    uint64 cend = csc_ptr[tgt + 1]
+                    uint64 ck = cstart
+                    while ck < cend {
+                        uint64 syn_i = csc_idx[ck]
+                        uint64 src = syn_src[syn_i]
+                        f64 w = col_w[syn_i]
+                        f64 xp = x_pre[src]
+                        f64 w_new = w + A_plus * xp
+                        if w_new < 0.0 { w_new = 0.0 }
+                        if w_new > w_max { w_new = w_max }
+                        col_w[syn_i] = w_new
+                        uint64 lp = 0
+                        unsafe { *(mt_ltp_events as uint64) -> lp }
+                        lp = lp + 1
+                        unsafe { *(mt_ltp_events as uint64) = lp }
+                        ck = ck + 1
+                    }
+                }
+                fb = fb + 1
+            }
+        }
+
+        step = step + 1
+    }
+
+    // Area-level summary instead of per-neuron trace (10k lines of spike
+    // counts at N=5000 would be noise; area totals are what Noesis logs).
+    uint64 spikes_E = 0
+    uint64 spikes_I = 0
+    uint64 active_E = 0
+    uint64 active_I = 0
+    uint64 oi = 0
+    while oi < N {
+        uint64 c = spike_count[oi]
+        if cell_type[oi] == 0 {
+            spikes_E = spikes_E + c
+            if c > 0 { active_E = active_E + 1 }
+        } else {
+            spikes_I = spikes_I + c
+            if c > 0 { active_I = active_I + 1 }
+        }
+        oi = oi + 1
+    }
+
+    // Per-neuron spike trace still matters for byte-identity verification,
+    // but print it as one line instead of one-line-per-neuron.
+    uint64 pi2 = 0
+    while pi2 < N {
+        print(pi2)
+        print(" ")
+        println(spike_count[pi2])
+        pi2 = pi2 + 1
+    }
+
+    print("# spikes_E=")
+    println(spikes_E)
+    print("# spikes_I=")
+    println(spikes_I)
+    print("# active_E=")
+    println(active_E)
+    print("# active_I=")
+    println(active_I)
+    uint64 ltp_events = 0
+    unsafe { *(mt_ltp_events as uint64) -> ltp_events }
+    uint64 ltd_events = 0
+    unsafe { *(mt_ltd_events as uint64) -> ltd_events }
+    print("# ltp_events=")
+    println(ltp_events)
+    print("# ltd_events=")
+    println(ltd_events)
+
+    // Final weight / state summaries
+    f64 sum_w_ee = 0.0
+    uint64 sc = 0
+    while sc < n_syn {
+        if col_is_inh[sc] == 0 {
+            uint64 tgt = col_tgt[sc]
+            if cell_type[tgt] == 0 { sum_w_ee = sum_w_ee + col_w[sc] }
+        }
+        sc = sc + 1
+    }
+    f64 sum_u = 0.0
+    f64 sum_x = 0.0
+    uint64 uk = 0
+    while uk < N {
+        sum_u = sum_u + u_stp[uk]
+        sum_x = sum_x + x_stp[uk]
+        uk = uk + 1
+    }
+    print("# sum_w_ee_ppm=")
+    println(f64_to_int(sum_w_ee * 1000000.0))
+    print("# sum_u_stp_milli=")
+    println(f64_to_int(sum_u * 1000.0))
+    print("# sum_x_stp_milli=")
+    println(f64_to_int(sum_x * 1000.0))
+    thread_pool_shutdown()
+    exit(0)
+}
