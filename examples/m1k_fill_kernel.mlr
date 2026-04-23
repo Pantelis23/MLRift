@@ -1,0 +1,16 @@
+// MLRift Stage-1 M1k: grid-wide f64 fill through the native
+// emitter. Sets buf[gid] = value for every gid in [0, n),
+// launched multi-block.
+
+fn tid_x() -> uint64 { return 0 }
+fn block_id_x() -> uint64 { return 0 }
+
+@kernel
+fn fill_step(uint64 buf, uint32 n, f64 value, uint32 bdim) {
+    if block_id_x() * bdim + tid_x() < n {
+        uint64 p = buf + (block_id_x() * bdim + tid_x()) * 8
+        unsafe { *(p as f64) = value }
+    }
+}
+
+fn main() { exit(0) }

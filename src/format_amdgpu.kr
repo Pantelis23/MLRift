@@ -798,6 +798,31 @@ fn asm_v_dual_mov_b32_mov_b32_sgpr(uint64 vdst_x, uint64 vdst_y, uint64 src_y_sg
     asm_u32(src_y_sgpr & 0x1FF)
 }
 
+// VOPD v_dual_mov with BOTH slots sourced from SGPRs. For splat-f64:
+//   v_dual_mov_b32 v0, s_lo :: v_dual_mov_b32 v1, s_hi
+// moves an SGPR pair into a VGPR pair in one issue. Still hard-wired
+// to the canonical (vdst_x=0, vdst_y=1) layout — VOPD's implicit
+// "vdst_y = vdst_x XOR 1" pairing means (0,1) is the natural slot
+// for data placed in v[0:1].
+// Verified against llvm-mc: `v_dual_mov_b32 v0, s4 :: v_dual_mov_b32 v1, s5`
+//   → 0xCA100004 0x00000005.
+fn asm_v_dual_mov_b32_sx_sy(uint64 vdst_x, uint64 vdst_y,
+                            uint64 src_x_sgpr, uint64 src_y_sgpr) {
+    if vdst_x != 0 {
+        write(2, "format_amdgpu: asm_v_dual_mov_b32_sx_sy only supports vdst_x=0\n", 63)
+        exit(1)
+    }
+    if vdst_y != 1 {
+        write(2, "format_amdgpu: asm_v_dual_mov_b32_sx_sy only supports vdst_y=1\n", 63)
+        exit(1)
+    }
+    // Same word-1 constant skeleton as the lit/sgpr variants, with
+    // the slot-x src occupying the low 9 bits.
+    uint64 word1 = 0xCA100000 | (src_x_sgpr & 0x1FF)
+    asm_u32(word1)
+    asm_u32(src_y_sgpr & 0x1FF)
+}
+
 // ── VOP2 — two-operand VGPR math in 32 bits. Layout (gfx11):
 //   [31]     = 0   (VOP2 marker — zero bit distinguishes from VOP3/VOPC)
 //   [30:25]  = op (6 bits)
@@ -1893,6 +1918,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     uint64 is_tid_guarded_shape = 0
     uint64 is_decay_shape        = 0
     uint64 is_grid_decay_shape   = 0
+    uint64 is_grid_fill_shape    = 0
     uint32 s0_kind = ast_kind(stmt0)
     if s0_kind == 13 {
         uint32 after_if = ast_next(stmt0)
@@ -1955,7 +1981,25 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         // lowering.
         if n_params == 2 { is_tid_guarded_shape = 1 }
         if n_params == 3 { is_decay_shape       = 1 }
-        if n_params == 4 { is_grid_decay_shape  = 1 }
+        if n_params == 4 {
+            // Disambiguate grid-decay vs grid-fill by counting the
+            // then-block's statements. Decay is 5 stmts (p, v, load,
+            // assign, store); fill is 2 stmts (p, store).
+            uint32 then_body = ast_data1(stmt0)
+            uint64 wthen = then_body
+            uint64 then_stmts = 0
+            if wthen != 0 {
+                uint32 bc = ast_child(wthen)
+                uint64 wbc = bc
+                while wbc != 0 {
+                    then_stmts = then_stmts + 1
+                    uint32 nxtbc = ast_next(wbc)
+                    wbc = nxtbc
+                }
+            }
+            if then_stmts <= 2 { is_grid_fill_shape  = 1 }
+            if then_stmts >= 3 { is_grid_decay_shape = 1 }
+        }
     }
 
     uint32 stmt1 = ast_next(stmt0)
@@ -2005,7 +2049,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
     uint64 wstmt = 0
     uint32 skind = 0
-    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 && is_grid_decay_shape == 0 {
+    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 && is_grid_decay_shape == 0 && is_grid_fill_shape == 0 {
         wstmt = stmt0
         skind = ast_kind(wstmt)
         if skind != 42 {
@@ -2015,7 +2059,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
     uint64 is_lit_shape = 0
     uint64 lit32 = 0
-    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 && is_grid_decay_shape == 0 {
+    if is_tid_shape == 0 && is_tid_guarded_shape == 0 && is_decay_shape == 0 && is_grid_decay_shape == 0 && is_grid_fill_shape == 0 {
         uint32 ts = ast_data1(wstmt)
         uint64 type_size = ts
         if type_size != 4 {
@@ -2072,7 +2116,55 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     // 6 × 16 bytes = up to 6 args × (size, kind); decay uses 3.
     uint64 args_desc = alloc(6 * 16)
 
-    if is_grid_decay_shape != 0 {
+    if is_grid_fill_shape != 0 {
+        // M1k grid-fill: buf[gid] = value for gid < n. Same kernarg
+        // layout as grid-decay (buf, n, value, bdim). Body simpler —
+        // no load/fma, just a splat from the f64 kernarg pair into
+        // v[0:1] and one 8-byte global store.
+        //
+        //   s_clause 0x1
+        //   s_load_b32 s2, s[0:1], 0x18    ; bdim
+        //   s_load_b32 s4, s[0:1], 0x8     ; n
+        //   s_waitcnt lgkmcnt(0)
+        //   v_mad_u32_u24 v1, s2, s15, v0  ; gid
+        //   v_cmp_gt_u32 vcc_lo, s4, v1
+        //   s_and_saveexec_b32 s3, vcc_lo
+        //   s_cbranch_execz 9
+        //   s_load_b64 s[2:3], s[0:1], null   ; buf
+        //   s_load_b64 s[4:5], s[0:1], 0x10   ; value (f64)
+        //   v_lshlrev_b32 v2, 3, v1
+        //   s_waitcnt lgkmcnt(0)
+        //   v_dual_mov_b32 v0, s4 :: v_dual_mov_b32 v1, s5
+        //   global_store_b64 v2, v[0:1], s[2:3]
+        //   s_endpgm
+        asm_s_clause(1)
+        asm_s_load_b32(1, 0, 0x18)                  // s2 = bdim
+        asm_s_load_b32(2, 0, 0x8)                   // s4 = n
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_v_mad_u32_u24(1, 2, 15, 0)              // v1 = s2 * s15 + v0
+        asm_v_cmp_gt_u32_sgpr_vgpr(4, 1)            // vcc_lo = (s4 > v1)
+        asm_s_and_saveexec_b32_vcc_lo(3)            // save EXEC
+        asm_s_cbranch_execz(10)                     // skip 10 dwords (s_load_b64 + s_load_b64_off + v_lshl + s_waitcnt + v_dual_mov + global_store_b64) to s_endpgm
+        asm_s_load_b64(1, 0)                        // s[2:3] <- buf
+        asm_s_load_b64_off(2, 0, 0x10)              // s[4:5] <- value f64
+        asm_v_lshlrev_b32_imm(2, 3, 1)              // v2 = v1 << 3
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_v_dual_mov_b32_sx_sy(0, 1, 4, 5)        // v[0:1] = s[4:5]
+        asm_global_store_b64(2, 0, 2)               // buf[gid] = v[0:1]
+        asm_s_endpgm()
+
+        uint64 adp0 = args_desc + 0;   unsafe { *(adp0 as uint64) = 8 }
+        uint64 adp1 = args_desc + 8;   unsafe { *(adp1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        uint64 adp2 = args_desc + 16;  unsafe { *(adp2 as uint64) = 4 }
+        uint64 adp3 = args_desc + 24;  unsafe { *(adp3 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        uint64 adp4 = args_desc + 32;  unsafe { *(adp4 as uint64) = 8 }
+        uint64 adp5 = args_desc + 40;  unsafe { *(adp5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        uint64 adp6 = args_desc + 48;  unsafe { *(adp6 as uint64) = 4 }
+        uint64 adp7 = args_desc + 56;  unsafe { *(adp7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        kernarg_size = 28
+        sgpr_count   = 18
+        n_args       = 4
+    } else if is_grid_decay_shape != 0 {
         // M1j grid-decay shape: decay body with a grid-wide tid.
         //     gid = wg_id_x * bdim + threadIdx.x
         // bdim is supplied as an explicit 4th kernarg (u32) —
@@ -2272,6 +2364,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     uint64 vgpr_count_k = 2
     if is_decay_shape != 0       { vgpr_count_k = 3 }
     if is_grid_decay_shape != 0  { vgpr_count_k = 3 }
+    if is_grid_fill_shape != 0   { vgpr_count_k = 3 }
     kt_push(kname_ptr, nl, k_text_buf, k_text_size,
             args_desc, n_args, kernarg_size,
             sgpr_count, vgpr_count_k,
