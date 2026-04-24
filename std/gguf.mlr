@@ -581,11 +581,17 @@ fn int_to_f32_gguf(u64 v) -> f32 {
     return f
 }
 
-// Correct IEEE-754 binary16 → binary32 conversion. The compiler's built-in
-// f16_to_f32 currently treats subnormal halves (exp field == 0, mant != 0)
-// as if they were normal numbers, which gives the wrong magnitude by up to
-// 2× — Q6_K blocks with very small `d` scales hit this routinely. Use this
-// helper instead inside the K-quant paths.
+// Module-level scratch for the f16→f32 bit-reinterpret. The old inline
+// `uint64[1] tmp` was mmap-backed by MLRift's stack-slot allocator,
+// costing ~3 µs per call — at 820 000 calls per 14B Q8_0 matmul that
+// was 2.5 s of pure syscall waste. A single lazily-allocated 4-byte
+// buffer reused forever kills the cost. NOTE: this is safe for
+// single-threaded callers only (all current callers in gguf.mlr are
+// one-shot dequant routines). For concurrent use, callers must inline
+// the bit twiddle against their own per-worker scratch — see
+// mm_worker_q8_0_f32_avx2 in std/matmul.mlr for the pattern.
+static u64 gguf_f16_scratch = 0
+
 fn gguf_f16_to_f32_exact(u64 bits) -> f32 {
     u64 sign = (bits >> 15) & 1
     u64 exp  = (bits >> 10) & 0x1F
@@ -607,8 +613,8 @@ fn gguf_f16_to_f32_exact(u64 bits) -> f32 {
         // Normal: widen the f16 bit pattern directly into an f32 one.
         //   f32 exp = f16 exp + (127 - 15) = f16 exp + 112
         //   f32 mant = f16 mant << 13
-        uint64[1] tmp
-        u64 tp = tmp
+        if gguf_f16_scratch == 0 { gguf_f16_scratch = alloc(4) }
+        u64 tp = gguf_f16_scratch
         u64 f32_bits = ((exp + 112) << 23) | (mant << 13)
         u32 bits32 = f32_bits
         unsafe { *(tp as uint32) = bits32 }
