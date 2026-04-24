@@ -4567,6 +4567,72 @@ fn emit_amdgpu_mt_csr_i_deliver_blob(uint64 out_path) -> uint64 {
     asm_u32(0xDC560000); asm_u32(0x08060002)        // edge_to_src  → v[8:9]   saddr=s6
     asm_s_waitcnt_vmcnt_zero()
 
+    // --- Compute per-lane src*8 offset → v[10:11] (src is in v[8:9]) ---
+    // Plan had 0x00021183 for word2; llvm-mc says 0x00021083. Using
+    // llvm-mc's value (src1=v[8:9] encodes as 0x108 → bits 17:9 of word2).
+    asm_u32(0xD73C000A); asm_u32(0x00021083)        // v_lshlrev_b64 v[10:11], 3, v[8:9]
+    asm_s_delay_alu(0x01)
+
+    // --- cell_type address: v[12:13] = s[8:9] + v[10:11] ---
+    // Plan had 0x0002140A for this word2; llvm-mc says 0x00021408 (src0=s8=0x08).
+    // Plan duplicated the s10 constant here; corrected to s8.
+    asm_u32(0xD7006A0C); asm_u32(0x00021408)        // v_add_co_u32 v12, vcc_lo, s8, v10
+    // Plan had 0x01AA160B for word2; llvm-mc says 0x01AA1609 (src0=s9=0x09, not 0x0B).
+    asm_u32(0xD5207C0D); asm_u32(0x01AA1609)        // v_add_co_ci_u32_e64 v13, null, s9, v11, vcc_lo
+    asm_s_delay_alu(0x01)
+
+    // --- Load cell_type[src] → v[16:17] via saddr=OFF + 64-bit v_addr ---
+    asm_u32(0xDC560000); asm_u32(0x107C000C)        // global_load_b64 v[16:17], v[12:13], off
+    asm_s_waitcnt_vmcnt_zero()
+
+    // --- Outer predicate: cell_type[src] == 1 ---
+    asm_v_cmp_eq_u32_imm_vgpr(1, 16)                // vcc_lo = (v16 == 1)
+    asm_s_and_saveexec_b32_vcc_lo(46)               // s46 = outer EXEC, EXEC &= ct==1
+
+    // --- Recompute release address (v[12:13] is scratch) ---
+    asm_u32(0xD7006A0C); asm_u32(0x0002140A)        // v_add_co_u32 v12, vcc_lo, s10, v10
+    asm_u32(0xD5207C0D); asm_u32(0x01AA160B)        // v_add_co_ci_u32_e64 v13, null, s11, v11, vcc_lo
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC560000); asm_u32(0x127C000C)        // global_load_b64 v[18:19], v[12:13], off
+    asm_s_waitcnt_vmcnt_zero()
+
+    // --- Inner predicate: release[src] > 0.0 ---
+    asm_v_cmp_lt_f64_zero_v(18)                     // vcc_lo = (0.0 < v[18:19])
+    asm_s_and_saveexec_b32_vcc_lo(47)               // s47 = post-ct EXEC, EXEC &= rel>0
+
+    // --- Scatter address: v[20:21] = s[12:13] + tgt*8 (tgt in v[4:5]) ---
+    asm_u32(0xD73C0014); asm_u32(0x00020883)        // v_lshlrev_b64 v[20:21], 3, v[4:5]
+    asm_s_delay_alu(0x01)
+    asm_u32(0xD7006A14); asm_u32(0x0002280C)        // v_add_co_u32 v20, vcc_lo, s12, v20
+    asm_u32(0xD5207C15); asm_u32(0x01AA2A0D)        // v_add_co_ci_u32_e64 v21, null, s13, v21, vcc_lo
+    asm_s_delay_alu(0x01)
+
+    // --- effective = w * rel → v[22:23] (v[6:7]=w, v[18:19]=rel) ---
+    asm_v_mul_f64_vv(22, 6, 18)
+    asm_s_delay_alu(0x01)
+
+    // --- Prime CAS assumed = *s_inh[tgt] via saddr=OFF load ---
+    asm_u32(0xDC560000); asm_u32(0x027C0014)        // global_load_b64 v[2:3], v[20:21], off
+    asm_s_waitcnt_vmcnt_zero()
+
+    // --- CAS retry loop for atomic f64 add ---
+    uint64 cas_head_off = asm_text_len / 4
+    asm_v_add_f64_vv(0, 2, 22)                      // v[0:1] = assumed + effective
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDD0A4000); asm_u32(0x007C0014)        // global_atomic_cmpswap_b64 v[0:1], v[20:21], v[0:3], off glc
+    asm_s_waitcnt_vmcnt_zero()
+    asm_s_waitcnt_vscnt_zero()
+    asm_v_cmp_ne_u64_vv(2, 0)
+    asm_v_mov_b32(2, 0x100 | 0)                     // v2 = returned_prev_lo (copy of v0)
+    asm_v_mov_b32(3, 0x100 | 1)                     // v3 = returned_prev_hi (copy of v1)
+    uint64 cas_branch_off = asm_text_len / 4
+    uint64 cas_delta = cas_head_off - (cas_branch_off + 1)
+    asm_s_cbranch_vccnz(cas_delta & 0xFFFF)
+
+    // --- Restore EXEC masks ---
+    asm_s_mov_b32(0x7E, 47)                         // exec_lo = s47 (drop rel>0)
+    asm_s_mov_b32(0x7E, 46)                         // exec_lo = s46 (drop ct==1)
+
     asm_s_endpgm()
 
     uint64 rsrc1 = 0xE0AF0002                       // VGPR granule=2 → 24 VGPRs
