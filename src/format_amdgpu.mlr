@@ -4383,6 +4383,9 @@ fn emit_amdgpu_mt_lif_full_blob(uint64 out_path) -> uint64 {
     //   s_lshl_b64 s[52:53], s[44:45], 7 → 0x84B4872C
     //   s_add_u32  s54, s42, s52          → 0x8036342A
     //   s_addc_u32 s55, s43, s53          → 0x8237352B
+    // Ring-base pointer arithmetic (scalar, executed once per wave):
+    //   s[52:53] = w_base << 7  (N*8 = 128 for N=16)
+    //   s[54:55] = buf_delay_ptr + s[52:53]  (full 64-bit base ptr)
     asm_u32(0x84B4872C)                             // s_lshl_b64 s[52:53], s[44:45], 7
     asm_u32(0x8036342A)                             // s_add_u32  s54, s42, s52
     asm_u32(0x8237352B)                             // s_addc_u32 s55, s43, s53
@@ -4437,7 +4440,7 @@ fn emit_amdgpu_mt_lif_full_blob(uint64 out_path) -> uint64 {
                                            asm_text_buf, asm_text_len,
                                            176,     // kernarg_size
                                            8,       // kernarg_align
-                                           50,      // sgpr_count
+                                           56,      // sgpr_count
                                            48,      // vgpr_count (granule 5)
                                            rsrc1, rsrc2, rsrc3, props,
                                            args_desc, 22)
