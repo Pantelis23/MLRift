@@ -34,16 +34,30 @@ arithmetic.
 
 ## Results (20-token greedy, same seed, same CPU)
 
-| Config | Wall | tok/s | vs PyTorch F32 | vs PyTorch BF16 |
-|---|---:|---:|---:|---:|
-| **MLRift safetensors** | **684 ms** | **29.24** | **3.14×** | **1.17×** |
-| **MLRift GGUF** | **685 ms** | **29.18** | **3.13×** | **1.17×** |
-| PyTorch BF16 (bf16 weights, f32 GEMM) | 801 ms | 24.94 | 2.68× | 1.00× |
-| PyTorch F32 (f32 weights, f32 GEMM) | 2 146 ms | 9.32 | 1.00× | 0.37× |
+Wall numbers are the decode-only segment (excluding model load).
+Memory is the kernel `RUSAGE_SELF.ru_maxrss` peak over the whole
+process (load + decode). Run-to-run variance is ±3 % on the wall
+numbers; memory is deterministic.
+
+| Config | Wall | tok/s | Peak RSS | vs PyTorch F32 | vs PyTorch BF16 |
+|---|---:|---:|---:|---:|---:|
+| **MLRift safetensors** | **670 ms** | **29.83** | **1.67 GB** | **3.05×** | **1.16×** |
+| **MLRift GGUF** | **661 ms** | **30.24** | **1.67 GB** | **3.09×** | **1.17×** |
+| PyTorch BF16 (bf16 weights, f32 GEMM) | 774 ms | 25.83 | 4.44 GB | 2.64× | 1.00× |
+| PyTorch F32 (f32 weights, f32 GEMM) | 2 043 ms | 9.79 | 7.23 GB | 1.00× | 0.38× |
 
 Reference frame that makes the most sense arithmetically is **MLRift
 vs PyTorch F32**: same FMA dtype, same accumulator dtype, same CPU.
-We're **3.14× faster**.
+We're **3.05× faster** and use **4.3× less memory**. Against PyTorch
+BF16 on the same CPU (which also runs f32 GEMM): **1.16× faster** and
+**2.6× less memory**.
+
+Memory story: MLRift mmap's bf16 weights once (1.4 GB resident for
+the touched pages) plus ~250 MB of fused Q/K/V + gate/up stacked
+copies and per-step scratch. PyTorch loads the whole checkpoint into
+torch tensors and keeps both a bf16 master copy and a f32 GEMM staging
+buffer, which is why bf16-on-CPU still uses ~3× what MLRift does for
+the same weights.
 
 ## Per-op breakdown (MLRift safetensors, 20-token run at 684 ms)
 
