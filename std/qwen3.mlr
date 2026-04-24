@@ -41,6 +41,9 @@ import "io.mlr"
 // Qwen3-0.6B architectural constants. Phase 1 keeps these as compile-time
 // globals; the eventual engine will read them from config.json instead.
 // -----------------------------------------------------------------------------
+// Qwen3 architectural constants. Default values are Qwen3-0.6B so
+// existing examples link unchanged. Larger models reconfigure via
+// qwen3_set_arch() before calling forward_layer.
 static u64 QWEN3_HIDDEN         = 1024
 static u64 QWEN3_HEAD_DIM       = 128
 static u64 QWEN3_N_HEADS        = 16
@@ -49,6 +52,17 @@ static u64 QWEN3_Q_DIM          = 2048   // N_HEADS × HEAD_DIM
 static u64 QWEN3_KV_DIM         = 1024   // N_KV_HEADS × HEAD_DIM
 static u64 QWEN3_INTERMEDIATE   = 3072
 static u64 QWEN3_ROPE_DIM       = 128    // head_dim (full RoPE across the head)
+
+fn qwen3_set_arch(u64 hidden, u64 head_dim, u64 n_heads, u64 n_kv_heads, u64 ff) {
+    QWEN3_HIDDEN       = hidden
+    QWEN3_HEAD_DIM     = head_dim
+    QWEN3_N_HEADS      = n_heads
+    QWEN3_N_KV_HEADS   = n_kv_heads
+    QWEN3_Q_DIM        = n_heads * head_dim
+    QWEN3_KV_DIM       = n_kv_heads * head_dim
+    QWEN3_INTERMEDIATE = ff
+    QWEN3_ROPE_DIM     = head_dim
+}
 
 // rope_theta = 1e6 (big-number base for long-context positional encoding).
 // Expressed as f64 because 1e6 is exact in float64 but not a compile-time
@@ -242,6 +256,41 @@ static u64 qwen3_rope_sin_cache = 0
 // is too big for the duplication.
 static u64 qwen3_fuse_qkv = 1
 fn qwen3_set_fuse_qkv(u64 on) { qwen3_fuse_qkv = on }
+
+// Weight dtype selector for the big projection matmuls (Q/K/V/o/gate/
+// up/down/lm_head). 0 = BF16 row-major, 1 = Q8_0 blocks. 0.6B (both
+// safetensors and our own BF16 GGUF) uses 0; 14B Q8_0 uses 1.
+static u64 qwen3_matmul_kind = 0
+fn qwen3_set_matmul_kind(u64 kind) { qwen3_matmul_kind = kind }
+
+// Norm-weight dtype selector. 0 = BF16 (0.6B), 1 = F32 (14B GGUF ships
+// all rms_norm.weight tensors as F32). Applies to input_norm, post_norm,
+// final_norm, and the QK-norm 128-entry tensors.
+static u64 qwen3_norm_kind = 0
+fn qwen3_set_norm_kind(u64 kind) { qwen3_norm_kind = kind }
+
+// Dispatch helper used by qwen3_forward_layer everywhere it used to call
+// matmul_bf16_weights_f32 directly. Q8_0 path ignores `use_kahan` (no
+// Kahan variant yet) — residual-stream drift at 14B hasn't been tuned.
+fn qwen3_main_matmul(u64 out_ptr, u64 x_ptr, u64 w_ptr,
+                     u64 M, u64 N, u64 K,
+                     u64 num_workers, u64 use_kahan) {
+    if qwen3_matmul_kind == 0 {
+        matmul_bf16_weights_f32(out_ptr, x_ptr, w_ptr, M, N, K, num_workers, use_kahan)
+    } else {
+        matmul_q8_0_weights_f32(out_ptr, x_ptr, w_ptr, M, N, K, num_workers)
+    }
+}
+
+// Norm dispatch. BF16 path reuses the existing AVX2 bf16-weight kernel;
+// F32 path feeds qwen3_rmsnorm_f32_weights directly.
+fn qwen3_main_rmsnorm(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
+    if qwen3_norm_kind == 0 {
+        qwen3_rmsnorm_bf16(out_ptr, in_ptr, w_ptr, dim)
+    } else {
+        qwen3_rmsnorm_f32_weights(out_ptr, in_ptr, w_ptr, dim)
+    }
+}
 
 // Per-op timing accumulators. Cleared by qwen3_profile_reset(); reported
 // with qwen3_profile_dump(g_fd).
@@ -853,7 +902,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
 
     u64 x_norm = alloc(hidden * 4)
     u64 p_t0 = time_now()
-    qwen3_rmsnorm_bf16(x_norm, x_in, w.input_norm_w, hidden)
+    qwen3_main_rmsnorm(x_norm, x_in, w.input_norm_w, hidden)
     qwen3_t_input_norm = qwen3_t_input_norm + time_elapsed(p_t0)
     // qwen3_dump5("x_norm", x_norm)
 
@@ -872,15 +921,15 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     if qwen3_fuse_qkv != 0 {
         u64 qkv_dim_local = q_dim + 2 * kv_dim
         u64 qkv_buf = alloc(qkv_dim_local * 4)
-        matmul_bf16_weights_f32(qkv_buf, x_norm, w.q_proj_w, 1, qkv_dim_local, hidden, num_workers, 0)
+        qwen3_main_matmul(qkv_buf, x_norm, w.q_proj_w, 1, qkv_dim_local, hidden, num_workers, 0)
         memcpy(q_buf,  qkv_buf,                        q_dim  * 4)
         memcpy(k_row,  qkv_buf + q_dim * 4,            kv_dim * 4)
         memcpy(v_row,  qkv_buf + (q_dim + kv_dim) * 4, kv_dim * 4)
         dealloc(qkv_buf)
     } else {
-        matmul_bf16_weights_f32(q_buf, x_norm, w.q_proj_w, 1, q_dim,  hidden, num_workers, 0)
-        matmul_bf16_weights_f32(k_row, x_norm, w.k_proj_w, 1, kv_dim, hidden, num_workers, 0)
-        matmul_bf16_weights_f32(v_row, x_norm, w.v_proj_w, 1, kv_dim, hidden, num_workers, 0)
+        qwen3_main_matmul(q_buf, x_norm, w.q_proj_w, 1, q_dim,  hidden, num_workers, 0)
+        qwen3_main_matmul(k_row, x_norm, w.k_proj_w, 1, kv_dim, hidden, num_workers, 0)
+        qwen3_main_matmul(v_row, x_norm, w.v_proj_w, 1, kv_dim, hidden, num_workers, 0)
     }
     qwen3_t_qkv_proj = qwen3_t_qkv_proj + time_elapsed(p_t1)
     // qwen3_dump5("q_raw", q_buf)
@@ -890,22 +939,39 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     // qwen3_dump5("v_raw", v_row)
 
     u64 p_t2 = time_now()
-    u64 qk_w_f32 = alloc(hd * 4)
-    qwen3_bf16_row_to_f32(qk_w_f32, w.q_norm_w, hd)
+    // QK-Norm. BF16-norm models need a one-off widen of w.q_norm_w /
+    // w.k_norm_w into an f32 scratch before the per-head RMSNorm. F32-
+    // norm models (14B Q8_0) can point the RMSNorm at the weight
+    // directly — no widen, no scratch.
+    u64 qk_w_q = 0
+    u64 qk_w_k = 0
+    u64 qk_w_f32 = 0
+    if qwen3_norm_kind == 0 {
+        qk_w_f32 = alloc(hd * 4)
+        qwen3_bf16_row_to_f32(qk_w_f32, w.q_norm_w, hd)
+        qk_w_q = qk_w_f32
+    } else {
+        qk_w_q = w.q_norm_w
+    }
     u64 h = 0
     while h < nh {
         u64 q_slice = q_buf + h * hd * 4
-        qwen3_rmsnorm_f32_weights(q_slice, q_slice, qk_w_f32, hd)
+        qwen3_rmsnorm_f32_weights(q_slice, q_slice, qk_w_q, hd)
         h = h + 1
     }
-    qwen3_bf16_row_to_f32(qk_w_f32, w.k_norm_w, hd)
+    if qwen3_norm_kind == 0 {
+        qwen3_bf16_row_to_f32(qk_w_f32, w.k_norm_w, hd)
+        qk_w_k = qk_w_f32
+    } else {
+        qk_w_k = w.k_norm_w
+    }
     h = 0
     while h < nkv {
         u64 k_slice = k_row + h * hd * 4
-        qwen3_rmsnorm_f32_weights(k_slice, k_slice, qk_w_f32, hd)
+        qwen3_rmsnorm_f32_weights(k_slice, k_slice, qk_w_k, hd)
         h = h + 1
     }
-    dealloc(qk_w_f32)
+    if qwen3_norm_kind == 0 { dealloc(qk_w_f32) }
     // qwen3_dump5("q_norm", q_buf)
     // qwen3_dump5("q_norm_h0_64", q_buf + 64 * 4)
     // qwen3_dump5("q_norm_h1", q_buf + 128 * 4)
@@ -944,7 +1010,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
 
     u64 o_buf = alloc(hidden * 4)
     u64 p_t4 = time_now()
-    matmul_bf16_weights_f32(o_buf, attn_out, w.o_proj_w, 1, hidden, q_dim, num_workers, 0)
+    qwen3_main_matmul(o_buf, attn_out, w.o_proj_w, 1, hidden, q_dim, num_workers, 0)
     // qwen3_dump5("o_out",  o_buf)
 
     // Residual add: x = resid + o_buf
@@ -962,7 +1028,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     // qwen3_dump5("mid",    mid)
     u64 p_t5 = time_now()
     u64 mid_norm = alloc(hidden * 4)
-    qwen3_rmsnorm_bf16(mid_norm, mid, w.post_norm_w, hidden)
+    qwen3_main_rmsnorm(mid_norm, mid, w.post_norm_w, hidden)
     qwen3_t_post_norm = qwen3_t_post_norm + time_elapsed(p_t5)
     // qwen3_dump5("mid_norm", mid_norm)
 
@@ -973,13 +1039,13 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     if qwen3_fuse_qkv != 0 {
         u64 gu_dim_local = 2 * ff
         u64 gu_buf = alloc(gu_dim_local * 4)
-        matmul_bf16_weights_f32(gu_buf, mid_norm, w.gate_proj_w, 1, gu_dim_local, hidden, num_workers, 0)
+        qwen3_main_matmul(gu_buf, mid_norm, w.gate_proj_w, 1, gu_dim_local, hidden, num_workers, 0)
         memcpy(gate_buf, gu_buf,               ff * 4)
         memcpy(up_buf,   gu_buf + ff * 4,      ff * 4)
         dealloc(gu_buf)
     } else {
-        matmul_bf16_weights_f32(gate_buf, mid_norm, w.gate_proj_w, 1, ff, hidden, num_workers, 0)
-        matmul_bf16_weights_f32(up_buf,   mid_norm, w.up_proj_w,   1, ff, hidden, num_workers, 0)
+        qwen3_main_matmul(gate_buf, mid_norm, w.gate_proj_w, 1, ff, hidden, num_workers, 0)
+        qwen3_main_matmul(up_buf,   mid_norm, w.up_proj_w,   1, ff, hidden, num_workers, 0)
     }
     qwen3_t_gate_up = qwen3_t_gate_up + time_elapsed(p_t6)
     u64 ff_buf = alloc(ff * 4)
@@ -993,7 +1059,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     // hotspot.
     u64 ff_out = alloc(hidden * 4)
     u64 p_t8 = time_now()
-    matmul_bf16_weights_f32(ff_out, ff_buf, w.down_proj_w, 1, hidden, ff, num_workers, 0)
+    qwen3_main_matmul(ff_out, ff_buf, w.down_proj_w, 1, hidden, ff, num_workers, 0)
     // qwen3_dump5("ff_out", ff_out)
 
     // Second residual add: x_out = mid + ff_out

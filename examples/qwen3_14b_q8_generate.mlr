@@ -1,0 +1,288 @@
+// Qwen3-14B Q8_0 greedy decode — scaling test for the whole pipeline.
+//
+// Qwen3-14B architecture (from the GGUF metadata):
+//   hidden_size         = 5120
+//   head_dim            = 128
+//   num_attention_heads = 40
+//   num_key_value_heads = 8
+//   intermediate_size   = 17408
+//   num_hidden_layers   = 40
+//   vocab_size          = 151 936
+//   rope_theta          = 1e6
+//   rms_norm_eps        = 1e-6
+//   tie_word_embeddings = false  (has a separate output.weight)
+//
+// Differences from Qwen3-0.6B this example has to handle:
+//   * Projections are Q8_0 (block-quantised) instead of BF16 row-major.
+//     → qwen3_set_matmul_kind(1) routes the matmul dispatcher to
+//       matmul_q8_0_weights_f32.
+//   * Norm weights ship as F32 (not BF16).
+//     → qwen3_set_norm_kind(1) skips the widen step and calls
+//       qwen3_rmsnorm_f32_weights directly on the mmap'd tensor.
+//   * Model size (~15 GB mmap) would blow up the QKV+gate/up fusion
+//     memcpy into ~5 GB of heap-resident duplicates.
+//     → qwen3_set_fuse_qkv(0) uses the 3+2 separate matmul path.
+//   * tie_word_embeddings=false: the lm_head weight is in
+//     `output.weight`, NOT `token_embd.weight`.
+//
+// Expected: generates coherent continuation of "hello" — first-token
+// argmax won't exactly match 0.6B's because architecture differs, but
+// should match `transformers.generate` on the same GGUF if we care to
+// cross-check (llama.cpp is the easier reference here).
+
+import "../std/qwen3.mlr"
+import "../std/gguf.mlr"
+import "../std/matmul.mlr"
+import "../std/inference.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/thread.mlr"
+import "../std/time.mlr"
+
+static u64 g_fd = 0
+fn eout(u64 s) {
+    print_str(s)
+    if g_fd != 0 {
+        u64 n = str_len(s)
+        file_write(g_fd, s, n)
+    }
+}
+fn eu64(u64 v) {
+    u64 s = fmt_dec(v)
+    eout(s)
+    dealloc(s)
+}
+
+fn main() {
+    u64 num_workers = 16
+    thread_pool_init(num_workers)
+    g_fd = file_open("/tmp/qw3_14b_gen.out", 1)
+
+    // --- Reconfigure qwen3.mlr for 14B Q8_0 ---
+    qwen3_set_arch(5120, 128, 40, 8, 17408)
+    qwen3_set_matmul_kind(1)   // Q8_0
+    qwen3_set_norm_kind(1)     // F32 norms
+    qwen3_set_fuse_qkv(0)      // no weight duplication
+
+    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-14B-Q8_0.gguf"
+    eout("[qwen3_14b] loading weights\n")
+    u64 load_start_ns = time_now()
+    GGUFFile gf = gguf_open(path)
+    if gf.file_size == 0 {
+        eout("open fail\n")
+        thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+
+    u64 hidden = QWEN3_HIDDEN
+    u64 kv_dim = QWEN3_KV_DIM
+    u64 n_layers = 40
+    u64 vocab = 151936
+    u64 max_seq = 64
+    u64 max_new = 10
+
+    // token_embd is Q8_0 at 14B — need a dequantized f32 copy for the
+    // initial embedding lookup (we don't have a Q8_0 single-row decode
+    // path yet). 151 936 × 5120 × 4 B = 3.1 GB of f32. Big but fits.
+    GGUFTensor embed_t = gguf_get(gf, "token_embd.weight")
+    if embed_t.ptr == 0 {
+        eout("missing token_embd.weight\n")
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+    GGUFTensor norm_t  = gguf_get(gf, "output_norm.weight")
+    if norm_t.ptr == 0 {
+        eout("missing output_norm.weight\n")
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+    GGUFTensor lmhead_t = gguf_get(gf, "output.weight")
+    if lmhead_t.ptr == 0 {
+        eout("missing output.weight\n")
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+
+    eout("[qwen3_14b] dequantising embedding (3.1 GB f32)\n")
+    u64 embed_f32_bytes = vocab * hidden * 4
+    u64 embed_f32 = alloc(embed_f32_bytes)
+    gguf_deq_q8_0(embed_f32, embed_t.ptr, vocab * hidden)
+
+    // Per-layer weight pointer table. 11 u64 pointers × 8 = 88 bytes.
+    u64 layers_arr = alloc(n_layers * 88)
+    u64 li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * 88
+        u64 li_s = fmt_dec(li)
+        u64 pre0 = str_cat("blk.", li_s)
+        u64 prefix = str_cat(pre0, ".")
+        dealloc(li_s); dealloc(pre0)
+
+        u64 n01 = str_cat(prefix, "attn_norm.weight")
+        GGUFTensor t01 = gguf_get(gf, n01)
+        unsafe { *((base + 0 * 8) as u64) = t01.ptr }
+        dealloc(n01)
+
+        u64 n02 = str_cat(prefix, "attn_q.weight")
+        GGUFTensor t02 = gguf_get(gf, n02)
+        unsafe { *((base + 1 * 8) as u64) = t02.ptr }
+        dealloc(n02)
+
+        u64 n03 = str_cat(prefix, "attn_k.weight")
+        GGUFTensor t03 = gguf_get(gf, n03)
+        unsafe { *((base + 2 * 8) as u64) = t03.ptr }
+        dealloc(n03)
+
+        u64 n04 = str_cat(prefix, "attn_v.weight")
+        GGUFTensor t04 = gguf_get(gf, n04)
+        unsafe { *((base + 3 * 8) as u64) = t04.ptr }
+        dealloc(n04)
+
+        u64 n05 = str_cat(prefix, "attn_q_norm.weight")
+        GGUFTensor t05 = gguf_get(gf, n05)
+        unsafe { *((base + 4 * 8) as u64) = t05.ptr }
+        dealloc(n05)
+
+        u64 n06 = str_cat(prefix, "attn_k_norm.weight")
+        GGUFTensor t06 = gguf_get(gf, n06)
+        unsafe { *((base + 5 * 8) as u64) = t06.ptr }
+        dealloc(n06)
+
+        u64 n07 = str_cat(prefix, "attn_output.weight")
+        GGUFTensor t07 = gguf_get(gf, n07)
+        unsafe { *((base + 6 * 8) as u64) = t07.ptr }
+        dealloc(n07)
+
+        u64 n08 = str_cat(prefix, "ffn_norm.weight")
+        GGUFTensor t08 = gguf_get(gf, n08)
+        unsafe { *((base + 7 * 8) as u64) = t08.ptr }
+        dealloc(n08)
+
+        u64 n09 = str_cat(prefix, "ffn_gate.weight")
+        GGUFTensor t09 = gguf_get(gf, n09)
+        unsafe { *((base + 8 * 8) as u64) = t09.ptr }
+        dealloc(n09)
+
+        u64 n10 = str_cat(prefix, "ffn_up.weight")
+        GGUFTensor t10 = gguf_get(gf, n10)
+        unsafe { *((base + 9 * 8) as u64) = t10.ptr }
+        dealloc(n10)
+
+        u64 n11 = str_cat(prefix, "ffn_down.weight")
+        GGUFTensor t11 = gguf_get(gf, n11)
+        unsafe { *((base + 10 * 8) as u64) = t11.ptr }
+        dealloc(n11)
+
+        dealloc(prefix)
+        li = li + 1
+    }
+    u64 load_elapsed_ns = time_elapsed(load_start_ns)
+    eout("[qwen3_14b] 40 layers indexed; load_ms=")
+    eu64(load_elapsed_ns / 1000000); eout("\n")
+
+    // Per-layer KV cache — same shape as 0.6B but kv_dim stays 1024.
+    u64 kv_row_bytes   = kv_dim * 4
+    u64 layer_stride   = max_seq * kv_row_bytes
+    u64 total_cache    = n_layers * layer_stride
+    u64 k_cache = alloc(total_cache)
+    u64 v_cache = alloc(total_cache)
+    eout("[qwen3_14b] KV cache allocated (")
+    eu64(total_cache * 2); eout(" bytes)\n")
+
+    u64 x_cur     = alloc(hidden * 4)
+    u64 x_nxt     = alloc(hidden * 4)
+    u64 final_out = alloc(hidden * 4)
+    u64 logits    = alloc(vocab * 4)
+
+    u64 seq_cap = max_new + 1
+    u64 seq_ids = alloc(seq_cap * 8)
+
+    u64 tok = 14990
+    unsafe { *((seq_ids + 0 * 8) as u64) = tok }
+    u64 seq_len = 1
+    eout("[qwen3_14b] seed token = "); eu64(tok); eout("\n")
+
+    // Embed seed token from the dequantised f32 copy.
+    u64 row = embed_f32 + tok * hidden * 4
+    memcpy(x_cur, row, hidden * 4)
+
+    u64 pos = 0
+    u64 step = 0
+    u64 decode_start_ns = time_now()
+    while step < max_new {
+        u64 step_start_ns = time_now()
+        eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
+
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen3LayerWeights w = layers_arr + layer * 88
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+            u64 tmp = x_cur
+            x_cur = x_nxt
+            x_nxt = tmp
+            layer = layer + 1
+        }
+
+        // Final F32 RMSNorm (output_norm.weight is F32 in 14B).
+        qwen3_rmsnorm_f32_weights(final_out, x_cur, norm_t.ptr, hidden)
+        // lm_head against the untied output matrix (Q8_0).
+        matmul_q8_0_weights_f32(logits, final_out, lmhead_t.ptr, 1, vocab, hidden, num_workers)
+
+        u64 best_id = 0
+        f32 best_val = 0.0f
+        u64 first = 1
+        u64 j = 0
+        while j < vocab {
+            f32 v = 0.0f
+            unsafe { *((logits + j * 4) as f32) -> v }
+            if first == 1 {
+                best_val = v; best_id = j; first = 0
+            } else {
+                if v > best_val { best_val = v; best_id = j }
+            }
+            j = j + 1
+        }
+        u64 step_elapsed_ns = time_elapsed(step_start_ns)
+        eout("  -> next_id = "); eu64(best_id); eout(" logit=")
+        u64 lvs = fmt_f32(best_val, 4); eout(lvs); dealloc(lvs)
+        eout(" step_ms="); eu64(step_elapsed_ns / 1000000); eout("\n")
+
+        unsafe { *((seq_ids + seq_len * 8) as u64) = best_id }
+        seq_len = seq_len + 1
+
+        // Embed new token from the dequantised buffer.
+        row = embed_f32 + best_id * hidden * 4
+        memcpy(x_cur, row, hidden * 4)
+        tok = best_id
+        pos = pos + 1
+        step = step + 1
+    }
+    u64 total_decode_ns = time_elapsed(decode_start_ns)
+    u64 total_ms = total_decode_ns / 1000000
+    u64 tokps_milli = 0
+    if total_decode_ns != 0 {
+        tokps_milli = (max_new * 1000 * 1000000000) / total_decode_ns
+    }
+
+    eout("\n=== GENERATED SEQUENCE ===\n")
+    u64 si = 0
+    while si < seq_len {
+        if si != 0 { eout(", ") }
+        u64 id = 0
+        unsafe { *((seq_ids + si * 8) as u64) -> id }
+        eu64(id)
+        si = si + 1
+    }
+    eout("\n\n=== TIMING ===\n")
+    eout("total_decode_ms="); eu64(total_ms); eout("\n")
+    eout("tokens_per_sec_x1000="); eu64(tokps_milli); eout("\n")
+    eout("tokens_generated="); eu64(max_new); eout("\n")
+
+    dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits)
+    dealloc(seq_ids); dealloc(layers_arr)
+    dealloc(k_cache); dealloc(v_cache)
+    dealloc(embed_f32)
+    gguf_free(gf)
+    thread_pool_shutdown()
+    file_close(g_fd)
+    exit(0)
+}
