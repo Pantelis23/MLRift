@@ -299,6 +299,97 @@ fn qwen3_rope_apply(u64 x_ptr, u64 cos_ptr, u64 sin_ptr, u64 n_heads, u64 head_d
 // out:   f32 [n_heads, head_dim]
 // GQA: kvh = (h * n_kv_heads) / n_heads.
 // -----------------------------------------------------------------------------
+static u64 qwen3_dot_scratch = 0
+
+// AVX2 dot product of two f32 vectors of length `n` (must be multiple
+// of 8). Returns scalar. Used for the Q·K computation inside attention.
+fn qwen3_dot_avx2(u64 a_ptr, u64 b_ptr, u64 n) -> f32 {
+    if qwen3_dot_scratch == 0 { qwen3_dot_scratch = alloc(16) }
+    u64 dot_buf = qwen3_dot_scratch
+    u64 n_iter = n / 8
+    if n_iter > 0 {
+        asm {
+            // vxorps ymm0, ymm0, ymm0      ; sum = 0
+            "0xC5 0xFC 0x57 0xC0"
+            // xor rax, rax                  ; k = 0
+            "0x48 0x31 0xC0"
+            // .loop: cmp rax, rdx           ; 3 bytes
+            "0x48 0x39 0xD0"
+            // jge +24 (past body to .done)   ; rel8
+            "0x7D 0x18"
+            // vmovups ymm1, [rsi+rax*4]     ; 5 bytes
+            "0xC5 0xFC 0x10 0x0C 0x86"
+            // vmovups ymm2, [rdi+rax*4]     ; 5 bytes
+            "0xC5 0xFC 0x10 0x14 0x87"
+            // vmulps  ymm1, ymm1, ymm2      ; 4 bytes
+            "0xC5 0xF4 0x59 0xCA"
+            // vaddps  ymm0, ymm0, ymm1      ; 4 bytes
+            "0xC5 0xFC 0x58 0xC1"
+            // add rax, 8                    ; 4 bytes
+            "0x48 0x83 0xC0 0x08"
+            // jmp .loop  rel8 = -29 = 0xE3
+            "0xEB 0xE3"
+            // .done:
+            // Horizontal reduce ymm0 to scalar
+            // vextractf128 xmm1, ymm0, 1
+            "0xC4 0xE3 0x7D 0x19 0xC1 0x01"
+            // vaddps xmm0, xmm0, xmm1
+            "0xC5 0xF8 0x58 0xC1"
+            // vhaddps xmm0, xmm0, xmm0
+            "0xC5 0xFB 0x7C 0xC0"
+            // vhaddps xmm0, xmm0, xmm0
+            "0xC5 0xFB 0x7C 0xC0"
+            // vmovss [rcx], xmm0
+            "0xC5 0xFA 0x11 0x01"
+            // vzeroupper
+            "0xC5 0xF8 0x77"
+        } in(a_ptr -> rsi, b_ptr -> rdi, n -> rdx, dot_buf -> rcx) clobbers(rax)
+    }
+    f32 result = 0.0f
+    unsafe { *(dot_buf as f32) -> result }
+    return result
+}
+
+static u64 qwen3_axpy_scratch = 0
+
+// AVX2 weighted accumulate: o[i] = o[i] + alpha * v[i] for i in [0, n),
+// n must be multiple of 8. Used in the attention pass-2 V-weighted-sum.
+fn qwen3_axpy_avx2(u64 o_ptr, u64 v_ptr, f32 alpha, u64 n) {
+    if qwen3_axpy_scratch == 0 { qwen3_axpy_scratch = alloc(4) }
+    u64 alpha_buf = qwen3_axpy_scratch
+    unsafe { *(alpha_buf as f32) = alpha }
+    u64 n_iter = n / 8
+    if n_iter > 0 {
+        asm {
+            // vbroadcastss ymm3, [rcx]  ; alpha in all lanes
+            "0xC4 0xE2 0x7D 0x18 0x19"
+            // xor rax, rax
+            "0x48 0x31 0xC0"
+            // .loop: cmp rax, rdx
+            "0x48 0x39 0xD0"
+            // jge +29 (past body to .done)
+            "0x7D 0x1D"
+            // vmovups ymm0, [rsi+rax*4]   ; v
+            "0xC5 0xFC 0x10 0x04 0x86"
+            // vmovups ymm1, [rdi+rax*4]   ; o
+            "0xC5 0xFC 0x10 0x0C 0x87"
+            // vmulps  ymm0, ymm0, ymm3    ; alpha*v
+            "0xC5 0xFC 0x59 0xC3"
+            // vaddps  ymm1, ymm1, ymm0    ; o + alpha*v
+            "0xC5 0xF4 0x58 0xC8"
+            // vmovups [rdi+rax*4], ymm1   ; store
+            "0xC5 0xFC 0x11 0x0C 0x87"
+            // add rax, 8
+            "0x48 0x83 0xC0 0x08"
+            // jmp .loop  rel8 = -34 = 0xDE
+            "0xEB 0xDE"
+            // .done:
+            // vzeroupper
+            "0xC5 0xF8 0x77"
+        } in(v_ptr -> rsi, o_ptr -> rdi, n -> rdx, alpha_buf -> rcx) clobbers(rax)
+    }
+}
+
 fn qwen3_attn_cached(u64 out_ptr,
                      u64 q_ptr, u64 k_cache, u64 v_cache,
                      u64 seq_len,
@@ -312,23 +403,14 @@ fn qwen3_attn_cached(u64 out_ptr,
         u64 q_row = q_ptr   + h * head_dim * 4
         u64 o_row = out_ptr + h * head_dim * 4
 
-        // Pass 1: find max raw score across positions. Scores computed on the
-        // fly (no scratch buffer — a tiny MLRift codegen bug was corrupting
-        // a 2-entry f32[] scratch here).
+        // Pass 1: find max raw score across positions. Uses AVX2 dot
+        // product (head_dim = 128 = 16 x 8-wide).
         f32 max_score = 0.0f
         u64 first = 1
         u64 t = 0
         while t < seq_len {
             u64 k_row = k_cache + t * kv_row_bytes + kvh * head_dim * 4
-            f32 s = 0.0f
-            u64 d = 0
-            while d < head_dim {
-                f32 qv = 0.0f; unsafe { *((q_row + d * 4) as f32) -> qv }
-                f32 kv = 0.0f; unsafe { *((k_row + d * 4) as f32) -> kv }
-                s = s + qv * kv
-                d = d + 1
-            }
-            s = s * scale
+            f32 s = qwen3_dot_avx2(q_row, k_row, head_dim) * scale
             if first == 1 {
                 max_score = s
                 first = 0
@@ -338,8 +420,7 @@ fn qwen3_attn_cached(u64 out_ptr,
             t = t + 1
         }
 
-        // Zero output row. We accumulate e*V[t] into it in pass 2, then
-        // divide by sum_exp at the end.
+        // Zero output row.
         f32 zero = 0.0f
         u64 d0 = 0
         while d0 < head_dim {
@@ -347,32 +428,17 @@ fn qwen3_attn_cached(u64 out_ptr,
             d0 = d0 + 1
         }
 
-        // Pass 2: recompute each score, e = exp(score - max), accumulate
-        // e*V[t] into o_row, and accumulate sum_exp. Recomputing scores
-        // costs one extra Q·K dot per position (tiny vs V accumulate).
+        // Pass 2: recompute each score (AVX2 dot), exp(score - max),
+        // accumulate e*V[t] into o_row (AVX2 axpy), sum_exp.
         f32 sum_exp = 0.0f
         t = 0
         while t < seq_len {
             u64 k_row = k_cache + t * kv_row_bytes + kvh * head_dim * 4
             u64 v_row = v_cache + t * kv_row_bytes + kvh * head_dim * 4
-            f32 s = 0.0f
-            u64 d = 0
-            while d < head_dim {
-                f32 qv = 0.0f; unsafe { *((q_row + d * 4) as f32) -> qv }
-                f32 kv = 0.0f; unsafe { *((k_row + d * 4) as f32) -> kv }
-                s = s + qv * kv
-                d = d + 1
-            }
-            s = s * scale
+            f32 s = qwen3_dot_avx2(q_row, k_row, head_dim) * scale
             f32 e = exp_f32_fast(s - max_score)
             sum_exp = sum_exp + e
-            u64 d2 = 0
-            while d2 < head_dim {
-                f32 vv = 0.0f; unsafe { *((v_row + d2 * 4) as f32) -> vv }
-                f32 ov = 0.0f; unsafe { *((o_row + d2 * 4) as f32) -> ov }
-                unsafe { *((o_row + d2 * 4) as f32) = ov + e * vv }
-                d2 = d2 + 1
-            }
+            qwen3_axpy_avx2(o_row, v_row, e, head_dim)
             t = t + 1
         }
 
