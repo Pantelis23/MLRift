@@ -4554,6 +4554,125 @@ fn main() {
                 write(1, fa_path, fpl)
                 write(1, " (amdgpu f64-atomic-add code object)\n", 37)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-csr-scatter-demo=", 31) != 0 {
+                // Stage-1 M1q smoke: CSR scatter demo. Composes the
+                // SALU loop (M1m), EXEC-narrowing per-lane guard (M1n),
+                // and f64-atomic-add CAS loop (M1p) into the full
+                // synapse-delivery idiom that csr_e_deliver / csr_i_deliver
+                // will use once the AST lowerer lands.
+                uint64 cs_path = arg + 31
+                uint64 cs_rc = emit_amdgpu_csr_scatter_demo_blob(cs_path)
+                if cs_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-csr-scatter-demo failed\n", 44)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 cpl = str_len(cs_path)
+                write(1, cs_path, cpl)
+                write(1, " (amdgpu csr-scatter-demo code object)\n", 39)
+                exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-csr-i-deliver=", 28) != 0 {
+                // Stage-1 M1r: full csr_i_deliver shape. Scatter with
+                // cell_type==1 and release>0 guards + w*rel multiply.
+                uint64 ci_path = arg + 28
+                uint64 ci_rc = emit_amdgpu_csr_i_deliver_blob(ci_path)
+                if ci_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-csr-i-deliver failed\n", 41)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 cipl = str_len(ci_path)
+                write(1, ci_path, cipl)
+                write(1, " (amdgpu csr-i-deliver code object)\n", 36)
+                exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-csr-e-deliver=", 28) != 0 {
+                // Stage-1 M1s: full csr_e_deliver shape. Extends M1r
+                // with the STDP LTD branch (is_ee guard, fma + clamp,
+                // non-atomic w writeback, atomic u64 ltd_events inc).
+                uint64 ce_path = arg + 28
+                uint64 ce_rc = emit_amdgpu_csr_e_deliver_blob(ce_path)
+                if ce_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-csr-e-deliver failed\n", 41)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 cepl = str_len(ce_path)
+                write(1, ce_path, cepl)
+                write(1, " (amdgpu csr-e-deliver code object)\n", 36)
+                exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-lif-integrate=", 28) != 0 {
+                // Stage-1 M1t (sub-milestone 1): LIF integrate kernel
+                // — refractory branch + membrane integration with the
+                // full f64 mul/add/sub chain. Spike detect + STP + ring
+                // buffer (the rest of lif_full) come in M1t-2/3/4.
+                uint64 li_path = arg + 28
+                uint64 li_rc = emit_amdgpu_lif_integrate_blob(li_path)
+                if li_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-lif-integrate failed\n", 41)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 lipl = str_len(li_path)
+                write(1, li_path, lipl)
+                write(1, " (amdgpu lif-integrate code object)\n", 36)
+                exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-lif-spike=", 24) != 0 {
+                // Stage-1 M1t (sub-milestone 2): LIF + spike detection.
+                // Extends lif_integrate with v_new>=V_thresh check
+                // which triggers V-reset + ref-set + spike-counter++.
+                uint64 ls_path = arg + 24
+                uint64 ls_rc = emit_amdgpu_lif_spike_blob(ls_path)
+                if ls_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-lif-spike failed\n", 37)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 lspl = str_len(ls_path)
+                write(1, ls_path, lspl)
+                write(1, " (amdgpu lif-spike code object)\n", 32)
+                exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-lif-stp=", 22) != 0 {
+                // Stage-1 M1t (sub-milestone 3): LIF + spike + traces +
+                // STP update (u *= 1 + U_baseline*(1-u_old)).
+                uint64 lp_path = arg + 22
+                uint64 lp_rc = emit_amdgpu_lif_stp_blob(lp_path)
+                if lp_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-lif-stp failed\n", 35)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 lppl = str_len(lp_path)
+                write(1, lp_path, lppl)
+                write(1, " (amdgpu lif-stp code object)\n", 30)
+                exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-lif-full=", 23) != 0 {
+                // Stage-1 M1t (sub-milestone 4, Stage 1 exit):
+                // lif_full — lif_stp + ring-buffer scatter for E cells.
+                uint64 lf_path = arg + 23
+                uint64 lf_rc = emit_amdgpu_lif_full_blob(lf_path)
+                if lf_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-lif-full failed\n", 36)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 lfpl = str_len(lf_path)
+                write(1, lf_path, lfpl)
+                write(1, " (amdgpu lif-full code object)\n", 31)
+                exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-mt-lif-integrate=", 31) != 0 {
+                // Path B2 sub-milestone M1u-1: multi-thread LIF
+                // integrate. Per-lane state via tid-indexed VMEM loads.
+                uint64 mt_path = arg + 31
+                uint64 mt_rc = emit_amdgpu_mt_lif_integrate_blob(mt_path)
+                if mt_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-mt-lif-integrate failed\n", 44)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 mtpl = str_len(mt_path)
+                write(1, mt_path, mtpl)
+                write(1, " (amdgpu mt-lif-integrate code object)\n", 39)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-per-lane-loop=", 28) != 0 {
                 // Stage-1 M1n smoke: hand-crafted kernel using the
                 // VALU divergent-loop primitives (v_cmp_lt_u32 per

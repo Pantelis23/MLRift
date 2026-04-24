@@ -1,0 +1,193 @@
+// M1q full-scope gate (post-M1q' fix): multi-synapse CSR scatter
+// using clang's saddr=OFF pattern. Loads rpi_tgt[syn]/rpi_w[syn] for
+// each synapse in the row, computes the scatter address from the
+// VMEM-loaded tgt, and atomic-adds the weight into s_out[tgt].
+//
+// Test data:
+//   rpi_ptr = [0, 4]                  (1 source, 4 outgoing synapses)
+//   rpi_tgt = [0, 1, 2, 3]            (each synapse targets a distinct neuron)
+//   rpi_w   = [1.0, 2.5, 3.0, 0.5]
+//   s_out[0..3] primed to 1.0.
+// Expected:
+//   s_out[0] = 1.0 + 1.0 = 2.0
+//   s_out[1] = 1.0 + 2.5 = 3.5
+//   s_out[2] = 1.0 + 3.0 = 4.0
+//   s_out[3] = 1.0 + 0.5 = 1.5
+
+import "../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("hipSetDevice", err) }
+
+    uint64 co_path = "/tmp/m1q.co"
+    uint64 fd = file_open(co_path, 0); if fd > 0xFFFFFFFFFFFFF000 { die("open", 1) }
+    uint64 co_size = file_size(fd); uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size); file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob); if err != 0 { die("load", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fn_slot = alloc(8); uint64 kname = "csr_scatter_demo"
+    err = hipModuleGetFunction(fn_slot, mod, kname); if err != 0 { die("getFn", err) }
+    uint64 fn_handle = 0; unsafe { *(fn_slot as uint64) -> fn_handle }
+
+    // --- Build host-side CSR test data ---
+    // rpi_ptr: u64[2] = [0, 4]  (1 source, 4 outgoing synapses)
+    uint64 h_rpi_ptr = alloc(16)
+    uint64 p0 = h_rpi_ptr + 0;  unsafe { *(p0 as uint64) = 0 }
+    uint64 p1 = h_rpi_ptr + 8;  unsafe { *(p1 as uint64) = 4 }
+
+    // rpi_tgt: u64[4] = [0, 1, 2, 3]  (each synapse targets a distinct neuron)
+    uint64 h_rpi_tgt = alloc(32)
+    uint64 ti = 0
+    while ti < 4 {
+        uint64 tp = h_rpi_tgt + ti * 8
+        unsafe { *(tp as uint64) = ti }
+        ti = ti + 1
+    }
+
+    // rpi_w: f64[4] = [1.0, 2.5, 3.0, 0.5]
+    uint64 h_rpi_w = alloc(32)
+    uint64 w0p = h_rpi_w + 0;  f64 w0 = 1.0; unsafe { *(w0p as f64) = w0 }
+    uint64 w1p = h_rpi_w + 8;  f64 w1 = 2.5; unsafe { *(w1p as f64) = w1 }
+    uint64 w2p = h_rpi_w + 16; f64 w2 = 3.0; unsafe { *(w2p as f64) = w2 }
+    uint64 w3p = h_rpi_w + 24; f64 w3 = 0.5; unsafe { *(w3p as f64) = w3 }
+
+    // s_out: f64[4] primed to 1.0 — one slot per target neuron.
+    // Using 1.0 (not 0.0) as the prime so any "not run" bug shows
+    // up distinctly instead of being confused with the expected 0.
+    uint64 h_sout = alloc(32)
+    uint64 si = 0
+    while si < 4 {
+        uint64 sp = h_sout + si * 8
+        f64 z = 1.0; unsafe { *(sp as f64) = z }
+        si = si + 1
+    }
+
+    // --- Copy each array to device ---
+    uint64 d_rpi_ptr = 0
+    uint64 ds0 = alloc(8)
+    err = hipMalloc(ds0, 16); if err != 0 { die("malloc rpi_ptr", err) }
+    unsafe { *(ds0 as uint64) -> d_rpi_ptr }
+    err = hipMemcpy(d_rpi_ptr, h_rpi_ptr, 16, 1); if err != 0 { die("H2D rpi_ptr", err) }
+
+    uint64 d_rpi_tgt = 0
+    uint64 ds1 = alloc(8)
+    err = hipMalloc(ds1, 32); if err != 0 { die("malloc rpi_tgt", err) }
+    unsafe { *(ds1 as uint64) -> d_rpi_tgt }
+    err = hipMemcpy(d_rpi_tgt, h_rpi_tgt, 32, 1); if err != 0 { die("H2D rpi_tgt", err) }
+
+    uint64 d_rpi_w = 0
+    uint64 ds2 = alloc(8)
+    err = hipMalloc(ds2, 32); if err != 0 { die("malloc rpi_w", err) }
+    unsafe { *(ds2 as uint64) -> d_rpi_w }
+    err = hipMemcpy(d_rpi_w, h_rpi_w, 32, 1); if err != 0 { die("H2D rpi_w", err) }
+
+    uint64 d_sout = 0
+    uint64 ds3 = alloc(8)
+    err = hipMalloc(ds3, 32); if err != 0 { die("malloc s_out", err) }
+    unsafe { *(ds3 as uint64) -> d_sout }
+    err = hipMemcpy(d_sout, h_sout, 32, 1); if err != 0 { die("H2D s_out", err) }
+
+    // --- Kernarg marshaling: 4 pointer slots ---
+    uint64 a0 = alloc(8); unsafe { *(a0 as uint64) = d_rpi_ptr }
+    uint64 a1 = alloc(8); unsafe { *(a1 as uint64) = d_rpi_tgt }
+    uint64 a2 = alloc(8); unsafe { *(a2 as uint64) = d_rpi_w }
+    uint64 a3 = alloc(8); unsafe { *(a3 as uint64) = d_sout }
+
+    uint64 kp = alloc(32)
+    unsafe { *(kp as uint64) = a0 }
+    uint64 kp1 = kp + 8;  unsafe { *(kp1 as uint64) = a1 }
+    uint64 kp2 = kp + 16; unsafe { *(kp2 as uint64) = a2 }
+    uint64 kp3 = kp + 24; unsafe { *(kp3 as uint64) = a3 }
+
+    err = hipModuleLaunchKernel(fn_handle, 1, 1, 1, 1, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    // --- D2H: verify s_out[i] = 1.0 + rpi_w[i] (bit-exact) for i=0..3. ---
+    uint64 h_result = alloc(32)
+    err = hipMemcpy(h_result, d_sout, 32, 2); if err != 0 { die("D2H", err) }
+
+    uint64 exp_slot = alloc(8)
+
+    f64 e0 = 2.0; unsafe { *(exp_slot as f64) = e0 }
+    uint64 eb0 = 0; unsafe { *(exp_slot as uint64) -> eb0 }
+    f64 e1 = 3.5; unsafe { *(exp_slot as f64) = e1 }
+    uint64 eb1 = 0; unsafe { *(exp_slot as uint64) -> eb1 }
+    f64 e2 = 4.0; unsafe { *(exp_slot as f64) = e2 }
+    uint64 eb2 = 0; unsafe { *(exp_slot as uint64) -> eb2 }
+    f64 e3 = 1.5; unsafe { *(exp_slot as f64) = e3 }
+    uint64 eb3 = 0; unsafe { *(exp_slot as uint64) -> eb3 }
+
+    uint64 p_s0 = h_result + 0 ; uint64 b0 = 0; unsafe { *(p_s0 as uint64) -> b0 }
+    uint64 p_s1 = h_result + 8 ; uint64 b1 = 0; unsafe { *(p_s1 as uint64) -> b1 }
+    uint64 p_s2 = h_result + 16; uint64 b2 = 0; unsafe { *(p_s2 as uint64) -> b2 }
+    uint64 p_s3 = h_result + 24; uint64 b3 = 0; unsafe { *(p_s3 as uint64) -> b3 }
+
+    print_label_val("s_out[0] (bits)", 15, b0)
+    print_label_val("s_out[1] (bits)", 15, b1)
+    print_label_val("s_out[2] (bits)", 15, b2)
+    print_label_val("s_out[3] (bits)", 15, b3)
+
+    uint64 ok = 1
+    if b0 != eb0 { ok = 0 }
+    if b1 != eb1 { ok = 0 }
+    if b2 != eb2 { ok = 0 }
+    if b3 != eb3 { ok = 0 }
+
+    if ok == 1 {
+        puts("M1q gate: GREEN")
+        hipFree(d_rpi_ptr); hipFree(d_rpi_tgt); hipFree(d_rpi_w); hipFree(d_sout)
+        exit(0)
+    }
+    puts("FAIL: CSR scatter output did not match expected pattern")
+    hipFree(d_rpi_ptr); hipFree(d_rpi_tgt); hipFree(d_rpi_w); hipFree(d_sout)
+    exit(1)
+}

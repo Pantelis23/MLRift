@@ -1,0 +1,185 @@
+// M1r gate: full csr_i_deliver shape — nested guards + f64 multiply
+// + CSR scatter with atomic f64 add. Single-thread, one source neuron.
+//
+// Test data:
+//   cell_type[0] = 1           (passes ct == 1 guard)
+//   release[0]   = 0.5         (passes rel > 0 guard)
+//   rpi_ptr      = [0, 3]      (3 outgoing synapses)
+//   rpi_tgt      = [0, 1, 2]   (each hits a distinct neuron)
+//   rpi_w        = [2.0, 4.0, 6.0]
+//   s_inh[0..3]  primed to 0.0
+//
+// Expected: s_inh[i] = rel * rpi_w[i]
+//   s_inh[0] = 0.5 * 2.0 = 1.0
+//   s_inh[1] = 0.5 * 4.0 = 2.0
+//   s_inh[2] = 0.5 * 6.0 = 3.0
+//   s_inh[3] = 0.0 (untouched)
+
+import "../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+fn hmalloc_copy(uint64 host_buf, uint64 nbytes) -> uint64 {
+    uint64 dslot = alloc(8)
+    uint32 err = hipMalloc(dslot, nbytes); if err != 0 { die("hipMalloc", err) }
+    uint64 dptr = 0; unsafe { *(dslot as uint64) -> dptr }
+    err = hipMemcpy(dptr, host_buf, nbytes, 1); if err != 0 { die("H2D", err) }
+    return dptr
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("hipSetDevice", err) }
+
+    uint64 co_path = "/tmp/m1r.co"
+    uint64 fd = file_open(co_path, 0); if fd > 0xFFFFFFFFFFFFF000 { die("open", 1) }
+    uint64 co_size = file_size(fd); uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size); file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob); if err != 0 { die("load", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fn_slot = alloc(8); uint64 kname = "csr_i_deliver"
+    err = hipModuleGetFunction(fn_slot, mod, kname); if err != 0 { die("getFn", err) }
+    uint64 fn_handle = 0; unsafe { *(fn_slot as uint64) -> fn_handle }
+
+    // Host-side CSR test data.
+    uint64 h_rpi_ptr = alloc(16)
+    uint64 p0 = h_rpi_ptr + 0; unsafe { *(p0 as uint64) = 0 }
+    uint64 p1 = h_rpi_ptr + 8; unsafe { *(p1 as uint64) = 3 }
+
+    uint64 h_rpi_tgt = alloc(24)
+    uint64 ti = 0
+    while ti < 3 {
+        uint64 tp = h_rpi_tgt + ti * 8
+        unsafe { *(tp as uint64) = ti }
+        ti = ti + 1
+    }
+
+    uint64 h_rpi_w = alloc(24)
+    uint64 w0p = h_rpi_w + 0;  f64 w0 = 2.0; unsafe { *(w0p as f64) = w0 }
+    uint64 w1p = h_rpi_w + 8;  f64 w1 = 4.0; unsafe { *(w1p as f64) = w1 }
+    uint64 w2p = h_rpi_w + 16; f64 w2 = 6.0; unsafe { *(w2p as f64) = w2 }
+
+    uint64 h_cell_type = alloc(8)
+    unsafe { *(h_cell_type as uint64) = 1 }  // passes ct==1
+
+    uint64 h_release = alloc(8)
+    f64 rel = 0.5; unsafe { *(h_release as f64) = rel }
+
+    uint64 h_sinh = alloc(32)
+    uint64 si = 0
+    while si < 4 {
+        uint64 sp = h_sinh + si * 8
+        f64 z = 0.0; unsafe { *(sp as f64) = z }
+        si = si + 1
+    }
+
+    uint64 d_rpi_ptr    = hmalloc_copy(h_rpi_ptr,    16)
+    uint64 d_rpi_tgt    = hmalloc_copy(h_rpi_tgt,    24)
+    uint64 d_rpi_w      = hmalloc_copy(h_rpi_w,      24)
+    uint64 d_cell_type  = hmalloc_copy(h_cell_type,  8)
+    uint64 d_release    = hmalloc_copy(h_release,    8)
+    uint64 d_sinh       = hmalloc_copy(h_sinh,       32)
+
+    // Kernarg marshaling: 7 slots (6 pointers + 1 by-value u64 n).
+    uint64 a0 = alloc(8); unsafe { *(a0 as uint64) = d_rpi_ptr }
+    uint64 a1 = alloc(8); unsafe { *(a1 as uint64) = d_rpi_tgt }
+    uint64 a2 = alloc(8); unsafe { *(a2 as uint64) = d_rpi_w }
+    uint64 a3 = alloc(8); unsafe { *(a3 as uint64) = d_cell_type }
+    uint64 a4 = alloc(8); unsafe { *(a4 as uint64) = d_release }
+    uint64 a5 = alloc(8); unsafe { *(a5 as uint64) = d_sinh }
+    uint64 a6 = alloc(8); unsafe { *(a6 as uint64) = 1 }  // n = 1
+
+    uint64 kp = alloc(56)
+    unsafe { *(kp as uint64) = a0 }
+    uint64 kp1 = kp + 8;  unsafe { *(kp1 as uint64) = a1 }
+    uint64 kp2 = kp + 16; unsafe { *(kp2 as uint64) = a2 }
+    uint64 kp3 = kp + 24; unsafe { *(kp3 as uint64) = a3 }
+    uint64 kp4 = kp + 32; unsafe { *(kp4 as uint64) = a4 }
+    uint64 kp5 = kp + 40; unsafe { *(kp5 as uint64) = a5 }
+    uint64 kp6 = kp + 48; unsafe { *(kp6 as uint64) = a6 }
+
+    err = hipModuleLaunchKernel(fn_handle, 1, 1, 1, 1, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 h_result = alloc(32)
+    err = hipMemcpy(h_result, d_sinh, 32, 2); if err != 0 { die("D2H", err) }
+
+    uint64 exp_slot = alloc(8)
+    f64 e0 = 1.0; unsafe { *(exp_slot as f64) = e0 }
+    uint64 eb0 = 0; unsafe { *(exp_slot as uint64) -> eb0 }
+    f64 e1 = 2.0; unsafe { *(exp_slot as f64) = e1 }
+    uint64 eb1 = 0; unsafe { *(exp_slot as uint64) -> eb1 }
+    f64 e2 = 3.0; unsafe { *(exp_slot as f64) = e2 }
+    uint64 eb2 = 0; unsafe { *(exp_slot as uint64) -> eb2 }
+    f64 e3 = 0.0; unsafe { *(exp_slot as f64) = e3 }
+    uint64 eb3 = 0; unsafe { *(exp_slot as uint64) -> eb3 }
+
+    uint64 p_r0 = h_result + 0 ; uint64 b0 = 0; unsafe { *(p_r0 as uint64) -> b0 }
+    uint64 p_r1 = h_result + 8 ; uint64 b1 = 0; unsafe { *(p_r1 as uint64) -> b1 }
+    uint64 p_r2 = h_result + 16; uint64 b2 = 0; unsafe { *(p_r2 as uint64) -> b2 }
+    uint64 p_r3 = h_result + 24; uint64 b3 = 0; unsafe { *(p_r3 as uint64) -> b3 }
+
+    print_label_val("s_inh[0] (bits)", 15, b0)
+    print_label_val("s_inh[1] (bits)", 15, b1)
+    print_label_val("s_inh[2] (bits)", 15, b2)
+    print_label_val("s_inh[3] (bits)", 15, b3)
+
+    uint64 ok = 1
+    if b0 != eb0 { ok = 0 }
+    if b1 != eb1 { ok = 0 }
+    if b2 != eb2 { ok = 0 }
+    if b3 != eb3 { ok = 0 }
+
+    hipFree(d_rpi_ptr); hipFree(d_rpi_tgt); hipFree(d_rpi_w)
+    hipFree(d_cell_type); hipFree(d_release); hipFree(d_sinh)
+
+    if ok == 1 { puts("M1r gate: GREEN"); exit(0) }
+    puts("FAIL: csr_i_deliver output did not match expected")
+    exit(1)
+}

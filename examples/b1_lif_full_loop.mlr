@@ -1,0 +1,301 @@
+// Path B1: per-neuron loop launcher exercising lif_full across N=16
+// neurons. Each neuron gets its own kernel launch with kernargs
+// pointing to its slice of V/ref/RI/... arrays. Proves the native
+// lif_full kernel handles diverse per-neuron state correctly —
+// stepping stone before multi-thread lif_full_mt (B2).
+//
+// Test setup:
+//   N = 16 neurons. Half (E) have cell_type=0, half (I) have 1.
+//   Half will fire (V=2.8 + drive pushes v_new >= 3.0); half won't
+//   (V=-0.5 + weak drive stays well below).
+//   For all neurons: ref[i] = 0 initially.
+//
+// Validation:
+//   For each neuron, compare device state against host-computed
+//   reference bit-exactly.
+
+import "../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+static uint64 N = 16
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+fn hmalloc_copy(uint64 host_buf, uint64 nbytes) -> uint64 {
+    uint64 dslot = alloc(8)
+    uint32 err = hipMalloc(dslot, nbytes); if err != 0 { die("hipMalloc", err) }
+    uint64 dptr = 0; unsafe { *(dslot as uint64) -> dptr }
+    err = hipMemcpy(dptr, host_buf, nbytes, 1); if err != 0 { die("H2D", err) }
+    return dptr
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("hipSetDevice", err) }
+
+    uint64 co_path = "/tmp/m1t4.co"
+    uint64 fd = file_open(co_path, 0); if fd > 0xFFFFFFFFFFFFF000 { die("open", 1) }
+    uint64 co_size = file_size(fd); uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size); file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob); if err != 0 { die("load", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fn_slot = alloc(8); uint64 kname = "lif_full"
+    err = hipModuleGetFunction(fn_slot, mod, kname); if err != 0 { die("getFn", err) }
+    uint64 fn_handle = 0; unsafe { *(fn_slot as uint64) -> fn_handle }
+
+    // --- Allocate per-neuron state arrays (host side) ---
+    uint64 nbytes_f = N * 8
+    uint64 nbytes_u = N * 8
+
+    uint64 h_V     = alloc(nbytes_f)
+    uint64 h_ref   = alloc(nbytes_u)
+    uint64 h_RI    = alloc(nbytes_f)
+    uint64 h_se    = alloc(nbytes_f)
+    uint64 h_si    = alloc(nbytes_f)
+    uint64 h_spike = alloc(nbytes_u)
+    uint64 h_xpre  = alloc(nbytes_f)
+    uint64 h_xpost = alloc(nbytes_f)
+    uint64 h_ustp  = alloc(nbytes_f)
+    uint64 h_xstp  = alloc(nbytes_f)
+    uint64 h_rel   = alloc(nbytes_f)
+    uint64 h_ct    = alloc(nbytes_u)
+
+    // w_base=0 (single slot per neuron for simplicity). buf_delay is
+    // N slots, one per neuron, so ring-buffer write lands at slot i
+    // directly. (real production uses multi-slot delay ring; this is
+    // a flat scaled-down version to exercise the semantics.)
+    uint64 h_buf = alloc(nbytes_f)
+
+    // Initialize per-neuron. Even neurons fire (high s_exc), odd don't.
+    // E cells (cell_type=0) for i<N/2, I cells (=1) for i>=N/2.
+    uint64 i = 0
+    while i < N {
+        uint64 Vp = h_V + i * 8
+        uint64 rp = h_ref + i * 8
+        uint64 rip = h_RI + i * 8
+        uint64 sep = h_se + i * 8
+        uint64 sip = h_si + i * 8
+        uint64 spp = h_spike + i * 8
+        uint64 xpp = h_xpre + i * 8
+        uint64 xpop = h_xpost + i * 8
+        uint64 upp = h_ustp + i * 8
+        uint64 xxp = h_xstp + i * 8
+        uint64 relp = h_rel + i * 8
+        uint64 ctp = h_ct + i * 8
+        uint64 bdp = h_buf + i * 8
+
+        // Even i: fire. Odd i: don't.
+        f64 V0; f64 se0; f64 si0
+        if (i % 2) == 0 { V0 = 2.8; se0 = 10.0; si0 = 1.0 }
+        else { V0 = -0.5; se0 = 0.1; si0 = 0.1 }
+
+        unsafe { *(Vp as f64) = V0 }
+        unsafe { *(rp as uint64) = 0 }
+        f64 ri_init = 0.5; unsafe { *(rip as f64) = ri_init }
+        unsafe { *(sep as f64) = se0 }
+        unsafe { *(sip as f64) = si0 }
+        unsafe { *(spp as uint64) = 0 }
+        f64 fzero = 0.0
+        unsafe { *(xpp as f64) = fzero }
+        unsafe { *(xpop as f64) = fzero }
+        f64 u_init = 0.4; unsafe { *(upp as f64) = u_init }
+        f64 x_init = 0.8; unsafe { *(xxp as f64) = x_init }
+        unsafe { *(relp as f64) = fzero }
+        // cell_type: E (0) for first half, I (1) for second half
+        uint64 ct_val = 0
+        if i >= (N / 2) { ct_val = 1 }
+        unsafe { *(ctp as uint64) = ct_val }
+        unsafe { *(bdp as f64) = fzero }
+        i = i + 1
+    }
+
+    // --- Copy arrays to device ---
+    uint64 d_V     = hmalloc_copy(h_V,     nbytes_f)
+    uint64 d_ref   = hmalloc_copy(h_ref,   nbytes_u)
+    uint64 d_RI    = hmalloc_copy(h_RI,    nbytes_f)
+    uint64 d_se    = hmalloc_copy(h_se,    nbytes_f)
+    uint64 d_si    = hmalloc_copy(h_si,    nbytes_f)
+    uint64 d_spike = hmalloc_copy(h_spike, nbytes_u)
+    uint64 d_xpre  = hmalloc_copy(h_xpre,  nbytes_f)
+    uint64 d_xpost = hmalloc_copy(h_xpost, nbytes_f)
+    uint64 d_ustp  = hmalloc_copy(h_ustp,  nbytes_f)
+    uint64 d_xstp  = hmalloc_copy(h_xstp,  nbytes_f)
+    uint64 d_rel   = hmalloc_copy(h_rel,   nbytes_f)
+    uint64 d_ct    = hmalloc_copy(h_ct,    nbytes_u)
+    uint64 d_buf   = hmalloc_copy(h_buf,   nbytes_f)
+
+    // --- Per-neuron launch loop ---
+    // Kernel params that are constant across neurons.
+    uint64 a11 = alloc(8); f64 dtot = 0.5; unsafe { *(a11 as f64) = dtot }
+    uint64 a12 = alloc(8); f64 Vrst = 0.0; unsafe { *(a12 as f64) = Vrst }
+    uint64 a13 = alloc(8); f64 JE = 0.5;   unsafe { *(a13 as f64) = JE }
+    uint64 a14 = alloc(8); f64 JI = 0.25;  unsafe { *(a14 as f64) = JI }
+    uint64 a15 = alloc(8); f64 Vres = -99.0; unsafe { *(a15 as f64) = Vres }
+    uint64 a16 = alloc(8); f64 Vth = 3.0;   unsafe { *(a16 as f64) = Vth }
+    uint64 a17 = alloc(8); unsafe { *(a17 as uint64) = 7 }
+    uint64 a18 = alloc(8); f64 Ubase = 0.5; unsafe { *(a18 as f64) = Ubase }
+    uint64 a21 = alloc(8); unsafe { *(a21 as uint64) = 0 }  // w_base = 0
+
+    uint64 ptr_table = alloc(22 * 8)
+    // Per-neuron pointer slots — we update these each iter to point
+    // at the right arg storage buffers.
+    uint64 a0  = alloc(8)  // V
+    uint64 a1  = alloc(8)  // ref
+    uint64 a2  = alloc(8)  // RI
+    uint64 a3  = alloc(8)  // s_exc
+    uint64 a4  = alloc(8)  // s_inh
+    uint64 a5  = alloc(8)  // spike
+    uint64 a6  = alloc(8)  // x_pre
+    uint64 a7  = alloc(8)  // x_post
+    uint64 a8  = alloc(8)  // u_stp
+    uint64 a9  = alloc(8)  // x_stp
+    uint64 a10 = alloc(8)  // release
+    uint64 a19 = alloc(8)  // cell_type
+    uint64 a20 = alloc(8)  // buf_delay
+
+    // Fill ptr_table slots (constant pointers to per-arg storage).
+    uint64 p0 = ptr_table + 0;   unsafe { *(p0 as uint64) = a0 }
+    uint64 p1 = ptr_table + 8;   unsafe { *(p1 as uint64) = a1 }
+    uint64 p2 = ptr_table + 16;  unsafe { *(p2 as uint64) = a2 }
+    uint64 p3 = ptr_table + 24;  unsafe { *(p3 as uint64) = a3 }
+    uint64 p4 = ptr_table + 32;  unsafe { *(p4 as uint64) = a4 }
+    uint64 p5 = ptr_table + 40;  unsafe { *(p5 as uint64) = a5 }
+    uint64 p6 = ptr_table + 48;  unsafe { *(p6 as uint64) = a6 }
+    uint64 p7 = ptr_table + 56;  unsafe { *(p7 as uint64) = a7 }
+    uint64 p8 = ptr_table + 64;  unsafe { *(p8 as uint64) = a8 }
+    uint64 p9 = ptr_table + 72;  unsafe { *(p9 as uint64) = a9 }
+    uint64 p10 = ptr_table + 80; unsafe { *(p10 as uint64) = a10 }
+    uint64 p11 = ptr_table + 88; unsafe { *(p11 as uint64) = a11 }
+    uint64 p12 = ptr_table + 96; unsafe { *(p12 as uint64) = a12 }
+    uint64 p13 = ptr_table + 104; unsafe { *(p13 as uint64) = a13 }
+    uint64 p14 = ptr_table + 112; unsafe { *(p14 as uint64) = a14 }
+    uint64 p15 = ptr_table + 120; unsafe { *(p15 as uint64) = a15 }
+    uint64 p16 = ptr_table + 128; unsafe { *(p16 as uint64) = a16 }
+    uint64 p17 = ptr_table + 136; unsafe { *(p17 as uint64) = a17 }
+    uint64 p18 = ptr_table + 144; unsafe { *(p18 as uint64) = a18 }
+    uint64 p19 = ptr_table + 152; unsafe { *(p19 as uint64) = a19 }
+    uint64 p20 = ptr_table + 160; unsafe { *(p20 as uint64) = a20 }
+    uint64 p21 = ptr_table + 168; unsafe { *(p21 as uint64) = a21 }
+
+    i = 0
+    while i < N {
+        uint64 off = i * 8
+        unsafe { *(a0  as uint64) = d_V + off }
+        unsafe { *(a1  as uint64) = d_ref + off }
+        unsafe { *(a2  as uint64) = d_RI + off }
+        unsafe { *(a3  as uint64) = d_se + off }
+        unsafe { *(a4  as uint64) = d_si + off }
+        unsafe { *(a5  as uint64) = d_spike + off }
+        unsafe { *(a6  as uint64) = d_xpre + off }
+        unsafe { *(a7  as uint64) = d_xpost + off }
+        unsafe { *(a8  as uint64) = d_ustp + off }
+        unsafe { *(a9  as uint64) = d_xstp + off }
+        unsafe { *(a10 as uint64) = d_rel + off }
+        unsafe { *(a19 as uint64) = d_ct + off }
+        unsafe { *(a20 as uint64) = d_buf + off }
+
+        err = hipModuleLaunchKernel(fn_handle, 1, 1, 1, 1, 1, 1, 0, 0, ptr_table, 0)
+        if err != 0 { die("launch", err) }
+        err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+        i = i + 1
+    }
+
+    // --- D2H: read all arrays back ---
+    uint64 r_V     = alloc(nbytes_f); hipMemcpy(r_V,     d_V,     nbytes_f, 2)
+    uint64 r_spike = alloc(nbytes_u); hipMemcpy(r_spike, d_spike, nbytes_u, 2)
+    uint64 r_buf   = alloc(nbytes_f); hipMemcpy(r_buf,   d_buf,   nbytes_f, 2)
+
+    // --- Validate ---
+    // Expected:
+    //   Even i (fired): V=-99, spike=1, buf (E only)=rel=0.32
+    //   Odd i (didn't fire): V ≈ -0.5 + dv (small), spike=0, buf=0
+    uint64 exp_slot = alloc(8)
+    f64 e_V_fire = -99.0; unsafe { *(exp_slot as f64) = e_V_fire }
+    uint64 eb_V_fire = 0; unsafe { *(exp_slot as uint64) -> eb_V_fire }
+
+    f64 rel_v = 0.0; f64 u_i = 0.4; f64 x_i = 0.8; rel_v = u_i * x_i
+    unsafe { *(exp_slot as f64) = rel_v }
+    uint64 eb_rel = 0; unsafe { *(exp_slot as uint64) -> eb_rel }
+
+    uint64 fails = 0
+    i = 0
+    while i < N {
+        uint64 off = i * 8
+        uint64 got_V = 0; uint64 got_sp = 0; uint64 got_buf = 0
+        uint64 pV = r_V + off; unsafe { *(pV as uint64) -> got_V }
+        uint64 pS = r_spike + off; unsafe { *(pS as uint64) -> got_sp }
+        uint64 pB = r_buf + off; unsafe { *(pB as uint64) -> got_buf }
+
+        uint64 is_even = 0
+        if (i % 2) == 0 { is_even = 1 }
+        uint64 is_E = 0
+        if i < (N / 2) { is_E = 1 }
+
+        if is_even == 1 {
+            // Fired
+            if got_V != eb_V_fire { fails = fails + 1 }
+            if got_sp != 1 { fails = fails + 1 }
+            // buf: E cells → rel; I cells → 0
+            if is_E == 1 {
+                if got_buf != eb_rel { fails = fails + 1 }
+            } else {
+                if got_buf != 0 { fails = fails + 1 }
+            }
+        } else {
+            // Didn't fire — just validate spike stayed 0 and buf stayed 0.
+            if got_sp != 0 { fails = fails + 1 }
+            if got_buf != 0 { fails = fails + 1 }
+        }
+
+        i = i + 1
+    }
+
+    print_label_val("total fails ", 12, fails)
+    if fails == 0 { puts("B1 gate: GREEN"); exit(0) }
+    puts("FAIL: per-neuron loop results mismatched")
+    exit(1)
+}

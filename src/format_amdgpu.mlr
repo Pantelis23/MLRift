@@ -258,8 +258,17 @@ fn mp_fixmap(uint64 n) {
 }
 
 fn mp_fixarray(uint64 n) {
-    uint64 tag = 0x90 | (n & 0x0F)
-    amd_byte(tag)
+    if n < 16 {
+        uint64 tag = 0x90 | (n & 0x0F)
+        amd_byte(tag)
+    } else {
+        // array16 tag: 0xDC followed by u16 BE count. Needed once
+        // kernels with more than 15 kernargs appeared (M1t-3's
+        // lif_stp has 19 kernargs; lif_full will have 22).
+        amd_byte(0xDC)
+        amd_byte((n >> 8) & 0xFF)
+        amd_byte(n & 0xFF)
+    }
 }
 
 fn mp_map16(uint64 n) {
@@ -768,6 +777,18 @@ fn asm_s_cmp_lt_u32(uint64 ssrc0, uint64 ssrc1) {
     asm_u32(word)
 }
 
+// s_cmp_eq_u32 ssrc0, ssrc1  (SOPC op 0x06).
+//   Sets SCC = (ssrc0 == ssrc1). For "test register against small
+//   constant" patterns (e.g. cell_type == 1), pass ssrc1 = 0x80 + K
+//   for inline constant K. Verified: s_cmp_eq_u32 s14, 1 → 0xBF06810E.
+fn asm_s_cmp_eq_u32(uint64 ssrc0, uint64 ssrc1) {
+    uint64 word = (0xBF << 24)
+                  | (0x06 << 16)
+                  | ((ssrc1 & 0xFF) << 8)
+                  | (ssrc0 & 0xFF)
+    asm_u32(word)
+}
+
 // s_mov_b32 sdst, 0  (SOP1 op 0x00 with inline-0 src).
 //   Format: [31:23]=0x17D | [22:16]=sdst | [15:8]=op | [7:0]=ssrc0
 //   Clang reference: s_mov_b32 s2, 0 → 0xBE820080.
@@ -819,6 +840,32 @@ fn asm_v_cmp_ne_u64_vv(uint64 vsrc0_pair, uint64 vsrc1_pair) {
     uint64 src0_enc = 0x100 | (vsrc0_pair & 0xFF)
     uint64 word = (0x3E << 25)
                   | (0x5D << 17)
+                  | ((vsrc1_pair & 0xFF) << 9)
+                  | (src0_enc & 0x1FF)
+    asm_u32(word)
+}
+
+// v_cmp_lt_f64_e32 vcc_lo, 0, v[vsrc1_pair:+1]  — VOPC op 0x21.
+//   Sets VCC[lane] = (0.0 < v[vsrc1:vsrc1+1]) per active lane. With
+//   src0 pinned to inline-zero (0x80), this is the "rel > 0.0" guard
+//   used by csr_i_deliver / csr_e_deliver. Verified against llvm-mc:
+//   `v_cmp_lt_f64_e32 vcc_lo, 0, v[4:5]` → 0x7C420880.
+fn asm_v_cmp_lt_f64_zero_v(uint64 vsrc1_pair) {
+    uint64 word = (0x3E << 25)
+                  | (0x21 << 17)
+                  | ((vsrc1_pair & 0xFF) << 9)
+                  | 0x80                       // src0 = inline 0.0
+    asm_u32(word)
+}
+
+// v_cmp_ge_f64_e32 vcc_lo, v[src0:+1], v[src1:+1]  — VOPC op 0x26.
+//   Sets VCC[lane] = (v[src0:+1] >= v[src1:+1]) per active lane. Used
+//   by lif_spike to test v_new >= V_thresh for spike detection.
+//   Verified: `v_cmp_ge_f64_e32 vcc_lo, v[0:1], v[22:23]` → 0x7C4C2D00.
+fn asm_v_cmp_ge_f64_vv(uint64 vsrc0_pair, uint64 vsrc1_pair) {
+    uint64 src0_enc = 0x100 | (vsrc0_pair & 0xFF)
+    uint64 word = (0x3E << 25)
+                  | (0x26 << 17)
                   | ((vsrc1_pair & 0xFF) << 9)
                   | (src0_enc & 0x1FF)
     asm_u32(word)
@@ -878,10 +925,16 @@ fn asm_s_cbranch_execnz(uint64 simm16_dwords) { asm_sopp(0x26, simm16_dwords & 0
 //   [17]     reserved
 //   [14]     DLC
 //   [13]     GLC
-//   [12:7]   sdata (6-bit) — SGPR index for load dst / store src
-//   [6:0]    sbase_pair (7-bit) — SGPR-pair index (the even sgpr's
-//             index; gfx11 pairs align to even SGPR so the encoding
-//             is literally the SGPR number, not halved).
+//   [12:7]   sdata_pair (6-bit) — SGPR-pair index (halved): to load
+//             into s[2N:2N+1], pass N. asm_s_load_b64(0, 0) loads into
+//             s[0:1]; asm_s_load_b64(1, 0) into s[2:3]; etc.
+//   [6:0]    sbase_pair (7-bit) — SGPR-pair index, ALSO halved (NOT
+//             a raw SGPR index). To read from s[2:3], pass sbase=1;
+//             from s[4:5], pass sbase=2. This asymmetry with FLAT/
+//             GLOBAL saddr (which is raw) was verified against
+//             llvm-mc — an earlier comment here claimed the opposite
+//             because the single caller only ever used sbase=0,
+//             masking the issue.
 // Word 2 (offset):
 //   [31:25]  soffset (7-bit SGPR index; 0x7D = SGPR_NULL)
 //   [24:0]   25-bit signed immediate offset
@@ -1127,6 +1180,29 @@ fn asm_global_load_b64(uint64 vdst_pair, uint64 v_addr, uint64 saddr_pair) {
     asm_u32(word2)
 }
 
+// global_load_b64 ... glc  — bit 14 of word1 forces a bypass of L0
+// so the load reads through L2. Needed when reading a location that
+// an atomic just wrote on this same wave: a plain load would hit
+// stale L0 and the CAS-loop's "assumed" would not match the actual
+// post-atomic memory value. Verified via llvm-mc: word1 = 0xDC564000.
+fn asm_global_load_b64_glc(uint64 vdst_pair, uint64 v_addr, uint64 saddr_pair) {
+    asm_u32(0xDC564000)
+    uint64 word2 = ((saddr_pair & 0x7F) << 16)
+                   | ((vdst_pair & 0xFF) << 24)
+                   | ((v_addr    & 0xFF) << 0)
+    asm_u32(word2)
+}
+
+// buffer_gl0_inv — invalidate the L0 cache. No operands; emits
+// a 64-bit instruction (word1=0xE0AC0000, word2=0). Used after
+// an atomic-with-return so that subsequent plain global_loads
+// from the same address do not return the pre-atomic value from
+// a stale L0 cache line.
+fn asm_buffer_gl0_inv() {
+    asm_u32(0xE0AC0000)
+    asm_u32(0x00000000)
+}
+
 // global_store_b64 v_addr, v[vdata_pair:+1], s[saddr_pair:+1]  (op 0x1B)
 // Stores the VGPR pair starting at vdata_pair to (s[saddr]+v_addr).
 // Verified against llvm-mc:
@@ -1244,6 +1320,37 @@ fn asm_v_add_f64_vv(uint64 vdst_pair, uint64 v_src0_pair, uint64 v_src1_pair) {
     uint64 src0_enc = 0x100 | (v_src0_pair & 0xFF)
     uint64 src1_enc = 0x100 | (v_src1_pair & 0xFF)
     uint64 word2 = ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word2)
+}
+
+// v_mul_f64 vdst_pair, v_src0_pair, v_src1_pair  (VOP3 op 0x128).
+//   Companion to v_add_f64_vv. csr_i_deliver computes effective =
+//   w * release, both VGPR pairs, storing into another pair.
+//   Verified: v_mul_f64 v[0:1], v[2:3], v[4:5] → 0xD7280000 0x00020902.
+fn asm_v_mul_f64_vv(uint64 vdst_pair, uint64 v_src0_pair, uint64 v_src1_pair) {
+    uint64 word1 = (0x6B << 25) | (0x128 << 16) | (vdst_pair & 0xFF)
+    asm_u32(word1)
+    uint64 src0_enc = 0x100 | (v_src0_pair & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1_pair & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word2)
+}
+
+// v_sub_f64 vdst_pair, v_src0_pair, v_src1_pair  (= v_add_f64 with neg[1]=1).
+//   Implemented as `v_add_f64 vdst, src0, -src1` on gfx11 (no dedicated
+//   subtract op). Used by the LIF integrate body for V_rest - V and
+//   drive - s_inh * J_I. Verified: v_add_f64 v[2:3], v[2:3], -v[6:7]
+//   → 0xD7270002 0x40020D02 (neg bit at word2[30]).
+fn asm_v_sub_f64_vv(uint64 vdst_pair, uint64 v_src0_pair, uint64 v_src1_pair) {
+    uint64 word1 = (0x6B << 25) | (0x127 << 16) | (vdst_pair & 0xFF)
+    asm_u32(word1)
+    uint64 src0_enc = 0x100 | (v_src0_pair & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1_pair & 0xFF)
+    uint64 neg = 0x2                                // neg[1] = 1 → src1 negated
+    uint64 word2 = (neg << 29)
+                   | ((src1_enc & 0x1FF) << 9)
                    | (src0_enc & 0x1FF)
     asm_u32(word2)
 }
@@ -2385,6 +2492,1694 @@ fn emit_amdgpu_f64_atomic_add_blob(uint64 out_path) -> uint64 {
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
         write(2, "emit_amdgpu_f64_atomic_add_blob: cannot open output\n", 52)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// M1q (post-M1q' hazard fix) full CSR scatter demo: multi-synapse
+// while loop + CSR-indirected (tgt, w) loads + f64 atomic-add into
+// s_out[tgt]. Uses the clang-matching pattern discovered during the
+// M1q' investigation:
+//   * Scalar precomputation of rpi_tgt+syn*8 and rpi_w+syn*8 in SGPR
+//     pairs (s_lshl_b64 + s_add_u32 + s_addc_u32).
+//   * VMEM loads of tgt/w with saddr=<precomputed pair> and a
+//     constant-zero v_addr VGPR (v8=0).
+//   * 64-bit scatter address computed as a VGPR pair (v[6:7]) via
+//     v_lshlrev_b64 + v_add_co_u32 + v_add_co_ci_u32_e64.
+//   * Assumed-load and global_atomic_cmpswap use saddr=OFF (0x7C)
+//     with a full 64-bit v_addr pair. The mixed saddr+32b-v_addr
+//     mode my earlier attempts used failed under two specific
+//     conditions that this pattern avoids: (a) VMEM-loaded VGPR
+//     used as v_lshlrev source, and (b) chained atomic ops to the
+//     same saddr-anchored address.
+//
+// Kernargs (32 bytes):
+//   [0..7]   = rpi_ptr_ptr  (u64* — CSR row pointers)
+//   [8..15]  = rpi_tgt_ptr  (u64* — target-neuron column indices)
+//   [16..23] = rpi_w_ptr    (f64* — synapse weights)
+//   [24..31] = s_out_ptr    (f64* — scatter destination)
+@export
+fn emit_amdgpu_csr_scatter_demo_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "csr_scatter_demo"
+    uint64 klen  = 16
+
+    asm_init()
+
+    // --- Prologue: 4 pointer kernargs ---
+    asm_s_load_b64(1, 0)                            // s[2:3] = rpi_ptr_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5] = rpi_tgt_ptr
+    asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7] = rpi_w_ptr
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9] = s_out_ptr
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // --- Second-level SMEM: [start, end] = rpi_ptr[0..1] ---
+    asm_s_load_b64_off(5, 1, 0x00)                  // s[10:11] = start
+    asm_s_load_b64_off(6, 1, 0x08)                  // s[12:13] = end
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Constant zero VGPR used as v_addr for saddr-only VMEM loads.
+    asm_v_mov_b32_inline_u(8, 0)
+
+    // --- loop_head (SALU-driven while loop over synapses) ---
+    uint64 loop_head_off = asm_text_len / 4
+    asm_s_cmp_lt_u32(10, 12)                        // scc = (syn < end)
+    uint64 scc_patch_off = asm_text_len / 4
+    asm_s_cbranch_scc0(0)                           // (placeholder, patched below)
+
+    // Scalar precompute: s[14:15] = syn * 8
+    asm_u32(0x848E830A)                             // s_lshl_b64 s[14:15], s[10:11], 3
+
+    // s[16:17] = rpi_tgt_ptr + syn*8  (64-bit add)
+    asm_u32(0x80100E04)                             // s_add_u32  s16, s4, s14
+    asm_u32(0x82110F05)                             // s_addc_u32 s17, s5, s15
+
+    // s[18:19] = rpi_w_ptr + syn*8
+    asm_u32(0x80120E06)                             // s_add_u32  s18, s6, s14
+    asm_u32(0x82130F07)                             // s_addc_u32 s19, s7, s15
+
+    // Clang-matching layout: tgt goes into v[0:1], gets shifted in
+    // place, then the scatter addr is built into v[6:7]. vmcnt(1) to
+    // wait for ONLY the tgt load, like clang does.
+    asm_u32(0xDC560000)                             // global_load_b64 v[0:1], v8, s[16:17]
+    asm_u32(0x00100008)
+    asm_u32(0xDC560000)                             // global_load_b64 v[4:5], v8, s[18:19]
+    asm_u32(0x04120008)
+    // s_waitcnt vmcnt(1) → word 0xBF8907F7 per clang. 0x07F7 = vmcnt=1
+    // with other counters max.
+    asm_u32(0xBF8907F7)
+
+    // Shift tgt in place as 64-bit pair (byte offset for scatter).
+    asm_u32(0xD73C0000)                             // v_lshlrev_b64 v[0:1], 3, v[0:1]
+    asm_u32(0x00020083)
+
+    // Compound s_delay_alu matching clang between v_lshlrev_b64 and
+    // v_add_co_u32: VALU_DEP_1 | instskip(NEXT) | instid1(VALU_DEP_1)
+    // = simm 0x0091 (SOPP op 0x07).
+    asm_u32(0xBF870091)
+
+    // Scatter address v[6:7] = s[8:9] + v[0:1] with carry.
+    asm_u32(0xD7006A06)                             // v_add_co_u32 v6, vcc_lo, s8, v0
+    asm_u32(0x00020008)
+    asm_u32(0xD5207C07)                             // v_add_co_ci_u32_e64 v7, null, s9, v1, vcc_lo
+    asm_u32(0x01AA0209)
+
+    // Prime CAS "assumed" — saddr=OFF, v[6:7] is the 64-bit v_addr.
+    asm_u32(0xDC560000)                             // global_load_b64 v[2:3], v[6:7], off
+    asm_u32(0x027C0006)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // --- CAS retry loop for f64 atomic-add ---
+    uint64 cas_head_off = asm_text_len / 4
+    asm_v_add_f64_vv(0, 2, 4)                       // v[0:1] = assumed + w
+    asm_s_delay_alu(0x01)
+
+    asm_u32(0xDD0A4000)                             // global_atomic_cmpswap_b64 v[0:1], v[6:7], v[0:3], off glc
+    asm_u32(0x007C0006)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_s_waitcnt_vscnt_zero()
+
+    asm_v_cmp_ne_u64_vv(2, 0)
+    asm_v_mov_b32(2, 0x100 | 0)
+    asm_v_mov_b32(3, 0x100 | 1)
+    uint64 cas_branch_off = asm_text_len / 4
+    uint64 cas_delta = cas_head_off - (cas_branch_off + 1)
+    asm_s_cbranch_vccnz(cas_delta & 0xFFFF)
+
+    // Bump syn and loop back.
+    asm_s_add_u32_imm(10, 10, 1)
+    uint64 outer_branch_off = asm_text_len / 4
+    uint64 outer_delta = loop_head_off - (outer_branch_off + 1)
+    asm_s_branch(outer_delta & 0xFFFF)
+
+    // loop_exit: back-patch the scc0 cbranch.
+    uint64 loop_exit_off = asm_text_len / 4
+    uint64 scc_skip = loop_exit_off - (scc_patch_off + 1)
+    uint64 patch_byte = asm_text_buf + scc_patch_off * 4
+    uint32 new_word = 0xBFA10000 | (scc_skip & 0xFFFF)
+    unsafe { *(patch_byte as uint32) = new_word }
+
+    asm_s_endpgm()
+
+    uint64 rsrc1 = 0xE0AF0000
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    // Four GLOBAL_BUFFER pointer kernargs.
+    uint64[8] args_desc
+    uint64 a0 = args_desc + 0;  unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;  unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16; unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24; unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32; unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40; unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6 = args_desc + 48; unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56; unsafe { *(a7 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           32,      // kernarg_size (4 × 8 bytes)
+                                           8,       // kernarg_align
+                                           20,      // sgpr_count (s0..s19)
+                                           16,      // vgpr_count (v0..v15)
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 4)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_csr_scatter_demo_blob: cannot open output\n", 54)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// M1r csr_i_deliver: the first full scientific shape — the inhibitory
+// CSR delivery kernel. Extends M1q's scatter with:
+//   * Two nested guards over scalar state (cell_type == 1, release > 0)
+//     implemented with SALU compares + scc/vccz branches so the body
+//     is skipped when the guards fail (single-thread scope).
+//   * f64 multiply of w * rel to produce the effective conductance
+//     before the atomic-add.
+// Single-thread semantics mirror the inner body of csr_i_deliver in
+// examples/gpu_csr_i.mlr; a future milestone wires this into the AST
+// lowerer + multi-thread EXEC-narrowing.
+//
+// Kernargs (56 bytes):
+//   [0..7]   rpi_ptr_ptr    (u64*)
+//   [8..15]  rpi_tgt_ptr    (u64*)
+//   [16..23] rpi_w_ptr      (f64*)
+//   [24..31] cell_type_ptr  (u64*)
+//   [32..39] release_ptr    (f64*)
+//   [40..47] s_inh_ptr      (f64*, scatter destination)
+//   [48..55] n              (u64 by-value; unused in single-thread)
+@export
+fn emit_amdgpu_csr_i_deliver_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "csr_i_deliver"
+    uint64 klen  = 13
+
+    asm_init()
+
+    // --- Prologue: 6 pointer kernargs (+ n kernarg skipped) ---
+    asm_s_load_b64(1, 0)                            // s[2:3]   = rpi_ptr_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5]   = rpi_tgt_ptr
+    asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7]   = rpi_w_ptr
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9]   = cell_type_ptr
+    asm_s_load_b64_off(5, 0, 0x20)                  // s[10:11] = release_ptr
+    asm_s_load_b64_off(6, 0, 0x28)                  // s[12:13] = s_inh_ptr
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // --- Guard 1: ct == 1 ---
+    asm_s_load_b64_off(7, 4, 0x00)                  // s[14:15] = *cell_type_ptr
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_s_cmp_eq_u32(14, 0x81)                      // scc = (s14 == 1)
+    uint64 ct_patch_off = asm_text_len / 4
+    asm_s_cbranch_scc0(0)                           // placeholder → loop_exit
+
+    // --- Guard 2: rel > 0.0 ---
+    asm_s_load_b64_off(8, 5, 0x00)                  // s[16:17] = rel bits
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_v_mov_b32(4, 16)                            // v4 = s16 (rel_lo)
+    asm_v_mov_b32(5, 17)                            // v5 = s17 (rel_hi)
+    asm_s_delay_alu(0x02)
+    asm_v_cmp_lt_f64_zero_v(4)                      // vcc = (0.0 < rel)
+    uint64 rel_patch_off = asm_text_len / 4
+    asm_sopp(0x23, 0)                               // s_cbranch_vccz placeholder → loop_exit
+
+    // --- Load start, end via SMEM (sbase=1 = s[2:3] = rpi_ptr_ptr) ---
+    asm_s_load_b64_off(9, 1, 0x00)                  // s[18:19] = start
+    asm_s_load_b64_off(10, 1, 0x08)                 // s[20:21] = end
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // v8 = 0 constant for saddr-only VMEM loads.
+    asm_v_mov_b32_inline_u(8, 0)
+
+    // --- Outer loop: for syn in [start, end) ---
+    uint64 loop_head_off = asm_text_len / 4
+    asm_s_cmp_lt_u32(18, 20)                        // scc = (syn < end)
+    uint64 loop_patch_off = asm_text_len / 4
+    asm_s_cbranch_scc0(0)                           // placeholder → loop_exit
+
+    // Scalar precompute of rpi_tgt+syn*8 and rpi_w+syn*8.
+    asm_u32(0x84968312)                             // s_lshl_b64 s[22:23], s[18:19], 3
+    asm_u32(0x80181604)                             // s_add_u32  s24, s4, s22
+    asm_u32(0x82191705)                             // s_addc_u32 s25, s5, s23
+    asm_u32(0x801A1606)                             // s_add_u32  s26, s6, s22
+    asm_u32(0x821B1707)                             // s_addc_u32 s27, s7, s23
+
+    // VMEM: v[0:1] = rpi_tgt[syn], v[6:7] = rpi_w[syn]
+    asm_u32(0xDC560000)                             // global_load_b64 v[0:1], v8, s[24:25]
+    asm_u32(0x00180008)
+    asm_u32(0xDC560000)                             // global_load_b64 v[6:7], v8, s[26:27]
+    asm_u32(0x061A0008)
+    asm_u32(0xBF8907F7)                             // s_waitcnt vmcnt(1) — wait for tgt only
+
+    // Shift tgt*8 in place (clang-matching layout).
+    asm_u32(0xD73C0000)                             // v_lshlrev_b64 v[0:1], 3, v[0:1]
+    asm_u32(0x00020083)
+    asm_u32(0xBF870091)                             // s_delay_alu VALU_DEP_1 | instskip(NEXT) | instid1(VALU_DEP_1)
+
+    // Scatter addr v[10:11] = s_inh + tgt*8.
+    asm_u32(0xD7006A0A)                             // v_add_co_u32 v10, vcc_lo, s12, v0
+    asm_u32(0x0002000C)
+    asm_u32(0xD5207C0B)                             // v_add_co_ci_u32_e64 v11, null, s13, v1, vcc_lo
+    asm_u32(0x01AA020D)
+
+    // Wait for w load, then compute effective = w * rel.
+    asm_s_waitcnt_vmcnt_zero()
+    asm_v_mul_f64_vv(12, 6, 4)                      // v[12:13] = w * rel
+    asm_s_delay_alu(0x01)
+
+    // Prime CAS assumed = *s_inh[tgt] via saddr=OFF load.
+    asm_u32(0xDC560000)                             // global_load_b64 v[2:3], v[10:11], off
+    asm_u32(0x027C000A)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // --- CAS retry loop for the atomic add ---
+    uint64 cas_head_off = asm_text_len / 4
+    asm_v_add_f64_vv(0, 2, 12)                      // v[0:1] = assumed + effective
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDD0A4000)                             // global_atomic_cmpswap_b64 v[0:1], v[10:11], v[0:3], off glc
+    asm_u32(0x007C000A)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_s_waitcnt_vscnt_zero()
+    asm_v_cmp_ne_u64_vv(2, 0)
+    asm_v_mov_b32(2, 0x100 | 0)
+    asm_v_mov_b32(3, 0x100 | 1)
+    uint64 cas_branch_off = asm_text_len / 4
+    uint64 cas_delta = cas_head_off - (cas_branch_off + 1)
+    asm_s_cbranch_vccnz(cas_delta & 0xFFFF)
+
+    // Bump syn and branch back.
+    asm_s_add_u32_imm(18, 18, 1)
+    uint64 outer_branch_off = asm_text_len / 4
+    uint64 outer_delta = loop_head_off - (outer_branch_off + 1)
+    asm_s_branch(outer_delta & 0xFFFF)
+
+    // --- loop_exit: patch the three forward-skip placeholders ---
+    uint64 loop_exit_off = asm_text_len / 4
+
+    uint64 ct_skip = loop_exit_off - (ct_patch_off + 1)
+    uint64 pb0 = asm_text_buf + ct_patch_off * 4
+    uint32 w_ct = 0xBFA10000 | (ct_skip & 0xFFFF)
+    unsafe { *(pb0 as uint32) = w_ct }
+
+    uint64 rel_skip = loop_exit_off - (rel_patch_off + 1)
+    uint64 pb1 = asm_text_buf + rel_patch_off * 4
+    uint32 w_rel = 0xBFA30000 | (rel_skip & 0xFFFF)
+    unsafe { *(pb1 as uint32) = w_rel }
+
+    uint64 loop_skip = loop_exit_off - (loop_patch_off + 1)
+    uint64 pb2 = asm_text_buf + loop_patch_off * 4
+    uint32 w_loop = 0xBFA10000 | (loop_skip & 0xFFFF)
+    unsafe { *(pb2 as uint32) = w_loop }
+
+    asm_s_endpgm()
+
+    // rsrc values matching clang for this kernel shape (7 kernargs,
+    // ~14 VGPRs): rsrc1 bit 0 set (VGPR granules = 1 → allows up to
+    // ~36 VGPRs wave32) and rsrc3 = 0x30 (gfx11 forward-progress bits).
+    uint64 rsrc1 = 0xE0AF0001
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000030
+    uint64 props = 0x0408
+
+    // 7 kernargs: 6 GLOBAL_BUFFER + 1 BY_VALUE.
+    uint64[14] args_desc
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a8 = args_desc + 64;  unsafe { *(a8 as uint64) = 8 }
+    uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a10 = args_desc + 80; unsafe { *(a10 as uint64) = 8 }
+    uint64 a11 = args_desc + 88; unsafe { *(a11 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a12 = args_desc + 96; unsafe { *(a12 as uint64) = 8 }
+    uint64 a13 = args_desc + 104;unsafe { *(a13 as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           56,      // kernarg_size (7 × 8 bytes)
+                                           8,       // kernarg_align
+                                           28,      // sgpr_count (s0..s27)
+                                           16,      // vgpr_count (v0..v15)
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 7)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_csr_i_deliver_blob: cannot open output\n", 51)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// M1s csr_e_deliver: the full excitatory CSR delivery kernel, adding
+// STDP LTD on top of M1r's csr_i_deliver shape.
+//
+// Semantics (single-thread, src = 0):
+//   for each synapse syn in [rpe_ptr[0], rpe_ptr[1]):
+//     tgt  = rpe_tgt[syn]
+//     w    = rpe_w[syn]
+//     atomicAdd(&s_exc[tgt], w * release)
+//     if rpe_is_ee[syn] != 0:
+//       w_new = clamp(w + A_minus * x_post[tgt], 0.0, w_max)
+//       rpe_w[syn] = w_new                     (non-atomic — one
+//                                               thread per source)
+//       atomicAdd_u64(ltd_events, 1)
+//
+// Kernargs (11 args, 88 bytes):
+//   [0..7]   rpe_ptr_ptr    (u64*)
+//   [8..15]  rpe_tgt_ptr    (u64*)
+//   [16..23] rpe_w_ptr      (f64*)
+//   [24..31] rpe_is_ee_ptr  (u64*)
+//   [32..39] x_post_ptr     (f64*)
+//   [40..47] release_ptr    (f64*)
+//   [48..55] s_exc_ptr      (f64*)
+//   [56..63] ltd_events_ptr (u64*)
+//   [64..71] n              (u64 by-value, unused single-thread)
+//   [72..79] A_minus        (f64 by-value)
+//   [80..87] w_max          (f64 by-value)
+@export
+fn emit_amdgpu_csr_e_deliver_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "csr_e_deliver"
+    uint64 klen  = 13
+
+    asm_init()
+
+    // --- Prologue: 8 pointer kernargs + 2 f64 by-value (skip n) ---
+    asm_s_load_b64(1, 0)                            // s[2:3]   = rpe_ptr_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5]   = rpe_tgt_ptr
+    asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7]   = rpe_w_ptr
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9]   = rpe_is_ee_ptr
+    asm_s_load_b64_off(5, 0, 0x20)                  // s[10:11] = x_post_ptr
+    asm_s_load_b64_off(6, 0, 0x28)                  // s[12:13] = release_ptr (transient)
+    asm_s_load_b64_off(7, 0, 0x30)                  // s[14:15] = s_exc_ptr
+    asm_s_load_b64_off(8, 0, 0x38)                  // s[16:17] = ltd_events_ptr
+    asm_s_load_b64_off(9, 0, 0x48)                  // s[18:19] = A_minus bits (skip n at 0x40)
+    asm_s_load_b64_off(10, 0, 0x50)                 // s[20:21] = w_max bits
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // --- Guard: rel > 0.0 ---
+    asm_s_load_b64_off(11, 6, 0x00)                 // s[22:23] = *release_ptr (sbase=6 = s[12:13])
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_v_mov_b32(4, 22)                            // v4 = rel_lo
+    asm_v_mov_b32(5, 23)                            // v5 = rel_hi
+    asm_s_delay_alu(0x02)
+    asm_v_cmp_lt_f64_zero_v(4)                      // vcc = (0.0 < rel)
+    uint64 rel_patch_off = asm_text_len / 4
+    asm_sopp(0x23, 0)                               // s_cbranch_vccz placeholder → loop_exit
+
+    // --- Load start/end via rpe_ptr_ptr (sbase=1 = s[2:3]) ---
+    asm_s_load_b64_off(12, 1, 0x00)                 // s[24:25] = start
+    asm_s_load_b64_off(13, 1, 0x08)                 // s[26:27] = end
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Move A_minus and w_max into VGPR pairs (v[16:17], v[18:19]).
+    asm_v_mov_b32(16, 18)                           // v16 = s18
+    asm_v_mov_b32(17, 19)                           // v17 = s19
+    asm_v_mov_b32(18, 20)                           // v18 = s20
+    asm_v_mov_b32(19, 21)                           // v19 = s21
+
+    // Constants in VGPRs: v8 = 0 (v_addr zero), v[26:27] = (1, 0) for
+    // ltd_events atomic increment.
+    asm_v_mov_b32_inline_u(8, 0)
+    asm_v_mov_b32_inline_u(26, 1)
+    asm_v_mov_b32_inline_u(27, 0)
+    asm_s_delay_alu(0x04)                           // settle v_mov burst
+
+    // --- Outer loop: syn = start .. end ---
+    uint64 loop_head_off = asm_text_len / 4
+    asm_s_cmp_lt_u32(24, 26)                        // scc = (syn < end)
+    uint64 loop_patch_off = asm_text_len / 4
+    asm_s_cbranch_scc0(0)                           // placeholder → loop_exit
+
+    // Scalar per-iter address compute.
+    asm_u32(0x849C8318)                             // s_lshl_b64 s[28:29], s[24:25], 3
+    asm_u32(0x801E1C04)                             // s_add_u32  s30, s4, s28  (rpe_tgt+syn*8 lo)
+    asm_u32(0x821F1D05)                             // s_addc_u32 s31, s5, s29
+    asm_u32(0x80201C06)                             // s_add_u32  s32, s6, s28  (rpe_w+syn*8 lo)
+    asm_u32(0x82211D07)                             // s_addc_u32 s33, s7, s29
+    asm_u32(0x80221C08)                             // s_add_u32  s34, s8, s28  (rpe_is_ee+syn*8 lo)
+    asm_u32(0x82231D09)                             // s_addc_u32 s35, s9, s29
+
+    // VMEM: load tgt into v[0:1], w into v[6:7].
+    asm_u32(0xDC560000)                             // global_load_b64 v[0:1], v8, s[30:31]
+    asm_u32(0x001E0008)
+    asm_u32(0xDC560000)                             // global_load_b64 v[6:7], v8, s[32:33]
+    asm_u32(0x06200008)
+    asm_u32(0xBF8907F7)                             // s_waitcnt vmcnt(1) — wait for tgt
+
+    // Shift tgt*8 in place, delay for settlement.
+    asm_u32(0xD73C0000)                             // v_lshlrev_b64 v[0:1], 3, v[0:1]
+    asm_u32(0x00020083)
+    asm_u32(0xBF870091)                             // s_delay_alu compound
+
+    // Scatter addr v[10:11] = s_exc + tgt*8.
+    asm_u32(0xD7006A0A)                             // v_add_co_u32 v10, vcc_lo, s14, v0
+    asm_u32(0x0002000E)
+    asm_u32(0xD5207C0B)                             // v_add_co_ci_u32_e64 v11, null, s15, v1, vcc_lo
+    asm_u32(0x01AA020F)
+
+    // x_post addr v[22:23] = x_post + tgt*8.
+    asm_u32(0xD7006A16)                             // v_add_co_u32 v22, vcc_lo, s10, v0
+    asm_u32(0x0002000A)
+    asm_u32(0xD5207C17)                             // v_add_co_ci_u32_e64 v23, null, s11, v1, vcc_lo
+    asm_u32(0x01AA020B)
+
+    asm_s_waitcnt_vmcnt_zero()                      // wait for w
+
+    // effective = w * rel → v[12:13]
+    asm_v_mul_f64_vv(12, 6, 4)
+    asm_s_delay_alu(0x01)
+
+    // Prime CAS assumed = *s_exc[tgt].
+    asm_u32(0xDC560000)                             // global_load_b64 v[2:3], v[10:11], off
+    asm_u32(0x027C000A)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // CAS retry loop.
+    uint64 cas_head_off = asm_text_len / 4
+    asm_v_add_f64_vv(0, 2, 12)                      // new = assumed + effective
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDD0A4000)                             // global_atomic_cmpswap_b64 v[0:1], v[10:11], v[0:3], off glc
+    asm_u32(0x007C000A)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_s_waitcnt_vscnt_zero()
+    asm_v_cmp_ne_u64_vv(2, 0)
+    asm_v_mov_b32(2, 0x100 | 0)
+    asm_v_mov_b32(3, 0x100 | 1)
+    uint64 cas_branch_off = asm_text_len / 4
+    uint64 cas_delta = cas_head_off - (cas_branch_off + 1)
+    asm_s_cbranch_vccnz(cas_delta & 0xFFFF)
+
+    // --- STDP guard: is_ee[syn] != 0 (SMEM) ---
+    asm_u32(0xF4040911)                             // s_load_b64 s[36:37], s[34:35], null
+    asm_u32(0xF8000000)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(0xBF108024)                             // s_cmp_eq_u64 s[36:37], 0
+    uint64 stdp_patch_off = asm_text_len / 4
+    asm_s_cbranch_scc1(0)                           // scc=1 (is_ee==0) → skip
+
+    // Load x_post[tgt] via precomputed v[22:23] (saddr=OFF).
+    asm_u32(0xDC560000)                             // global_load_b64 v[14:15], v[22:23], off
+    asm_u32(0x0E7C0016)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // w_new = fma(A_minus, x_post, w) → v[20:21]
+    asm_u32(0xD6140014)                             // v_fma_f64 v[20:21], v[16:17], v[14:15], v[6:7]
+    asm_u32(0x041A1D10)
+    asm_s_delay_alu(0x01)
+
+    // Clamp: w_new = max(w_new, 0.0)
+    asm_u32(0xD72A0014)                             // v_max_f64 v[20:21], v[20:21], 0
+    asm_u32(0x00010114)
+    asm_s_delay_alu(0x01)
+
+    // Clamp: w_new = min(w_new, w_max)
+    asm_u32(0xD7290014)                             // v_min_f64 v[20:21], v[20:21], v[18:19]
+    asm_u32(0x00022514)
+    asm_s_delay_alu(0x01)
+
+    // Non-atomic store w_new → rpe_w[syn]  (saddr-mode via s[32:33])
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[20:21], s[32:33]
+    asm_u32(0x00201408)
+    asm_s_waitcnt_vscnt_zero()
+
+    // Atomic ++ ltd_events
+    asm_u32(0xDD0E0000)                             // global_atomic_add_u64 v0, v[26:27], s[16:17]
+    asm_u32(0x00101A00)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_s_waitcnt_vscnt_zero()
+
+    // --- skip_stdp: patch the stdp forward branch to here ---
+    uint64 skip_stdp_off = asm_text_len / 4
+    uint64 stdp_skip = skip_stdp_off - (stdp_patch_off + 1)
+    uint64 pb_s = asm_text_buf + stdp_patch_off * 4
+    uint32 w_stdp = 0xBFA20000 | (stdp_skip & 0xFFFF)   // s_cbranch_scc1
+    unsafe { *(pb_s as uint32) = w_stdp }
+
+    // syn++ and branch back to loop_head.
+    asm_s_add_u32_imm(24, 24, 1)
+    uint64 outer_branch_off = asm_text_len / 4
+    uint64 outer_delta = loop_head_off - (outer_branch_off + 1)
+    asm_s_branch(outer_delta & 0xFFFF)
+
+    // --- loop_exit: patch the rel-guard + outer-loop placeholders ---
+    uint64 loop_exit_off = asm_text_len / 4
+
+    uint64 rel_skip = loop_exit_off - (rel_patch_off + 1)
+    uint64 pb_r = asm_text_buf + rel_patch_off * 4
+    uint32 w_rel = 0xBFA30000 | (rel_skip & 0xFFFF)
+    unsafe { *(pb_r as uint32) = w_rel }
+
+    uint64 loop_skip = loop_exit_off - (loop_patch_off + 1)
+    uint64 pb_l = asm_text_buf + loop_patch_off * 4
+    uint32 w_loop = 0xBFA10000 | (loop_skip & 0xFFFF)
+    unsafe { *(pb_l as uint32) = w_loop }
+
+    asm_s_endpgm()
+
+    // VGPR granules = 3 (gfx11 wave32 granule = 8 → up to 32 VGPRs).
+    // Kernel uses v0..v27 = 28 VGPRs, so granules=3 gives headroom.
+    uint64 rsrc1 = 0xE0AF0003
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000030
+    uint64 props = 0x0408
+
+    // 11 kernargs: 8 GLOBAL_BUFFER + 3 BY_VALUE (n, A_minus, w_max).
+    uint64[22] args_desc
+    uint64 i = 0
+    while i < 8 {
+        uint64 ap = args_desc + i * 16;      unsafe { *(ap as uint64) = 8 }
+        uint64 ak = args_desc + i * 16 + 8;  unsafe { *(ak as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        i = i + 1
+    }
+    // by-value args
+    uint64 a16 = args_desc + 128; unsafe { *(a16 as uint64) = 8 }
+    uint64 a17 = args_desc + 136; unsafe { *(a17 as uint64) = AMD_ARG_KIND_BY_VALUE }   // n
+    uint64 a18 = args_desc + 144; unsafe { *(a18 as uint64) = 8 }
+    uint64 a19 = args_desc + 152; unsafe { *(a19 as uint64) = AMD_ARG_KIND_BY_VALUE }   // A_minus
+    uint64 a20 = args_desc + 160; unsafe { *(a20 as uint64) = 8 }
+    uint64 a21 = args_desc + 168; unsafe { *(a21 as uint64) = AMD_ARG_KIND_BY_VALUE }   // w_max
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           88,      // kernarg_size (11 × 8)
+                                           8,       // kernarg_align
+                                           40,      // sgpr_count (s0..s37 + pad)
+                                           28,      // vgpr_count (v0..v27)
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 11)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_csr_e_deliver_blob: cannot open output\n", 51)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// M1t (first sub-milestone) lif_integrate: the core LIF neuron
+// update — refractory decrement OR membrane integration. Single-
+// thread, one neuron. Full lif_full (spike detection + STP + ring
+// buffer writes) stays deferred; this demo proves the f64 math chain
+// and the nested conditional path.
+//
+// Semantics (for neuron i=0, single-thread):
+//   if ref[0] > 0:
+//       ref[0] -= 1
+//       V[0]  = V_reset
+//   else:
+//       drive  = RI[0] + s_exc[0] * J_E - s_inh[0] * J_I
+//       dv     = dt_over_tau * (V_rest - V[0] + drive)
+//       V[0]  += dv
+//
+// Kernargs (80 bytes, 10 × 8):
+//   [0..7]   V_ptr          (f64*)
+//   [8..15]  ref_ptr        (u64*)
+//   [16..23] RI_ptr         (f64*)
+//   [24..31] s_exc_ptr      (f64*)
+//   [32..39] s_inh_ptr      (f64*)
+//   [40..47] dt_over_tau    (f64 by-value, precomputed = dt / tau_m)
+//   [48..55] V_rest         (f64 by-value)
+//   [56..63] J_E            (f64 by-value)
+//   [64..71] J_I            (f64 by-value)
+//   [72..79] V_reset        (f64 by-value)
+@export
+fn emit_amdgpu_lif_integrate_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "lif_integrate"
+    uint64 klen  = 13
+
+    asm_init()
+
+    // --- Prologue: 5 pointers + 5 f64 by-value kernargs ---
+    asm_s_load_b64(1, 0)                            // s[2:3]   = V_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5]   = ref_ptr
+    asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7]   = RI_ptr
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9]   = s_exc_ptr
+    asm_s_load_b64_off(5, 0, 0x20)                  // s[10:11] = s_inh_ptr
+    asm_s_load_b64_off(6, 0, 0x28)                  // s[12:13] = dt_over_tau bits
+    asm_s_load_b64_off(7, 0, 0x30)                  // s[14:15] = V_rest bits
+    asm_s_load_b64_off(8, 0, 0x38)                  // s[16:17] = J_E bits
+    asm_s_load_b64_off(9, 0, 0x40)                  // s[18:19] = J_I bits
+    asm_s_load_b64_off(10, 0, 0x48)                 // s[20:21] = V_reset bits
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // --- Load ref[0] via SMEM (deref ref_ptr = s[4:5]) ---
+    asm_s_load_b64_off(11, 2, 0x00)                 // s[22:23] = ref[0] (sbase=2 = s[4:5])
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Guard: if ref[0] == 0 → integrate (scc=1 → fall through)
+    //                   > 0 → refractory (scc=0 → branch).
+    asm_s_cmp_eq_u32(22, 0x80)                      // scc = (s22 == 0)
+    uint64 integrate_else_off = asm_text_len / 4
+    asm_s_cbranch_scc0(0)                           // placeholder → refractory_body
+
+    // --- Integrate path ---
+    asm_v_mov_b32_inline_u(8, 0)                    // v8 = 0 (v_addr for saddr loads)
+
+    // VMEM loads:
+    //   v[0:1] = V[0]        (saddr = s[2:3], raw SGPR 2)
+    //   v[2:3] = RI[0]       (saddr = s[6:7], raw SGPR 6)
+    //   v[4:5] = s_exc[0]    (saddr = s[8:9], raw SGPR 8)
+    //   v[6:7] = s_inh[0]    (saddr = s[10:11], raw SGPR 10)
+    asm_u32(0xDC560000)                             // global_load_b64 v[0:1], v8, s[2:3]
+    asm_u32(0x00020008)
+    asm_u32(0xDC560000)                             // global_load_b64 v[2:3], v8, s[6:7]
+    asm_u32(0x02060008)
+    asm_u32(0xDC560000)                             // global_load_b64 v[4:5], v8, s[8:9]
+    asm_u32(0x04080008)
+    asm_u32(0xDC560000)                             // global_load_b64 v[6:7], v8, s[10:11]
+    asm_u32(0x060A0008)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // Move f64 kernargs into VGPR pairs.
+    asm_v_mov_b32(10, 12)                           // v10 = s12 (dt_over_tau lo)
+    asm_v_mov_b32(11, 13)                           // v11 = s13
+    asm_v_mov_b32(12, 14)                           // v12 = s14 (V_rest lo)
+    asm_v_mov_b32(13, 15)                           // v13 = s15
+    asm_v_mov_b32(14, 16)                           // v14 = s16 (J_E lo)
+    asm_v_mov_b32(15, 17)                           // v15 = s17
+    asm_v_mov_b32(16, 18)                           // v16 = s18 (J_I lo)
+    asm_v_mov_b32(17, 19)                           // v17 = s19
+    asm_s_delay_alu(0x04)                           // settle 4 VALU back
+
+    // Arithmetic chain (re-using VGPRs per notes above):
+    //   v[4:5] = s_exc * J_E
+    //   v[6:7] = s_inh * J_I
+    //   v[2:3] = RI + s_exc*J_E
+    //   v[2:3] = v[2:3] - s_inh*J_I        (= drive)
+    //   v[4:5] = V_rest - V
+    //   v[2:3] = v[4:5] + v[2:3]           (= V_rest - V + drive)
+    //   v[4:5] = dt_over_tau * v[2:3]      (= dv)
+    //   v[0:1] = V + dv                    (= v_new)
+    asm_v_mul_f64_vv(4, 4, 14)                      // v[4:5] = s_exc * J_E
+    asm_v_mul_f64_vv(6, 6, 16)                      // v[6:7] = s_inh * J_I
+    asm_s_delay_alu(0x02)
+    asm_v_add_f64_vv(2, 2, 4)                       // v[2:3] = RI + s_exc*J_E
+    asm_s_delay_alu(0x01)
+    asm_v_sub_f64_vv(2, 2, 6)                       // v[2:3] = v[2:3] - s_inh*J_I (drive)
+    asm_v_sub_f64_vv(4, 12, 0)                      // v[4:5] = V_rest - V
+    asm_s_delay_alu(0x02)
+    asm_v_add_f64_vv(2, 4, 2)                       // v[2:3] = V_rest - V + drive
+    asm_s_delay_alu(0x01)
+    asm_v_mul_f64_vv(4, 10, 2)                      // v[4:5] = dt_over_tau * v[2:3] (dv)
+    asm_s_delay_alu(0x01)
+    asm_v_add_f64_vv(0, 0, 4)                       // v[0:1] = V + dv (v_new)
+    asm_s_delay_alu(0x01)
+
+    // Store v[0:1] = v_new to V[0].
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[0:1], s[2:3]
+    asm_u32(0x00020008)
+    asm_s_waitcnt_vscnt_zero()
+
+    // Branch to end.
+    uint64 skip_refr_off = asm_text_len / 4
+    asm_s_branch(0)                                 // placeholder → end
+
+    // --- Refractory path: patch above scc0 to land here ---
+    uint64 refr_off = asm_text_len / 4
+    uint64 ie_skip = refr_off - (integrate_else_off + 1)
+    uint64 pb_ie = asm_text_buf + integrate_else_off * 4
+    uint32 w_ie = 0xBFA10000 | (ie_skip & 0xFFFF)
+    unsafe { *(pb_ie as uint32) = w_ie }
+
+    // refractory body:
+    //   s22 = s22 - 1       (ref_new)
+    //   *ref[0] = s[22:23]
+    //   *V[0]   = V_reset (s[20:21])
+    asm_u32(0x80968116)                             // s_sub_u32 s22, s22, 1
+    asm_v_mov_b32_inline_u(8, 0)                    // v8 = 0
+    asm_v_mov_b32(18, 22)                           // v18 = s22 (ref_new lo)
+    asm_v_mov_b32(19, 23)                           // v19 = s23
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[18:19], s[4:5]
+    asm_u32(0x00041208)                             // saddr=4, vdata=18, v_addr=8
+    asm_s_waitcnt_vscnt_zero()
+
+    // *V[0] = V_reset.
+    asm_v_mov_b32(18, 20)                           // v18 = s20 (V_reset lo)
+    asm_v_mov_b32(19, 21)                           // v19 = s21
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[18:19], s[2:3]
+    asm_u32(0x00021208)                             // saddr=2, vdata=18, v_addr=8
+    asm_s_waitcnt_vscnt_zero()
+
+    // --- end: patch the integrate skip-to-end ---
+    uint64 end_off = asm_text_len / 4
+    uint64 end_skip = end_off - (skip_refr_off + 1)
+    uint64 pb_se = asm_text_buf + skip_refr_off * 4
+    uint32 w_se = 0xBFA00000 | (end_skip & 0xFFFF)  // SOPP op 0x20 = s_branch
+    unsafe { *(pb_se as uint32) = w_se }
+
+    asm_s_endpgm()
+
+    uint64 rsrc1 = 0xE0AF0003                       // VGPR granules=3 (32 VGPRs)
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000030
+    uint64 props = 0x0408
+
+    // 10 kernargs: 5 GLOBAL_BUFFER + 5 BY_VALUE.
+    uint64[20] args_desc
+    uint64 ai = 0
+    while ai < 5 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        ai = ai + 1
+    }
+    while ai < 10 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        ai = ai + 1
+    }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           80,      // kernarg_size (10 × 8)
+                                           8,       // kernarg_align
+                                           24,      // sgpr_count (s0..s23)
+                                           24,      // vgpr_count (v0..v23)
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 10)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_lif_integrate_blob: cannot open output\n", 51)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// M1t-2 lif_spike: LIF integrate + spike detection. Extends M1t-1
+// with a threshold compare: if v_new >= V_thresh the neuron fires —
+// V resets, ref becomes ref_steps, spike counter increments.
+// Otherwise V just absorbs v_new.
+//
+// Kernargs (13 args, 104 bytes):
+//   [0..7]   V_ptr        (f64*)
+//   [8..15]  ref_ptr      (u64*)
+//   [16..23] RI_ptr       (f64*)
+//   [24..31] s_exc_ptr    (f64*)
+//   [32..39] s_inh_ptr    (f64*)
+//   [40..47] spike_ptr    (u64*)    — NEW
+//   [48..55] dt_over_tau  (f64)
+//   [56..63] V_rest       (f64)
+//   [64..71] J_E          (f64)
+//   [72..79] J_I          (f64)
+//   [80..87] V_reset      (f64)
+//   [88..95] V_thresh     (f64)     — NEW
+//   [96..103] ref_steps   (u64)     — NEW
+@export
+fn emit_amdgpu_lif_spike_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "lif_spike"
+    uint64 klen  = 9
+
+    asm_init()
+
+    // --- Prologue: 6 pointers + 7 by-value kernargs ---
+    asm_s_load_b64(1, 0)                            // s[2:3]   V_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5]   ref_ptr
+    asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7]   RI_ptr
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9]   s_exc_ptr
+    asm_s_load_b64_off(5, 0, 0x20)                  // s[10:11] s_inh_ptr
+    asm_s_load_b64_off(6, 0, 0x28)                  // s[12:13] spike_ptr
+    asm_s_load_b64_off(7, 0, 0x30)                  // s[14:15] dt_over_tau
+    asm_s_load_b64_off(8, 0, 0x38)                  // s[16:17] V_rest
+    asm_s_load_b64_off(9, 0, 0x40)                  // s[18:19] J_E
+    asm_s_load_b64_off(10, 0, 0x48)                 // s[20:21] J_I
+    asm_s_load_b64_off(11, 0, 0x50)                 // s[22:23] V_reset
+    asm_s_load_b64_off(12, 0, 0x58)                 // s[24:25] V_thresh
+    asm_s_load_b64_off(13, 0, 0x60)                 // s[26:27] ref_steps
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Load ref[0] (SMEM deref of s[4:5]).
+    asm_s_load_b64_off(14, 2, 0x00)                 // s[28:29] = ref[0]
+    // Load spike[0] (SMEM deref of s[12:13]).
+    asm_s_load_b64_off(15, 6, 0x00)                 // s[30:31] = spike[0] (sbase=6 = s[12:13])
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Guard: ref[0] == 0 → integrate; > 0 → refractory.
+    asm_s_cmp_eq_u32(28, 0x80)
+    uint64 integrate_else_off = asm_text_len / 4
+    asm_s_cbranch_scc0(0)                           // placeholder → refractory
+
+    // ---- Integrate path ----
+    asm_v_mov_b32_inline_u(8, 0)                    // v8 = 0
+
+    // VMEM loads via saddr-only (raw SGPR index for saddr).
+    asm_u32(0xDC560000)                             // global_load_b64 v[0:1], v8, s[2:3]
+    asm_u32(0x00020008)
+    asm_u32(0xDC560000)                             // global_load_b64 v[2:3], v8, s[6:7]
+    asm_u32(0x02060008)
+    asm_u32(0xDC560000)                             // global_load_b64 v[4:5], v8, s[8:9]
+    asm_u32(0x04080008)
+    asm_u32(0xDC560000)                             // global_load_b64 v[6:7], v8, s[10:11]
+    asm_u32(0x060A0008)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // Move f64 kernarg SGPRs to VGPR pairs for arithmetic.
+    asm_v_mov_b32(10, 14)                           // v10 = s14 (dt_over_tau lo)
+    asm_v_mov_b32(11, 15)
+    asm_v_mov_b32(12, 16)                           // v12 = s16 (V_rest lo)
+    asm_v_mov_b32(13, 17)
+    asm_v_mov_b32(14, 18)                           // v14 = s18 (J_E lo)
+    asm_v_mov_b32(15, 19)
+    asm_v_mov_b32(16, 20)                           // v16 = s20 (J_I lo)
+    asm_v_mov_b32(17, 21)
+    asm_v_mov_b32(20, 24)                           // v20 = s24 (V_thresh lo)
+    asm_v_mov_b32(21, 25)
+    asm_s_delay_alu(0x04)
+
+    // Arithmetic chain (same as M1t-1): v_new → v[0:1].
+    asm_v_mul_f64_vv(4, 4, 14)                      // v[4:5] = s_exc * J_E
+    asm_v_mul_f64_vv(6, 6, 16)                      // v[6:7] = s_inh * J_I
+    asm_s_delay_alu(0x02)
+    asm_v_add_f64_vv(2, 2, 4)                       // v[2:3] = RI + s_exc*J_E
+    asm_s_delay_alu(0x01)
+    asm_v_sub_f64_vv(2, 2, 6)                       // v[2:3] = drive
+    asm_v_sub_f64_vv(4, 12, 0)                      // v[4:5] = V_rest - V
+    asm_s_delay_alu(0x02)
+    asm_v_add_f64_vv(2, 4, 2)                       // v[2:3] = V_rest - V + drive
+    asm_s_delay_alu(0x01)
+    asm_v_mul_f64_vv(4, 10, 2)                      // v[4:5] = dv
+    asm_s_delay_alu(0x01)
+    asm_v_add_f64_vv(0, 0, 4)                       // v[0:1] = v_new
+    asm_s_delay_alu(0x01)
+
+    // Spike detect: vcc = (v_new >= V_thresh).
+    asm_v_cmp_ge_f64_vv(0, 20)
+    uint64 spike_patch_off = asm_text_len / 4
+    asm_s_cbranch_vccnz(0)                          // placeholder → spike body
+
+    // No-spike: V[0] = v_new.
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[0:1], s[2:3]
+    asm_u32(0x00020008)
+    asm_s_waitcnt_vscnt_zero()
+    uint64 after_no_spike_off = asm_text_len / 4
+    asm_s_branch(0)                                 // placeholder → end
+
+    // ---- Spike body ----
+    uint64 spike_off = asm_text_len / 4
+    // Patch spike cbranch forward.
+    uint64 sp_skip = spike_off - (spike_patch_off + 1)
+    uint64 pb_sp = asm_text_buf + spike_patch_off * 4
+    uint32 w_sp = 0xBFA40000 | (sp_skip & 0xFFFF)   // SOPP op 0x24 = s_cbranch_vccnz
+    unsafe { *(pb_sp as uint32) = w_sp }
+
+    // V = V_reset (move s[22:23] to v[18:19], store via s[2:3]).
+    asm_v_mov_b32(18, 22)                           // v18 = s22 (V_reset lo)
+    asm_v_mov_b32(19, 23)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[18:19], s[2:3]
+    asm_u32(0x00021208)
+    asm_s_waitcnt_vscnt_zero()
+
+    // ref = ref_steps (move s[26:27] to v[18:19], store via s[4:5]).
+    asm_v_mov_b32(18, 26)                           // v18 = s26 (ref_steps lo)
+    asm_v_mov_b32(19, 27)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[18:19], s[4:5]
+    asm_u32(0x00041208)
+    asm_s_waitcnt_vscnt_zero()
+
+    // spike[0] += 1 (scalar: s[30:31] + 1 with carry, then store via s[12:13]).
+    asm_u32(0x801E811E)                             // s_add_u32 s30, s30, 1 (inline 1 = 0x81)
+    asm_u32(0x821F801F)                             // s_addc_u32 s31, s31, 0
+    asm_v_mov_b32(18, 30)                           // v18 = s30 (new spike lo)
+    asm_v_mov_b32(19, 31)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[18:19], s[12:13]
+    asm_u32(0x000C1208)                             // saddr=12, vdata=18, v_addr=8
+    asm_s_waitcnt_vscnt_zero()
+
+    // Branch to end.
+    uint64 after_spike_off = asm_text_len / 4
+    asm_s_branch(0)                                 // placeholder → end
+
+    // ---- Refractory body ----
+    uint64 refr_off = asm_text_len / 4
+    uint64 ie_skip = refr_off - (integrate_else_off + 1)
+    uint64 pb_ie = asm_text_buf + integrate_else_off * 4
+    uint32 w_ie = 0xBFA10000 | (ie_skip & 0xFFFF)
+    unsafe { *(pb_ie as uint32) = w_ie }
+
+    asm_u32(0x809C811C)                             // s_sub_u32 s28, s28, 1
+    asm_v_mov_b32_inline_u(8, 0)
+    asm_v_mov_b32(18, 28)                           // v18 = s28 (ref_new lo)
+    asm_v_mov_b32(19, 29)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[18:19], s[4:5]
+    asm_u32(0x00041208)
+    asm_s_waitcnt_vscnt_zero()
+
+    // V = V_reset.
+    asm_v_mov_b32(18, 22)                           // v18 = s22 (V_reset lo)
+    asm_v_mov_b32(19, 23)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[18:19], s[2:3]
+    asm_u32(0x00021208)
+    asm_s_waitcnt_vscnt_zero()
+
+    // ---- end: patch the two forward branches ----
+    uint64 end_off = asm_text_len / 4
+
+    uint64 ns_skip = end_off - (after_no_spike_off + 1)
+    uint64 pb_ns = asm_text_buf + after_no_spike_off * 4
+    uint32 w_ns = 0xBFA00000 | (ns_skip & 0xFFFF)   // s_branch
+    unsafe { *(pb_ns as uint32) = w_ns }
+
+    uint64 as_skip = end_off - (after_spike_off + 1)
+    uint64 pb_as = asm_text_buf + after_spike_off * 4
+    uint32 w_as = 0xBFA00000 | (as_skip & 0xFFFF)
+    unsafe { *(pb_as as uint32) = w_as }
+
+    asm_s_endpgm()
+
+    uint64 rsrc1 = 0xE0AF0003
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000030
+    uint64 props = 0x0408
+
+    // 13 kernargs: 6 GLOBAL_BUFFER + 7 BY_VALUE.
+    uint64[26] args_desc
+    uint64 ai = 0
+    while ai < 6 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        ai = ai + 1
+    }
+    while ai < 13 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        ai = ai + 1
+    }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           104,     // kernarg_size (13 × 8)
+                                           8,       // kernarg_align
+                                           32,      // sgpr_count (s0..s31)
+                                           24,      // vgpr_count (v0..v23)
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 13)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_lif_spike_blob: cannot open output\n", 47)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// M1t-3 lif_stp: lif_spike + post-spike trace bumps (x_pre += 1.0,
+// x_post += 1.0) + STP update:
+//     rel       = u_stp * x_stp
+//     release  := rel
+//     x_stp    := x_stp - rel
+//     u_stp    := u_stp + U_baseline * (1.0 - u_stp)
+//
+// Kernargs (19 args, 152 bytes). Appends x_pre_ptr, x_post_ptr,
+// u_stp_ptr, x_stp_ptr, release_ptr, U_baseline to M1t-2's layout.
+@export
+fn emit_amdgpu_lif_stp_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "lif_stp"
+    uint64 klen  = 7
+
+    asm_init()
+
+    // --- Prologue: load all 19 kernargs ---
+    asm_s_load_b64(1, 0)                            // s[2:3]   V_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5]   ref_ptr
+    asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7]   RI_ptr
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9]   s_exc_ptr
+    asm_s_load_b64_off(5, 0, 0x20)                  // s[10:11] s_inh_ptr
+    asm_s_load_b64_off(6, 0, 0x28)                  // s[12:13] spike_ptr
+    asm_s_load_b64_off(7, 0, 0x30)                  // s[14:15] x_pre_ptr
+    asm_s_load_b64_off(8, 0, 0x38)                  // s[16:17] x_post_ptr
+    asm_s_load_b64_off(9, 0, 0x40)                  // s[18:19] u_stp_ptr
+    asm_s_load_b64_off(10, 0, 0x48)                 // s[20:21] x_stp_ptr
+    asm_s_load_b64_off(11, 0, 0x50)                 // s[22:23] release_ptr
+    asm_s_load_b64_off(12, 0, 0x58)                 // s[24:25] dt_over_tau
+    asm_s_load_b64_off(13, 0, 0x60)                 // s[26:27] V_rest
+    asm_s_load_b64_off(14, 0, 0x68)                 // s[28:29] J_E
+    asm_s_load_b64_off(15, 0, 0x70)                 // s[30:31] J_I
+    asm_s_load_b64_off(16, 0, 0x78)                 // s[32:33] V_reset
+    asm_s_load_b64_off(17, 0, 0x80)                 // s[34:35] V_thresh
+    asm_s_load_b64_off(18, 0, 0x88)                 // s[36:37] ref_steps
+    asm_s_load_b64_off(19, 0, 0x90)                 // s[38:39] U_baseline
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Load ref[0] (deref ref_ptr, sbase=2).
+    asm_s_load_b64_off(20, 2, 0x00)                 // s[40:41] = ref[0]
+    // Load spike[0] (deref spike_ptr, sbase=6).
+    asm_s_load_b64_off(21, 6, 0x00)                 // s[42:43] = spike[0]
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Guard: ref[0] == 0 → integrate; > 0 → refractory.
+    asm_s_cmp_eq_u32(40, 0x80)
+    uint64 integrate_else_off = asm_text_len / 4
+    asm_s_cbranch_scc0(0)                           // placeholder → refractory
+
+    // ---- Integrate path ----
+    asm_v_mov_b32_inline_u(8, 0)                    // v8 = 0
+
+    // VMEM loads
+    asm_u32(0xDC560000)                             // global_load_b64 v[0:1], v8, s[2:3]
+    asm_u32(0x00020008)
+    asm_u32(0xDC560000)                             // global_load_b64 v[2:3], v8, s[6:7]
+    asm_u32(0x02060008)
+    asm_u32(0xDC560000)                             // global_load_b64 v[4:5], v8, s[8:9]
+    asm_u32(0x04080008)
+    asm_u32(0xDC560000)                             // global_load_b64 v[6:7], v8, s[10:11]
+    asm_u32(0x060A0008)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // Move f64 kernargs to VGPR pairs.
+    asm_v_mov_b32(10, 24)                           // v10 = s24 (dt_over_tau lo)
+    asm_v_mov_b32(11, 25)
+    asm_v_mov_b32(12, 26)                           // v12 = s26 (V_rest lo)
+    asm_v_mov_b32(13, 27)
+    asm_v_mov_b32(14, 28)                           // v14 = s28 (J_E lo)
+    asm_v_mov_b32(15, 29)
+    asm_v_mov_b32(16, 30)                           // v16 = s30 (J_I lo)
+    asm_v_mov_b32(17, 31)
+    asm_v_mov_b32(20, 34)                           // v20 = s34 (V_thresh lo)
+    asm_v_mov_b32(21, 35)
+    asm_v_mov_b32(30, 38)                           // v30 = s38 (U_baseline lo)
+    asm_v_mov_b32(31, 39)
+    asm_s_delay_alu(0x04)
+
+    // v_new arithmetic chain (same pattern as M1t-1/2).
+    asm_v_mul_f64_vv(4, 4, 14)                      // v[4:5] = s_exc * J_E
+    asm_v_mul_f64_vv(6, 6, 16)                      // v[6:7] = s_inh * J_I
+    asm_s_delay_alu(0x02)
+    asm_v_add_f64_vv(2, 2, 4)                       // v[2:3] = RI + s_exc*J_E
+    asm_s_delay_alu(0x01)
+    asm_v_sub_f64_vv(2, 2, 6)                       // v[2:3] = drive
+    asm_v_sub_f64_vv(4, 12, 0)                      // v[4:5] = V_rest - V
+    asm_s_delay_alu(0x02)
+    asm_v_add_f64_vv(2, 4, 2)                       // v[2:3] = V_rest - V + drive
+    asm_s_delay_alu(0x01)
+    asm_v_mul_f64_vv(4, 10, 2)                      // v[4:5] = dv
+    asm_s_delay_alu(0x01)
+    asm_v_add_f64_vv(0, 0, 4)                       // v[0:1] = v_new
+    asm_s_delay_alu(0x01)
+
+    // Spike detect.
+    asm_v_cmp_ge_f64_vv(0, 20)
+    uint64 spike_patch_off = asm_text_len / 4
+    asm_s_cbranch_vccnz(0)                          // placeholder → spike body
+
+    // --- No-spike: store v_new to V[0] ---
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[0:1], s[2:3]
+    asm_u32(0x00020008)
+    asm_s_waitcnt_vscnt_zero()
+    uint64 after_no_spike_off = asm_text_len / 4
+    asm_s_branch(0)                                 // → end
+
+    // ---- Spike body ----
+    uint64 spike_off = asm_text_len / 4
+    uint64 sp_skip = spike_off - (spike_patch_off + 1)
+    uint64 pb_sp = asm_text_buf + spike_patch_off * 4
+    uint32 w_sp = 0xBFA40000 | (sp_skip & 0xFFFF)
+    unsafe { *(pb_sp as uint32) = w_sp }
+
+    // V = V_reset (s[32:33] → v[18:19], store via s[2:3]).
+    asm_v_mov_b32(18, 32)
+    asm_v_mov_b32(19, 33)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[18:19], s[2:3]
+    asm_u32(0x00021208)
+    asm_s_waitcnt_vscnt_zero()
+
+    // ref = ref_steps (s[36:37] → v[18:19], store via s[4:5]).
+    asm_v_mov_b32(18, 36)
+    asm_v_mov_b32(19, 37)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[18:19], s[4:5]
+    asm_u32(0x00041208)
+    asm_s_waitcnt_vscnt_zero()
+
+    // spike[0] += 1.
+    asm_u32(0x802A812A)                             // s_add_u32 s42, s42, 1
+    asm_u32(0x822B802B)                             // s_addc_u32 s43, s43, 0
+    asm_v_mov_b32(18, 42)
+    asm_v_mov_b32(19, 43)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[18:19], s[12:13]
+    asm_u32(0x000C1208)
+    asm_s_waitcnt_vscnt_zero()
+
+    // x_pre[0] += 1.0.
+    asm_u32(0xDC560000)                             // global_load_b64 v[22:23], v8, s[14:15]
+    asm_u32(0x160E0008)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0xD7270016)                             // v_add_f64 v[22:23], v[22:23], 1.0 (src1=0xF2)
+    asm_u32(0x0001E516)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[22:23], s[14:15]
+    asm_u32(0x000E1608)
+    asm_s_waitcnt_vscnt_zero()
+
+    // x_post[0] += 1.0.
+    asm_u32(0xDC560000)                             // global_load_b64 v[22:23], v8, s[16:17]
+    asm_u32(0x16100008)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0xD7270016)                             // v_add_f64 v[22:23], v[22:23], 1.0
+    asm_u32(0x0001E516)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[22:23], s[16:17]
+    asm_u32(0x00101608)
+    asm_s_waitcnt_vscnt_zero()
+
+    // STP: load u_stp[0] → v[24:25], x_stp[0] → v[26:27].
+    asm_u32(0xDC560000)                             // global_load_b64 v[24:25], v8, s[18:19]
+    asm_u32(0x18120008)
+    asm_u32(0xDC560000)                             // global_load_b64 v[26:27], v8, s[20:21]
+    asm_u32(0x1A140008)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // rel = u * x → v[28:29].
+    asm_v_mul_f64_vv(28, 24, 26)
+    asm_s_delay_alu(0x01)
+
+    // release[0] = rel (store v[28:29] to s[22:23]).
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[28:29], s[22:23]
+    asm_u32(0x00161C08)
+    asm_s_waitcnt_vscnt_zero()
+
+    // x_new = x - rel.
+    asm_v_sub_f64_vv(26, 26, 28)                    // v[26:27] = v[26:27] - v[28:29]
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[26:27], s[20:21]
+    asm_u32(0x00141A08)
+    asm_s_waitcnt_vscnt_zero()
+
+    // u_new = u + U_baseline * (1 - u)
+    //   tmp = 1.0 - u
+    //   prod = U_baseline * tmp
+    //   u_new = u + prod
+    asm_u32(0xD727001C)                             // v_add_f64 v[28:29], 1.0, -v[24:25]
+    asm_u32(0x400230F2)
+    asm_s_delay_alu(0x01)
+    asm_v_mul_f64_vv(28, 30, 28)                    // v[28:29] = U_baseline * tmp
+    asm_s_delay_alu(0x01)
+    asm_v_add_f64_vv(24, 24, 28)                    // v[24:25] = u + prod
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[24:25], s[18:19]
+    asm_u32(0x00121808)
+    asm_s_waitcnt_vscnt_zero()
+
+    uint64 after_spike_off = asm_text_len / 4
+    asm_s_branch(0)                                 // → end
+
+    // ---- Refractory body ----
+    uint64 refr_off = asm_text_len / 4
+    uint64 ie_skip = refr_off - (integrate_else_off + 1)
+    uint64 pb_ie = asm_text_buf + integrate_else_off * 4
+    uint32 w_ie = 0xBFA10000 | (ie_skip & 0xFFFF)
+    unsafe { *(pb_ie as uint32) = w_ie }
+
+    asm_u32(0x80A88128)                             // s_sub_u32 s40, s40, 1 (ref--)
+    asm_v_mov_b32_inline_u(8, 0)
+    asm_v_mov_b32(18, 40)
+    asm_v_mov_b32(19, 41)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[18:19], s[4:5]
+    asm_u32(0x00041208)
+    asm_s_waitcnt_vscnt_zero()
+
+    asm_v_mov_b32(18, 32)                           // V_reset lo
+    asm_v_mov_b32(19, 33)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000)                             // global_store_b64 v8, v[18:19], s[2:3]
+    asm_u32(0x00021208)
+    asm_s_waitcnt_vscnt_zero()
+
+    // ---- end: patch forward branches ----
+    uint64 end_off = asm_text_len / 4
+
+    uint64 ns_skip = end_off - (after_no_spike_off + 1)
+    uint64 pb_ns = asm_text_buf + after_no_spike_off * 4
+    uint32 w_ns = 0xBFA00000 | (ns_skip & 0xFFFF)
+    unsafe { *(pb_ns as uint32) = w_ns }
+
+    uint64 as_skip = end_off - (after_spike_off + 1)
+    uint64 pb_as = asm_text_buf + after_spike_off * 4
+    uint32 w_as = 0xBFA00000 | (as_skip & 0xFFFF)
+    unsafe { *(pb_as as uint32) = w_as }
+
+    asm_s_endpgm()
+
+    uint64 rsrc1 = 0xE0AF0004                       // granules=4 → 40 VGPRs
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000030
+    uint64 props = 0x0408
+
+    // 19 kernargs: 11 GLOBAL_BUFFER + 8 BY_VALUE.
+    uint64[38] args_desc
+    uint64 ai = 0
+    while ai < 11 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        ai = ai + 1
+    }
+    while ai < 19 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        ai = ai + 1
+    }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           152,     // kernarg_size
+                                           8,       // kernarg_align
+                                           48,      // sgpr_count
+                                           32,      // vgpr_count
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 19)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_lif_stp_blob: cannot open output\n", 45)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// M1t-4 lif_full (Stage-1 exit kernel): lif_stp + ring-buffer scatter
+// for E-cells. After the STP update, if cell_type[i] == 0, the release
+// value is stored into buf_delay[w_base + i] — the pending-delivery
+// entry for the next-timestep synaptic fan-out. This is the kernel
+// the 200k-neuron simulation actually dispatches each step.
+//
+// Kernargs (22 args, 176 bytes). Appends cell_type_ptr, buf_delay_ptr,
+// w_base to M1t-3's layout.
+@export
+fn emit_amdgpu_lif_full_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "lif_full"
+    uint64 klen  = 8
+
+    asm_init()
+
+    // --- Prologue: load all 22 kernargs ---
+    // 11 pointer kernargs from lif_stp + 2 new pointers + 8 + 1 new by-val.
+    asm_s_load_b64(1, 0)                            // s[2:3]   V_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5]   ref_ptr
+    asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7]   RI_ptr
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9]   s_exc_ptr
+    asm_s_load_b64_off(5, 0, 0x20)                  // s[10:11] s_inh_ptr
+    asm_s_load_b64_off(6, 0, 0x28)                  // s[12:13] spike_ptr
+    asm_s_load_b64_off(7, 0, 0x30)                  // s[14:15] x_pre_ptr
+    asm_s_load_b64_off(8, 0, 0x38)                  // s[16:17] x_post_ptr
+    asm_s_load_b64_off(9, 0, 0x40)                  // s[18:19] u_stp_ptr
+    asm_s_load_b64_off(10, 0, 0x48)                 // s[20:21] x_stp_ptr
+    asm_s_load_b64_off(11, 0, 0x50)                 // s[22:23] release_ptr
+    asm_s_load_b64_off(12, 0, 0x58)                 // s[24:25] dt_over_tau
+    asm_s_load_b64_off(13, 0, 0x60)                 // s[26:27] V_rest
+    asm_s_load_b64_off(14, 0, 0x68)                 // s[28:29] J_E
+    asm_s_load_b64_off(15, 0, 0x70)                 // s[30:31] J_I
+    asm_s_load_b64_off(16, 0, 0x78)                 // s[32:33] V_reset
+    asm_s_load_b64_off(17, 0, 0x80)                 // s[34:35] V_thresh
+    asm_s_load_b64_off(18, 0, 0x88)                 // s[36:37] ref_steps
+    asm_s_load_b64_off(19, 0, 0x90)                 // s[38:39] U_baseline
+    asm_s_load_b64_off(22, 0, 0x98)                 // s[44:45] cell_type_ptr (NEW)
+    asm_s_load_b64_off(23, 0, 0xA0)                 // s[46:47] buf_delay_ptr (NEW)
+    asm_s_load_b64_off(24, 0, 0xA8)                 // s[48:49] w_base (NEW)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Load ref[0] and spike[0] into scratch (sbase pair-halved).
+    asm_s_load_b64_off(20, 2, 0x00)                 // s[40:41] = ref[0]
+    asm_s_load_b64_off(21, 6, 0x00)                 // s[42:43] = spike[0]
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Guard: ref == 0 → integrate; > 0 → refractory.
+    asm_s_cmp_eq_u32(40, 0x80)
+    uint64 integrate_else_off = asm_text_len / 4
+    asm_s_cbranch_scc0(0)
+
+    // ---- Integrate path ----
+    asm_v_mov_b32_inline_u(8, 0)
+
+    // VMEM loads of V, RI, s_exc, s_inh.
+    asm_u32(0xDC560000); asm_u32(0x00020008)        // V → v[0:1]
+    asm_u32(0xDC560000); asm_u32(0x02060008)        // RI → v[2:3]
+    asm_u32(0xDC560000); asm_u32(0x04080008)        // s_exc → v[4:5]
+    asm_u32(0xDC560000); asm_u32(0x060A0008)        // s_inh → v[6:7]
+    asm_s_waitcnt_vmcnt_zero()
+
+    // Move f64 kernargs to VGPR pairs.
+    asm_v_mov_b32(10, 24); asm_v_mov_b32(11, 25)    // v[10:11] = dt_over_tau
+    asm_v_mov_b32(12, 26); asm_v_mov_b32(13, 27)    // v[12:13] = V_rest
+    asm_v_mov_b32(14, 28); asm_v_mov_b32(15, 29)    // v[14:15] = J_E
+    asm_v_mov_b32(16, 30); asm_v_mov_b32(17, 31)    // v[16:17] = J_I
+    asm_v_mov_b32(20, 34); asm_v_mov_b32(21, 35)    // v[20:21] = V_thresh
+    asm_v_mov_b32(30, 38); asm_v_mov_b32(31, 39)    // v[30:31] = U_baseline
+    asm_s_delay_alu(0x04)
+
+    // v_new arithmetic chain.
+    asm_v_mul_f64_vv(4, 4, 14)                      // s_exc * J_E
+    asm_v_mul_f64_vv(6, 6, 16)                      // s_inh * J_I
+    asm_s_delay_alu(0x02)
+    asm_v_add_f64_vv(2, 2, 4)                       // RI + s_exc*J_E
+    asm_s_delay_alu(0x01)
+    asm_v_sub_f64_vv(2, 2, 6)                       // drive
+    asm_v_sub_f64_vv(4, 12, 0)                      // V_rest - V
+    asm_s_delay_alu(0x02)
+    asm_v_add_f64_vv(2, 4, 2)                       // V_rest - V + drive
+    asm_s_delay_alu(0x01)
+    asm_v_mul_f64_vv(4, 10, 2)                      // dv
+    asm_s_delay_alu(0x01)
+    asm_v_add_f64_vv(0, 0, 4)                       // v_new
+    asm_s_delay_alu(0x01)
+
+    // Spike detect.
+    asm_v_cmp_ge_f64_vv(0, 20)
+    uint64 spike_patch_off = asm_text_len / 4
+    asm_s_cbranch_vccnz(0)
+
+    // No-spike: store v_new to V.
+    asm_u32(0xDC6E0000); asm_u32(0x00020008)
+    asm_s_waitcnt_vscnt_zero()
+    uint64 after_no_spike_off = asm_text_len / 4
+    asm_s_branch(0)
+
+    // ---- Spike body ----
+    uint64 spike_off = asm_text_len / 4
+    uint64 sp_skip = spike_off - (spike_patch_off + 1)
+    uint64 pb_sp = asm_text_buf + spike_patch_off * 4
+    uint32 w_sp = 0xBFA40000 | (sp_skip & 0xFFFF)
+    unsafe { *(pb_sp as uint32) = w_sp }
+
+    // V = V_reset.
+    asm_v_mov_b32(18, 32); asm_v_mov_b32(19, 33)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000); asm_u32(0x00021208)
+    asm_s_waitcnt_vscnt_zero()
+
+    // ref = ref_steps.
+    asm_v_mov_b32(18, 36); asm_v_mov_b32(19, 37)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000); asm_u32(0x00041208)
+    asm_s_waitcnt_vscnt_zero()
+
+    // spike++.
+    asm_u32(0x802A812A)                             // s_add_u32 s42, s42, 1
+    asm_u32(0x822B802B)                             // s_addc_u32 s43, s43, 0
+    asm_v_mov_b32(18, 42); asm_v_mov_b32(19, 43)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000); asm_u32(0x000C1208)
+    asm_s_waitcnt_vscnt_zero()
+
+    // x_pre += 1.0.
+    asm_u32(0xDC560000); asm_u32(0x160E0008)        // load x_pre → v[22:23]
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0xD7270016); asm_u32(0x0001E516)        // v_add_f64 v[22:23], v[22:23], 1.0
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000); asm_u32(0x000E1608)
+    asm_s_waitcnt_vscnt_zero()
+
+    // x_post += 1.0.
+    asm_u32(0xDC560000); asm_u32(0x16100008)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0xD7270016); asm_u32(0x0001E516)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000); asm_u32(0x00101608)
+    asm_s_waitcnt_vscnt_zero()
+
+    // STP: load u, x; rel = u*x; store release; x_new = x - rel; u_new = u + U*(1-u).
+    asm_u32(0xDC560000); asm_u32(0x18120008)        // u → v[24:25]
+    asm_u32(0xDC560000); asm_u32(0x1A140008)        // x → v[26:27]
+    asm_s_waitcnt_vmcnt_zero()
+
+    asm_v_mul_f64_vv(28, 24, 26)                    // v[28:29] = rel = u*x
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000); asm_u32(0x00161C08)        // release[0] = rel
+    asm_s_waitcnt_vscnt_zero()
+
+    asm_v_sub_f64_vv(26, 26, 28)                    // x_new = x - rel
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000); asm_u32(0x00141A08)        // x_stp[0] = x_new
+    asm_s_waitcnt_vscnt_zero()
+
+    // u_new = u + U_baseline * (1 - u)
+    asm_u32(0xD727001C); asm_u32(0x400230F2)        // v[28:29] = 1.0 - u
+    asm_s_delay_alu(0x01)
+    asm_v_mul_f64_vv(28, 30, 28)                    // U_base * (1-u)
+    asm_s_delay_alu(0x01)
+    asm_v_add_f64_vv(24, 24, 28)                    // u_new
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000); asm_u32(0x00121808)        // u_stp[0] = u_new
+    asm_s_waitcnt_vscnt_zero()
+
+    // --- Ring buffer: if cell_type[0] == 0, write rel to buf_delay[w_base+0] ---
+    // Reload rel into v[28:29] (it was overwritten by u_new intermediate).
+    asm_u32(0xDC560000); asm_u32(0x1C160008)        // global_load_b64 v[28:29], v8, s[22:23]  (re-read release[0])
+    asm_s_waitcnt_vmcnt_zero()
+
+    // SMEM load cell_type[0] (sbase=22 → s[44:45]).
+    asm_u32(0xF4040C96); asm_u32(0xF8000000)        // s_load_b64 s[50:51], s[44:45], null
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    asm_u32(0xBF068032)                             // s_cmp_eq_u32 s50, 0
+    uint64 ring_patch_off = asm_text_len / 4
+    asm_s_cbranch_scc0(0)                           // skip ring if ct != 0
+
+    // scatter addr: buf_delay + w_base*8.
+    asm_u32(0x84B48330)                             // s_lshl_b64 s[52:53], s[48:49], 3
+    asm_u32(0x8036342E)                             // s_add_u32  s54, s46, s52
+    asm_u32(0x8237352F)                             // s_addc_u32 s55, s47, s53
+
+    // Store v[28:29] (rel) at s[54:55].
+    asm_u32(0xDC6E0000); asm_u32(0x00361C08)        // global_store_b64 v8, v[28:29], s[54:55]
+    asm_s_waitcnt_vscnt_zero()
+
+    // skip_ring patch.
+    uint64 skip_ring_off = asm_text_len / 4
+    uint64 ring_skip = skip_ring_off - (ring_patch_off + 1)
+    uint64 pb_ring = asm_text_buf + ring_patch_off * 4
+    uint32 w_ring = 0xBFA10000 | (ring_skip & 0xFFFF)
+    unsafe { *(pb_ring as uint32) = w_ring }
+
+    uint64 after_spike_off = asm_text_len / 4
+    asm_s_branch(0)
+
+    // ---- Refractory body ----
+    uint64 refr_off = asm_text_len / 4
+    uint64 ie_skip = refr_off - (integrate_else_off + 1)
+    uint64 pb_ie = asm_text_buf + integrate_else_off * 4
+    uint32 w_ie = 0xBFA10000 | (ie_skip & 0xFFFF)
+    unsafe { *(pb_ie as uint32) = w_ie }
+
+    asm_u32(0x80A88128)                             // s_sub_u32 s40, s40, 1
+    asm_v_mov_b32_inline_u(8, 0)
+    asm_v_mov_b32(18, 40); asm_v_mov_b32(19, 41)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000); asm_u32(0x00041208)
+    asm_s_waitcnt_vscnt_zero()
+
+    asm_v_mov_b32(18, 32); asm_v_mov_b32(19, 33)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000); asm_u32(0x00021208)
+    asm_s_waitcnt_vscnt_zero()
+
+    // ---- end: patch forward branches ----
+    uint64 end_off = asm_text_len / 4
+
+    uint64 ns_skip = end_off - (after_no_spike_off + 1)
+    uint64 pb_ns = asm_text_buf + after_no_spike_off * 4
+    uint32 w_ns = 0xBFA00000 | (ns_skip & 0xFFFF)
+    unsafe { *(pb_ns as uint32) = w_ns }
+
+    uint64 as_skip = end_off - (after_spike_off + 1)
+    uint64 pb_as = asm_text_buf + after_spike_off * 4
+    uint32 w_as = 0xBFA00000 | (as_skip & 0xFFFF)
+    unsafe { *(pb_as as uint32) = w_as }
+
+    asm_s_endpgm()
+
+    uint64 rsrc1 = 0xE0AF0004
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000030
+    uint64 props = 0x0408
+
+    // 22 kernargs: 13 GLOBAL_BUFFER + 9 BY_VALUE.
+    uint64[44] args_desc
+    uint64 ai = 0
+    while ai < 13 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        ai = ai + 1
+    }
+    while ai < 22 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        ai = ai + 1
+    }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           176,     // kernarg_size (22 × 8)
+                                           8,       // kernarg_align
+                                           56,      // sgpr_count
+                                           32,      // vgpr_count
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 22)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_lif_full_blob: cannot open output\n", 46)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// M1u-1 mt_lif_integrate: multi-thread LIF integrate. Each lane
+// processes neuron i = tid. The integrate math (v_new = v + dt_over_tau
+// * (V_rest - v + drive)) is the same as M1t-1, but now operating on
+// VGPR pairs whose values were VMEM-loaded from arrays indexed by tid*8.
+// No refractory branch, no spike detect — this is just the arithmetic-
+// at-scale smoke test before the full mt_lif_full port.
+//
+// Launch convention: block_x = N, grid_x = 1. Hardware sets EXEC so
+// that only lanes 0..N-1 run, so we skip the explicit tid<n guard.
+//
+// Kernargs (8 args, 64 bytes):
+//   [0..7]   V_ptr
+//   [8..15]  RI_ptr
+//   [16..23] s_exc_ptr
+//   [24..31] s_inh_ptr
+//   [32..39] dt_over_tau (f64)
+//   [40..47] V_rest      (f64)
+//   [48..55] J_E         (f64)
+//   [56..63] J_I         (f64)
+@export
+fn emit_amdgpu_mt_lif_integrate_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "mt_lif_integrate"
+    uint64 klen  = 16
+
+    asm_init()
+
+    // Kernarg loads.
+    asm_s_load_b64(1, 0)                            // s[2:3]   V_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5]   RI_ptr
+    asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7]   s_exc_ptr
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9]   s_inh_ptr
+    asm_s_load_b64_off(5, 0, 0x20)                  // s[10:11] dt_over_tau
+    asm_s_load_b64_off(6, 0, 0x28)                  // s[12:13] V_rest
+    asm_s_load_b64_off(7, 0, 0x30)                  // s[14:15] J_E
+    asm_s_load_b64_off(8, 0, 0x38)                  // s[16:17] J_I
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Per-lane byte offset: v2 = tid * 8 (v0 already holds tid_x).
+    asm_v_lshlrev_b32_imm(2, 3, 0)                  // v2 = v0 << 3
+    asm_s_delay_alu(0x01)
+
+    // VMEM loads per-lane (saddr = s[X:X+1], v_addr = v2).
+    // Encodings: [word1=0xDC560000, word2=(vdst<<24) | (saddr<<16) | v_addr]
+    asm_u32(0xDC560000); asm_u32(0x04020002)        // V    → v[4:5]   (saddr=2)
+    asm_u32(0xDC560000); asm_u32(0x06040002)        // RI   → v[6:7]   (saddr=4)
+    asm_u32(0xDC560000); asm_u32(0x08060002)        // s_exc→ v[8:9]   (saddr=6)
+    asm_u32(0xDC560000); asm_u32(0x0A080002)        // s_inh→ v[10:11] (saddr=8)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // Move f64 kernargs SGPR→VGPR pairs.
+    asm_v_mov_b32(12, 10); asm_v_mov_b32(13, 11)    // v[12:13] dt_over_tau
+    asm_v_mov_b32(14, 12); asm_v_mov_b32(15, 13)    // v[14:15] V_rest
+    asm_v_mov_b32(16, 14); asm_v_mov_b32(17, 15)    // v[16:17] J_E
+    asm_v_mov_b32(18, 16); asm_v_mov_b32(19, 17)    // v[18:19] J_I
+    asm_s_delay_alu(0x04)
+
+    // Arithmetic chain (same as M1t-1 but with shifted VGPR layout):
+    //   v[8:9]  = s_exc * J_E
+    //   v[10:11]= s_inh * J_I
+    //   v[6:7]  = RI + s_exc*J_E
+    //   v[6:7] -= s_inh*J_I           (= drive)
+    //   v[8:9]  = V_rest - V
+    //   v[6:7]  = v[8:9] + v[6:7]      (= V_rest - V + drive)
+    //   v[8:9]  = dt_over_tau * v[6:7] (= dv)
+    //   v[4:5]  += dv                  (= v_new)
+    asm_v_mul_f64_vv(8, 8, 16)                      // s_exc * J_E
+    asm_v_mul_f64_vv(10, 10, 18)                    // s_inh * J_I
+    asm_s_delay_alu(0x02)
+    asm_v_add_f64_vv(6, 6, 8)                       // RI + s_exc*J_E
+    asm_s_delay_alu(0x01)
+    asm_v_sub_f64_vv(6, 6, 10)                      // drive
+    asm_v_sub_f64_vv(8, 14, 4)                      // V_rest - V
+    asm_s_delay_alu(0x02)
+    asm_v_add_f64_vv(6, 8, 6)                       // V_rest - V + drive
+    asm_s_delay_alu(0x01)
+    asm_v_mul_f64_vv(8, 12, 6)                      // dv = dt_over_tau * (...)
+    asm_s_delay_alu(0x01)
+    asm_v_add_f64_vv(4, 4, 8)                       // v_new = V + dv
+    asm_s_delay_alu(0x01)
+
+    // Store v_new to V[tid]  (saddr=s[2:3], v_addr=v2, vdata=v4).
+    asm_u32(0xDC6E0000); asm_u32(0x00020402)        // global_store_b64 v2, v[4:5], s[2:3]
+    asm_s_waitcnt_vscnt_zero()
+
+    asm_s_endpgm()
+
+    uint64 rsrc1 = 0xE0AF0002                       // VGPR granules=2 → 24 VGPRs (we use v0..v19)
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000030
+    uint64 props = 0x0408
+
+    // 8 kernargs: 4 GLOBAL_BUFFER + 4 BY_VALUE.
+    uint64[16] args_desc
+    uint64 ai = 0
+    while ai < 4 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        ai = ai + 1
+    }
+    while ai < 8 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        ai = ai + 1
+    }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           64,      // kernarg_size
+                                           8,       // kernarg_align
+                                           20,      // sgpr_count
+                                           20,      // vgpr_count
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 8)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_mt_lif_integrate_blob: cannot open output\n", 54)
         return 1
     }
     file_write(fd, amd_buf, size)
