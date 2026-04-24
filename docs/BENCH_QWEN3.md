@@ -41,15 +41,15 @@ numbers; memory is deterministic.
 
 | Config | Wall | tok/s | Peak RSS | vs PyTorch F32 | vs PyTorch BF16 |
 |---|---:|---:|---:|---:|---:|
-| **MLRift safetensors** | **670 ms** | **29.83** | **1.67 GB** | **3.05×** | **1.16×** |
-| **MLRift GGUF** | **661 ms** | **30.24** | **1.67 GB** | **3.09×** | **1.17×** |
+| **MLRift safetensors** | **624 ms** | **32.03** | **1.67 GB** | **3.27×** | **1.24×** |
+| **MLRift GGUF** | **619 ms** | **32.27** | **1.67 GB** | **3.30×** | **1.25×** |
 | PyTorch BF16 (bf16 weights, f32 GEMM) | 774 ms | 25.83 | 4.44 GB | 2.64× | 1.00× |
 | PyTorch F32 (f32 weights, f32 GEMM) | 2 043 ms | 9.79 | 7.23 GB | 1.00× | 0.38× |
 
 Reference frame that makes the most sense arithmetically is **MLRift
 vs PyTorch F32**: same FMA dtype, same accumulator dtype, same CPU.
-We're **3.05× faster** and use **4.3× less memory**. Against PyTorch
-BF16 on the same CPU (which also runs f32 GEMM): **1.16× faster** and
+We're **3.27× faster** and use **4.3× less memory**. Against PyTorch
+BF16 on the same CPU (which also runs f32 GEMM): **1.24× faster** and
 **2.6× less memory**.
 
 Memory story: MLRift mmap's bf16 weights once (1.4 GB resident for
@@ -99,7 +99,10 @@ Each row correctness-verified bit-identical to PyTorch before commit:
 | `d61f0d7` | AVX2 attention (dot + axpy with static scratch) | 770 ms | 25.96 | 63× |
 | `68d517b` | Static RMSNorm eps (no `uint64[1]` mmap per call) | 729 ms | 27.41 | 66.8× |
 | `7b25eb5` | 2-wide AVX2 matmul (independent FMA accumulators) | 703 ms | 28.44 | 69.3× |
-| `ef27a56` | Fuse Q/K/V + gate/up matmuls at load time | **684 ms** | **29.24** | **71.2×** |
+| `ef27a56` | Fuse Q/K/V + gate/up matmuls at load time | 684 ms | 29.24 | 71.2× |
+| `e114133` | AVX2 rmsnorm (bf16-weight + f32-weight) | 642 ms | 31.15 | 75.8× |
+| `312bc74` | Main thread runs its own matmul slice inline | 632 ms | 31.65 | 77.0× |
+| `211a8d3` | (opt) unfused path for large-model memory savings | **624 ms** | **32.03** | **78.0×** |
 
 ## Reproduce
 
