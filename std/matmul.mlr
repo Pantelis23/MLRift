@@ -187,6 +187,127 @@ fn mm_worker_bf16_f32_naive(u64 start_n, u64 end_n, u64 ctx_ptr) {
 //
 // K must be a multiple of 8. That's fine for Qwen3 (K ∈ {1024, 3072}).
 // The entry dispatcher falls back to the scalar worker for non-multiples.
+// Same as mm_worker_bf16_f32_avx2_naive but processes TWO output columns
+// per outer iteration, each with its own 8-wide accumulator (ymm0,
+// ymm3). The FMAs into the two accumulators are independent, so the
+// CPU can keep both FMA ports busy instead of serializing on a single
+// dependency chain. On Zen 4 with FMA latency 4 / throughput 2, this
+// roughly doubles the effective GFLOP/s when it's the bottleneck.
+//
+// Requires an even (end_n - start_n); the dispatcher sends an odd tail
+// column through the 1-wide worker.
+fn mm_worker_bf16_f32_avx2_naive_2w(u64 start_n, u64 end_n, u64 ctx_ptr) {
+    u64 out_ptr = 0
+    unsafe { *(ctx_ptr as u64) -> out_ptr }
+    u64 x_ptr = 0
+    unsafe { *((ctx_ptr + 8) as u64) -> x_ptr }
+    u64 w_ptr = 0
+    unsafe { *((ctx_ptr + 16) as u64) -> w_ptr }
+    u64 M = 0
+    unsafe { *((ctx_ptr + 24) as u64) -> M }
+    u64 N = 0
+    unsafe { *((ctx_ptr + 32) as u64) -> N }
+    u64 K = 0
+    unsafe { *((ctx_ptr + 40) as u64) -> K }
+
+    u64 m = 0
+    while m < M {
+        u64 x_row = x_ptr + m * K * 4
+        u64 o_row = out_ptr + m * N * 4
+        u64 n = start_n
+        while n + 1 < end_n {
+            u64 w_row1 = w_ptr + n * K * 2
+            u64 w_row2 = w_row1 + K * 2
+            u64 out_slot = o_row + n * 4
+            asm {
+                // vxorps ymm0, ymm0, ymm0       ; acc1 = 0
+                "0xC5 0xFC 0x57 0xC0"
+                // vxorps ymm3, ymm3, ymm3       ; acc2 = 0
+                "0xC5 0xE4 0x57 0xDB"
+                // xor rax, rax
+                "0x48 0x31 0xC0"
+                // .loop: cmp rax, rdx            ; (3)
+                "0x48 0x39 0xD0"
+                // jge +52 (past body to reduce)  ; rel8 = 0x34
+                "0x7D 0x34"
+                // vmovups ymm1, [rsi + rax*4]    ; (5) x shared
+                "0xC5 0xFC 0x10 0x0C 0x86"
+                // vmovdqu xmm2, [rdi + rax*2]    ; (5) col1 weights
+                "0xC5 0xFA 0x6F 0x14 0x47"
+                // vpmovzxwd ymm2, xmm2           ; (5)
+                "0xC4 0xE2 0x7D 0x33 0xD2"
+                // vpslld ymm2, ymm2, 16          ; (5)
+                "0xC5 0xED 0x72 0xF2 0x10"
+                // vfmadd231ps ymm0, ymm1, ymm2   ; (5) acc1 += x*w1
+                "0xC4 0xE2 0x75 0xB8 0xC2"
+                // vmovdqu xmm2, [r8 + rax*2]     ; (6) col2 weights (r8 base)
+                "0xC4 0xC1 0x7A 0x6F 0x14 0x40"
+                // vpmovzxwd ymm2, xmm2           ; (5)
+                "0xC4 0xE2 0x7D 0x33 0xD2"
+                // vpslld ymm2, ymm2, 16          ; (5)
+                "0xC5 0xED 0x72 0xF2 0x10"
+                // vfmadd231ps ymm3, ymm1, ymm2   ; (5) acc2 += x*w2
+                "0xC4 0xE2 0x75 0xB8 0xDA"
+                // add rax, 8                     ; (4)
+                "0x48 0x83 0xC0 0x08"
+                // jmp .loop                       ; rel8 = -57 = 0xC7
+                "0xEB 0xC7"
+                // .done: horizontal reduce ymm0 → xmm0[0]
+                // vextractf128 xmm1, ymm0, 1     ; (6)
+                "0xC4 0xE3 0x7D 0x19 0xC1 0x01"
+                // vaddps xmm0, xmm0, xmm1        ; (4)
+                "0xC5 0xF8 0x58 0xC1"
+                // vhaddps xmm0, xmm0, xmm0       ; (4)
+                "0xC5 0xFB 0x7C 0xC0"
+                // vhaddps xmm0, xmm0, xmm0       ; (4)
+                "0xC5 0xFB 0x7C 0xC0"
+                // vmovss [rcx], xmm0             ; (4) store col1 scalar
+                "0xC5 0xFA 0x11 0x01"
+                // Reduce ymm3 → xmm3[0]
+                // vextractf128 xmm1, ymm3, 1     ; (6)
+                "0xC4 0xE3 0x7D 0x19 0xD9 0x01"
+                // vaddps xmm3, xmm3, xmm1        ; (4)
+                "0xC5 0xE0 0x58 0xD9"
+                // vhaddps xmm3, xmm3, xmm3       ; (4)
+                "0xC5 0xE3 0x7C 0xDB"
+                // vhaddps xmm3, xmm3, xmm3       ; (4)
+                "0xC5 0xE3 0x7C 0xDB"
+                // vmovss [rcx+4], xmm3           ; (5) store col2 scalar
+                "0xC5 0xFA 0x11 0x59 0x04"
+                // vzeroupper                     ; (3)
+                "0xC5 0xF8 0x77"
+            } in(x_row -> rsi, w_row1 -> rdi, w_row2 -> r8, K -> rdx, out_slot -> rcx) clobbers(rax)
+            n = n + 2
+        }
+        // Odd tail column — reuse the 1-wide path inline so the caller
+        // doesn't need to orchestrate it.
+        if n < end_n {
+            u64 w_row = w_ptr + n * K * 2
+            u64 out_slot = o_row + n * 4
+            asm {
+                "0xC5 0xFC 0x57 0xC0"
+                "0x48 0x31 0xC0"
+                "0x48 0x39 0xD0"
+                "0x7D 0x1F"
+                "0xC5 0xFC 0x10 0x0C 0x86"
+                "0xC5 0xFA 0x6F 0x14 0x47"
+                "0xC4 0xE2 0x7D 0x33 0xD2"
+                "0xC5 0xED 0x72 0xF2 0x10"
+                "0xC4 0xE2 0x75 0xB8 0xC2"
+                "0x48 0x83 0xC0 0x08"
+                "0xEB 0xDC"
+                "0xC4 0xE3 0x7D 0x19 0xC1 0x01"
+                "0xC5 0xF8 0x58 0xC1"
+                "0xC5 0xFB 0x7C 0xC0"
+                "0xC5 0xFB 0x7C 0xC0"
+                "0xC5 0xFA 0x11 0x01"
+                "0xC5 0xF8 0x77"
+            } in(x_row -> rsi, w_row -> rdi, K -> rdx, out_slot -> rcx) clobbers(rax)
+        }
+        m = m + 1
+    }
+}
+
 fn mm_worker_bf16_f32_avx2_naive(u64 start_n, u64 end_n, u64 ctx_ptr) {
     u64 out_ptr = 0
     unsafe { *(ctx_ptr as u64) -> out_ptr }
@@ -293,12 +414,12 @@ fn matmul_bf16_weights_f32(u64 out_ptr, u64 x_ptr, u64 w_ptr,
     if use_kahan != 0 {
         fn_ptr = fn_addr("mm_worker_bf16_f32_kahan")
     } else {
-        // Naive path — use AVX2 when K is a multiple of 8 (true for
-        // every Qwen3 matmul: hidden=1024, ff=3072, vocab=151936).
-        // Future CPUID-based feature detection can switch this to
-        // mm_worker_bf16_f32_naive on non-AVX2 hosts.
+        // Naive path — use AVX2 2-wide when K is a multiple of 8. The
+        // 2-wide kernel runs two independent accumulators per inner
+        // iter, so both FMA ports stay busy even under the loop-carried
+        // dep; single-accumulator version serializes on one port.
         if (K & 7) == 0 {
-            fn_ptr = fn_addr("mm_worker_bf16_f32_avx2_naive")
+            fn_ptr = fn_addr("mm_worker_bf16_f32_avx2_naive_2w")
         } else {
             fn_ptr = fn_addr("mm_worker_bf16_f32_naive")
         }
