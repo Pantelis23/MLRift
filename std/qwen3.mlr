@@ -397,18 +397,177 @@ fn qwen3_attn_cached(u64 out_ptr,
 //   y    = down_proj(h)            [hidden]
 // silu(x) = x / (1 + exp(-x)) = x * sigmoid(x)
 // -----------------------------------------------------------------------------
-fn qwen3_silu_mul(u64 out_ptr, u64 gate_ptr, u64 up_ptr, u64 dim) {
+// AVX2 constants pool for qwen3_silu_mul_avx2. 16 f32 slots (1 cache
+// line): log2e, half, c1..c5, 1.0, 127.0 (as f32 for vcvtps2dq domain
+// check), 87.0, -87.0, and a few spares. Laid out so each broadcastss
+// target is a separate offset from rcx.
+//   [ 0] log2_e        [ 4] c5            [ 8] c4
+//   [12] c3            [16] c2            [20] c1
+//   [24] 1.0           [28] 127 (int32)    — int bias for 2^n
+//   [32] max_clamp 87  [36] min_clamp -87
+//   [40] ones mask for sigmoid (= 1.0f)
+//   ...
+static u64 qwen3_silu_consts = 0
+
+fn qwen3_silu_consts_init() {
+    if qwen3_silu_consts != 0 { return }
+    qwen3_silu_consts = alloc(64)
+    u64 c = qwen3_silu_consts
+    f32 log2_e = 1.4426950408889634f
+    f32 c5 = 0.00133335f
+    f32 c4 = 0.00960802f
+    f32 c3 = 0.05550411f
+    f32 c2 = 0.24022651f
+    f32 c1 = 0.69314718f
+    f32 one  = 1.0f
+    f32 p87  = 87.0f
+    f32 n87  = 0.0f - 87.0f
+    unsafe { *((c +  0) as f32) = log2_e }
+    unsafe { *((c +  4) as f32) = c5 }
+    unsafe { *((c +  8) as f32) = c4 }
+    unsafe { *((c + 12) as f32) = c3 }
+    unsafe { *((c + 16) as f32) = c2 }
+    unsafe { *((c + 20) as f32) = c1 }
+    unsafe { *((c + 24) as f32) = one }
+    // int32 127 (biased exponent base) as u32 bits into offset 28
+    u64 bias_u = 127
+    unsafe { *((c + 28) as u32) = bias_u }
+    unsafe { *((c + 32) as f32) = p87 }
+    unsafe { *((c + 36) as f32) = n87 }
+}
+
+// AVX2 SiLU × mul: out[i] = (g[i] * sigmoid(g[i])) * u[i], 8 lanes per
+// iter. Replaces ~185 ms of scalar loop on Qwen3-0.6B (3072 elems ×
+// 28 layers × 20 tokens) with a vectorized path; no parallelism across
+// workers needed at this size (thread-pool submit overhead would wash
+// the per-call time).
+//
+// SIMD exp inside: same polynomial as scalar exp_f32_fast — r = x * log2e,
+// n = round(r), f = r - n (in [-0.5, 0.5]), 2^f via horner poly,
+// 2^n via bit-inject into f32 exponent field. Everything stays in ymm.
+//
+// dim must be a multiple of 8 (true for Qwen3 ff=3072). A scalar tail
+// pass handles any residue — see fallback below.
+fn qwen3_silu_mul_avx2(u64 out_ptr, u64 gate_ptr, u64 up_ptr, u64 dim) {
+    qwen3_silu_consts_init()
+    u64 c = qwen3_silu_consts
+    u64 dim8 = dim & 0xFFFFFFFFFFFFFFF8
+
+    // Outer 8-step loop in MLRift; asm block processes one 8-wide chunk
+    // per invocation. No jumps inside the asm, so rel8 encoding concerns
+    // don't apply. Per-call asm prologue/epilogue is minimal (MLRift
+    // just binds `in()` regs — no ymm save/restore).
     u64 i = 0
+    while i < dim8 {
+        u64 g_addr = gate_ptr + i * 4
+        u64 u_addr = up_ptr   + i * 4
+        u64 o_addr = out_ptr  + i * 4
+        asm {
+            // vmovups ymm0, [rsi]              ; g
+            "0xC5 0xFC 0x10 0x06"
+            // vxorps  ymm1, ymm1, ymm1         ; 0
+            "0xC5 0xF4 0x57 0xC9"
+            // vsubps  ymm2, ymm1, ymm0         ; -g
+            "0xC5 0xF4 0x5C 0xD0"
+            // vbroadcastss ymm6, [rcx+36]      ; -87 clamp
+            "0xC4 0xE2 0x7D 0x18 0x71 0x24"
+            // vmaxps  ymm2, ymm2, ymm6         ; clamp min
+            "0xC5 0xEC 0x5F 0xD6"
+            // vbroadcastss ymm6, [rcx+32]      ; +87 clamp
+            "0xC4 0xE2 0x7D 0x18 0x71 0x20"
+            // vminps  ymm2, ymm2, ymm6         ; clamp max
+            "0xC5 0xEC 0x5D 0xD6"
+            // vbroadcastss ymm6, [rcx]         ; log2e
+            "0xC4 0xE2 0x7D 0x18 0x31"
+            // vmulps  ymm2, ymm2, ymm6         ; r = x*log2e
+            "0xC5 0xEC 0x59 0xD6"
+            // vcvtps2dq ymm4, ymm2             ; n
+            "0xC5 0xFD 0x5B 0xE2"
+            // vcvtdq2ps ymm3, ymm4             ; n_f
+            "0xC5 0xFC 0x5B 0xDC"
+            // vsubps  ymm2, ymm2, ymm3         ; f in [-0.5, 0.5]
+            "0xC5 0xEC 0x5C 0xD3"
+            // Poly as separate MUL+ADD (not FMA) so the rounding matches
+            // the scalar reference exactly. Using vfmadd213ps gives a
+            // more accurate result per step but diverges by ~1 ULP from
+            // the scalar path, and those differences compound over the
+            // 28 Qwen3 layers enough to flip argmax. Keeping bit-exact
+            // match with scalar preserves PyTorch greedy tokens.
+            // vbroadcastss ymm5, [rcx+4]       ; c5
+            "0xC4 0xE2 0x7D 0x18 0x69 0x04"
+            // vmulps ymm5, ymm5, ymm2          ; c5*f
+            "0xC5 0xD4 0x59 0xEA"
+            // vbroadcastss ymm6, [rcx+8]       ; c4
+            "0xC4 0xE2 0x7D 0x18 0x71 0x08"
+            // vaddps ymm5, ymm5, ymm6          ; +c4
+            "0xC5 0xD4 0x58 0xEE"
+            // vmulps ymm5, ymm5, ymm2
+            "0xC5 0xD4 0x59 0xEA"
+            // vbroadcastss ymm6, [rcx+12]      ; c3
+            "0xC4 0xE2 0x7D 0x18 0x71 0x0C"
+            // vaddps ymm5, ymm5, ymm6
+            "0xC5 0xD4 0x58 0xEE"
+            // vmulps ymm5, ymm5, ymm2
+            "0xC5 0xD4 0x59 0xEA"
+            // vbroadcastss ymm6, [rcx+16]      ; c2
+            "0xC4 0xE2 0x7D 0x18 0x71 0x10"
+            // vaddps ymm5, ymm5, ymm6
+            "0xC5 0xD4 0x58 0xEE"
+            // vmulps ymm5, ymm5, ymm2
+            "0xC5 0xD4 0x59 0xEA"
+            // vbroadcastss ymm6, [rcx+20]      ; c1
+            "0xC4 0xE2 0x7D 0x18 0x71 0x14"
+            // vaddps ymm5, ymm5, ymm6
+            "0xC5 0xD4 0x58 0xEE"
+            // vmulps ymm5, ymm5, ymm2
+            "0xC5 0xD4 0x59 0xEA"
+            // vbroadcastss ymm6, [rcx+24]      ; 1.0
+            "0xC4 0xE2 0x7D 0x18 0x71 0x18"
+            // vaddps ymm5, ymm5, ymm6          ; → 2^f
+            "0xC5 0xD4 0x58 0xEE"
+            // vpbroadcastd ymm6, [rcx+28]      ; int 127
+            "0xC4 0xE2 0x7D 0x58 0x71 0x1C"
+            // vpaddd  ymm4, ymm4, ymm6         ; n + 127
+            "0xC5 0xDD 0xFE 0xE6"
+            // vpslld  ymm4, ymm4, 23           ; → f32 2^n
+            "0xC5 0xDD 0x72 0xF4 0x17"
+            // vmulps  ymm5, ymm5, ymm4         ; exp = 2^f * 2^n
+            "0xC5 0xD4 0x59 0xEC"
+            // vbroadcastss ymm6, [rcx+24]      ; 1.0
+            "0xC4 0xE2 0x7D 0x18 0x71 0x18"
+            // vaddps  ymm5, ymm5, ymm6         ; 1 + exp
+            "0xC5 0xD4 0x58 0xEE"
+            // vdivps  ymm5, ymm6, ymm5         ; sigmoid
+            "0xC5 0xCC 0x5E 0xED"
+            // vmulps  ymm0, ymm0, ymm5         ; silu(g)
+            "0xC5 0xFC 0x59 0xC5"
+            // vmovups ymm1, [rdi]              ; u
+            "0xC5 0xFC 0x10 0x0F"
+            // vmulps  ymm0, ymm0, ymm1         ; * u
+            "0xC5 0xFC 0x59 0xC1"
+            // vmovups [r8], ymm0
+            "0xC4 0xC1 0x7C 0x11 0x00"
+            // vzeroall — clear every ymm register so no stale AVX state
+            // leaks into subsequent SSE/AVX code in caller.
+            "0xC5 0xFC 0x77"
+        } in(g_addr -> rsi, u_addr -> rdi, o_addr -> r8, c -> rcx)
+        i = i + 8
+    }
+
+    // Scalar tail for any residue.
     f32 one = 1.0f
     while i < dim {
         f32 g = 0.0f; unsafe { *((gate_ptr + i * 4) as f32) -> g }
         f32 u = 0.0f; unsafe { *((up_ptr   + i * 4) as f32) -> u }
-        // sigmoid(g) = 1/(1+exp(-g))
         f32 sig = one / (one + exp_f32_fast(0.0f - g))
         f32 y = g * sig * u
         unsafe { *((out_ptr + i * 4) as f32) = y }
         i = i + 1
     }
+}
+
+fn qwen3_silu_mul(u64 out_ptr, u64 gate_ptr, u64 up_ptr, u64 dim) {
+    qwen3_silu_mul_avx2(out_ptr, gate_ptr, up_ptr, dim)
 }
 
 // Fast f32 exp via 2^(x*log2e) with a polynomial 2^f approximation on
