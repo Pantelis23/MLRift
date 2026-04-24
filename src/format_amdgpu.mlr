@@ -4293,6 +4293,24 @@ fn emit_amdgpu_mt_lif_full_blob(uint64 out_path) -> uint64 {
     asm_v_mov_b32(42, 38); asm_v_mov_b32(43, 39)    // v[42:43] U_baseline
     asm_s_delay_alu(0x04)
 
+    // --- Integrate arithmetic: v_new = V + dt_over_tau * (V_rest - V + drive) ---
+    // drive    = RI + s_exc*J_E - s_inh*J_I
+    // Uses v[26:27], v[28:29], v[30:31] as reusable f64 scratch.
+    asm_v_mul_f64_vv(28, 8, 34)                     // v[28:29] = s_exc * J_E
+    asm_v_mul_f64_vv(30, 10, 36)                    // v[30:31] = s_inh * J_I
+    asm_s_delay_alu(0x02)
+    asm_v_add_f64_vv(26, 6, 28)                     // v[26:27] = RI + s_exc*J_E
+    asm_s_delay_alu(0x01)
+    asm_v_sub_f64_vv(26, 26, 30)                    // v[26:27] = drive
+    asm_v_sub_f64_vv(28, 32, 4)                     // v[28:29] = V_rest - V
+    asm_s_delay_alu(0x02)
+    asm_v_add_f64_vv(26, 28, 26)                    // v[26:27] = V_rest - V + drive
+    asm_s_delay_alu(0x01)
+    asm_v_mul_f64_vv(28, 44, 26)                    // v[28:29] = dv = dt_over_tau * (...)
+    asm_s_delay_alu(0x01)
+    asm_v_add_f64_vv(26, 4, 28)                     // v[26:27] = v_new (live for spike branch in Task 4)
+    asm_s_delay_alu(0x01)
+
     asm_s_endpgm()
 
     uint64 rsrc1 = 0xE0AF0005                       // VGPR granule=5: (5+1)*8 = 48 VGPRs
