@@ -1,0 +1,76 @@
+// Correctness test for matmul_q8_0_weights_f32.
+//
+// Lays out one Q8_0 tensor of shape [N=2, K=32] by hand:
+//   row 0: scale=1.0f, qs=[1, 2, ..., 32]
+//   row 1: scale=0.5f, qs=[-16, -15, ..., -16+31]
+// And an x vector [K] = [1, 1, ..., 1].
+//
+// Expected:
+//   out[0] = 1.0 * (1 + 2 + ... + 32)              = 1 * 528   = 528
+//   out[1] = 0.5 * (-16 + -15 + ... + 15)          = 0.5 * -16 = -8
+// Run matmul_q8_0_weights_f32 with num_workers=1 and compare.
+
+import "../std/matmul.mlr"
+import "../std/gguf.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/thread.mlr"
+
+fn put(u64 s) { print_str(s) }
+
+fn main() {
+    thread_pool_init(2)
+
+    u64 N = 2
+    u64 K = 32
+    u64 n_blocks = K / 32  // = 1
+
+    // Build Q8_0 tensor by hand.
+    //   Block 0 (row 0): scale = 1.0f as f16, qs[0..31] = 1..32
+    //   Block 1 (row 1): scale = 0.5f as f16, qs[0..31] = -16..15
+    u64 w_bytes = N * n_blocks * 34
+    u64 w = alloc(w_bytes)
+    // Row 0 scale = 1.0 as f16 (binary16: 0x3C00)
+    u8 r0_lo = 0x00; u8 r0_hi = 0x3C
+    store8(w + 0, r0_lo); store8(w + 1, r0_hi)
+    u64 j = 0
+    while j < 32 {
+        u8 v = j + 1
+        store8(w + 2 + j, v)
+        j = j + 1
+    }
+    // Row 1 scale = 0.5 as f16 (binary16: 0x3800)
+    u8 r1_lo = 0x00; u8 r1_hi = 0x38
+    store8(w + 34 + 0, r1_lo); store8(w + 34 + 1, r1_hi)
+    j = 0
+    while j < 32 {
+        i64 sj = j
+        i64 val = sj - 16  // -16..+15
+        u8 vb = val & 0xFF // encode as 2's-complement int8
+        store8(w + 34 + 2 + j, vb)
+        j = j + 1
+    }
+
+    // Activations: all 1.0f
+    u64 x = alloc(K * 4)
+    f32 one_f = 1.0f
+    u64 i = 0
+    while i < K {
+        unsafe { *((x + i * 4) as f32) = one_f }
+        i = i + 1
+    }
+
+    u64 out = alloc(N * 4)
+    matmul_q8_0_weights_f32(out, x, w, 1, N, K, 2)
+
+    f32 o0 = 0.0f; unsafe { *(out as f32) -> o0 }
+    f32 o1 = 0.0f; unsafe { *((out + 4) as f32) -> o1 }
+    put("out[0] = "); u64 s0 = fmt_f32(o0, 4); put(s0); dealloc(s0)
+    put("   expect 528.0\n")
+    put("out[1] = "); u64 s1 = fmt_f32(o1, 4); put(s1); dealloc(s1)
+    put("   expect -8.0\n")
+
+    dealloc(out); dealloc(x); dealloc(w)
+    thread_pool_shutdown()
+    exit(0)
+}
