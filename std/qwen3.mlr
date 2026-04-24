@@ -510,8 +510,10 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     // qwen3_dump5("attn",   attn_out)
 
     u64 o_buf = alloc(hidden * 4)
-    // o_proj feeds the first residual add — Kahan on.
-    matmul_bf16_weights_f32(o_buf, attn_out, w.o_proj_w, 1, hidden, q_dim, num_workers, 1)
+    // o_proj feeds the first residual add. Kahan was needed on the
+    // scalar path to avoid argmax drift; the AVX2 naive kernel is
+    // precise enough on Qwen3-0.6B (verified bit-identical tokens).
+    matmul_bf16_weights_f32(o_buf, attn_out, w.o_proj_w, 1, hidden, q_dim, num_workers, 0)
     // qwen3_dump5("o_out",  o_buf)
 
     // Residual add: x = resid + o_buf
@@ -545,8 +547,9 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     // that's fixed now, so the MT path works and parallelises the 3M-element
     // hotspot.
     u64 ff_out = alloc(hidden * 4)
-    // down_proj feeds the second residual add — Kahan on.
-    matmul_bf16_weights_f32(ff_out, ff_buf, w.down_proj_w, 1, hidden, ff, num_workers, 1)
+    // down_proj feeds the second residual add. See note on o_proj above —
+    // AVX2 naive preserves argmax on Qwen3-0.6B.
+    matmul_bf16_weights_f32(ff_out, ff_buf, w.down_proj_w, 1, hidden, ff, num_workers, 0)
     // qwen3_dump5("ff_out", ff_out)
 
     // Second residual add: x_out = mid + ff_out

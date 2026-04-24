@@ -178,6 +178,80 @@ fn mm_worker_bf16_f32_naive(u64 start_n, u64 end_n, u64 ctx_ptr) {
     }
 }
 
+// AVX2 BF16×F32 inner loop. Same output as mm_worker_bf16_f32_naive but
+// the K loop runs 8 elements per iteration using an ymm accumulator.
+//
+// BF16-to-F32 decode in vector: load 8 bf16 into an xmm register,
+// vpmovzxwd widens to 8×u32 in ymm, vpslld by 16 aligns the bf16 payload
+// into the f32 high bits — reinterpretation then gives a valid f32 lane.
+//
+// K must be a multiple of 8. That's fine for Qwen3 (K ∈ {1024, 3072}).
+// The entry dispatcher falls back to the scalar worker for non-multiples.
+fn mm_worker_bf16_f32_avx2_naive(u64 start_n, u64 end_n, u64 ctx_ptr) {
+    u64 out_ptr = 0
+    unsafe { *(ctx_ptr as u64) -> out_ptr }
+    u64 x_ptr = 0
+    unsafe { *((ctx_ptr + 8) as u64) -> x_ptr }
+    u64 w_ptr = 0
+    unsafe { *((ctx_ptr + 16) as u64) -> w_ptr }
+    u64 M = 0
+    unsafe { *((ctx_ptr + 24) as u64) -> M }
+    u64 N = 0
+    unsafe { *((ctx_ptr + 32) as u64) -> N }
+    u64 K = 0
+    unsafe { *((ctx_ptr + 40) as u64) -> K }
+
+    u64 m = 0
+    while m < M {
+        u64 x_row = x_ptr + m * K * 4
+        u64 o_row = out_ptr + m * N * 4
+        u64 n = start_n
+        while n < end_n {
+            u64 w_row = w_ptr + n * K * 2
+            u64 out_slot = o_row + n * 4
+            asm {
+                // vxorps ymm0, ymm0, ymm0       ; accumulator = 0
+                "0xC5 0xFC 0x57 0xC0"
+                // xor rax, rax                   ; k = 0
+                "0x48 0x31 0xC0"
+                // .loop: cmp rax, rdx            ; 3 bytes
+                "0x48 0x39 0xD0"
+                // jge +31 (past loop body to reduce block)
+                "0x7D 0x1F"
+                // vmovups ymm1, [rsi + rax*4]    ; 8 f32 activations
+                "0xC5 0xFC 0x10 0x0C 0x86"
+                // vmovdqu xmm2, [rdi + rax*2]    ; 8 bf16 weights (16 bytes)
+                "0xC5 0xFA 0x6F 0x14 0x47"
+                // vpmovzxwd ymm2, xmm2           ; widen 8 u16 → 8 u32
+                "0xC4 0xE2 0x7D 0x33 0xD2"
+                // vpslld ymm2, ymm2, 16          ; bf16 bits → upper 16 of f32
+                "0xC5 0xED 0x72 0xF2 0x10"
+                // vfmadd231ps ymm0, ymm1, ymm2   ; acc += x * w
+                "0xC4 0xE2 0x75 0xB8 0xC2"
+                // add rax, 8
+                "0x48 0x83 0xC0 0x08"
+                // jmp .loop  (-36 = back to cmp)
+                "0xEB 0xDC"
+                // .done: horizontal reduce ymm0 → scalar
+                // vextractf128 xmm1, ymm0, 1
+                "0xC4 0xE3 0x7D 0x19 0xC1 0x01"
+                // vaddps xmm0, xmm0, xmm1
+                "0xC5 0xF8 0x58 0xC1"
+                // vhaddps xmm0, xmm0, xmm0
+                "0xC5 0xFB 0x7C 0xC0"
+                // vhaddps xmm0, xmm0, xmm0       ; xmm0[0] = sum of all 8 lanes
+                "0xC5 0xFB 0x7C 0xC0"
+                // vmovss [rcx], xmm0             ; store scalar f32 output
+                "0xC5 0xFA 0x11 0x01"
+                // vzeroupper                     ; clean AVX→SSE transition
+                "0xC5 0xF8 0x77"
+            } in(x_row -> rsi, w_row -> rdi, K -> rdx, out_slot -> rcx) clobbers(rax)
+            n = n + 1
+        }
+        m = m + 1
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry: matmul with BF16 weights, F32 activations, Kahan on/off.
 //
@@ -219,7 +293,15 @@ fn matmul_bf16_weights_f32(u64 out_ptr, u64 x_ptr, u64 w_ptr,
     if use_kahan != 0 {
         fn_ptr = fn_addr("mm_worker_bf16_f32_kahan")
     } else {
-        fn_ptr = fn_addr("mm_worker_bf16_f32_naive")
+        // Naive path — use AVX2 when K is a multiple of 8 (true for
+        // every Qwen3 matmul: hidden=1024, ff=3072, vocab=151936).
+        // Future CPUID-based feature detection can switch this to
+        // mm_worker_bf16_f32_naive on non-AVX2 hosts.
+        if (K & 7) == 0 {
+            fn_ptr = fn_addr("mm_worker_bf16_f32_avx2_naive")
+        } else {
+            fn_ptr = fn_addr("mm_worker_bf16_f32_naive")
+        }
     }
 
     u64 chunk = N / num_workers
