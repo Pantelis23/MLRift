@@ -21,6 +21,7 @@
 import "safetensors.mlr"
 import "thread.mlr"
 import "math_float.mlr"
+import "matmul.mlr"
 
 // int-to-f32 helper: the compiler has int_to_f64 + f64_to_f32 as
 // built-ins but a named wrapper makes callsites readable.
@@ -102,103 +103,13 @@ fn rmsnorm_bf16_weights_f32(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
     }
 }
 
-// Worker for the BF16-weight matmul below. Context layout (6 u64s):
-//   [0]  out_ptr     [1]  x_ptr        [2]  w_ptr
-//   [3]  M           [4]  N            [5]  K
-// Each worker handles columns [start_n, end_n) of the output matrix.
-fn infer_matmul_worker(u64 start_n, u64 end_n, u64 ctx_ptr) {
-    u64 out_ptr = 0
-    unsafe { *(ctx_ptr as u64) -> out_ptr }
-    u64 x_ptr = 0
-    unsafe { *((ctx_ptr + 8) as u64) -> x_ptr }
-    u64 w_ptr = 0
-    unsafe { *((ctx_ptr + 16) as u64) -> w_ptr }
-    u64 M = 0
-    unsafe { *((ctx_ptr + 24) as u64) -> M }
-    u64 N = 0
-    unsafe { *((ctx_ptr + 32) as u64) -> N }
-    u64 K = 0
-    unsafe { *((ctx_ptr + 40) as u64) -> K }
-
-    // BF16 decode scratch — one 4-byte buffer per worker, reused for every
-    // weight element. The first two bytes stay 0 (f32 low bits); only the
-    // top two bytes change per call. Replaces a per-element alloc/dealloc
-    // that was costing ~2 µs per weight = minutes per matmul.
-    u64 scratch = alloc(4)
-    u8 zero = 0
-    store8(scratch + 0, zero)
-    store8(scratch + 1, zero)
-
-    // Kahan-summation matmul: the compensation `c` carries low-order bits
-    // that a naive running sum would lose, dropping effective precision
-    // from O(n·ε) to O(ε). Critical for the 28-layer residual stream —
-    // without it, the accumulated drift flips argmax away from Python's.
-    u64 m = 0
-    while m < M {
-        u64 n = start_n
-        while n < end_n {
-            f32 sum = 0.0f
-            f32 c = 0.0f
-            u64 k = 0
-            while k < K {
-                f32 xv = 0.0f
-                unsafe { *((x_ptr + (m * K + k) * 4) as f32) -> xv }
-                u64 w_off = (n * K + k) * 2
-                u8 b0u = load8(w_ptr + w_off)
-                u8 b1u = load8(w_ptr + w_off + 1)
-                store8(scratch + 2, b0u)
-                store8(scratch + 3, b1u)
-                f32 wv = 0.0f
-                unsafe { *(scratch as f32) -> wv }
-                f32 prod = xv * wv
-                f32 y = prod - c
-                f32 t = sum + y
-                c = (t - sum) - y
-                sum = t
-                k = k + 1
-            }
-            unsafe { *((out_ptr + (m * N + n) * 4) as f32) = sum }
-            n = n + 1
-        }
-        m = m + 1
-    }
-    dealloc(scratch)
-}
-
-// MatMul:  out[M x N] = x[M x K] · w[K x N]ᵀ, with `w` stored as
-// BF16 in row-major [N x K] (Hugging Face convention — each output
-// column is one weight row). Columns are sharded across the thread
-// pool. `num_workers` must be ≥ 1 and ≤ the pool size.
+// Legacy Kahan-on matmul entry, forwarded to the new std/matmul.mlr
+// library. The real implementation lives there; this wrapper preserves
+// the existing callers (examples/qwen3_forward.mlr,
+// examples/qwen3_generate.mlr, std/qwen3.mlr) while the perf work lands.
 fn matmul_bf16_weights_f32_mt(u64 out_ptr, u64 x_ptr, u64 w_ptr,
                               u64 M, u64 N, u64 K, u64 num_workers) {
-    u64 ctx_ptr = alloc(48)
-    unsafe { *(ctx_ptr as u64) = out_ptr }
-    u64 cp8 = ctx_ptr + 8
-    unsafe { *(cp8 as u64) = x_ptr }
-    u64 cp16 = ctx_ptr + 16
-    unsafe { *(cp16 as u64) = w_ptr }
-    u64 cp24 = ctx_ptr + 24
-    unsafe { *(cp24 as u64) = M }
-    u64 cp32 = ctx_ptr + 32
-    unsafe { *(cp32 as u64) = N }
-    u64 cp40 = ctx_ptr + 40
-    unsafe { *(cp40 as u64) = K }
-
-    u64 chunk = N / num_workers
-    u64 fn_ptr = fn_addr("infer_matmul_worker")
-
-    u64 w = 0
-    while w < num_workers {
-        u64 start_n = w * chunk
-        u64 end_n = start_n + chunk
-        if w == num_workers - 1 {
-            end_n = N
-        }
-        thread_pool_submit(w, fn_ptr, start_n, end_n, ctx_ptr)
-        w = w + 1
-    }
-    thread_pool_wait()
-    dealloc(ctx_ptr)
+    matmul_bf16_weights_f32(out_ptr, x_ptr, w_ptr, M, N, K, num_workers, 1)
 }
 
 // Embed-and-scale: copy the `token_id`-th row out of a BF16 embedding

@@ -455,9 +455,12 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     // downstream QK-norm and RoPE mutate the cache in place. V is stored raw
     // (no norm, no RoPE — Qwen3 only rotates Q and K).
     u64 q_buf = alloc(q_dim * 4)
-    matmul_bf16_weights_f32_mt(q_buf, x_norm, w.q_proj_w, 1, q_dim,  hidden, num_workers)
-    matmul_bf16_weights_f32_mt(k_row, x_norm, w.k_proj_w, 1, kv_dim, hidden, num_workers)
-    matmul_bf16_weights_f32_mt(v_row, x_norm, w.v_proj_w, 1, kv_dim, hidden, num_workers)
+    // Q / K / V projections — one matmul each. Not on the residual
+    // stream, so the naive accumulator is plenty (Kahan-off). The
+    // residual-stream ones (o_proj, down_proj) below keep Kahan on.
+    matmul_bf16_weights_f32(q_buf, x_norm, w.q_proj_w, 1, q_dim,  hidden, num_workers, 0)
+    matmul_bf16_weights_f32(k_row, x_norm, w.k_proj_w, 1, kv_dim, hidden, num_workers, 0)
+    matmul_bf16_weights_f32(v_row, x_norm, w.v_proj_w, 1, kv_dim, hidden, num_workers, 0)
     // qwen3_dump5("q_raw", q_buf)
     // qwen3_dump5("q_raw_h1", q_buf + 128 * 4)
     // qwen3_dump5("k_raw", k_row)
@@ -507,7 +510,8 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     // qwen3_dump5("attn",   attn_out)
 
     u64 o_buf = alloc(hidden * 4)
-    matmul_bf16_weights_f32_mt(o_buf, attn_out, w.o_proj_w, 1, hidden, q_dim, num_workers)
+    // o_proj feeds the first residual add — Kahan on.
+    matmul_bf16_weights_f32(o_buf, attn_out, w.o_proj_w, 1, hidden, q_dim, num_workers, 1)
     // qwen3_dump5("o_out",  o_buf)
 
     // Residual add: x = resid + o_buf
@@ -528,9 +532,10 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
 
     u64 gate_buf = alloc(ff * 4)
     u64 up_buf   = alloc(ff * 4)
-    matmul_bf16_weights_f32_mt(gate_buf, mid_norm, w.gate_proj_w, 1, ff, hidden, num_workers)
+    // gate_proj and up_proj feed silu(gate) * up, not a residual — Kahan off.
+    matmul_bf16_weights_f32(gate_buf, mid_norm, w.gate_proj_w, 1, ff, hidden, num_workers, 0)
     // qwen3_dump5("gate",   gate_buf)
-    matmul_bf16_weights_f32_mt(up_buf,   mid_norm, w.up_proj_w,   1, ff, hidden, num_workers)
+    matmul_bf16_weights_f32(up_buf,   mid_norm, w.up_proj_w,   1, ff, hidden, num_workers, 0)
     // qwen3_dump5("up",     up_buf)
     u64 ff_buf = alloc(ff * 4)
     qwen3_silu_mul(ff_buf, gate_buf, up_buf, ff)
@@ -540,7 +545,8 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     // that's fixed now, so the MT path works and parallelises the 3M-element
     // hotspot.
     u64 ff_out = alloc(hidden * 4)
-    matmul_bf16_weights_f32_mt(ff_out, ff_buf, w.down_proj_w, 1, hidden, ff, num_workers)
+    // down_proj feeds the second residual add — Kahan on.
+    matmul_bf16_weights_f32(ff_out, ff_buf, w.down_proj_w, 1, hidden, ff, num_workers, 1)
     // qwen3_dump5("ff_out", ff_out)
 
     // Second residual add: x_out = mid + ff_out
