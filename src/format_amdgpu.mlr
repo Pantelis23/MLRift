@@ -4625,9 +4625,15 @@ fn emit_amdgpu_mt_csr_i_deliver_blob(uint64 out_path) -> uint64 {
     asm_v_cmp_ne_u64_vv(2, 0)
     asm_v_mov_b32(2, 0x100 | 0)                     // v2 = returned_prev_lo (copy of v0)
     asm_v_mov_b32(3, 0x100 | 1)                     // v3 = returned_prev_hi (copy of v1)
+    // Narrow EXEC to lanes that still need to retry. Without this, lanes
+    // that already succeeded keep re-participating in the loop body,
+    // which for atomic-add is not idempotent — successful lanes keep
+    // adding `effective` on top of other lanes' writes, so no lane ever
+    // sees a stable "assumed" value and the loop never terminates.
+    asm_s_and_b32_exec_vcc_lo()                     // exec_lo &= vcc_lo
     uint64 cas_branch_off = asm_text_len / 4
     uint64 cas_delta = cas_head_off - (cas_branch_off + 1)
-    asm_s_cbranch_vccnz(cas_delta & 0xFFFF)
+    asm_s_cbranch_execnz(cas_delta & 0xFFFF)
 
     // --- Restore EXEC masks ---
     asm_s_mov_b32(0x7E, 47)                         // exec_lo = s47 (drop rel>0)
@@ -4658,7 +4664,7 @@ fn emit_amdgpu_mt_csr_i_deliver_blob(uint64 out_path) -> uint64 {
                                            asm_text_buf, asm_text_len,
                                            72,      // kernarg_size (9 × 8)
                                            8,       // kernarg_align
-                                           24,      // sgpr_count (reserves s20..s23 for later EXEC saves + scratch)
+                                           48,      // sgpr_count (s2..s19 kernargs, s46/s47 EXEC saves)
                                            24,      // vgpr_count
                                            rsrc1, rsrc2, rsrc3, props,
                                            args_desc, 9)
@@ -4775,9 +4781,22 @@ fn emit_amdgpu_mt_csr_e_delayed_blob(uint64 out_path) -> uint64 {
     asm_v_mul_f64_vv(26, 6, 20)
     asm_s_delay_alu(0x01)
 
+    // Save v2 (per-lane tid*8 byte offset) to v44 BEFORE the prime CAS
+    // load — that load clobbers v[2:3] with s_exc[tgt]'s current value.
+    // The CAS retry later re-clobbers v2 each iteration. Post-CAS, v2
+    // is restored from v44 so STDP LTD + first-edge-clear VMEM stores
+    // address their lane's rpe_w / buf_delay slot correctly.
+    asm_v_mov_b32(44, 0x100 | 2)                    // v44 = v2 (tid*8)
+    asm_s_delay_alu(0x01)
+
     // --- Prime CAS assumed = *s_exc[tgt] ---
     asm_u32(0xDC560000); asm_u32(0x027C0018)        // global_load_b64 v[2:3], v[24:25], off
     asm_s_waitcnt_vmcnt_zero()
+
+    // Save the rel>0 EXEC mask to s49; the CAS loop narrows EXEC as
+    // lanes succeed, leaving EXEC=0 at loop exit. Subsequent STDP LTD
+    // and first-edge-clear blocks need EXEC = rel>0 mask to run.
+    asm_s_mov_b32(49, 0x7E)                         // s49 = exec_lo
 
     // --- CAS retry loop for atomic f64 add ---
     uint64 cas_head_e_off = asm_text_len / 4
@@ -4789,16 +4808,33 @@ fn emit_amdgpu_mt_csr_e_delayed_blob(uint64 out_path) -> uint64 {
     asm_v_cmp_ne_u64_vv(2, 0)
     asm_v_mov_b32(2, 0x100 | 0)
     asm_v_mov_b32(3, 0x100 | 1)
+    // Narrow EXEC to retrying lanes (see mt_csr_i_deliver for rationale).
+    asm_s_and_b32_exec_vcc_lo()
     uint64 cas_branch_e_off = asm_text_len / 4
     uint64 cas_delta_e = cas_head_e_off - (cas_branch_e_off + 1)
-    asm_s_cbranch_vccnz(cas_delta_e & 0xFFFF)
+    asm_s_cbranch_execnz(cas_delta_e & 0xFFFF)
 
-    // --- Nested: if rpe_is_ee[edge] != 0 { STDP LTD } ---
-    // v[12:13] holds is_ee (loaded in prologue; low 32 bits = flag).
-    // Invert "ne 0" as "not (eq 0)": use v_cmp_ne_u32 which is VOPC op 0x4D.
-    // Verified llvm-mc: `v_cmp_ne_u32_e32 vcc_lo, 0, v12` → 0x7C9A1880.
-    asm_u32(0x7C9A1880)                             // v_cmp_ne_u32 vcc_lo, 0, v12
-    asm_s_and_saveexec_b32_vcc_lo(47)               // s47 = outer mask, EXEC &= (is_ee != 0)
+    // Restore EXEC FIRST (CAS narrowed it to 0), so the v2 restore below
+    // actually runs on the rel>0 lanes. If we moved v2 before this,
+    // the VALU would execute on zero lanes and do nothing.
+    asm_s_mov_b32(0x7E, 49)                         // exec_lo = s49
+
+    // Restore v2 (tid*8 byte offset) from v44 for the STDP + first-edge
+    // VMEM stores — the CAS retry clobbered v2 via v_mov v2, v0.
+    asm_v_mov_b32(2, 0x100 | 44)                    // v2 = v44
+    asm_s_delay_alu(0x01)
+
+    // Precompute rpe_w store addr v[46:47] = s[4:5] + v44 (= rpe_w_ptr + tid*8).
+    // Use v44 directly (instead of v2 via restore) so no VALU-VGPR
+    // restore hazard can bite. v44 was saved from v2 pre-CAS under
+    // rel>0 EXEC and the CAS loop doesn't touch v44.
+    asm_u32(0xD7006A2E); asm_u32(0x00025804)        // v_add_co_u32 v46, vcc_lo, s4, v44
+    asm_u32(0xD5207C2F); asm_u32(0x01AA2E05)        // v_add_co_ci_u32_e64 v47, null, s5, v23, vcc_lo
+    asm_s_delay_alu(0x01)
+
+    // --- Nested: if rpe_is_ee[edge] == 1 { STDP LTD } ---
+    asm_v_cmp_eq_u32_imm_vgpr(1, 12)                // vcc_lo = (is_ee == 1)
+    asm_s_and_saveexec_b32_vcc_lo(47)               // s47 = outer mask, EXEC &= (is_ee == 1)
 
     // --- Load x_post[tgt] via saddr=OFF + 64-bit v_addr ---
     // Build x_post addr: v[28:29] = s[16:17] + v[22:23] (v[22:23]=tgt*8 from Task-5 scatter calc)
@@ -4828,7 +4864,10 @@ fn emit_amdgpu_mt_csr_e_delayed_blob(uint64 out_path) -> uint64 {
 
     // --- Store w_new back to rpe_w[edge] via saddr=s[4:5], v_addr=v2 ---
     // Encoding: 0xDC6E0000, (vdst_ignored<<24 | saddr<<16 | vdata<<8 | vaddr) = 0x00042402
-    asm_u32(0xDC6E0000); asm_u32(0x00042402)        // global_store_b64 v2, v[36:37], s[4:5]
+    // v[46:47] was precomputed before the is_ee saveexec so the addr
+    // pair is fresh for ALL rel>0 lanes, not just is_ee ones. Store
+    // uses saddr=OFF + full 64-bit v_addr to avoid the gfx11 H1 hazard.
+    asm_u32(0xDC6E0000); asm_u32(0x007C242E)        // global_store_b64 v[46:47], v[36:37], off
     asm_s_waitcnt_vscnt_zero()
 
     // --- atomic_add_u64(ltd_events, 1) ---

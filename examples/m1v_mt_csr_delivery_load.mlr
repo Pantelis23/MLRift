@@ -1,14 +1,17 @@
 // M1v gate: multi-thread CSR delivery at N_pre=16, fully-connected matrices.
-// Case 1 (mt_csr_i_deliver): 16 I-cells, each fires. Weight pattern
-//   w(src,tgt) = 0.1*src + 0.01*tgt. release = 0.5 per src.
-//   Expected s_inh[t] = sum_src 0.5 * (0.1*src + 0.01*t)
-//                     = 0.5 * (0.1*120 + 0.01*16*t)
-//                     = 6.0 + 0.08*t.
-// Case 2 (mt_csr_e_delayed): buf_delay primed to 0.5 for each src.
-//   Same weight pattern. is_ee alternates by target (tgt%2==0 is E→E).
-//   A_minus=0.1, w_max=10.0, x_post=0.3.
-//   Expected s_exc[t]     = 6.0 + 0.08*t.
-//   Expected rpe_w[e]     = w_old + 0.03 for E→E edges (tgt%2==0),
+// Weights are integer-valued so atomic-add sums are f64-exact regardless
+// of hardware serialization order.
+// Case 1 (mt_csr_i_deliver): 16 I-cells, each fires.
+//   w(src,tgt) = src + tgt, rel = 0.5.
+//   Expected s_inh[t] = sum_src 0.5*(src + t) = 0.5*(120 + 16*t) = 60 + 8*t.
+// Case 2 (mt_csr_e_delayed):
+//   Same weights. buf_delay primed to 0.5 for each src.
+//   is_ee alternates by target (tgt%2==0 is E→E).
+//   A_minus = 0.25, w_max = 1024.0, x_post = 0.5.
+//   Expected s_exc[t]     = 60 + 8*t.
+//   Expected rpe_w[e]     = w_old + 0.125 for E→E (A_minus*x_post*rel = 0.25*0.5*1 wait rel=0.5 here too)
+//                           Actually for E→E: w_new = w_old + A_minus*x_post = src+tgt + 0.125
+//                           (x_post is already loaded in f64, not weighted by rel)
 //                           w_old unchanged for E→I edges.
 //   Expected ltd_events   = 128 (8 E→E × 16 src).
 //   Expected buf_delay[s] = 0.0 for all src (first-edge clear).
@@ -117,7 +120,7 @@ fn run_case1_i_deliver(uint64 mod) -> uint64 {
             uint64 p_w = h_w + e * 8
             f64 sf = 0.0; uint64 ifs = src; sf = ifs
             f64 tf = 0.0; uint64 ift = tgt; tf = ift
-            f64 wv = sf * 0.1 + tf * 0.01
+            f64 wv = sf + tf
             unsafe { *(p_w as f64) = wv }
             tgt = tgt + 1
         }
@@ -173,7 +176,7 @@ fn run_case1_i_deliver(uint64 mod) -> uint64 {
     uint64 t = 0
     while t < N_PRE {
         f64 tf = 0.0; uint64 ift = t; tf = ift
-        f64 exp = 6.0 + 0.08 * tf
+        f64 exp = 60.0 + 8.0 * tf
         unsafe { *(exp_slot as f64) = exp }
         uint64 eb = 0; unsafe { *(exp_slot as uint64) -> eb }
         uint64 pg = r_sinh + t * 8
@@ -218,7 +221,7 @@ fn run_case2_e_delayed(uint64 mod) -> uint64 {
             uint64 p_tgt = h_tgt + e * 8; unsafe { *(p_tgt as uint64) = tgt }
             f64 sf = 0.0; uint64 ifs = src; sf = ifs
             f64 tf = 0.0; uint64 ift = tgt; tf = ift
-            f64 wv = sf * 0.1 + tf * 0.01
+            f64 wv = sf + tf
             uint64 p_w = h_w + e * 8; unsafe { *(p_w as f64) = wv }
             uint64 isee_val = 0; if (tgt - (tgt / 2) * 2) == 0 { isee_val = 1 }
             uint64 p_ee = h_isee + e * 8; unsafe { *(p_ee as uint64) = isee_val }
@@ -231,7 +234,7 @@ fn run_case2_e_delayed(uint64 mod) -> uint64 {
     uint64 i = 0
     while i < N_PRE {
         uint64 p = h_buf + i * 8; f64 bv = 0.5; unsafe { *(p as f64) = bv }
-        p = h_xpost + i * 8; f64 xv = 0.3; unsafe { *(p as f64) = xv }
+        p = h_xpost + i * 8; f64 xv = 0.5; unsafe { *(p as f64) = xv }
         p = h_sexc + i * 8; f64 sv = 0.0; unsafe { *(p as f64) = sv }
         i = i + 1
     }
@@ -258,8 +261,8 @@ fn run_case2_e_delayed(uint64 mod) -> uint64 {
     uint64 a8 = alloc(8); unsafe { *(a8 as uint64) = d_sexc }
     uint64 a9 = alloc(8); unsafe { *(a9 as uint64) = d_ltd }
     uint64 a10 = alloc(8); unsafe { *(a10 as uint64) = N_PRE }
-    uint64 a11 = alloc(8); f64 am = 0.1; unsafe { *(a11 as f64) = am }
-    uint64 a12 = alloc(8); f64 wm = 10.0; unsafe { *(a12 as f64) = wm }
+    uint64 a11 = alloc(8); f64 am = 0.25; unsafe { *(a11 as f64) = am }
+    uint64 a12 = alloc(8); f64 wm = 1024.0; unsafe { *(a12 as f64) = wm }
     uint64 a13 = alloc(8); unsafe { *(a13 as uint64) = 0 }
 
     uint64 pt = alloc(14 * 8)
@@ -291,11 +294,11 @@ fn run_case2_e_delayed(uint64 mod) -> uint64 {
     uint64 fails = 0
     uint64 exp_slot = alloc(8)
 
-    // s_exc[t] = 6.0 + 0.08*t
+    // s_exc[t] = sum_src 0.5*(src + t) = 60 + 8*t
     uint64 t = 0
     while t < N_PRE {
         f64 tf = 0.0; uint64 ift = t; tf = ift
-        f64 exp = 6.0 + 0.08 * tf
+        f64 exp = 60.0 + 8.0 * tf
         unsafe { *(exp_slot as f64) = exp }
         uint64 eb = 0; unsafe { *(exp_slot as uint64) -> eb }
         uint64 pg = r_sexc + t * 8
@@ -304,7 +307,8 @@ fn run_case2_e_delayed(uint64 mod) -> uint64 {
         t = t + 1
     }
 
-    // rpe_w[e]: E→E (tgt%2==0) → w_old + 0.03 (clamped); E→I → unchanged.
+    // rpe_w[e]: E→E (tgt%2==0) → w_old + A_minus*x_post = w_old + 0.125 (clamped);
+    //           E→I → unchanged.
     uint64 es = 0
     while es < N_PRE {
         uint64 et = 0
@@ -312,11 +316,11 @@ fn run_case2_e_delayed(uint64 mod) -> uint64 {
             uint64 e = es * N_PRE + et
             f64 sf = 0.0; uint64 ifs = es; sf = ifs
             f64 tf2 = 0.0; uint64 ift2 = et; tf2 = ift2
-            f64 w_old = sf * 0.1 + tf2 * 0.01
+            f64 w_old = sf + tf2
             f64 w_exp = w_old
-            if (et - (et / 2) * 2) == 0 { w_exp = w_old + 0.03 }
+            if (et - (et / 2) * 2) == 0 { w_exp = w_old + 0.125 }
             if w_exp < 0.0 { w_exp = 0.0 }
-            if w_exp > 10.0 { w_exp = 10.0 }
+            if w_exp > 1024.0 { w_exp = 1024.0 }
             unsafe { *(exp_slot as f64) = w_exp }
             uint64 eb = 0; unsafe { *(exp_slot as uint64) -> eb }
             uint64 pg = r_w + e * 8
