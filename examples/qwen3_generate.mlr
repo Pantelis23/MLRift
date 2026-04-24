@@ -137,6 +137,44 @@ fn main() {
         dealloc(prefix)
         li = li + 1
     }
+
+    // Fuse Q / K / V weights into a single stacked [q_dim + 2*kv_dim,
+    // hidden] bf16 matrix per layer. qwen3_forward_layer then does 1
+    // matmul instead of 3. Stacked ptr overwrites the q_proj_w slot
+    // (1*8) in Qwen3LayerWeights; k_proj_w / v_proj_w (2, 3) unused.
+    // Also fuse gate_proj + up_proj into [2*ff, hidden]; stacked ptr
+    // lands in the gate_proj_w slot (8*8), up_proj_w (9*8) unused.
+    u64 qkv_dim_elems = QWEN3_Q_DIM + 2 * QWEN3_KV_DIM
+    u64 qkv_row_bytes = QWEN3_HIDDEN * 2
+    u64 q_bytes       = QWEN3_Q_DIM  * qkv_row_bytes
+    u64 kv_bytes      = QWEN3_KV_DIM * qkv_row_bytes
+    u64 stacked_bytes = qkv_dim_elems * qkv_row_bytes
+    u64 gu_dim_elems  = 2 * QWEN3_INTERMEDIATE
+    u64 gu_row_bytes  = QWEN3_HIDDEN * 2
+    u64 gate_bytes    = QWEN3_INTERMEDIATE * gu_row_bytes
+    u64 gu_stacked_bytes = gu_dim_elems * gu_row_bytes
+    eout("[qwen3_generate] fusing QKV + gate/up weights (")
+    eu64((stacked_bytes + gu_stacked_bytes) * n_layers); eout(" bytes total)\n")
+    li = 0
+    while li < n_layers {
+        u64 base  = layers_arr + li * 88
+        u64 qp = 0; unsafe { *((base + 1 * 8) as u64) -> qp }
+        u64 kp = 0; unsafe { *((base + 2 * 8) as u64) -> kp }
+        u64 vp = 0; unsafe { *((base + 3 * 8) as u64) -> vp }
+        u64 stacked = alloc(stacked_bytes)
+        memcpy(stacked,               qp, q_bytes)
+        memcpy(stacked + q_bytes,     kp, kv_bytes)
+        memcpy(stacked + q_bytes + kv_bytes, vp, kv_bytes)
+        unsafe { *((base + 1 * 8) as u64) = stacked }
+
+        u64 gpw = 0; unsafe { *((base + 8 * 8) as u64) -> gpw }
+        u64 upw = 0; unsafe { *((base + 9 * 8) as u64) -> upw }
+        u64 gu_stacked = alloc(gu_stacked_bytes)
+        memcpy(gu_stacked,              gpw, gate_bytes)
+        memcpy(gu_stacked + gate_bytes, upw, gate_bytes)
+        unsafe { *((base + 8 * 8) as u64) = gu_stacked }
+        li = li + 1
+    }
     u64 load_elapsed_ns = time_elapsed(load_start_ns)
     eout("[qwen3_generate] 28 layers indexed; load_ms=")
     eu64(load_elapsed_ns / 1000000); eout("\n")
