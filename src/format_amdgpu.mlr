@@ -1281,6 +1281,19 @@ fn asm_global_atomic_cmpswap_b64_glc(uint64 vdst_pair, uint64 v_addr,
     asm_u32(word2)
 }
 
+// global_atomic_add_u64 v[vaddr:+1], v[vdata:+1], off  — GLOBAL op 0x0E,
+//   no-return form. Adds u64(vdata_pair) to *((uint64*)&mem[vaddr_pair])
+//   atomically. Used for bumping the LTD event counter in mt_csr_e_delayed.
+//   Verified: `global_atomic_add_u64 v[0:1], v[2:3], off` → 0xDD0E0000, 0x007C0200.
+fn asm_global_atomic_add_u64_offvaddr(uint64 vaddr_pair, uint64 vdata_pair) {
+    // word1 fixed: GLOBAL prefix + op 0x0E + vdst=0 (no return).
+    asm_u32(0xDD0E0000)
+    uint64 word2 = ((vaddr_pair & 0xFF) << 0)
+                   | ((vdata_pair & 0xFF) << 8)
+                   | (0x7C << 16)                       // saddr = OFF/NULL
+    asm_u32(word2 & 0xFFFFFFFF)
+}
+
 // ── VOP3 — 64-bit three-source vector op. Layout (gfx11, non-VOP3P):
 //   Word 1:
 //     [31:26] = 0x35  (VOP3 prefix)
@@ -1383,6 +1396,32 @@ fn asm_v_sub_f64_vv(uint64 vdst_pair, uint64 v_src0_pair, uint64 v_src1_pair) {
                    | ((src1_enc & 0x1FF) << 9)
                    | (src0_enc & 0x1FF)
     asm_u32(word2)
+}
+
+// v_max_f64 vdst, v[src0:+1], v[src1:+1]  — VOP3A op 0x2A.
+//   Sets v[vdst:vdst+1] = max(v[src0:src0+1], v[src1:src1+1]) as f64.
+//   Same shape as asm_v_mul_f64_vv, different op. Used by the STDP
+//   LTD weight clamp in mt_csr_e_delayed.
+//   Verified: `v_max_f64 v[0:1], v[2:3], v[4:5]` → 0xD72A0000, 0x00020902.
+fn asm_v_max_f64_vv(uint64 vdst_pair, uint64 vsrc0_pair, uint64 vsrc1_pair) {
+    uint64 word1 = (0xD7 << 24) | (0x2A << 16) | (vdst_pair & 0xFF)
+    uint64 src0_enc = 0x100 | (vsrc0_pair & 0xFF)
+    uint64 src1_enc = 0x100 | (vsrc1_pair & 0xFF)
+    uint64 word2 = (src1_enc << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2 & 0xFFFFFFFF)
+}
+
+// v_min_f64 vdst, v[src0:+1], v[src1:+1]  — VOP3A op 0x29.
+//   Sets v[vdst:vdst+1] = min(v[src0:src0+1], v[src1:src1+1]) as f64.
+//   Verified: `v_min_f64 v[0:1], v[2:3], v[4:5]` → 0xD7290000, 0x00020902.
+fn asm_v_min_f64_vv(uint64 vdst_pair, uint64 vsrc0_pair, uint64 vsrc1_pair) {
+    uint64 word1 = (0xD7 << 24) | (0x29 << 16) | (vdst_pair & 0xFF)
+    uint64 src0_enc = 0x100 | (vsrc0_pair & 0xFF)
+    uint64 src1_enc = 0x100 | (vsrc1_pair & 0xFF)
+    uint64 word2 = (src1_enc << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2 & 0xFFFFFFFF)
 }
 
 // v_fma_f64 vdst_pair, s_pair, v_src1_pair, v_src2_pair  (no neg)
