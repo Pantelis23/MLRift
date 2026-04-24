@@ -1,0 +1,256 @@
+// Qwen3 Phase 3 (GGUF loader variant) — identical forward pass to
+// qwen3_generate.mlr, but loads weights from a BF16 GGUF instead of HF
+// safetensors. Used to prove MLRift's GGUF path composes with the same
+// qwen3_forward_layer implementation the safetensors path uses.
+//
+// The GGUF file was produced offline by
+// MLRift-experimental/qwen3_safetensors_to_gguf.py, which emits BF16
+// tensors (no quantisation). Both files hold the same bytes per weight,
+// just with different metadata + tensor naming:
+//
+//   HF safetensors                                 GGUF (qwen3 arch)
+//   model.embed_tokens.weight                      token_embd.weight
+//   model.norm.weight                              output_norm.weight
+//   model.layers.N.input_layernorm.weight          blk.N.attn_norm.weight
+//   model.layers.N.self_attn.q_proj.weight         blk.N.attn_q.weight
+//   model.layers.N.self_attn.k_proj.weight         blk.N.attn_k.weight
+//   model.layers.N.self_attn.v_proj.weight         blk.N.attn_v.weight
+//   model.layers.N.self_attn.q_norm.weight         blk.N.attn_q_norm.weight
+//   model.layers.N.self_attn.k_norm.weight         blk.N.attn_k_norm.weight
+//   model.layers.N.self_attn.o_proj.weight         blk.N.attn_output.weight
+//   model.layers.N.post_attention_layernorm.weight blk.N.ffn_norm.weight
+//   model.layers.N.mlp.gate_proj.weight            blk.N.ffn_gate.weight
+//   model.layers.N.mlp.up_proj.weight              blk.N.ffn_up.weight
+//   model.layers.N.mlp.down_proj.weight            blk.N.ffn_down.weight
+//
+// Expected output is the same 20-token greedy sequence as the
+// safetensors path:
+//   14582 284 330 9707 11 4337 17199 1350 3203 4791
+//   14582 692 2 1173 279 1156 3409 198 1350 3203
+
+import "../std/qwen3.mlr"
+import "../std/gguf.mlr"
+import "../std/inference.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/thread.mlr"
+
+static u64 g_fd = 0
+fn eout(u64 s) {
+    print_str(s)
+    if g_fd != 0 {
+        u64 n = str_len(s)
+        file_write(g_fd, s, n)
+    }
+}
+fn eu64(u64 v) {
+    u64 s = fmt_dec(v)
+    eout(s)
+    dealloc(s)
+}
+
+fn main() {
+    u64 num_workers = 16
+    thread_pool_init(num_workers)
+    g_fd = file_open("/tmp/qw3_gen_gguf.out", 1)
+
+    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-0.6B-BF16.gguf"
+    eout("[qwen3_generate_gguf] loading weights\n")
+    GGUFFile gf = gguf_open(path)
+    if gf.file_size == 0 {
+        eout("open fail\n")
+        thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+
+    u64 hidden = QWEN3_HIDDEN
+    u64 kv_dim = QWEN3_KV_DIM
+    u64 n_layers = 28
+    u64 vocab = 151936
+    u64 max_seq = 64
+    u64 max_new = 20
+
+    GGUFTensor embed_t = gguf_get(gf, "token_embd.weight")
+    u64 embed_ptr = embed_t.ptr
+    GGUFTensor norm_t = gguf_get(gf, "output_norm.weight")
+    u64 norm_ptr = norm_t.ptr
+    if embed_ptr == 0 || norm_ptr == 0 {
+        eout("missing embed or final norm\n")
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+
+    // Per-layer weight pointer table. 11 pointers × 8 bytes = 88 bytes
+    // per layer (matches Qwen3LayerWeights field layout from std/qwen3.mlr).
+    u64 layers_arr = alloc(n_layers * 88)
+    u64 li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * 88
+        u64 li_s = fmt_dec(li)
+        u64 pre0 = str_cat("blk.", li_s)
+        u64 prefix = str_cat(pre0, ".")
+        dealloc(li_s); dealloc(pre0)
+
+        u64 n01 = str_cat(prefix, "attn_norm.weight")
+        GGUFTensor t01 = gguf_get(gf, n01)
+        unsafe { *((base + 0 * 8) as u64) = t01.ptr }
+        dealloc(n01)
+
+        u64 n02 = str_cat(prefix, "attn_q.weight")
+        GGUFTensor t02 = gguf_get(gf, n02)
+        unsafe { *((base + 1 * 8) as u64) = t02.ptr }
+        dealloc(n02)
+
+        u64 n03 = str_cat(prefix, "attn_k.weight")
+        GGUFTensor t03 = gguf_get(gf, n03)
+        unsafe { *((base + 2 * 8) as u64) = t03.ptr }
+        dealloc(n03)
+
+        u64 n04 = str_cat(prefix, "attn_v.weight")
+        GGUFTensor t04 = gguf_get(gf, n04)
+        unsafe { *((base + 3 * 8) as u64) = t04.ptr }
+        dealloc(n04)
+
+        u64 n05 = str_cat(prefix, "attn_q_norm.weight")
+        GGUFTensor t05 = gguf_get(gf, n05)
+        unsafe { *((base + 4 * 8) as u64) = t05.ptr }
+        dealloc(n05)
+
+        u64 n06 = str_cat(prefix, "attn_k_norm.weight")
+        GGUFTensor t06 = gguf_get(gf, n06)
+        unsafe { *((base + 5 * 8) as u64) = t06.ptr }
+        dealloc(n06)
+
+        u64 n07 = str_cat(prefix, "attn_output.weight")
+        GGUFTensor t07 = gguf_get(gf, n07)
+        unsafe { *((base + 6 * 8) as u64) = t07.ptr }
+        dealloc(n07)
+
+        u64 n08 = str_cat(prefix, "ffn_norm.weight")
+        GGUFTensor t08 = gguf_get(gf, n08)
+        unsafe { *((base + 7 * 8) as u64) = t08.ptr }
+        dealloc(n08)
+
+        u64 n09 = str_cat(prefix, "ffn_gate.weight")
+        GGUFTensor t09 = gguf_get(gf, n09)
+        unsafe { *((base + 8 * 8) as u64) = t09.ptr }
+        dealloc(n09)
+
+        u64 n10 = str_cat(prefix, "ffn_up.weight")
+        GGUFTensor t10 = gguf_get(gf, n10)
+        unsafe { *((base + 9 * 8) as u64) = t10.ptr }
+        dealloc(n10)
+
+        u64 n11 = str_cat(prefix, "ffn_down.weight")
+        GGUFTensor t11 = gguf_get(gf, n11)
+        unsafe { *((base + 10 * 8) as u64) = t11.ptr }
+        dealloc(n11)
+
+        dealloc(prefix)
+        li = li + 1
+    }
+    eout("[qwen3_generate_gguf] 28 layers indexed\n")
+
+    // Per-layer KV cache: same shape as safetensors variant.
+    u64 kv_row_bytes   = kv_dim * 4
+    u64 layer_stride   = max_seq * kv_row_bytes
+    u64 total_cache    = n_layers * layer_stride
+    u64 k_cache = alloc(total_cache)
+    u64 v_cache = alloc(total_cache)
+    eout("[qwen3_generate_gguf] KV cache allocated (")
+    eu64(total_cache * 2); eout(" bytes)\n")
+
+    u64 x_cur     = alloc(hidden * 4)
+    u64 x_nxt     = alloc(hidden * 4)
+    u64 final_out = alloc(hidden * 4)
+    u64 logits    = alloc(vocab * 4)
+
+    u64 seq_cap = max_new + 1
+    u64 seq_ids = alloc(seq_cap * 8)
+
+    u64 tok = 14990
+    unsafe { *((seq_ids + 0 * 8) as u64) = tok }
+    u64 seq_len = 1
+    eout("[qwen3_generate_gguf] seed token = "); eu64(tok); eout("\n")
+
+    // Embed seed token
+    u64 row = embed_ptr + tok * hidden * 2
+    u64 i0 = 0
+    while i0 < hidden {
+        f32 v = bf16_to_f32(row + i0 * 2)
+        unsafe { *((x_cur + i0 * 4) as f32) = v }
+        i0 = i0 + 1
+    }
+
+    u64 pos = 0
+    u64 step = 0
+    while step < max_new {
+        eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
+
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen3LayerWeights w = layers_arr + layer * 88
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+            u64 tmp = x_cur
+            x_cur = x_nxt
+            x_nxt = tmp
+            layer = layer + 1
+        }
+
+        qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
+        matmul_bf16_weights_f32_mt(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers)
+
+        u64 best_id = 0
+        f32 best_val = 0.0f
+        u64 first = 1
+        u64 j = 0
+        while j < vocab {
+            f32 v = 0.0f
+            unsafe { *((logits + j * 4) as f32) -> v }
+            if first == 1 {
+                best_val = v; best_id = j; first = 0
+            } else {
+                if v > best_val { best_val = v; best_id = j }
+            }
+            j = j + 1
+        }
+        eout("  -> next_id = "); eu64(best_id); eout(" logit=")
+        u64 lvs = fmt_f32(best_val, 4); eout(lvs); dealloc(lvs); eout("\n")
+
+        unsafe { *((seq_ids + seq_len * 8) as u64) = best_id }
+        seq_len = seq_len + 1
+
+        row = embed_ptr + best_id * hidden * 2
+        u64 i1 = 0
+        while i1 < hidden {
+            f32 v = bf16_to_f32(row + i1 * 2)
+            unsafe { *((x_cur + i1 * 4) as f32) = v }
+            i1 = i1 + 1
+        }
+        tok = best_id
+        pos = pos + 1
+        step = step + 1
+    }
+
+    eout("\n=== GENERATED SEQUENCE ===\n")
+    u64 si = 0
+    while si < seq_len {
+        if si != 0 { eout(", ") }
+        u64 id = 0
+        unsafe { *((seq_ids + si * 8) as u64) -> id }
+        eu64(id)
+        si = si + 1
+    }
+    eout("\n")
+    eout("=== SAFETENSORS REF ===\n")
+    eout("14990, 14582, 284, 330, 9707, 11, 4337, 17199, 1350, 3203, 4791, 14582, 692, 2, 1173, 279, 1156, 3409, 198, 1350, 3203\n")
+
+    dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits)
+    dealloc(seq_ids); dealloc(layers_arr)
+    dealloc(k_cache); dealloc(v_cache)
+    gguf_free(gf)
+    thread_pool_shutdown()
+    file_close(g_fd)
+    exit(0)
+}
