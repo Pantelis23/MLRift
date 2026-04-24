@@ -181,11 +181,18 @@ fn main() {
     u64 step = 0
     u64 decode_start_ns = time_now()
     u64 sum_decode_ns = 0
+    // Accumulate op-level timings to see where wall-time really goes.
+    u64 sum_layer_ns  = 0
+    u64 sum_norm_ns   = 0
+    u64 sum_lmhead_ns = 0
+    u64 sum_argmax_ns = 0
+    u64 sum_embed_ns  = 0
     while step < max_new {
         u64 step_start_ns = time_now()
         eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
 
         // Sweep 28 layers at this position; each writes K/V into cache[layer][pos].
+        u64 layer_start_ns = time_now()
         u64 layer = 0
         while layer < n_layers {
             Qwen3LayerWeights w = layers_arr + layer * 88
@@ -197,12 +204,18 @@ fn main() {
             x_nxt = tmp
             layer = layer + 1
         }
+        sum_layer_ns = sum_layer_ns + time_elapsed(layer_start_ns)
 
         // Final RMSNorm → lm_head (tied to embed_tokens) → greedy argmax.
+        u64 norm_start_ns = time_now()
         qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
+        sum_norm_ns = sum_norm_ns + time_elapsed(norm_start_ns)
         // lm_head: tied embedding matmul. Not on a residual — Kahan off.
+        u64 lmhead_start_ns = time_now()
         matmul_bf16_weights_f32(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
+        sum_lmhead_ns = sum_lmhead_ns + time_elapsed(lmhead_start_ns)
 
+        u64 argmax_start_ns = time_now()
         u64 best_id = 0
         f32 best_val = 0.0f
         u64 first = 1
@@ -217,6 +230,7 @@ fn main() {
             }
             j = j + 1
         }
+        sum_argmax_ns = sum_argmax_ns + time_elapsed(argmax_start_ns)
         eout("  -> next_id = "); eu64(best_id); eout(" logit=")
         u64 lvs = fmt_f32(best_val, 4); eout(lvs); dealloc(lvs); eout("\n")
 
@@ -224,6 +238,7 @@ fn main() {
         seq_len = seq_len + 1
 
         // Embed the new token into x_cur for the next iteration.
+        u64 embed_start_ns = time_now()
         row = embed_ptr + best_id * hidden * 2
         u64 i1 = 0
         while i1 < hidden {
@@ -231,6 +246,7 @@ fn main() {
             unsafe { *((x_cur + i1 * 4) as f32) = v }
             i1 = i1 + 1
         }
+        sum_embed_ns = sum_embed_ns + time_elapsed(embed_start_ns)
         tok = best_id
         pos = pos + 1
         u64 step_elapsed_ns = time_elapsed(step_start_ns)
@@ -251,6 +267,13 @@ fn main() {
         tokps_milli = (max_new * 1000 * 1000000000) / total_decode_ns
     }
     eout("tokens_per_sec_x1000="); eu64(tokps_milli); eout("\n")
+    eout("\n=== BREAKDOWN (ms) ===\n")
+    eout("layer_sweep_ms=");     eu64(sum_layer_ns  / 1000000); eout("\n")
+    eout("final_norm_ms=");      eu64(sum_norm_ns   / 1000000); eout("\n")
+    eout("lmhead_ms=");          eu64(sum_lmhead_ns / 1000000); eout("\n")
+    eout("argmax_ms=");          eu64(sum_argmax_ns / 1000000); eout("\n")
+    eout("embed_ms=");           eu64(sum_embed_ns  / 1000000); eout("\n")
+    qwen3_profile_dump()
 
     // Print final sequence
     eout("\n=== GENERATED SEQUENCE ===\n")
