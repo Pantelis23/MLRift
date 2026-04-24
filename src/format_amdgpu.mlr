@@ -4740,6 +4740,62 @@ fn emit_amdgpu_mt_csr_e_delayed_blob(uint64 out_path) -> uint64 {
     asm_v_mov_b32(32, 26); asm_v_mov_b32(33, 27)    // v[32:33] w_max
     asm_s_delay_alu(0x02)
 
+    // --- Gather: rel = buf_delay[row_base + src] ---
+    // Scalar precompute: s[30:31] = buf_delay_ptr + row_base * 8
+    asm_u32(0x849E830E)                             // s_lshl_b64 s[30:31], s[14:15], 3
+    asm_u32(0x801E1E0C)                             // s_add_u32  s30, s12, s30
+    asm_u32(0x821F1F0D)                             // s_addc_u32 s31, s13, s31
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Per-lane offset: v[16:17] = src * 8 (v[8:9] holds src, shift by 3)
+    asm_u32(0xD73C0010); asm_u32(0x00021083)        // v_lshlrev_b64 v[16:17], 3, v[8:9]
+    asm_s_delay_alu(0x01)
+
+    // Build per-lane vaddr: v[18:19] = s[30:31] + v[16:17]
+    asm_u32(0xD7006A12); asm_u32(0x0002201E)        // v_add_co_u32 v18, vcc_lo, s30, v16
+    asm_u32(0xD5207C13); asm_u32(0x01AA221F)        // v_add_co_ci_u32_e64 v19, null, s31, v17, vcc_lo
+    asm_s_delay_alu(0x01)
+
+    // Load rel → v[20:21]
+    asm_u32(0xDC560000); asm_u32(0x147C0012)        // global_load_b64 v[20:21], v[18:19], off
+    asm_s_waitcnt_vmcnt_zero()
+
+    // --- Outer predicate: rel > 0.0 ---
+    asm_v_cmp_lt_f64_zero_v(20)                     // vcc_lo = (0.0 < v[20:21])
+    asm_s_and_saveexec_b32_vcc_lo(46)               // s46 = initial EXEC, EXEC &= rel>0
+
+    // --- Scatter address: v[24:25] = s_exc_ptr + tgt*8 (tgt in v[4:5]) ---
+    asm_u32(0xD73C0016); asm_u32(0x00020883)        // v_lshlrev_b64 v[22:23], 3, v[4:5]
+    asm_s_delay_alu(0x01)
+    asm_u32(0xD7006A18); asm_u32(0x00022C12)        // v_add_co_u32 v24, vcc_lo, s18, v22
+    asm_u32(0xD5207C19); asm_u32(0x01AA2E13)        // v_add_co_ci_u32_e64 v25, null, s19, v23, vcc_lo
+    asm_s_delay_alu(0x01)
+
+    // --- effective = w * rel → v[26:27] (v[6:7]=w, v[20:21]=rel) ---
+    asm_v_mul_f64_vv(26, 6, 20)
+    asm_s_delay_alu(0x01)
+
+    // --- Prime CAS assumed = *s_exc[tgt] ---
+    asm_u32(0xDC560000); asm_u32(0x027C0018)        // global_load_b64 v[2:3], v[24:25], off
+    asm_s_waitcnt_vmcnt_zero()
+
+    // --- CAS retry loop for atomic f64 add ---
+    uint64 cas_head_e_off = asm_text_len / 4
+    asm_v_add_f64_vv(0, 2, 26)                      // v[0:1] = assumed + effective
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDD0A4000); asm_u32(0x007C0018)        // global_atomic_cmpswap_b64 v[0:1], v[24:25], v[0:3], off glc
+    asm_s_waitcnt_vmcnt_zero()
+    asm_s_waitcnt_vscnt_zero()
+    asm_v_cmp_ne_u64_vv(2, 0)
+    asm_v_mov_b32(2, 0x100 | 0)
+    asm_v_mov_b32(3, 0x100 | 1)
+    uint64 cas_branch_e_off = asm_text_len / 4
+    uint64 cas_delta_e = cas_head_e_off - (cas_branch_e_off + 1)
+    asm_s_cbranch_vccnz(cas_delta_e & 0xFFFF)
+
+    // --- Restore outer EXEC (STDP LTD and buf_delay clear land in next commit) ---
+    asm_s_mov_b32(0x7E, 46)
+
     asm_s_endpgm()
 
     uint64 rsrc1 = 0xE0AF0004                       // VGPR granule=4 → 40 VGPRs
