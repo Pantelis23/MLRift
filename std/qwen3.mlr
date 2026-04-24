@@ -233,6 +233,16 @@ static u64 qwen3_rope_cache_pos = 0xFFFFFFFFFFFFFFFF
 static u64 qwen3_rope_cos_cache = 0
 static u64 qwen3_rope_sin_cache = 0
 
+// QKV + gate/up weight fusion. When enabled, callers have already
+// concatenated q_proj_w+k_proj_w+v_proj_w into the q_proj_w slot, and
+// gate_proj_w+up_proj_w into the gate_proj_w slot. Saves thread-pool
+// submit overhead but costs ~50 % extra heap for the stacked copies —
+// worth it at 0.6B, prohibitive at 14B Q8_0 (5+ GB of duplicates).
+// Examples flip this off before the weight-load pass when the model
+// is too big for the duplication.
+static u64 qwen3_fuse_qkv = 1
+fn qwen3_set_fuse_qkv(u64 on) { qwen3_fuse_qkv = on }
+
 // Per-op timing accumulators. Cleared by qwen3_profile_reset(); reported
 // with qwen3_profile_dump(g_fd).
 static u64 qwen3_t_input_norm  = 0
@@ -850,21 +860,29 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     // Q / K / V projections. K and V target the cache slot at `pos` directly;
     // downstream QK-norm and RoPE mutate the cache in place. V is stored raw
     // (no norm, no RoPE — Qwen3 only rotates Q and K).
-    // Q/K/V fused: w.q_proj_w actually points at a stacked
-    // [q_dim + 2*kv_dim, hidden] matrix (built by the caller at load
-    // time). One matmul replaces three, cutting thread-pool submit
-    // overhead ~2/3×.
-    u64 qkv_dim_local = q_dim + 2 * kv_dim
-    u64 qkv_buf = alloc(qkv_dim_local * 4)
-    u64 p_t1 = time_now()
-    matmul_bf16_weights_f32(qkv_buf, x_norm, w.q_proj_w, 1, qkv_dim_local, hidden, num_workers, 0)
-    qwen3_t_qkv_proj = qwen3_t_qkv_proj + time_elapsed(p_t1)
-    // Split into q_buf (new alloc) and cache slots k_row/v_row.
+    // Q/K/V projections. Two code paths:
+    //   * qwen3_fuse_qkv != 0 (small models): caller pre-stacked the
+    //     weights into w.q_proj_w; one matmul + memcpy-split.
+    //   * qwen3_fuse_qkv == 0 (large models like 14B Q8_0): 3 separate
+    //     matmuls hitting the original weight pointers. Avoids ~50 %
+    //     heap duplication cost at the price of a few extra thread-pool
+    //     round trips.
     u64 q_buf = alloc(q_dim * 4)
-    memcpy(q_buf,  qkv_buf,                      q_dim  * 4)
-    memcpy(k_row,  qkv_buf + q_dim * 4,          kv_dim * 4)
-    memcpy(v_row,  qkv_buf + (q_dim + kv_dim) * 4, kv_dim * 4)
-    dealloc(qkv_buf)
+    u64 p_t1 = time_now()
+    if qwen3_fuse_qkv != 0 {
+        u64 qkv_dim_local = q_dim + 2 * kv_dim
+        u64 qkv_buf = alloc(qkv_dim_local * 4)
+        matmul_bf16_weights_f32(qkv_buf, x_norm, w.q_proj_w, 1, qkv_dim_local, hidden, num_workers, 0)
+        memcpy(q_buf,  qkv_buf,                        q_dim  * 4)
+        memcpy(k_row,  qkv_buf + q_dim * 4,            kv_dim * 4)
+        memcpy(v_row,  qkv_buf + (q_dim + kv_dim) * 4, kv_dim * 4)
+        dealloc(qkv_buf)
+    } else {
+        matmul_bf16_weights_f32(q_buf, x_norm, w.q_proj_w, 1, q_dim,  hidden, num_workers, 0)
+        matmul_bf16_weights_f32(k_row, x_norm, w.k_proj_w, 1, kv_dim, hidden, num_workers, 0)
+        matmul_bf16_weights_f32(v_row, x_norm, w.v_proj_w, 1, kv_dim, hidden, num_workers, 0)
+    }
+    qwen3_t_qkv_proj = qwen3_t_qkv_proj + time_elapsed(p_t1)
     // qwen3_dump5("q_raw", q_buf)
     // qwen3_dump5("q_raw_h1", q_buf + 128 * 4)
     // qwen3_dump5("k_raw", k_row)
@@ -948,20 +966,22 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     qwen3_t_post_norm = qwen3_t_post_norm + time_elapsed(p_t5)
     // qwen3_dump5("mid_norm", mid_norm)
 
-    // gate/up fused: w.gate_proj_w actually points at a stacked
-    // [2*ff, hidden] matrix (gate rows first, then up rows). One
-    // matmul replaces two.
-    u64 gu_dim_local = 2 * ff
-    u64 gu_buf = alloc(gu_dim_local * 4)
-    u64 p_t6 = time_now()
-    matmul_bf16_weights_f32(gu_buf, mid_norm, w.gate_proj_w, 1, gu_dim_local, hidden, num_workers, 0)
-    qwen3_t_gate_up = qwen3_t_gate_up + time_elapsed(p_t6)
-    // Split into gate_buf and up_buf via memcpy.
+    // gate/up: same dual-path story as QKV above.
     u64 gate_buf = alloc(ff * 4)
     u64 up_buf   = alloc(ff * 4)
-    memcpy(gate_buf, gu_buf,               ff * 4)
-    memcpy(up_buf,   gu_buf + ff * 4,      ff * 4)
-    dealloc(gu_buf)
+    u64 p_t6 = time_now()
+    if qwen3_fuse_qkv != 0 {
+        u64 gu_dim_local = 2 * ff
+        u64 gu_buf = alloc(gu_dim_local * 4)
+        matmul_bf16_weights_f32(gu_buf, mid_norm, w.gate_proj_w, 1, gu_dim_local, hidden, num_workers, 0)
+        memcpy(gate_buf, gu_buf,               ff * 4)
+        memcpy(up_buf,   gu_buf + ff * 4,      ff * 4)
+        dealloc(gu_buf)
+    } else {
+        matmul_bf16_weights_f32(gate_buf, mid_norm, w.gate_proj_w, 1, ff, hidden, num_workers, 0)
+        matmul_bf16_weights_f32(up_buf,   mid_norm, w.up_proj_w,   1, ff, hidden, num_workers, 0)
+    }
+    qwen3_t_gate_up = qwen3_t_gate_up + time_elapsed(p_t6)
     u64 ff_buf = alloc(ff * 4)
     u64 p_t7 = time_now()
     qwen3_silu_mul(ff_buf, gate_buf, up_buf, ff)
