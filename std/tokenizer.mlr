@@ -48,6 +48,18 @@ struct Tokenizer {
     u64 unk_id
 }
 
+// Byte-level (GPT-2 / Qwen) tokenizer state. Would naturally live on
+// Tokenizer, but MLRift's current codegen has a known offset bug past
+// 16 u64 fields (see gguf.mlr:109) — so we keep the active-tokenizer
+// state process-global instead. This restricts us to one byte-level
+// tokenizer at a time; fine for all current callers.
+//   tk_gpt2_kind   : 0 = SentencePiece (default), 1 = GPT-2 byte-level.
+//   tk_gpt2_b2c    : 256 × u32 — byte → Unicode codepoint.
+//   tk_gpt2_c2b    : 324 × u8  — codepoint → byte, 0xFF = unmapped.
+static u64 tk_gpt2_kind = 0
+static u64 tk_gpt2_b2c  = 0
+static u64 tk_gpt2_c2b  = 0
+
 // ---------------------------------------------------------------------------
 // Small JSON scanning helpers — tailored to tokenizer.json's structure.
 // `pos` is a byte offset into the mmap; returned pos is advanced past what
@@ -476,9 +488,65 @@ fn tokenizer_free(Tokenizer tk) {
     if tk.id_to_off != 0 { dealloc(tk.id_to_off) }
     if tk.id_to_len != 0 { dealloc(tk.id_to_len) }
     if tk.hash_tab != 0  { dealloc(tk.hash_tab)  }
+    if tk_gpt2_b2c != 0 { dealloc(tk_gpt2_b2c); tk_gpt2_b2c = 0 }
+    if tk_gpt2_c2b != 0 { dealloc(tk_gpt2_c2b); tk_gpt2_c2b = 0 }
+    tk_gpt2_kind = 0
     if tk.file_base != 0 && tk.file_size != 0 {
         syscall_raw(11, tk.file_base, tk.file_size, 0, 0, 0, 0)    // munmap
     }
+}
+
+// ---------------------------------------------------------------------------
+// Switch a loaded tokenizer to GPT-2 byte-level BPE mode.
+//
+// Allocates and fills two tables:
+//   byte_to_cp[256]  : byte → Unicode codepoint (per GPT-2 bytes_to_unicode)
+//   cp_to_byte[324]  : codepoint → byte (0xFF for unmapped codepoints)
+//
+// The mapping: bytes in the "printable" ranges [33..126] ∪ [161..172] ∪
+// [174..255] map to themselves (188 bytes). The remaining 68 "unprintable"
+// bytes (0..32, 127..160, 173) are assigned codepoints 256..323 in the
+// order they are encountered (so space=32 → U+0120 "Ġ", newline=10 →
+// U+010A "Ċ", etc.). After switching kind, tokenizer_encode will
+// byte-level-escape its input before greedy-matching, and tokenizer_decode
+// will reverse the escape on its output.
+// ---------------------------------------------------------------------------
+fn tokenizer_set_kind_gpt2(Tokenizer tk) {
+    tk_gpt2_kind = 1
+    if tk_gpt2_b2c != 0 { dealloc(tk_gpt2_b2c) }
+    if tk_gpt2_c2b != 0 { dealloc(tk_gpt2_c2b) }
+    u64 b2c = alloc(256 * 4)
+    u64 c2b = alloc(324)
+    u64 k = 0
+    while k < 324 {
+        u8 ff = 0xFF
+        store8(c2b + k, ff)
+        k = k + 1
+    }
+    u64 b = 0
+    u64 n = 0
+    while b < 256 {
+        u64 is_good = 0
+        if b >= 33 && b <= 126 { is_good = 1 }
+        else if b >= 161 && b <= 172 { is_good = 1 }
+        else if b >= 174 && b <= 255 { is_good = 1 }
+        if is_good != 0 {
+            u32 cp = b
+            unsafe { *((b2c + b * 4) as uint32) = cp }
+            u8 bb = b
+            store8(c2b + b, bb)
+        } else {
+            u64 cp64 = 256 + n
+            u32 cp2 = cp64
+            unsafe { *((b2c + b * 4) as uint32) = cp2 }
+            u8 bb2 = b
+            store8(c2b + cp64, bb2)
+            n = n + 1
+        }
+        b = b + 1
+    }
+    tk_gpt2_b2c = b2c
+    tk_gpt2_c2b = c2b
 }
 
 // ---------------------------------------------------------------------------
@@ -511,28 +579,44 @@ fn tokenizer_lookup(Tokenizer tk, u64 id, u64 out_ptr, u64 out_len) {
 // ---------------------------------------------------------------------------
 fn tokenizer_encode(Tokenizer tk, u64 input, u64 input_len,
                     u64 out_ids_ptr, u64 out_count_ptr) {
-    // Step 1: normalise — every 0x20 becomes the 3-byte UTF-8 sequence
-    // E2 96 81 (Unicode U+2581 "▁"). Worst-case expansion factor: 3x.
+    // Step 1: normalise.
+    //   kind == 0 (SentencePiece): 0x20 → U+2581 "▁" (3-byte UTF-8).
+    //   kind == 1 (GPT-2 byte-level): each input byte b → UTF-8 of
+    //                                 byte_to_cp[b]. Worst case is 2 bytes
+    //                                 (codepoints ≤ U+0143 for our table).
+    // Worst-case expansion factor is 3x for kind 0, 2x for kind 1 — use 3x
+    // so the same buffer works in both cases.
     u64 norm_cap = input_len * 3 + 4
     u64 norm = alloc(norm_cap)
     u64 nlen = 0
     u64 i = 0
-    while i < input_len {
-        u64 c = load8(input + i)
-        if c == 32 {
-            u8 a = 0xE2
-            u8 b = 0x96
-            u8 cc = 0x81
-            store8(norm + nlen, a)
-            store8(norm + nlen + 1, b)
-            store8(norm + nlen + 2, cc)
-            nlen = nlen + 3
-        } else {
-            u8 cb = c
-            store8(norm + nlen, cb)
-            nlen = nlen + 1
+    if tk_gpt2_kind == 1 {
+        while i < input_len {
+            u64 c = load8(input + i)
+            u32 cp32 = 0
+            unsafe { *((tk_gpt2_b2c + c * 4) as uint32) -> cp32 }
+            u64 cp = cp32
+            nlen = tk_utf8_encode(norm, nlen, cp)
+            i = i + 1
         }
-        i = i + 1
+    } else {
+        while i < input_len {
+            u64 c = load8(input + i)
+            if c == 32 {
+                u8 a = 0xE2
+                u8 b = 0x96
+                u8 cc = 0x81
+                store8(norm + nlen, a)
+                store8(norm + nlen + 1, b)
+                store8(norm + nlen + 2, cc)
+                nlen = nlen + 3
+            } else {
+                u8 cb = c
+                store8(norm + nlen, cb)
+                nlen = nlen + 1
+            }
+            i = i + 1
+        }
     }
 
     // Step 2: greedy match. Output array sized to nlen (worst case: every
@@ -562,12 +646,21 @@ fn tokenizer_encode(Tokenizer tk, u64 input, u64 input_len,
         }
 
         if matched_len == 0 {
-            // Byte fallback: emit <0xHH> for the single byte at p.
-            u64 bv = load8(norm + p)
-            u32 fb_id = tk.byte_fallback_base + bv
-            unsafe { *((ids + count * 4) as uint32) = fb_id }
-            count = count + 1
-            p = p + 1
+            if tk_gpt2_kind == 1 {
+                // GPT-2 byte-level has no <0xHH> table; every single
+                // bytes_to_unicode codepoint is guaranteed present in the
+                // vocab as a 1-char token. If we still fall through, the
+                // vocab is broken — advance one byte and keep going so we
+                // produce *something* rather than looping forever.
+                p = p + 1
+            } else {
+                // Byte fallback: emit <0xHH> for the single byte at p.
+                u64 bv = load8(norm + p)
+                u32 fb_id = tk.byte_fallback_base + bv
+                unsafe { *((ids + count * 4) as uint32) = fb_id }
+                count = count + 1
+                p = p + 1
+            }
         } else {
             u32 mid = matched_id
             unsafe { *((ids + count * 4) as uint32) = mid }
@@ -628,8 +721,56 @@ fn tokenizer_decode(Tokenizer tk, u64 ids, u64 count) -> u64 {
         i = i + 1
     }
 
-    // In-place: replace every "▁" (E2 96 81) with a single space, shifting
-    // the tail left by 2 bytes per match. Simple O(n) pass.
+    if tk_gpt2_kind == 1 {
+        // GPT-2 byte-level reverse. The concatenated token-string buffer
+        // is UTF-8 of Unicode codepoints in [0..323]. Walk the codepoints
+        // one at a time and map each back to its original byte via the
+        // static cp_to_byte table. Output shrinks (≤ 1 output byte per
+        // codepoint) so in-place would be safe too, but a second buffer
+        // keeps the code simpler.
+        u64 out_byte = alloc(w + 1)
+        u64 r2 = 0
+        u64 wo = 0
+        while r2 < w {
+            u64 b0 = load8(buf + r2)
+            u64 cp = 0
+            u64 used = 1
+            if b0 < 0x80 {
+                cp = b0
+                used = 1
+            } else if (b0 & 0xE0) == 0xC0 {
+                u64 b1 = load8(buf + r2 + 1)
+                cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+                used = 2
+            } else if (b0 & 0xF0) == 0xE0 {
+                u64 b1 = load8(buf + r2 + 1)
+                u64 b2 = load8(buf + r2 + 2)
+                cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+                used = 3
+            } else {
+                // 4-byte UTF-8. Not reachable for GPT-2 byte-level vocab
+                // (codepoints capped at 323) but keep it safe: skip.
+                used = 4
+                cp = 0xFFFF
+            }
+            if cp < 324 {
+                u64 rb = load8(tk_gpt2_c2b + cp)
+                if rb < 256 {
+                    u8 ob = rb
+                    store8(out_byte + wo, ob)
+                    wo = wo + 1
+                }
+            }
+            r2 = r2 + used
+        }
+        u8 zero2 = 0
+        store8(out_byte + wo, zero2)
+        dealloc(buf)
+        return out_byte
+    }
+
+    // kind == 0 (SentencePiece): in-place replace every "▁" (E2 96 81)
+    // with a single space, shifting the tail left by 2 bytes per match.
     u64 r = 0
     u64 sw = 0
     while r < w {

@@ -1,0 +1,74 @@
+// Standalone byte-level tokenizer smoke test. Loads the Qwen3 tokenizer,
+// switches it into GPT-2 byte-level mode, encodes a short prompt, prints
+// ids, decodes back, prints the round-tripped text. Intended as a fast
+// isolation test so we don't burn a 60-s 14B decode just to check ids.
+
+import "../std/tokenizer.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+
+fn put(u64 s) { print_str(s) }
+fn putu(u64 v) { u64 s = fmt_dec(v); put(s); dealloc(s) }
+
+fn main() {
+    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/tokenizer.json"
+    Tokenizer tk = tokenizer_load(path)
+    if tk.file_size == 0 { put("load fail\n"); exit(1) }
+
+    put("before set_kind: tk_gpt2_kind="); putu(tk_gpt2_kind); put("\n")
+    tokenizer_set_kind_gpt2(tk)
+    put("after set_kind:  tk_gpt2_kind="); putu(tk_gpt2_kind)
+    put(" b2c="); putu(tk_gpt2_b2c)
+    put(" c2b="); putu(tk_gpt2_c2b); put("\n")
+
+    // Spot-check a couple of known bytes_to_unicode entries.
+    u32 cp_space = 0
+    unsafe { *((tk_gpt2_b2c + 32 * 4) as uint32) -> cp_space }
+    u64 cp_space64 = cp_space
+    put("byte_to_cp[' '] = "); putu(cp_space64); put(" (expect 288 for Ġ)\n")
+
+    u32 cp_nl = 0
+    unsafe { *((tk_gpt2_b2c + 10 * 4) as uint32) -> cp_nl }
+    u64 cp_nl64 = cp_nl
+    put("byte_to_cp['\\n'] = "); putu(cp_nl64); put(" (expect 266 for Ċ)\n")
+
+    u32 cp_A = 0
+    unsafe { *((tk_gpt2_b2c + 65 * 4) as uint32) -> cp_A }
+    u64 cp_A64 = cp_A
+    put("byte_to_cp['A'] = "); putu(cp_A64); put(" (expect 65)\n")
+
+    u64 prompt = "The capital of France is"
+    u64 plen = str_len(prompt)
+    put("prompt: \""); put(prompt); put("\" len="); putu(plen); put("\n")
+
+    u64 ids = 0
+    u64 cnt = 0
+    uint64[1] ids_slot
+    uint64[1] cnt_slot
+    u64 ids_p = ids_slot
+    u64 cnt_p = cnt_slot
+    tokenizer_encode(tk, prompt, plen, ids_p, cnt_p)
+    unsafe { *(ids_p as u64) -> ids }
+    unsafe { *(cnt_p as u64) -> cnt }
+
+    put("tokens="); putu(cnt); put(" ids=[")
+    u64 i = 0
+    while i < cnt {
+        if i != 0 { put(", ") }
+        u32 id32 = 0
+        unsafe { *((ids + i * 4) as uint32) -> id32 }
+        u64 id64 = id32
+        putu(id64)
+        i = i + 1
+    }
+    put("]\n")
+
+    u64 txt = tokenizer_decode(tk, ids, cnt)
+    put("roundtrip: \""); put(txt); put("\"\n")
+
+    dealloc(txt)
+    if ids != 0 { dealloc(ids) }
+    tokenizer_free(tk)
+    exit(0)
+}

@@ -34,6 +34,7 @@ import "../std/qwen3.mlr"
 import "../std/gguf.mlr"
 import "../std/matmul.mlr"
 import "../std/inference.mlr"
+import "../std/tokenizer.mlr"
 import "../std/io.mlr"
 import "../std/fmt.mlr"
 import "../std/string.mlr"
@@ -78,10 +79,18 @@ fn main() {
     u64 kv_dim = QWEN3_KV_DIM
     u64 n_layers = 40
     u64 vocab = 151936
-    u64 max_seq = 64
-    u64 max_new = 5
+    // Room for a ~100-tok prompt + 20-tok generation. Bump if the prompt
+    // is longer. KV cache cost is linear in max_seq at 40 × 8 × 128 ×
+    // 2 × 4 = 327 680 B per position.
+    u64 max_seq = 256
+    u64 max_new = 20
     // DIAG: bail after this many layers (0 = run full 40).
     u64 layers_cap = 0
+
+    // ---- Prompt (hardcoded for now; trivial to wire to argv later) ----
+    u64 prompt = "The capital of France is"
+    u64 prompt_len = str_len(prompt)
+    eout("[qwen3_14b] prompt: \""); eout(prompt); eout("\"\n")
 
     // token_embd is Q8_0 at 14B — need a dequantized f32 copy for the
     // initial embedding lookup (we don't have a Q8_0 single-row decode
@@ -196,18 +205,88 @@ fn main() {
     u64 final_out = alloc(hidden * 4)
     u64 logits    = alloc(vocab * 4)
 
-    u64 seq_cap = max_new + 1
-    u64 seq_ids = alloc(seq_cap * 8)
+    // ---- Tokenizer + prompt encode ----
+    u64 tok_path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/tokenizer.json"
+    eout("[qwen3_14b] loading tokenizer\n")
+    Tokenizer tk = tokenizer_load(tok_path)
+    if tk.file_size == 0 {
+        eout("tokenizer load failed\n")
+        dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits)
+        dealloc(layers_arr); dealloc(k_cache); dealloc(v_cache)
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+    // Qwen3 uses GPT-2-style byte-level BPE (space → "Ġ" = U+0120, etc.),
+    // not Gemma / Llama SentencePiece (space → "▁" = U+2581). Switch the
+    // tokenizer into byte-level mode before we encode.
+    tokenizer_set_kind_gpt2(tk)
+    u64 prompt_ids   = 0
+    u64 prompt_count = 0
+    // tokenizer_encode writes (ids_heap, count) through the two out pointers.
+    uint64[1] pid_slot
+    uint64[1] pcn_slot
+    u64 pid_slot_ptr = pid_slot
+    u64 pcn_slot_ptr = pcn_slot
+    tokenizer_encode(tk, prompt, prompt_len, pid_slot_ptr, pcn_slot_ptr)
+    unsafe { *(pid_slot_ptr as u64) -> prompt_ids }
+    unsafe { *(pcn_slot_ptr as u64) -> prompt_count }
+    eout("[qwen3_14b] prompt_tokens="); eu64(prompt_count); eout(" ids=[")
+    u64 pi = 0
+    while pi < prompt_count {
+        if pi != 0 { eout(", ") }
+        u32 id32 = 0
+        unsafe { *((prompt_ids + pi * 4) as uint32) -> id32 }
+        u64 id64 = id32
+        eu64(id64)
+        pi = pi + 1
+    }
+    eout("]\n")
 
-    u64 tok = 14990
-    unsafe { *((seq_ids + 0 * 8) as u64) = tok }
-    u64 seq_len = 1
-    eout("[qwen3_14b] seed token = "); eu64(tok); eout("\n")
+    // Full id buffer (prompt + generated) used for final detokenize.
+    u64 seq_cap = prompt_count + max_new
+    u64 seq_ids32 = alloc(seq_cap * 4)
+    u64 si = 0
+    while si < prompt_count {
+        u32 pid32 = 0
+        unsafe { *((prompt_ids + si * 4) as uint32) -> pid32 }
+        unsafe { *((seq_ids32 + si * 4) as uint32) = pid32 }
+        si = si + 1
+    }
+    u64 seq_len = prompt_count
 
-    // Embed seed token — decode one Q8_0 row into x_cur.
-    gguf_deq_q8_0(x_cur, embed_base + tok * row_bytes, hidden)
-
+    // ---- Prompt prefill: every prompt token except the last needs the
+    // layer stack run over it so its K/V is cached. The LAST prompt
+    // token's forward pass produces the first generation logits, so we
+    // fold that into the decode loop (step 0). ----
     u64 pos = 0
+    u64 prefill_start_ns = time_now()
+    while pos + 1 < prompt_count {
+        u32 pt32 = 0
+        unsafe { *((prompt_ids + pos * 4) as uint32) -> pt32 }
+        u64 pt = pt32
+        gguf_deq_q8_0(x_cur, embed_base + pt * row_bytes, hidden)
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen3LayerWeights w = layers_arr + layer * 88
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+            u64 tmp = x_cur
+            x_cur = x_nxt
+            x_nxt = tmp
+            layer = layer + 1
+        }
+        pos = pos + 1
+    }
+    u64 prefill_ns = time_elapsed(prefill_start_ns)
+    eout("[qwen3_14b] prefill_ms="); eu64(prefill_ns / 1000000); eout("\n")
+
+    // Load the last prompt token's embedding — the decode loop will
+    // run its forward pass as step 0 and argmax the result.
+    u32 last_pt32 = 0
+    unsafe { *((prompt_ids + (prompt_count - 1) * 4) as uint32) -> last_pt32 }
+    u64 last_pt = last_pt32
+    gguf_deq_q8_0(x_cur, embed_base + last_pt * row_bytes, hidden)
+
     u64 step = 0
     u64 decode_start_ns = time_now()
     while step < max_new {
@@ -220,7 +299,6 @@ fn main() {
         }
         u64 layer = 0
         while layer < layer_limit {
-            u64 l_start_ns = time_now()
             Qwen3LayerWeights w = layers_arr + layer * 88
             u64 kc = k_cache + layer * layer_stride
             u64 vc = v_cache + layer * layer_stride
@@ -228,9 +306,6 @@ fn main() {
             u64 tmp = x_cur
             x_cur = x_nxt
             x_nxt = tmp
-            u64 l_ms = time_elapsed(l_start_ns) / 1000000
-            eout("  layer "); eu64(layer); eout(" done, ")
-            eu64(l_ms); eout(" ms\n")
             layer = layer + 1
         }
         if layers_cap > 0 {
@@ -262,12 +337,12 @@ fn main() {
         u64 lvs = fmt_f32(best_val, 4); eout(lvs); dealloc(lvs)
         eout(" step_ms="); eu64(step_elapsed_ns / 1000000); eout("\n")
 
-        unsafe { *((seq_ids + seq_len * 8) as u64) = best_id }
+        u32 best_id32 = best_id
+        unsafe { *((seq_ids32 + seq_len * 4) as uint32) = best_id32 }
         seq_len = seq_len + 1
 
         // Decode the new token's embedding row on demand.
         gguf_deq_q8_0(x_cur, embed_base + best_id * row_bytes, hidden)
-        tok = best_id
         pos = pos + 1
         step = step + 1
     }
@@ -278,23 +353,33 @@ fn main() {
         tokps_milli = (max_new * 1000 * 1000000000) / total_decode_ns
     }
 
-    eout("\n=== GENERATED SEQUENCE ===\n")
-    u64 si = 0
-    while si < seq_len {
-        if si != 0 { eout(", ") }
-        u64 id = 0
-        unsafe { *((seq_ids + si * 8) as u64) -> id }
-        eu64(id)
-        si = si + 1
+    eout("\n=== GENERATED IDs ===\n")
+    u64 gi = 0
+    while gi < seq_len {
+        if gi != 0 { eout(", ") }
+        u32 gid32 = 0
+        unsafe { *((seq_ids32 + gi * 4) as uint32) -> gid32 }
+        u64 gid = gid32
+        eu64(gid)
+        gi = gi + 1
     }
-    eout("\n\n=== TIMING ===\n")
+    eout("\n\n=== GENERATED TEXT ===\n")
+    u64 txt = tokenizer_decode(tk, seq_ids32, seq_len)
+    eout(txt); eout("\n")
+    dealloc(txt)
+
+    eout("\n=== TIMING ===\n")
+    eout("prompt_tokens="); eu64(prompt_count); eout("\n")
+    eout("prefill_ms="); eu64(prefill_ns / 1000000); eout("\n")
     eout("total_decode_ms="); eu64(total_ms); eout("\n")
     eout("tokens_per_sec_x1000="); eu64(tokps_milli); eout("\n")
     eout("tokens_generated="); eu64(max_new); eout("\n")
 
     dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits)
-    dealloc(seq_ids); dealloc(layers_arr)
+    dealloc(seq_ids32); dealloc(layers_arr)
     dealloc(k_cache); dealloc(v_cache)
+    if prompt_ids != 0 { dealloc(prompt_ids) }
+    tokenizer_free(tk)
     gguf_free(gf)
     thread_pool_shutdown()
     file_close(g_fd)
