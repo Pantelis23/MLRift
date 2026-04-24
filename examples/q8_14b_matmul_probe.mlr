@@ -1,0 +1,76 @@
+// One-matmul probe at 14B Q8_0 size. Opens the GGUF, reads blk.0.attn_q.weight
+// (shape [5120, 5120] Q8_0), allocates f32 input + f32 output, runs ONE
+// matmul_q8_0_weights_f32 call, prints wall time. Nothing else.
+//
+// If this is in the 10s+ range, the AVX2 Q8_0 kernel is still slow
+// (decode/bandwidth bound). If it's <1s, the 62s/layer in qwen3_14b
+// must come from something else (per-op setup, thread-pool, cold disk).
+
+import "../std/gguf.mlr"
+import "../std/matmul.mlr"
+import "../std/thread.mlr"
+import "../std/time.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+
+fn put(u64 s) { print_str(s) }
+
+fn main() {
+    u64 num_workers = 16
+    thread_pool_init(num_workers)
+
+    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-14B-Q8_0.gguf"
+    put("opening GGUF...\n")
+    u64 t0 = time_now()
+    GGUFFile gf = gguf_open(path)
+    if gf.file_size == 0 { put("open fail\n"); thread_pool_shutdown(); exit(1) }
+    put("gguf_open_ms=")
+    u64 s0 = fmt_dec(time_elapsed(t0) / 1000000); put(s0); dealloc(s0); put("\n")
+
+    put("fetching blk.0.attn_q.weight...\n")
+    u64 t1 = time_now()
+    GGUFTensor tq = gguf_get(gf, "blk.0.attn_q.weight")
+    if tq.ptr == 0 { put("missing\n"); gguf_free(gf); thread_pool_shutdown(); exit(1) }
+    put("gguf_get_ms="); u64 s1 = fmt_dec(time_elapsed(t1) / 1000000); put(s1); dealloc(s1); put("\n")
+
+    u64 K = 5120
+    u64 N = 5120
+    put("K="); u64 sk = fmt_dec(K); put(sk); dealloc(sk); put(" N="); u64 sn = fmt_dec(N); put(sn); dealloc(sn); put("\n")
+
+    u64 x = alloc(K * 4)
+    u64 i = 0
+    f32 one_f = 1.0f
+    while i < K { unsafe { *((x + i * 4) as f32) = one_f }; i = i + 1 }
+    u64 out = alloc(N * 4)
+
+    // Warm-up: one call (pulls pages into cache, init persistent ctx).
+    put("warmup call...\n")
+    u64 t2 = time_now()
+    matmul_q8_0_weights_f32(out, x, tq.ptr, 1, N, K, num_workers)
+    u64 warm_ms = time_elapsed(t2) / 1000000
+    put("warmup_ms="); u64 s2 = fmt_dec(warm_ms); put(s2); dealloc(s2); put("\n")
+
+    // Timed call on the now-warm pages.
+    put("hot call...\n")
+    u64 t3 = time_now()
+    matmul_q8_0_weights_f32(out, x, tq.ptr, 1, N, K, num_workers)
+    u64 hot_ms = time_elapsed(t3) / 1000000
+    put("hot_ms="); u64 s3 = fmt_dec(hot_ms); put(s3); dealloc(s3); put("\n")
+
+    // Sanity: print out[0..3] so we know it's not producing zeros.
+    put("out[:4] = ")
+    i = 0
+    while i < 4 {
+        if i != 0 { put(", ") }
+        f32 v = 0.0f
+        unsafe { *((out + i * 4) as f32) -> v }
+        u64 vs = fmt_f32(v, 4); put(vs); dealloc(vs)
+        i = i + 1
+    }
+    put("\n")
+
+    dealloc(x); dealloc(out)
+    gguf_free(gf)
+    thread_pool_shutdown()
+    exit(0)
+}

@@ -477,6 +477,133 @@ fn matmul_bf16_weights_f32(u64 out_ptr, u64 x_ptr, u64 w_ptr,
 // gguf_f16_to_f32_exact; keep a local alias for type stability.
 // ---------------------------------------------------------------------------
 
+// AVX2 Q8_0 × F32 matmul worker. Processes one block (32 int8 weights)
+// per inner iter using 4× 8-wide FMA against the cross-block accumulator
+// in ymm0.  Register convention matches the caller-bound asm input:
+//   rsi = x_addr          (start of 32 f32 activations for the block)
+//   rdi = block_ptr       (start of 34-byte Q8_0 block)
+//   rcx = scale_scratch   (4 bytes holding f16→f32 scale of this block)
+//   r8  = acc_scratch     (32 bytes storing ymm0 across block iters)
+//
+// Both scratches sit inside the ctx-slot-owned per-worker cache line
+// (allocated once in mm_init): bytes 0..3 hold the scale, bytes 32..63
+// hold the accumulator.
+fn mm_worker_q8_0_f32_avx2(u64 start_n, u64 end_n, u64 ctx_ptr) {
+    u64 out_ptr = 0
+    unsafe { *(ctx_ptr as u64) -> out_ptr }
+    u64 x_ptr = 0
+    unsafe { *((ctx_ptr + 8) as u64) -> x_ptr }
+    u64 w_ptr = 0
+    unsafe { *((ctx_ptr + 16) as u64) -> w_ptr }
+    u64 M = 0
+    unsafe { *((ctx_ptr + 24) as u64) -> M }
+    u64 N = 0
+    unsafe { *((ctx_ptr + 32) as u64) -> N }
+    u64 K = 0
+    unsafe { *((ctx_ptr + 40) as u64) -> K }
+    u64 scratch_base = 0
+    unsafe { *((ctx_ptr + 48) as u64) -> scratch_base }
+
+    u64 n_blocks = K / 32
+    u64 block_row_bytes = n_blocks * 34
+
+    u64 scale_buf = scratch_base
+    u64 acc_buf   = scratch_base + 32
+
+    u64 m = 0
+    while m < M {
+        u64 x_row = x_ptr + m * K * 4
+        u64 o_row = out_ptr + m * N * 4
+        u64 n = start_n
+        while n < end_n {
+            u64 w_row = w_ptr + n * block_row_bytes
+            // Zero accumulator (8 f32 lanes of ymm0).
+            f32 zero_f = 0.0f
+            u64 zi = 0
+            while zi < 8 {
+                unsafe { *((acc_buf + zi * 4) as f32) = zero_f }
+                zi = zi + 1
+            }
+            u64 bi = 0
+            while bi < n_blocks {
+                u64 block = w_row + bi * 34
+                // INLINED f16→f32 of the block scale. The old path called
+                // gguf_f16_to_f32_exact, which allocated a fresh `uint64[1]
+                // tmp` stack slot per call — at 51 200 calls/worker this
+                // dominated the kernel (~2.6 s per matmul on a 5120×5120
+                // Q8_0 weight). Writing the bit pattern directly into the
+                // per-worker scale_buf sidesteps both the function call and
+                // the stack-slot mmap. Subnormal + Inf/NaN halves aren't
+                // expected for Q8_0 scales (they're bounded and ~1e-3..1e-1
+                // in practice), so we hardcode the normal-number fast path.
+                u64 sb_lo = load8(block)
+                u64 sb_hi = load8(block + 1)
+                u64 sbits = sb_lo | (sb_hi << 8)
+                u64 exp_f16 = (sbits >> 10) & 0x1F
+                u64 mant_f16 = sbits & 0x3FF
+                u64 sign_f16 = (sbits >> 15) & 1
+                u64 f32_bits = ((exp_f16 + 112) << 23) | (mant_f16 << 13) | (sign_f16 << 31)
+                u32 f32_u32 = f32_bits
+                unsafe { *(scale_buf as uint32) = f32_u32 }
+
+                u64 x_b = x_row + bi * 32 * 4
+                asm {
+                    // vmovups ymm0, [r8]               ; load acc
+                    "0xC4 0xC1 0x7C 0x10 0x00"
+                    // vbroadcastss ymm3, [rcx]         ; broadcast scale
+                    "0xC4 0xE2 0x7D 0x18 0x19"
+                    // -- chunk 0: weights [rdi+2 .. +9], x [rsi..] --
+                    // vpmovsxbd ymm1, [rdi+2]          ; 8 int8 → 8 int32
+                    "0xC4 0xE2 0x7D 0x21 0x4F 0x02"
+                    // vcvtdq2ps ymm1, ymm1
+                    "0xC5 0xFC 0x5B 0xC9"
+                    // vmulps ymm1, ymm1, ymm3          ; * scale
+                    "0xC5 0xF4 0x59 0xCB"
+                    // vmovups ymm2, [rsi]              ; 8 f32 activations
+                    "0xC5 0xFC 0x10 0x16"
+                    // vfmadd231ps ymm0, ymm1, ymm2
+                    "0xC4 0xE2 0x75 0xB8 0xC2"
+                    // -- chunk 1: weights [rdi+10 .. +17], x [rsi+32..] --
+                    "0xC4 0xE2 0x7D 0x21 0x4F 0x0A"
+                    "0xC5 0xFC 0x5B 0xC9"
+                    "0xC5 0xF4 0x59 0xCB"
+                    "0xC5 0xFC 0x10 0x56 0x20"
+                    "0xC4 0xE2 0x75 0xB8 0xC2"
+                    // -- chunk 2: weights [rdi+18 .. +25], x [rsi+64..] --
+                    "0xC4 0xE2 0x7D 0x21 0x4F 0x12"
+                    "0xC5 0xFC 0x5B 0xC9"
+                    "0xC5 0xF4 0x59 0xCB"
+                    "0xC5 0xFC 0x10 0x56 0x40"
+                    "0xC4 0xE2 0x75 0xB8 0xC2"
+                    // -- chunk 3: weights [rdi+26 .. +33], x [rsi+96..] --
+                    "0xC4 0xE2 0x7D 0x21 0x4F 0x1A"
+                    "0xC5 0xFC 0x5B 0xC9"
+                    "0xC5 0xF4 0x59 0xCB"
+                    "0xC5 0xFC 0x10 0x56 0x60"
+                    "0xC4 0xE2 0x75 0xB8 0xC2"
+                    // vmovups [r8], ymm0               ; store acc
+                    "0xC4 0xC1 0x7C 0x11 0x00"
+                    // vzeroupper
+                    "0xC5 0xF8 0x77"
+                } in(x_b -> rsi, block -> rdi, scale_buf -> rcx, acc_buf -> r8)
+                bi = bi + 1
+            }
+            // Horizontal reduce the 8-lane acc to scalar.
+            f32 sum = 0.0f
+            u64 li = 0
+            while li < 8 {
+                f32 v = 0.0f
+                unsafe { *((acc_buf + li * 4) as f32) -> v }
+                sum = sum + v
+                li = li + 1
+            }
+            unsafe { *((o_row + n * 4) as f32) = sum }
+            n = n + 1
+        }
+        m = m + 1
+    }
+}
+
 fn mm_worker_q8_0_f32_naive(u64 start_n, u64 end_n, u64 ctx_ptr) {
     u64 out_ptr = 0
     unsafe { *(ctx_ptr as u64) -> out_ptr }
@@ -490,6 +617,8 @@ fn mm_worker_q8_0_f32_naive(u64 start_n, u64 end_n, u64 ctx_ptr) {
     unsafe { *((ctx_ptr + 32) as u64) -> N }
     u64 K = 0
     unsafe { *((ctx_ptr + 40) as u64) -> K }
+    u64 scratch_base = 0
+    unsafe { *((ctx_ptr + 48) as u64) -> scratch_base }
 
     u64 n_blocks = K / 32
     u64 block_row_bytes = n_blocks * 34
@@ -506,7 +635,16 @@ fn mm_worker_q8_0_f32_naive(u64 start_n, u64 end_n, u64 ctx_ptr) {
                 u64 lo = load8(block)
                 u64 hi = load8(block + 1)
                 u64 dbits = lo | (hi << 8)
-                f32 d = gguf_f16_to_f32_exact(dbits)
+                // INLINED f16→f32 normal-path decode. See mm_worker_q8_0_f32_avx2
+                // for the rationale (removes per-call stack-slot mmap).
+                u64 d_exp  = (dbits >> 10) & 0x1F
+                u64 d_mant = dbits & 0x3FF
+                u64 d_sign = (dbits >> 15) & 1
+                u64 d_bits32 = ((d_exp + 112) << 23) | (d_mant << 13) | (d_sign << 31)
+                u32 d_u32 = d_bits32
+                unsafe { *(scratch_base as uint32) = d_u32 }
+                f32 d = 0.0f
+                unsafe { *(scratch_base as f32) -> d }
                 u64 qs = block + 2
                 u64 j = 0
                 while j < 32 {
@@ -558,7 +696,8 @@ fn matmul_q8_0_weights_f32(u64 out_ptr, u64 x_ptr, u64 w_ptr,
         w = w + 1
     }
 
-    u64 fn_ptr = fn_addr("mm_worker_q8_0_f32_naive")
+    u64 fn_ptr = fn_addr("mm_worker_q8_0_f32_avx2")
+    if (K & 31) != 0 { fn_ptr = fn_addr("mm_worker_q8_0_f32_naive") }
     u64 chunk = N / num_workers
     w = 0
     while w + 1 < num_workers {
@@ -571,6 +710,10 @@ fn matmul_q8_0_weights_f32(u64 out_ptr, u64 x_ptr, u64 w_ptr,
     u64 main_start = (num_workers - 1) * chunk
     u64 main_end   = N
     u64 main_ctx   = mm_ctx_base + (num_workers - 1) * 64
-    mm_worker_q8_0_f32_naive(main_start, main_end, main_ctx)
+    if (K & 31) == 0 {
+        mm_worker_q8_0_f32_avx2(main_start, main_end, main_ctx)
+    } else {
+        mm_worker_q8_0_f32_naive(main_start, main_end, main_ctx)
+    }
     thread_pool_wait()
 }

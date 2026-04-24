@@ -79,7 +79,9 @@ fn main() {
     u64 n_layers = 40
     u64 vocab = 151936
     u64 max_seq = 64
-    u64 max_new = 10
+    u64 max_new = 5
+    // DIAG: bail after this many layers (0 = run full 40).
+    u64 layers_cap = 0
 
     // token_embd is Q8_0 at 14B — need a dequantized f32 copy for the
     // initial embedding lookup (we don't have a Q8_0 single-row decode
@@ -100,10 +102,13 @@ fn main() {
         gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
     }
 
-    eout("[qwen3_14b] dequantising embedding (3.1 GB f32)\n")
-    u64 embed_f32_bytes = vocab * hidden * 4
-    u64 embed_f32 = alloc(embed_f32_bytes)
-    gguf_deq_q8_0(embed_f32, embed_t.ptr, vocab * hidden)
+    // NOTE: 14B embed is Q8_0 and 3.1 GB in f32 if eagerly decoded —
+    // together with the 15 GB mmap that blew the 30 GB box into swap
+    // and killed the process. Decode one row per embed lookup instead.
+    u64 embed_base = embed_t.ptr
+    u64 row_blocks = hidden / 32
+    u64 row_bytes  = row_blocks * 34
+    eout("[qwen3_14b] embed row decoded on demand ("); eu64(row_bytes); eout(" B/row)\n")
 
     // Per-layer weight pointer table. 11 u64 pointers × 8 = 88 bytes.
     u64 layers_arr = alloc(n_layers * 88)
@@ -199,9 +204,8 @@ fn main() {
     u64 seq_len = 1
     eout("[qwen3_14b] seed token = "); eu64(tok); eout("\n")
 
-    // Embed seed token from the dequantised f32 copy.
-    u64 row = embed_f32 + tok * hidden * 4
-    memcpy(x_cur, row, hidden * 4)
+    // Embed seed token — decode one Q8_0 row into x_cur.
+    gguf_deq_q8_0(x_cur, embed_base + tok * row_bytes, hidden)
 
     u64 pos = 0
     u64 step = 0
@@ -210,8 +214,13 @@ fn main() {
         u64 step_start_ns = time_now()
         eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
 
+        u64 layer_limit = n_layers
+        if layers_cap > 0 {
+            if layers_cap < n_layers { layer_limit = layers_cap }
+        }
         u64 layer = 0
-        while layer < n_layers {
+        while layer < layer_limit {
+            u64 l_start_ns = time_now()
             Qwen3LayerWeights w = layers_arr + layer * 88
             u64 kc = k_cache + layer * layer_stride
             u64 vc = v_cache + layer * layer_stride
@@ -219,7 +228,14 @@ fn main() {
             u64 tmp = x_cur
             x_cur = x_nxt
             x_nxt = tmp
+            u64 l_ms = time_elapsed(l_start_ns) / 1000000
+            eout("  layer "); eu64(layer); eout(" done, ")
+            eu64(l_ms); eout(" ms\n")
             layer = layer + 1
+        }
+        if layers_cap > 0 {
+            eout("[DIAG] stopped after "); eu64(layers_cap); eout(" layers — skipping lm_head\n")
+            break
         }
 
         // Final F32 RMSNorm (output_norm.weight is F32 in 14B).
@@ -249,9 +265,8 @@ fn main() {
         unsafe { *((seq_ids + seq_len * 8) as u64) = best_id }
         seq_len = seq_len + 1
 
-        // Embed new token from the dequantised buffer.
-        row = embed_f32 + best_id * hidden * 4
-        memcpy(x_cur, row, hidden * 4)
+        // Decode the new token's embedding row on demand.
+        gguf_deq_q8_0(x_cur, embed_base + best_id * row_bytes, hidden)
         tok = best_id
         pos = pos + 1
         step = step + 1
@@ -280,7 +295,6 @@ fn main() {
     dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits)
     dealloc(seq_ids); dealloc(layers_arr)
     dealloc(k_cache); dealloc(v_cache)
-    dealloc(embed_f32)
     gguf_free(gf)
     thread_pool_shutdown()
     file_close(g_fd)
