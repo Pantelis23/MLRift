@@ -4674,6 +4674,124 @@ fn emit_amdgpu_mt_csr_i_deliver_blob(uint64 out_path) -> uint64 {
 }
 
 // ---------------------------------------------------------------------------
+// B3 mt_csr_e_delayed: multi-thread excitatory CSR delivery with
+// delay-line read, STDP LTD, and fused buf_delay clear.
+//
+// Launch convention: block_x = total_edges, grid_x = 1.
+//
+// Kernargs (14 entries, 112 bytes):
+//   [0x00] rpe_tgt_ptr         (u64*)
+//   [0x08] rpe_w_ptr           (f64*)
+//   [0x10] rpe_is_ee_ptr       (u64*)
+//   [0x18] edge_to_src_e_ptr   (u64*)
+//   [0x20] is_first_edge_e_ptr (u64*)
+//   [0x28] buf_delay_ptr       (f64*)
+//   [0x30] row_base            (u64 by-value)
+//   [0x38] x_post_ptr          (f64*)
+//   [0x40] s_exc_ptr           (f64*)
+//   [0x48] ltd_events_ptr      (u64*)
+//   [0x50] n_pre               (u64 by-value)
+//   [0x58] A_minus             (f64 by-value)
+//   [0x60] w_max               (f64 by-value)
+//   [0x68] _reserved           (u64)
+//
+// THIS IS THE SCAFFOLD STAGE. Outer predicate + atomic scatter land
+// in the next commit; STDP LTD + first-edge clear land after that.
+@export
+fn emit_amdgpu_mt_csr_e_delayed_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "mt_csr_e_delayed"
+    uint64 klen  = 16
+
+    asm_init()
+
+    // --- Prologue: 14 kernarg SMEM loads ---
+    asm_s_load_b64(1, 0)                            // s[2:3]   rpe_tgt_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5]   rpe_w_ptr
+    asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7]   rpe_is_ee_ptr
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9]   edge_to_src_e_ptr
+    asm_s_load_b64_off(5, 0, 0x20)                  // s[10:11] is_first_edge_e_ptr
+    asm_s_load_b64_off(6, 0, 0x28)                  // s[12:13] buf_delay_ptr
+    asm_s_load_b64_off(7, 0, 0x30)                  // s[14:15] row_base
+    asm_s_load_b64_off(8, 0, 0x38)                  // s[16:17] x_post_ptr
+    asm_s_load_b64_off(9, 0, 0x40)                  // s[18:19] s_exc_ptr
+    asm_s_load_b64_off(10, 0, 0x48)                 // s[20:21] ltd_events_ptr
+    asm_s_load_b64_off(11, 0, 0x50)                 // s[22:23] n_pre (unused)
+    asm_s_load_b64_off(12, 0, 0x58)                 // s[24:25] A_minus
+    asm_s_load_b64_off(13, 0, 0x60)                 // s[26:27] w_max
+    asm_s_load_b64_off(14, 0, 0x68)                 // s[28:29] _reserved
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Per-lane byte offset v2 = tid*8.
+    asm_v_lshlrev_b32_imm(2, 3, 0)
+    asm_s_delay_alu(0x01)
+
+    // --- Per-lane VMEM loads (saddr = raw SGPR index of pair low half) ---
+    // Encoding: [word1=0xDC560000, word2=(vdst<<24) | (saddr<<16) | v_addr]
+    // Outputs: v[4:5]=rpe_tgt, v[6:7]=rpe_w, v[12:13]=rpe_is_ee, v[8:9]=edge_to_src, v[14:15]=is_first
+    asm_u32(0xDC560000); asm_u32(0x04020002)        // rpe_tgt         → v[4:5]   saddr=s2
+    asm_u32(0xDC560000); asm_u32(0x06040002)        // rpe_w           → v[6:7]   saddr=s4
+    asm_u32(0xDC560000); asm_u32(0x0C060002)        // rpe_is_ee       → v[12:13] saddr=s6
+    asm_u32(0xDC560000); asm_u32(0x08080002)        // edge_to_src_e   → v[8:9]   saddr=s8
+    asm_u32(0xDC560000); asm_u32(0x0E0A0002)        // is_first_edge_e → v[14:15] saddr=s10
+    asm_s_waitcnt_vmcnt_zero()
+
+    // --- SGPR→VGPR broadcast of f64 by-value constants ---
+    asm_v_mov_b32(30, 24); asm_v_mov_b32(31, 25)    // v[30:31] A_minus
+    asm_v_mov_b32(32, 26); asm_v_mov_b32(33, 27)    // v[32:33] w_max
+    asm_s_delay_alu(0x02)
+
+    asm_s_endpgm()
+
+    uint64 rsrc1 = 0xE0AF0004                       // VGPR granule=4 → 40 VGPRs
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000030
+    uint64 props = 0x0408
+
+    uint64[28] args_desc
+    uint64 ai = 0
+    // 10 pointer args: rpe_tgt, rpe_w, rpe_is_ee, edge_to_src_e, is_first_edge_e
+    while ai < 6 {
+        uint64 p0 = args_desc + ai * 16;     unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8; unsafe { *(p1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        ai = ai + 1
+    }
+    // row_base (by-value) at index 6
+    uint64 rb_p0 = args_desc + ai * 16;     unsafe { *(rb_p0 as uint64) = 8 }
+    uint64 rb_p1 = args_desc + ai * 16 + 8; unsafe { *(rb_p1 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    ai = ai + 1
+    // x_post_ptr, s_exc_ptr, ltd_events_ptr at indices 7, 8, 9
+    while ai < 10 {
+        uint64 p0 = args_desc + ai * 16;     unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8; unsafe { *(p1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        ai = ai + 1
+    }
+    // n_pre, A_minus, w_max, _reserved (4 by-values) at indices 10-13
+    while ai < 14 {
+        uint64 p0 = args_desc + ai * 16;     unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8; unsafe { *(p1 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        ai = ai + 1
+    }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           112,     // kernarg_size (14 × 8)
+                                           8,       // kernarg_align
+                                           36,      // sgpr_count (kernargs + EXEC saves + scratch)
+                                           40,      // vgpr_count (granule 4)
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 14)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_mt_csr_e_delayed_blob: cannot open output\n", 54)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
 // M1m loop-demo: hand-crafted kernel that exercises the SALU while-
 // loop primitives (s_add_u32, s_cmp_lt_u32, s_cbranch_scc0,
 // s_branch backward) before any AST-lowerer shape wires them in.
