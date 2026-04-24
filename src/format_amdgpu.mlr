@@ -5046,6 +5046,105 @@ fn emit_amdgpu_decay_step_blob(uint64 out_path) -> uint64 {
 }
 
 // ---------------------------------------------------------------------------
+// B4 relax_step: per-lane relaxation toward a target.
+//   buf[tid] = buf[tid] + (target - buf[tid]) * factor
+// Semantics matches examples/gpu_stage13_full.mlr:52-62.
+//
+// Launch: block_x = N, grid_x = 1. Guard via tid < n.
+//
+// Kernargs (5 entries, 40 bytes):
+//   [0x00] buf_ptr   (f64*)
+//   [0x08] n         (u64 by-value)
+//   [0x10] target    (f64 by-value)
+//   [0x18] factor    (f64 by-value)
+//   [0x20] _reserved (u64)
+@export
+fn emit_amdgpu_relax_step_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "relax_step"
+    uint64 klen  = 10
+
+    asm_init()
+
+    // --- Prologue: 5 kernarg SMEM loads ---
+    asm_s_load_b64(1, 0)                            // s[2:3]   buf_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5]   n
+    asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7]   target
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9]   factor
+    asm_s_load_b64_off(5, 0, 0x20)                  // s[10:11] _reserved
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // tid < n guard.
+    asm_v_cmp_gt_u32_sgpr_vgpr(4, 0)                // vcc_lo = (s4 > v0)
+    asm_s_and_saveexec_b32_vcc_lo(46)               // s46 = outer EXEC, EXEC &= (tid < n)
+
+    // v2 = tid * 8.
+    asm_v_lshlrev_b32_imm(2, 3, 0)
+    asm_s_delay_alu(0x01)
+
+    // Load buf[tid] → v[4:5].
+    asm_u32(0xDC560000); asm_u32(0x04020002)        // global_load_b64 v[4:5], v2, s[2:3]
+    asm_s_waitcnt_vmcnt_zero()
+
+    // Broadcast target → v[6:7], factor → v[8:9].
+    asm_v_mov_b32(6, 6); asm_v_mov_b32(7, 7)        // v[6:7] = target
+    asm_v_mov_b32(8, 8); asm_v_mov_b32(9, 9)        // v[8:9] = factor
+    asm_s_delay_alu(0x04)
+
+    // v[10:11] = target - buf
+    asm_v_sub_f64_vv(10, 6, 4)
+    asm_s_delay_alu(0x01)
+    // v[10:11] = (target - buf) * factor
+    asm_v_mul_f64_vv(10, 10, 8)
+    asm_s_delay_alu(0x01)
+    // v[4:5] = buf + (target - buf) * factor
+    asm_v_add_f64_vv(4, 4, 10)
+    asm_s_delay_alu(0x01)
+
+    // Store v[4:5] back to buf[tid].
+    asm_u32(0xDC6E0000); asm_u32(0x00020402)        // global_store_b64 v2, v[4:5], s[2:3]
+    asm_s_waitcnt_vscnt_zero()
+
+    asm_s_mov_b32(0x7E, 46)
+    asm_s_endpgm()
+
+    uint64 rsrc1 = 0xE0AF0001                       // granule 1 → 16 VGPRs
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000030
+    uint64 props = 0x0408
+
+    // 5 kernargs: 1 GLOBAL_BUFFER + 4 BY_VALUE.
+    uint64[10] args_desc
+    uint64 p0s = args_desc + 0;   unsafe { *(p0s as uint64) = 8 }
+    uint64 p0k = args_desc + 8;   unsafe { *(p0k as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 p1s = args_desc + 16;  unsafe { *(p1s as uint64) = 8 }
+    uint64 p1k = args_desc + 24;  unsafe { *(p1k as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 p2s = args_desc + 32;  unsafe { *(p2s as uint64) = 8 }
+    uint64 p2k = args_desc + 40;  unsafe { *(p2k as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 p3s = args_desc + 48;  unsafe { *(p3s as uint64) = 8 }
+    uint64 p3k = args_desc + 56;  unsafe { *(p3k as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 p4s = args_desc + 64;  unsafe { *(p4s as uint64) = 8 }
+    uint64 p4k = args_desc + 72;  unsafe { *(p4k as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           40,      // kernarg_size (5 × 8)
+                                           8,       // kernarg_align
+                                           48,      // sgpr_count
+                                           16,      // vgpr_count
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 5)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_relax_step_blob: cannot open output\n", 48)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
 // M1m loop-demo: hand-crafted kernel that exercises the SALU while-
 // loop primitives (s_add_u32, s_cmp_lt_u32, s_cbranch_scc0,
 // s_branch backward) before any AST-lowerer shape wires them in.
