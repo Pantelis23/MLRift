@@ -4311,6 +4311,107 @@ fn emit_amdgpu_mt_lif_full_blob(uint64 out_path) -> uint64 {
     asm_v_add_f64_vv(26, 4, 28)                     // v[26:27] = v_new (live for spike branch in Task 4)
     asm_s_delay_alu(0x01)
 
+    // --- Spike branch (per-lane EXEC-mask predication) ---
+    // if v_new >= V_thresh { spike_body } else { V = v_new }
+    asm_v_cmp_ge_f64_vv(26, 40)                     // vcc_lo = (v_new >= V_thresh) per lane
+    asm_s_and_saveexec_b32_vcc_lo(47)               // s47 = outer EXEC, EXEC &= vcc_lo
+
+    // ---- spike-body (EXEC = spiking lanes) ----
+    // Store V = V_reset to V_ptr[tid].
+    asm_u32(0xDC6E0000); asm_u32(0x00022602)        // global_store_b64 v2, v[38:39], s[2:3]
+    asm_s_waitcnt_vscnt_zero()
+
+    // Store ref = ref_steps (low 32 bits) to ref_ptr[tid]. ref_steps
+    // arrives via s[36:37]; v[46] gets the low word, v[47] gets 0.
+    asm_v_mov_b32(46, 36)
+    asm_v_mov_b32_inline_u(47, 0)
+    asm_s_delay_alu(0x02)
+    asm_u32(0xDC6E0000); asm_u32(0x00042E02)        // global_store_b64 v2, v[46:47], s[4:5]
+    asm_s_waitcnt_vscnt_zero()
+
+    // spike++ — increment low 32 bits of v[14:15].
+    // v_add_nc_u32_e64 v14, v14, 1  (verified via llvm-mc gfx1100):
+    //   encoding bytes [0x0e,0x00,0x25,0xd5,0x0e,0x03,0x01,0x00]
+    //   → word1=0xD525000E, word2=0x0001030E (src0=v14, src1=inline 1).
+    asm_u32(0xD525000E); asm_u32(0x0001030E)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000); asm_u32(0x000C0E02)        // global_store_b64 v2, v[14:15], s[12:13]
+    asm_s_waitcnt_vscnt_zero()
+
+    // x_pre += 1.0 (VOP3 v_add_f64). Verified via llvm-mc:
+    //   v_add_f64 v[16:17], v[16:17], 1.0 → 0xD7270010, 0x0001E510.
+    asm_u32(0xD7270010); asm_u32(0x0001E510)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000); asm_u32(0x000E1002)        // global_store_b64 v2, v[16:17], s[14:15]
+    asm_s_waitcnt_vscnt_zero()
+
+    // x_post += 1.0 (same shape, vdst=18). Verified via llvm-mc:
+    //   v_add_f64 v[18:19], v[18:19], 1.0 → 0xD7270012, 0x0001E512.
+    asm_u32(0xD7270012); asm_u32(0x0001E512)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000); asm_u32(0x00101202)        // global_store_b64 v2, v[18:19], s[16:17]
+    asm_s_waitcnt_vscnt_zero()
+
+    // --- STP update ---
+    // rel = u * x → v[28:29] (scratch).
+    asm_v_mul_f64_vv(28, 20, 22)                    // v[28:29] = u * x = rel
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000); asm_u32(0x00161C02)        // store rel to release_ptr[tid] via s[22:23]
+    asm_s_waitcnt_vscnt_zero()
+
+    // x_new = x - rel (overwrites v[22:23] in place).
+    asm_v_sub_f64_vv(22, 22, 28)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000); asm_u32(0x00141602)        // store x_new to x_stp_ptr[tid] via s[20:21]
+    asm_s_waitcnt_vscnt_zero()
+
+    // u_new = u + U_baseline * (1 - u).
+    //   Step 1: v[30:31] = 1.0 + (-u) via v_add_f64 with src0=inline 1.0, src1=-v[20:21].
+    //   Verified via llvm-mc: v_add_f64 v[30:31], 1.0, -v[20:21] → 0xD727001E, 0x400228F2.
+    asm_u32(0xD727001E); asm_u32(0x400228F2)
+    asm_s_delay_alu(0x01)
+    asm_v_mul_f64_vv(30, 42, 30)                    // v[30:31] = U_base * (1 - u)
+    asm_s_delay_alu(0x01)
+    asm_v_add_f64_vv(20, 20, 30)                    // v[20:21] = u_new = u + U_base*(1-u)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000); asm_u32(0x00121402)        // store u_new to u_stp_ptr[tid] via s[18:19]
+    asm_s_waitcnt_vscnt_zero()
+
+    // --- Nested ring-buffer scatter: if cell_type[tid] == 0, write rel to buf_delay[w_base*N + tid] ---
+    // Compute scalar base = s[42:43] + (w_base << 7)   (N*8 = 128 = 1<<7 for N=16).
+    // All three verified via llvm-mc:
+    //   s_lshl_b64 s[52:53], s[44:45], 7 → 0x84B4872C
+    //   s_add_u32  s54, s42, s52          → 0x8036342A
+    //   s_addc_u32 s55, s43, s53          → 0x8237352B
+    asm_u32(0x84B4872C)                             // s_lshl_b64 s[52:53], s[44:45], 7
+    asm_u32(0x8036342A)                             // s_add_u32  s54, s42, s52
+    asm_u32(0x8237352B)                             // s_addc_u32 s55, s43, s53
+
+    // Reload rel from release_ptr[tid] into v[28:29] (it was overwritten by u-chain).
+    asm_u32(0xDC560000); asm_u32(0x1C160002)        // global_load_b64 v[28:29], v2, s[22:23]
+    asm_s_waitcnt_vmcnt_zero()
+
+    // Predicate on cell_type == 0.
+    asm_v_cmp_eq_u32_imm_vgpr(0, 24)                // vcc_lo = (v24 == 0)
+    asm_s_and_saveexec_b32_vcc_lo(48)               // s48 = spike-EXEC, EXEC &= (ct==0)
+
+    // Scatter: buf_delay_base (s[54:55]) + tid*8 (v2) ← v[28:29] (rel).
+    asm_u32(0xDC6E0000); asm_u32(0x00361C02)        // global_store_b64 v2, v[28:29], s[54:55]
+    asm_s_waitcnt_vscnt_zero()
+
+    // Restore EXEC to spike-path (drop ct-predicate).
+    asm_s_mov_b32(0x7E, 48)
+
+    // ---- no-spike body (complementary lanes within outer EXEC) ----
+    asm_s_xor_b32_exec_sgpr(47)                     // EXEC = old_EXEC ^ s47 = non-spiking lanes
+
+    // Store v_new to V_ptr[tid] for lanes that did NOT spike.
+    asm_u32(0xDC6E0000); asm_u32(0x00021A02)        // global_store_b64 v2, v[26:27], s[2:3]
+    asm_s_waitcnt_vscnt_zero()
+
+    // Restore outer EXEC.
+    asm_s_mov_b32(0x7E, 47)
+
     asm_s_endpgm()
 
     uint64 rsrc1 = 0xE0AF0005                       // VGPR granule=5: (5+1)*8 = 48 VGPRs
