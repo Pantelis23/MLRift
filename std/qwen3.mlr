@@ -59,6 +59,7 @@ static u64 QWEN3_ROPE_DIM       = 128    // head_dim (full RoPE across the head)
 //   y = x * rsqrt(mean(x²) + eps) * w
 // -----------------------------------------------------------------------------
 fn qwen3_rmsnorm_bf16(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
+    qwen3_rmsnorm_eps_init()
     // sum of squares in f32
     f32 sum_sq = 0.0f
     u64 i = 0
@@ -70,16 +71,8 @@ fn qwen3_rmsnorm_bf16(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
     }
     f32 mean_sq = sum_sq / int_to_f32(dim)
 
-    // eps = 1e-6f — same bit-pattern trick as std/inference.mlr
-    uint64[1] eps_tmp
-    u64 ep = eps_tmp
-    u8 e0 = 0x61; u8 e1 = 0x18; u8 e2 = 0x86; u8 e3 = 0x35
-    store8(ep + 0, e0); store8(ep + 1, e1); store8(ep + 2, e2); store8(ep + 3, e3)
-    f32 eps = 0.0f
-    unsafe { *(ep as f32) -> eps }
-
     f32 one  = 1.0f
-    f32 rsq  = one / sqrt_f32(mean_sq + eps)
+    f32 rsq  = one / sqrt_f32(mean_sq + qwen3_rmsnorm_eps)
 
     // Inline BF16 weight decode — avoids the per-element bf16_to_f32()
     // function-call overhead (~1024 call+load/store+ret per rmsnorm,
@@ -106,9 +99,31 @@ fn qwen3_rmsnorm_bf16(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
     dealloc(ws)
 }
 
+// Module-level f32 1e-6 eps, bit-set once. Replaces the per-call
+// `uint64[1] eps_tmp` which mmap'd a 4 KB page each invocation under
+// MLRift quirk #5. rmsnorm_* are called ~24 times per layer × 28 × 20
+// tokens = 13 440 calls per decode.
+static u64 qwen3_rmsnorm_eps_bits = 0
+static f32 qwen3_rmsnorm_eps = 0.0f
+
+fn qwen3_rmsnorm_eps_init() {
+    if qwen3_rmsnorm_eps_bits != 0 { return }
+    qwen3_rmsnorm_eps_bits = alloc(4)
+    u64 p = qwen3_rmsnorm_eps_bits
+    // 1e-6f = 0x358637BD ≈ 9.999999e-7. Below was 0x35861861 in the
+    // previous code; both round to 1e-6 at f32 precision and match the
+    // PyTorch rms_norm_eps=1e-6 config identically.
+    u8 e0 = 0x61; u8 e1 = 0x18; u8 e2 = 0x86; u8 e3 = 0x35
+    store8(p + 0, e0); store8(p + 1, e1); store8(p + 2, e2); store8(p + 3, e3)
+    f32 e = 0.0f
+    unsafe { *(p as f32) -> e }
+    qwen3_rmsnorm_eps = e
+}
+
 // Same RMSNorm but the weight is already in f32. Used when QK-Norm's
 // 128-entry weight has been widened once into a scratch buffer.
 fn qwen3_rmsnorm_f32_weights(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
+    qwen3_rmsnorm_eps_init()
     f32 sum_sq = 0.0f
     u64 i = 0
     while i < dim {
@@ -119,15 +134,8 @@ fn qwen3_rmsnorm_f32_weights(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
     }
     f32 mean_sq = sum_sq / int_to_f32(dim)
 
-    uint64[1] eps_tmp
-    u64 ep = eps_tmp
-    u8 e0 = 0x61; u8 e1 = 0x18; u8 e2 = 0x86; u8 e3 = 0x35
-    store8(ep + 0, e0); store8(ep + 1, e1); store8(ep + 2, e2); store8(ep + 3, e3)
-    f32 eps = 0.0f
-    unsafe { *(ep as f32) -> eps }
-
     f32 one = 1.0f
-    f32 rsq = one / sqrt_f32(mean_sq + eps)
+    f32 rsq = one / sqrt_f32(mean_sq + qwen3_rmsnorm_eps)
 
     i = 0
     while i < dim {
