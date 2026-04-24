@@ -1,0 +1,136 @@
+// qwen3_layer0 — numerical verification of the Qwen3 Phase 1 forward path.
+//
+// Loads Qwen3-0.6B safetensors, fetches the single-token embedding for
+// token 14990 ("hello"), runs it through layer 0, and prints the first 5
+// output values. Reference from transformers 5.6.2 (float32):
+//   hidden_states[1][0, 0, :5] = [-0.2150, 0.3201, 0.0887, -1.2590, -0.0759]
+//
+// Run (weights expected at the path below):
+//   ./build/mlrc examples/qwen3_layer0.mlr -o /tmp/qw3_l0
+//   /tmp/qw3_l0
+
+import "../std/qwen3.mlr"
+import "../std/safetensors.mlr"
+import "../std/inference.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/thread.mlr"
+
+// Output file so the data survives a closed terminal. Written both to
+// stdout and to /tmp/qw3l0.out.
+static u64 g_log_fd = 0
+
+fn log_open(u64 path) {
+    g_log_fd = file_open(path, 1)
+}
+fn log_close() {
+    if g_log_fd != 0 { file_close(g_log_fd) }
+}
+fn emit(u64 s) {
+    // IMPORTANT: use print_str, not print — print of a u64 variable prints
+    // the integer value (the pointer), not the string. Bit us with a
+    // pointer-decimal flood into stdout on the first run.
+    print_str(s)
+    if g_log_fd != 0 {
+        u64 n = str_len(s)
+        file_write(g_log_fd, s, n)
+    }
+}
+
+fn dump5(u64 p) {
+    u64 i = 0
+    while i < 5 {
+        if i != 0 { emit(" ") }
+        f32 v = 0.0f
+        unsafe { *((p + i * 4) as f32) -> v }
+        u64 s = fmt_f32(v, 4)
+        emit(s)
+        i = i + 1
+    }
+    emit("\n")
+}
+
+// NOTE: MLRift struct-param writes don't persist to the caller. Inline the
+// layer-weight population in main() for Phase 1 and revisit factoring when
+// we know the pattern the compiler accepts.
+
+fn main() {
+    u64 num_workers = 16
+    thread_pool_init(num_workers)
+    log_open("/tmp/qw3l0.out")
+
+    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-0.6B/model.safetensors"
+    emit("[qwen3_layer0] loading weights\n")
+    SafetensorFile st = safetensors_open(path)
+    if st.file_size == 0 {
+        emit("[qwen3_layer0] open failed\n")
+        thread_pool_shutdown()
+        log_close()
+        exit(1)
+    }
+
+    // 1. Fetch embed_tokens row 14990 into an f32 activation.
+    SafetensorView embed = safetensors_get(st, "model.embed_tokens.weight")
+    if embed.ptr == 0 {
+        emit("[qwen3_layer0] missing embed_tokens.weight\n")
+        safetensors_free(st); thread_pool_shutdown(); log_close(); exit(1)
+    }
+    u64 hidden = QWEN3_HIDDEN
+    u64 token_id = 14990
+    u64 x0 = alloc(hidden * 4)
+    u64 row = embed.ptr + token_id * hidden * 2     // BF16 = 2 bytes/elem
+    u64 i = 0
+    while i < hidden {
+        f32 v = bf16_to_f32(row + i * 2)
+        unsafe { *((x0 + i * 4) as f32) = v }
+        i = i + 1
+    }
+    emit("embed[14990][:5] = ")
+    dump5(x0)
+
+    // 2. Fetch layer 0 weight pointers.
+    Qwen3LayerWeights w = alloc(88)
+    SafetensorView v01 = safetensors_get(st, "model.layers.0.input_layernorm.weight")
+    w.input_norm_w = v01.ptr
+    SafetensorView v02 = safetensors_get(st, "model.layers.0.self_attn.q_proj.weight")
+    w.q_proj_w = v02.ptr
+    SafetensorView v03 = safetensors_get(st, "model.layers.0.self_attn.k_proj.weight")
+    w.k_proj_w = v03.ptr
+    SafetensorView v04 = safetensors_get(st, "model.layers.0.self_attn.v_proj.weight")
+    w.v_proj_w = v04.ptr
+    SafetensorView v05 = safetensors_get(st, "model.layers.0.self_attn.q_norm.weight")
+    w.q_norm_w = v05.ptr
+    SafetensorView v06 = safetensors_get(st, "model.layers.0.self_attn.k_norm.weight")
+    w.k_norm_w = v06.ptr
+    SafetensorView v07 = safetensors_get(st, "model.layers.0.self_attn.o_proj.weight")
+    w.o_proj_w = v07.ptr
+    SafetensorView v08 = safetensors_get(st, "model.layers.0.post_attention_layernorm.weight")
+    w.post_norm_w = v08.ptr
+    SafetensorView v09 = safetensors_get(st, "model.layers.0.mlp.gate_proj.weight")
+    w.gate_proj_w = v09.ptr
+    SafetensorView v10 = safetensors_get(st, "model.layers.0.mlp.up_proj.weight")
+    w.up_proj_w = v10.ptr
+    SafetensorView v11 = safetensors_get(st, "model.layers.0.mlp.down_proj.weight")
+    w.down_proj_w = v11.ptr
+    emit("layer0 weight ptrs OK\n")
+
+    // 3. Run layer 0 at position 0. Open a dump file for intermediates.
+    emit("[qwen3_layer0] running layer 0 (this is the slow part)\n")
+    u64 dfd = file_open("/tmp/qw3l0.dump", 1)
+    qwen3_set_dump_fd(dfd)
+    u64 x1 = alloc(hidden * 4)
+    qwen3_forward_layer(x1, x0, w, 0, num_workers)
+    file_close(dfd)
+    qwen3_set_dump_fd(0)
+    emit("[qwen3_layer0] layer 0 done\n")
+
+    emit("layer0_out[:5] = ")
+    dump5(x1)
+    emit("reference      = -0.2150 0.3201 0.0887 -1.2590 -0.0759\n")
+
+    dealloc(x0); dealloc(x1); dealloc(w)
+    safetensors_free(st)
+    thread_pool_shutdown()
+    log_close()
+    exit(0)
+}

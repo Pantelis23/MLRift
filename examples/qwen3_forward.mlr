@@ -1,0 +1,249 @@
+// Qwen3 Phase 2 — full 28-layer forward + lm_head + argmax.
+//
+// Loads Qwen3-0.6B safetensors, runs the full residual stream through
+// every layer, final norm, and a matmul against embed_tokens.weight (the
+// lm_head is tied). Prints the argmax token id.
+//
+// Reference (token 14990 "hello"): PyTorch argmax = 14582 "Question".
+
+import "../std/qwen3.mlr"
+import "../std/safetensors.mlr"
+import "../std/inference.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/thread.mlr"
+
+static u64 g_fd = 0
+fn eout(u64 s) {
+    print_str(s)
+    if g_fd != 0 {
+        u64 n = str_len(s)
+        file_write(g_fd, s, n)
+    }
+}
+fn eu64(u64 v) {
+    u64 s = fmt_dec(v)
+    eout(s)
+    dealloc(s)
+}
+
+fn main() {
+    u64 num_workers = 16
+    thread_pool_init(num_workers)
+    g_fd = file_open("/tmp/qw3_fwd.out", 1)
+
+    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-0.6B/model.safetensors"
+    eout("[qwen3_forward] loading weights\n")
+    SafetensorFile st = safetensors_open(path)
+    if st.file_size == 0 {
+        eout("open fail\n")
+        thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+
+    u64 hidden = QWEN3_HIDDEN
+    u64 n_layers = 28
+    u64 vocab = 151936
+
+    // ------------------------------------------------------------------
+    // Load embed + norm + per-layer weight pointers.
+    // Qwen3LayerWeights = 11 u64 pointers = 88 bytes. 28 layers × 88 = 2464 B.
+    // ------------------------------------------------------------------
+    SafetensorView embed_v = safetensors_get(st, "model.embed_tokens.weight")
+    u64 embed_ptr = embed_v.ptr
+    SafetensorView norm_v = safetensors_get(st, "model.norm.weight")
+    u64 norm_ptr = norm_v.ptr
+    if embed_ptr == 0 || norm_ptr == 0 {
+        eout("missing embed or final norm\n")
+        safetensors_free(st); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+
+    // NOTE: MLRift won't persist struct field writes when the struct variable
+    // was initialised by pointer arithmetic (`Qwen3LayerWeights w = base+off`).
+    // Write via explicit offsets instead. Field order mirrors Qwen3LayerWeights:
+    //   0  input_norm_w    1  q_proj_w       2  k_proj_w     3  v_proj_w
+    //   4  q_norm_w        5  k_norm_w       6  o_proj_w     7  post_norm_w
+    //   8  gate_proj_w     9  up_proj_w     10  down_proj_w
+    u64 layers_arr = alloc(n_layers * 88)
+    u64 li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * 88
+        u64 li_s = fmt_dec(li)
+        u64 pre0 = str_cat("model.layers.", li_s)
+        u64 prefix = str_cat(pre0, ".")
+        dealloc(li_s); dealloc(pre0)
+
+        u64 n01 = str_cat(prefix, "input_layernorm.weight")
+        SafetensorView v01 = safetensors_get(st, n01)
+        unsafe { *((base + 0 * 8) as u64) = v01.ptr }
+        dealloc(n01)
+
+        u64 n02 = str_cat(prefix, "self_attn.q_proj.weight")
+        SafetensorView v02 = safetensors_get(st, n02)
+        unsafe { *((base + 1 * 8) as u64) = v02.ptr }
+        dealloc(n02)
+
+        u64 n03 = str_cat(prefix, "self_attn.k_proj.weight")
+        SafetensorView v03 = safetensors_get(st, n03)
+        unsafe { *((base + 2 * 8) as u64) = v03.ptr }
+        dealloc(n03)
+
+        u64 n04 = str_cat(prefix, "self_attn.v_proj.weight")
+        SafetensorView v04 = safetensors_get(st, n04)
+        unsafe { *((base + 3 * 8) as u64) = v04.ptr }
+        dealloc(n04)
+
+        u64 n05 = str_cat(prefix, "self_attn.q_norm.weight")
+        SafetensorView v05 = safetensors_get(st, n05)
+        unsafe { *((base + 4 * 8) as u64) = v05.ptr }
+        dealloc(n05)
+
+        u64 n06 = str_cat(prefix, "self_attn.k_norm.weight")
+        SafetensorView v06 = safetensors_get(st, n06)
+        unsafe { *((base + 5 * 8) as u64) = v06.ptr }
+        dealloc(n06)
+
+        u64 n07 = str_cat(prefix, "self_attn.o_proj.weight")
+        SafetensorView v07 = safetensors_get(st, n07)
+        unsafe { *((base + 6 * 8) as u64) = v07.ptr }
+        dealloc(n07)
+
+        u64 n08 = str_cat(prefix, "post_attention_layernorm.weight")
+        SafetensorView v08 = safetensors_get(st, n08)
+        unsafe { *((base + 7 * 8) as u64) = v08.ptr }
+        dealloc(n08)
+
+        u64 n09 = str_cat(prefix, "mlp.gate_proj.weight")
+        SafetensorView v09 = safetensors_get(st, n09)
+        unsafe { *((base + 8 * 8) as u64) = v09.ptr }
+        dealloc(n09)
+
+        u64 n10 = str_cat(prefix, "mlp.up_proj.weight")
+        SafetensorView v10 = safetensors_get(st, n10)
+        unsafe { *((base + 9 * 8) as u64) = v10.ptr }
+        dealloc(n10)
+
+        u64 n11 = str_cat(prefix, "mlp.down_proj.weight")
+        SafetensorView v11 = safetensors_get(st, n11)
+        unsafe { *((base + 10 * 8) as u64) = v11.ptr }
+        dealloc(n11)
+
+        dealloc(prefix)
+        li = li + 1
+    }
+    eout("[qwen3_forward] 28 layers indexed\n")
+
+    // ------------------------------------------------------------------
+    // Embed token 14990 into x_cur.
+    // ------------------------------------------------------------------
+    u64 token_id = 14990
+    u64 x_cur = alloc(hidden * 4)
+    u64 x_nxt = alloc(hidden * 4)
+    u64 row = embed_ptr + token_id * hidden * 2
+    u64 i = 0
+    while i < hidden {
+        f32 v = bf16_to_f32(row + i * 2)
+        unsafe { *((x_cur + i * 4) as f32) = v }
+        i = i + 1
+    }
+    eout("[qwen3_forward] embed OK, running 28 layers...\n")
+
+    // ------------------------------------------------------------------
+    // Sweep every layer, ping-pong the residual buffer.
+    // ------------------------------------------------------------------
+    u64 layer = 0
+    while layer < n_layers {
+        eout("  layer "); eu64(layer); eout(" start\n")
+        Qwen3LayerWeights w = layers_arr + layer * 88
+        eout("    in_norm_w="); eu64(w.input_norm_w); eout(" q_proj_w="); eu64(w.q_proj_w); eout("\n")
+        qwen3_forward_layer(x_nxt, x_cur, w, 0, num_workers)
+        u64 tmp = x_cur
+        x_cur = x_nxt
+        x_nxt = tmp
+        eout("  layer "); eu64(layer); eout(" done\n")
+        layer = layer + 1
+    }
+    eout("[qwen3_forward] 28 layers complete\n")
+
+    // Dump residual stream after all 28 layers (before final norm)
+    eout("post_layer28 [:5] = ")
+    u64 di = 0
+    while di < 5 {
+        if di != 0 { eout(" ") }
+        f32 pv = 0.0f
+        unsafe { *((x_cur + di * 4) as f32) -> pv }
+        u64 pvs = fmt_f32(pv, 4); eout(pvs); dealloc(pvs)
+        di = di + 1
+    }
+    eout("\n")
+    // Python reference (hidden_states[28][0,0,:5]) will be printed separately
+
+    u64 final_out = alloc(hidden * 4)
+    qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
+    eout("post_final_norm[:5] = ")
+    di = 0
+    while di < 5 {
+        if di != 0 { eout(" ") }
+        f32 fv = 0.0f
+        unsafe { *((final_out + di * 4) as f32) -> fv }
+        u64 fvs = fmt_f32(fv, 4); eout(fvs); dealloc(fvs)
+        di = di + 1
+    }
+    eout("\n")
+
+    // ------------------------------------------------------------------
+    // lm_head: matmul against embed_tokens (tie_word_embeddings=true).
+    // [1, hidden] × [vocab, hidden] (row-major bf16) → [1, vocab]
+    // ------------------------------------------------------------------
+    u64 logits = alloc(vocab * 4)
+    matmul_bf16_weights_f32_mt(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers)
+    eout("[qwen3_forward] lm_head done\n")
+
+    // ------------------------------------------------------------------
+    // Top-5 logits with per-slot scan: for each of 5 slots, find current
+    // max over {not-yet-picked}, record id + value, mark it -INF equivalent
+    // (u64 arr of picked set), repeat. O(5 * vocab) — trivial.
+    // Also extract the logit at the reference token (14582) for comparison.
+    // ------------------------------------------------------------------
+    u64 picked_mask = alloc(vocab)   // u8 array, 0 = not picked, 1 = picked
+    u64 i5 = 0
+    while i5 < 5 {
+        f32 best_val = 0.0f
+        u64 best_id = 0
+        u64 seen_any = 0
+        u64 j = 0
+        while j < vocab {
+            u64 mv = load8(picked_mask + j)
+            if mv == 0 {
+                f32 v = 0.0f
+                unsafe { *((logits + j * 4) as f32) -> v }
+                if seen_any == 0 {
+                    best_val = v; best_id = j; seen_any = 1
+                } else {
+                    if v > best_val { best_val = v; best_id = j }
+                }
+            }
+            j = j + 1
+        }
+        u8 one = 1
+        store8(picked_mask + best_id, one)
+        eout("  top["); eu64(i5); eout("] id="); eu64(best_id); eout(" logit=")
+        u64 lvs = fmt_f32(best_val, 4)
+        eout(lvs); dealloc(lvs); eout("\n")
+        i5 = i5 + 1
+    }
+    dealloc(picked_mask)
+
+    // Value at reference token
+    f32 ref_logit = 0.0f
+    unsafe { *((logits + 14582 * 4) as f32) -> ref_logit }
+    eout("logit[14582 'Question'] = ")
+    u64 rls = fmt_f32(ref_logit, 4); eout(rls); dealloc(rls); eout("\n")
+    eout("(Python argmax = 14582)\n")
+
+    dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits); dealloc(layers_arr)
+    safetensors_free(st)
+    thread_pool_shutdown()
+    file_close(g_fd)
+    exit(0)
+}

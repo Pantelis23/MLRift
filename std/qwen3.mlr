@@ -1,0 +1,514 @@
+// MLRift Standard Library — Qwen3 forward-pass primitives
+//
+// Layer 0 numerical verification target (Qwen3-0.6B, input token 14990 "hello",
+// fp32 reference from transformers 5.6.2):
+//   hidden_states after layer 0, first 5 values:
+//     [-0.2150, 0.3201, 0.0887, -1.2590, -0.0759]
+//
+// Qwen3 architecture (config.json → this file's hard-coded constants for now):
+//   hidden_size            = 1024
+//   head_dim               = 128
+//   num_attention_heads    = 16
+//   num_key_value_heads    = 8
+//   intermediate_size      = 3072
+//   rms_norm_eps           = 1e-6
+//   rope_theta             = 1_000_000
+//   hidden_act             = silu (SwiGLU: gate * silu(gate) * up, then down_proj)
+//   tie_word_embeddings    = true
+//   QK-Norm                = per-head-dim RMSNorm applied to Q and K (shape
+//                            [head_dim], no +1 bias shift)
+//
+// Weights are BF16 row-major (HuggingFace safetensors convention):
+//   embed_tokens.weight: [vocab_size, hidden]
+//   q_proj.weight:       [num_heads * head_dim, hidden]           = [2048, 1024]
+//   k_proj.weight:       [num_kv_heads * head_dim, hidden]        = [1024, 1024]
+//   v_proj.weight:       [num_kv_heads * head_dim, hidden]        = [1024, 1024]
+//   o_proj.weight:       [hidden, num_heads * head_dim]           = [1024, 2048]
+//   q_norm.weight:       [head_dim] = [128]
+//   k_norm.weight:       [head_dim] = [128]
+//   input_layernorm.weight / post_attention_layernorm.weight: [hidden]
+//   gate_proj / up_proj: [intermediate_size, hidden]              = [3072, 1024]
+//   down_proj:           [hidden, intermediate_size]              = [1024, 3072]
+
+import "inference.mlr"
+import "safetensors.mlr"
+import "math_float.mlr"
+import "thread.mlr"
+import "fmt.mlr"
+import "io.mlr"
+
+// -----------------------------------------------------------------------------
+// Qwen3-0.6B architectural constants. Phase 1 keeps these as compile-time
+// globals; the eventual engine will read them from config.json instead.
+// -----------------------------------------------------------------------------
+static u64 QWEN3_HIDDEN         = 1024
+static u64 QWEN3_HEAD_DIM       = 128
+static u64 QWEN3_N_HEADS        = 16
+static u64 QWEN3_N_KV_HEADS     = 8
+static u64 QWEN3_Q_DIM          = 2048   // N_HEADS × HEAD_DIM
+static u64 QWEN3_KV_DIM         = 1024   // N_KV_HEADS × HEAD_DIM
+static u64 QWEN3_INTERMEDIATE   = 3072
+static u64 QWEN3_ROPE_DIM       = 128    // head_dim (full RoPE across the head)
+
+// rope_theta = 1e6 (big-number base for long-context positional encoding).
+// Expressed as f64 because 1e6 is exact in float64 but not a compile-time
+// integer-friendly constant to keep in the source as f32 / u64.
+
+// -----------------------------------------------------------------------------
+// RMSNorm without the (1 + w) shift used by Gemma. Standard Qwen/Llama form:
+//   y = x * rsqrt(mean(x²) + eps) * w
+// -----------------------------------------------------------------------------
+fn qwen3_rmsnorm_bf16(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
+    // sum of squares in f32
+    f32 sum_sq = 0.0f
+    u64 i = 0
+    while i < dim {
+        f32 v = 0.0f
+        unsafe { *((in_ptr + i * 4) as f32) -> v }
+        sum_sq = sum_sq + v * v
+        i = i + 1
+    }
+    f32 mean_sq = sum_sq / int_to_f32(dim)
+
+    // eps = 1e-6f — same bit-pattern trick as std/inference.mlr
+    uint64[1] eps_tmp
+    u64 ep = eps_tmp
+    u8 e0 = 0x61; u8 e1 = 0x18; u8 e2 = 0x86; u8 e3 = 0x35
+    store8(ep + 0, e0); store8(ep + 1, e1); store8(ep + 2, e2); store8(ep + 3, e3)
+    f32 eps = 0.0f
+    unsafe { *(ep as f32) -> eps }
+
+    f32 one  = 1.0f
+    f32 rsq  = one / sqrt_f32(mean_sq + eps)
+
+    i = 0
+    while i < dim {
+        f32 v = 0.0f
+        unsafe { *((in_ptr + i * 4) as f32) -> v }
+        f32 w = bf16_to_f32(w_ptr + i * 2)    // bf16 weight → f32
+        f32 y = v * rsq * w
+        unsafe { *((out_ptr + i * 4) as f32) = y }
+        i = i + 1
+    }
+}
+
+// Same RMSNorm but the weight is already in f32. Used when QK-Norm's
+// 128-entry weight has been widened once into a scratch buffer.
+fn qwen3_rmsnorm_f32_weights(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
+    f32 sum_sq = 0.0f
+    u64 i = 0
+    while i < dim {
+        f32 v = 0.0f
+        unsafe { *((in_ptr + i * 4) as f32) -> v }
+        sum_sq = sum_sq + v * v
+        i = i + 1
+    }
+    f32 mean_sq = sum_sq / int_to_f32(dim)
+
+    uint64[1] eps_tmp
+    u64 ep = eps_tmp
+    u8 e0 = 0x61; u8 e1 = 0x18; u8 e2 = 0x86; u8 e3 = 0x35
+    store8(ep + 0, e0); store8(ep + 1, e1); store8(ep + 2, e2); store8(ep + 3, e3)
+    f32 eps = 0.0f
+    unsafe { *(ep as f32) -> eps }
+
+    f32 one = 1.0f
+    f32 rsq = one / sqrt_f32(mean_sq + eps)
+
+    i = 0
+    while i < dim {
+        f32 v = 0.0f
+        unsafe { *((in_ptr + i * 4) as f32) -> v }
+        f32 w = 0.0f
+        unsafe { *((w_ptr + i * 4) as f32) -> w }
+        f32 y = v * rsq * w
+        unsafe { *((out_ptr + i * 4) as f32) = y }
+        i = i + 1
+    }
+}
+
+// Widen a BF16 weight row of `dim` elements into an f32 scratch buffer.
+// Used once per QK-Norm weight per layer so the inner-loop normalise doesn't
+// redecode the same 128 bytes for every head.
+fn qwen3_bf16_row_to_f32(u64 out_ptr, u64 src_ptr, u64 dim) {
+    u64 i = 0
+    while i < dim {
+        f32 v = bf16_to_f32(src_ptr + i * 2)
+        unsafe { *((out_ptr + i * 4) as f32) = v }
+        i = i + 1
+    }
+}
+
+// -----------------------------------------------------------------------------
+// RoPE (rotary positional embedding)
+//
+// Reference (transformers/models/qwen3/modeling_qwen3.py):
+//   inv_freq[i] = 1 / (theta^(2i/rope_dim)),  i = 0..rope_dim/2-1
+//   cos[p, i]   = cos(p * inv_freq[i])
+//   sin[p, i]   = sin(p * inv_freq[i])
+//   # rotate_half splits the last dim in half:
+//   x1 = x[..., :rope_dim/2]
+//   x2 = x[..., rope_dim/2:]
+//   x_rot = cat([x1*cos - x2*sin,  x1*sin + x2*cos], dim=-1)
+//
+// For single-token Phase-1 verification, position=0 → cos=1, sin=0 and RoPE
+// is the identity. We still emit the code path so Phase 2 (multi-token) uses
+// the same helpers without rewriting.
+// -----------------------------------------------------------------------------
+
+// Compute cos/sin for a single position into two f32 buffers of
+// length rope_dim/2. Caller keeps them stack-local.
+fn qwen3_rope_compute(u64 cos_out, u64 sin_out, u64 position, u64 rope_dim, f64 theta_base) {
+    u64 half = rope_dim / 2
+    // Fast path: position 0 → cos = 1, sin = 0 for all frequencies.
+    // Skips 64 log+exp calls per layer, which is the heaviest constant-cost
+    // path in the forward pass at the single-token Phase-1 test point.
+    if position == 0 {
+        f32 one_f = 1.0f
+        f32 zero_f = 0.0f
+        u64 i = 0
+        while i < half {
+            unsafe { *((cos_out + i * 4) as f32) = one_f }
+            unsafe { *((sin_out + i * 4) as f32) = zero_f }
+            i = i + 1
+        }
+        return
+    }
+    u64 i = 0
+    while i < half {
+        f64 exponent = int_to_f64(2 * i) / int_to_f64(rope_dim)
+        f64 denom = pow_f64(theta_base, exponent)
+        f64 inv_freq = int_to_f64(1) / denom
+        f64 angle = int_to_f64(position) * inv_freq
+        f32 c = f64_to_f32(cos_f64(angle))
+        f32 s = f64_to_f32(sin_f64(angle))
+        unsafe { *((cos_out + i * 4) as f32) = c }
+        unsafe { *((sin_out + i * 4) as f32) = s }
+        i = i + 1
+    }
+}
+
+// Apply RoPE in-place to a [n_heads, head_dim] f32 buffer. cos/sin are
+// shared across heads (same position for every head).
+fn qwen3_rope_apply(u64 x_ptr, u64 cos_ptr, u64 sin_ptr, u64 n_heads, u64 head_dim) {
+    u64 half = head_dim / 2
+    u64 h = 0
+    while h < n_heads {
+        u64 row = x_ptr + h * head_dim * 4
+        u64 i = 0
+        while i < half {
+            f32 x1 = 0.0f
+            f32 x2 = 0.0f
+            unsafe { *((row + i * 4) as f32) -> x1 }
+            unsafe { *((row + (i + half) * 4) as f32) -> x2 }
+            f32 c = 0.0f
+            f32 s = 0.0f
+            unsafe { *((cos_ptr + i * 4) as f32) -> c }
+            unsafe { *((sin_ptr + i * 4) as f32) -> s }
+            f32 y1 = x1 * c - x2 * s
+            f32 y2 = x1 * s + x2 * c
+            unsafe { *((row + i * 4) as f32) = y1 }
+            unsafe { *((row + (i + half) * 4) as f32) = y2 }
+            i = i + 1
+        }
+        h = h + 1
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Single-token scaled-dot-product attention with grouped-query broadcast.
+//
+// For position 0, seq_len = 1, so Q·Kᵀ is a single scalar and softmax is 1.0.
+// The output collapses to V, one row per query head. We still run the code
+// path (sum, softmax, weighted sum) so the shapes are right for Phase 2.
+//
+// q_ptr: f32 [n_heads, head_dim]    (after RoPE)
+// k_ptr: f32 [n_kv_heads, head_dim] (after RoPE)
+// v_ptr: f32 [n_kv_heads, head_dim]
+// out:   f32 [n_heads, head_dim]
+// GQA: each query head maps to kv head (h * n_kv_heads) / n_heads.
+// -----------------------------------------------------------------------------
+fn qwen3_attn_single_token(u64 out_ptr,
+                           u64 q_ptr, u64 k_ptr, u64 v_ptr,
+                           u64 n_heads, u64 n_kv_heads, u64 head_dim) {
+    // 1/sqrt(head_dim)
+    f32 scale = 1.0f / sqrt_f32(int_to_f32(head_dim))
+
+    u64 h = 0
+    while h < n_heads {
+        // Map query head to kv head (GQA broadcast).
+        u64 kvh = (h * n_kv_heads) / n_heads
+        u64 q_row = q_ptr + h   * head_dim * 4
+        u64 k_row = k_ptr + kvh * head_dim * 4
+        u64 v_row = v_ptr + kvh * head_dim * 4
+        u64 o_row = out_ptr + h * head_dim * 4
+
+        // score = (q · k) * scale — kept live so Phase 2 (multi-token)
+        // slots right in without rewriting the kernel. For seq_len = 1
+        // softmax is 1.0 and output collapses to V.
+        f32 _score = 0.0f
+        u64 d = 0
+        while d < head_dim {
+            f32 qv = 0.0f; unsafe { *((q_row + d * 4) as f32) -> qv }
+            f32 kv = 0.0f; unsafe { *((k_row + d * 4) as f32) -> kv }
+            _score = _score + qv * kv
+            d = d + 1
+        }
+        _score = _score * scale
+        d = 0
+        while d < head_dim {
+            f32 vv = 0.0f; unsafe { *((v_row + d * 4) as f32) -> vv }
+            unsafe { *((o_row + d * 4) as f32) = vv }
+            d = d + 1
+        }
+        h = h + 1
+    }
+}
+
+// -----------------------------------------------------------------------------
+// SwiGLU FFN
+//   gate = gate_proj(x)            [intermediate]
+//   up   = up_proj(x)              [intermediate]
+//   h    = silu(gate) * up         [intermediate]
+//   y    = down_proj(h)            [hidden]
+// silu(x) = x / (1 + exp(-x)) = x * sigmoid(x)
+// -----------------------------------------------------------------------------
+fn qwen3_silu_mul(u64 out_ptr, u64 gate_ptr, u64 up_ptr, u64 dim) {
+    u64 i = 0
+    f32 one = 1.0f
+    while i < dim {
+        f32 g = 0.0f; unsafe { *((gate_ptr + i * 4) as f32) -> g }
+        f32 u = 0.0f; unsafe { *((up_ptr   + i * 4) as f32) -> u }
+        // sigmoid(g) = 1/(1+exp(-g))
+        f32 sig = one / (one + exp_f32_fast(0.0f - g))
+        f32 y = g * sig * u
+        unsafe { *((out_ptr + i * 4) as f32) = y }
+        i = i + 1
+    }
+}
+
+// Reasonably-accurate single-precision exp. std/math_float.mlr's exp_f64
+// has a bug: for negative arguments it skips the 2^k scaling (k is negative,
+// f64_double_n doesn't handle that), returning the raw Taylor-reduced value.
+// So exp(-50) comes out ~1.84 instead of ~1.9e-22 — catastrophic for SiLU on
+// large positive gate activations where sigmoid(g) = 1/(1+exp(-g)) needs a
+// correct exp of a large negative number. Work around by pushing negative
+// arguments through the positive path via reciprocal.
+fn exp_f32_fast(f32 x) -> f32 {
+    f64 xd = f32_to_f64(x)
+    f64 zero = int_to_f64(0)
+    f64 one = int_to_f64(1)
+    if xd < zero {
+        f64 pos = zero - xd
+        f64 yp  = exp_f64(pos)
+        return f64_to_f32(one / yp)
+    }
+    f64 yd = exp_f64(xd)
+    return f64_to_f32(yd)
+}
+
+// -----------------------------------------------------------------------------
+// One full transformer layer (no KV cache, single token at position `pos`).
+//
+// Inputs:
+//   x_in    — f32 [hidden]  residual stream at layer entry
+//   weights — pointers to the 11 BF16 tensors this layer needs:
+//             input_norm_w, q_proj_w, k_proj_w, v_proj_w, q_norm_w, k_norm_w,
+//             o_proj_w, post_attn_norm_w, gate_proj_w, up_proj_w, down_proj_w
+//   pos     — absolute position (0 for first token)
+//
+// Output:
+//   x_out — f32 [hidden], hidden state after this layer (residual stream)
+//
+// Allocates scratch internally for readability; production path can bring
+// scratches in from the caller to avoid per-layer allocs.
+// -----------------------------------------------------------------------------
+struct Qwen3LayerWeights {
+    u64 input_norm_w
+    u64 q_proj_w
+    u64 k_proj_w
+    u64 v_proj_w
+    u64 q_norm_w
+    u64 k_norm_w
+    u64 o_proj_w
+    u64 post_norm_w
+    u64 gate_proj_w
+    u64 up_proj_w
+    u64 down_proj_w
+}
+
+// Dump file FD — caller sets via qwen3_set_dump_fd before calling forward_layer.
+// 0 = no dumping.
+static u64 qwen3_dump_fd = 0
+
+fn qwen3_set_dump_fd(u64 fd) { qwen3_dump_fd = fd }
+
+// Internal: emit a labelled "[label] v0 v1 v2 v3 v4\n" line to the dump fd.
+fn qwen3_dump5(u64 label, u64 ptr) {
+    if qwen3_dump_fd == 0 { return }
+    u64 ll = str_len(label)
+    file_write(qwen3_dump_fd, "[", 1)
+    file_write(qwen3_dump_fd, label, ll)
+    file_write(qwen3_dump_fd, "] ", 2)
+    u64 i = 0
+    while i < 5 {
+        if i != 0 { file_write(qwen3_dump_fd, " ", 1) }
+        f32 v = 0.0f
+        unsafe { *((ptr + i * 4) as f32) -> v }
+        u64 s = fmt_f32(v, 6)
+        u64 sl = str_len(s)
+        file_write(qwen3_dump_fd, s, sl)
+        dealloc(s)
+        i = i + 1
+    }
+    file_write(qwen3_dump_fd, "\n", 1)
+}
+
+fn qwen3_forward_layer(u64 x_out, u64 x_in,
+                       Qwen3LayerWeights w,
+                       u64 pos, u64 num_workers) {
+    u64 hidden = QWEN3_HIDDEN
+    u64 hd     = QWEN3_HEAD_DIM
+    u64 nh     = QWEN3_N_HEADS
+    u64 nkv    = QWEN3_N_KV_HEADS
+    u64 q_dim  = QWEN3_Q_DIM
+    u64 kv_dim = QWEN3_KV_DIM
+    u64 ff     = QWEN3_INTERMEDIATE
+
+    // dump disabled for phase 2:  qwen3_dump5("x_in",   x_in)
+    u64 resid = alloc(hidden * 4)
+    memcpy(resid, x_in, hidden * 4)
+
+    u64 x_norm = alloc(hidden * 4)
+    qwen3_rmsnorm_bf16(x_norm, x_in, w.input_norm_w, hidden)
+    // dump disabled for phase 2:  qwen3_dump5("x_norm", x_norm)
+
+    // Q / K / V projections
+    u64 q_buf = alloc(q_dim * 4)
+    u64 k_buf = alloc(kv_dim * 4)
+    u64 v_buf = alloc(kv_dim * 4)
+    matmul_bf16_weights_f32_mt(q_buf, x_norm, w.q_proj_w, 1, q_dim,  hidden, num_workers)
+    // dump disabled for phase 2:  qwen3_dump5("q_raw",  q_buf)
+    matmul_bf16_weights_f32_mt(k_buf, x_norm, w.k_proj_w, 1, kv_dim, hidden, num_workers)
+    // dump disabled for phase 2:  qwen3_dump5("k_raw",  k_buf)
+    matmul_bf16_weights_f32_mt(v_buf, x_norm, w.v_proj_w, 1, kv_dim, hidden, num_workers)
+    // dump disabled for phase 2:  qwen3_dump5("v_raw",  v_buf)
+
+    u64 qk_w_f32 = alloc(hd * 4)
+    qwen3_bf16_row_to_f32(qk_w_f32, w.q_norm_w, hd)
+    u64 h = 0
+    while h < nh {
+        u64 q_slice = q_buf + h * hd * 4
+        qwen3_rmsnorm_f32_weights(q_slice, q_slice, qk_w_f32, hd)
+        h = h + 1
+    }
+    qwen3_bf16_row_to_f32(qk_w_f32, w.k_norm_w, hd)
+    h = 0
+    while h < nkv {
+        u64 k_slice = k_buf + h * hd * 4
+        qwen3_rmsnorm_f32_weights(k_slice, k_slice, qk_w_f32, hd)
+        h = h + 1
+    }
+    dealloc(qk_w_f32)
+    // dump disabled for phase 2:  qwen3_dump5("q_norm", q_buf)
+    // dump disabled for phase 2:  qwen3_dump5("k_norm", k_buf)
+
+    u64 cos_buf = alloc((hd / 2) * 4)
+    u64 sin_buf = alloc((hd / 2) * 4)
+    f64 theta = 1000000.0
+    qwen3_rope_compute(cos_buf, sin_buf, pos, hd, theta)
+    qwen3_rope_apply(q_buf, cos_buf, sin_buf, nh,  hd)
+    qwen3_rope_apply(k_buf, cos_buf, sin_buf, nkv, hd)
+    dealloc(cos_buf)
+    dealloc(sin_buf)
+
+    u64 attn_out = alloc(q_dim * 4)
+    qwen3_attn_single_token(attn_out, q_buf, k_buf, v_buf, nh, nkv, hd)
+    // dump disabled for phase 2:  qwen3_dump5("attn",   attn_out)
+
+    u64 o_buf = alloc(hidden * 4)
+    matmul_bf16_weights_f32_mt(o_buf, attn_out, w.o_proj_w, 1, hidden, q_dim, num_workers)
+    // dump disabled for phase 2:  qwen3_dump5("o_out",  o_buf)
+
+    // Residual add: x = resid + o_buf
+    u64 mid = alloc(hidden * 4)
+    u64 i = 0
+    while i < hidden {
+        f32 a = 0.0f; unsafe { *((resid + i * 4) as f32) -> a }
+        f32 b = 0.0f; unsafe { *((o_buf + i * 4) as f32) -> b }
+        f32 y = a + b
+        unsafe { *((mid + i * 4) as f32) = y }
+        i = i + 1
+    }
+
+    // dump disabled for phase 2:  qwen3_dump5("mid",    mid)
+    u64 mid_norm = alloc(hidden * 4)
+    qwen3_rmsnorm_bf16(mid_norm, mid, w.post_norm_w, hidden)
+    // dump disabled for phase 2:  qwen3_dump5("mid_norm", mid_norm)
+
+    u64 gate_buf = alloc(ff * 4)
+    u64 up_buf   = alloc(ff * 4)
+    matmul_bf16_weights_f32_mt(gate_buf, mid_norm, w.gate_proj_w, 1, ff, hidden, num_workers)
+    // dump disabled for phase 2:  qwen3_dump5("gate",   gate_buf)
+    matmul_bf16_weights_f32_mt(up_buf,   mid_norm, w.up_proj_w,   1, ff, hidden, num_workers)
+    // dump disabled for phase 2:  qwen3_dump5("up",     up_buf)
+    u64 ff_buf = alloc(ff * 4)
+    qwen3_silu_mul(ff_buf, gate_buf, up_buf, ff)
+    // dump disabled for phase 2:  qwen3_dump5("silu",   ff_buf)
+    // Full down_proj, single-threaded (MT path was flaky on repeated submit).
+    // ff_buf: [1, ff] × down_proj_w: [hidden, ff] (bf16 row-major) → [1, hidden]
+    u64 ff_out = alloc(hidden * 4)
+    u64 dw = w.down_proj_w
+    // Same per-element BF16 decode inlining as infer_matmul_worker —
+    // reuses one 4-byte scratch across the whole 3 M-element loop.
+    u64 dw_scratch = alloc(4)
+    u8 dw_zero = 0
+    store8(dw_scratch + 0, dw_zero)
+    store8(dw_scratch + 1, dw_zero)
+    // Same Kahan-summation pattern as std/inference.mlr's worker (comment there
+    // explains why — without compensation the residual stream drifts too far
+    // after 28 layers and argmax flips to the wrong token).
+    u64 mm_n = 0
+    while mm_n < hidden {
+        f32 mm_sum = 0.0f
+        f32 mm_c = 0.0f
+        u64 mm_k = 0
+        while mm_k < ff {
+            f32 mm_x = 0.0f
+            unsafe { *((ff_buf + mm_k * 4) as f32) -> mm_x }
+            u64 wo = (mm_n * ff + mm_k) * 2
+            u8 b0u = load8(dw + wo)
+            u8 b1u = load8(dw + wo + 1)
+            store8(dw_scratch + 2, b0u)
+            store8(dw_scratch + 3, b1u)
+            f32 mm_w = 0.0f
+            unsafe { *(dw_scratch as f32) -> mm_w }
+            f32 prod = mm_x * mm_w
+            f32 y = prod - mm_c
+            f32 t = mm_sum + y
+            mm_c = (t - mm_sum) - y
+            mm_sum = t
+            mm_k = mm_k + 1
+        }
+        unsafe { *((ff_out + mm_n * 4) as f32) = mm_sum }
+        mm_n = mm_n + 1
+    }
+    dealloc(dw_scratch)
+    // dump disabled for phase 2:  qwen3_dump5("ff_out", ff_out)
+
+    // Second residual add: x_out = mid + ff_out
+    i = 0
+    while i < hidden {
+        f32 a = 0.0f; unsafe { *((mid + i * 4) as f32) -> a }
+        f32 b = 0.0f; unsafe { *((ff_out + i * 4) as f32) -> b }
+        f32 y = a + b
+        unsafe { *((x_out + i * 4) as f32) = y }
+        i = i + 1
+    }
+
+    dealloc(resid); dealloc(x_norm)
+    dealloc(q_buf); dealloc(k_buf); dealloc(v_buf)
+    dealloc(attn_out); dealloc(o_buf)
+    dealloc(mid); dealloc(mid_norm)
+    dealloc(gate_buf); dealloc(up_buf); dealloc(ff_buf); dealloc(ff_out)
+}
