@@ -425,15 +425,32 @@ fn matmul_bf16_weights_f32(u64 out_ptr, u64 x_ptr, u64 w_ptr,
         }
     }
 
+    // Submit jobs to workers 0..num_workers-2, and run the last slice
+    // inline on the main thread. Saves one futex_wake syscall per matmul
+    // (+the context-switch round trip); over ~1 680 matmul calls per
+    // 20-token decode that's ~3–5 ms of real wall time in our bench.
     u64 chunk = N / num_workers
     w = 0
-    while w < num_workers {
+    while w + 1 < num_workers {
         u64 start_n = w * chunk
         u64 end_n   = start_n + chunk
-        if w == num_workers - 1 { end_n = N }
         u64 ctx_w = mm_ctx_base + w * 64
         thread_pool_submit(w, fn_ptr, start_n, end_n, ctx_w)
         w = w + 1
+    }
+    // Last slice — main thread runs it directly. Handles the N-not-
+    // divisible-by-num_workers tail naturally because end=N.
+    u64 main_start = (num_workers - 1) * chunk
+    u64 main_end   = N
+    u64 main_ctx   = mm_ctx_base + (num_workers - 1) * 64
+    if use_kahan != 0 {
+        mm_worker_bf16_f32_kahan(main_start, main_end, main_ctx)
+    } else {
+        if (K & 7) == 0 {
+            mm_worker_bf16_f32_avx2_naive_2w(main_start, main_end, main_ctx)
+        } else {
+            mm_worker_bf16_f32_naive(main_start, main_end, main_ctx)
+        }
     }
     thread_pool_wait()
 }
