@@ -36,16 +36,16 @@ arithmetic.
 
 | Config | Wall | tok/s | vs PyTorch F32 | vs PyTorch BF16 |
 |---|---:|---:|---:|---:|
-| **MLRift safetensors** | **729 ms** | **27.41** | **2.94×** | **1.10×** |
-| **MLRift GGUF** | ~745 ms | ~26.9 | ~2.88× | ~1.07× |
+| **MLRift safetensors** | **684 ms** | **29.24** | **3.14×** | **1.17×** |
+| **MLRift GGUF** | **685 ms** | **29.18** | **3.13×** | **1.17×** |
 | PyTorch BF16 (bf16 weights, f32 GEMM) | 801 ms | 24.94 | 2.68× | 1.00× |
 | PyTorch F32 (f32 weights, f32 GEMM) | 2 146 ms | 9.32 | 1.00× | 0.37× |
 
 Reference frame that makes the most sense arithmetically is **MLRift
 vs PyTorch F32**: same FMA dtype, same accumulator dtype, same CPU.
-We're **2.94× faster**.
+We're **3.14× faster**.
 
-## Per-op breakdown (MLRift safetensors, 20-token run at 729 ms)
+## Per-op breakdown (MLRift safetensors, 20-token run at 684 ms)
 
 Per-run totals (ms), captured by `qwen3_profile_dump()` in
 `std/qwen3.mlr`. Adds to more than wall because some of the "matmul
@@ -53,12 +53,12 @@ submit" cost overlaps with MLRift's synchronous `thread_pool_wait`.
 
 | Op | ms | % of layer_sweep |
 |---|---:|---:|
-| qkv_proj (matmul, 3 per layer) | 131 | 18 |
-| gate_up (matmul, 2 per layer) | 169 | 23 |
-| down_res2 (matmul + residual, 1 per layer) | 86 | 12 |
-| oproj_res1 (matmul + residual, 1 per layer) | 67 | 9 |
-| qknorm_rope (scalar, now without eps mmap) | 31 | 4 |
-| attn (AVX2 dot + AVX2 axpy) | 24 | 3 |
+| qkv_proj (FUSED matmul, 1 per layer since `ef27a56`) | 103 | 15 |
+| gate_up (FUSED matmul, 1 per layer since `ef27a56`) | 150 | 22 |
+| down_res2 (matmul + residual, 1 per layer) | 86 | 13 |
+| oproj_res1 (matmul + residual, 1 per layer) | 67 | 10 |
+| qknorm_rope (scalar, no more eps mmap) | 31 | 5 |
+| attn (AVX2 dot + AVX2 axpy) | 24 | 4 |
 | post_norm (scalar) | 14 | 2 |
 | input_norm (scalar) | 13 | 2 |
 | silu (AVX2) | 7 | 1 |
@@ -83,7 +83,9 @@ Each row correctness-verified bit-identical to PyTorch before commit:
 | `55af77e` | Rope cache + polynomial `exp_f32_fast` + profiling | 996 ms | 20.1 | 49× |
 | `7e24197` | AVX2 SiLU (mul+add poly, dual clamp) | 876 ms | 22.8 | 55.6× |
 | `d61f0d7` | AVX2 attention (dot + axpy with static scratch) | 770 ms | 25.96 | 63× |
-| `68d517b` | Static RMSNorm eps (no `uint64[1]` mmap per call) | **729 ms** | **27.41** | **66.8×** |
+| `68d517b` | Static RMSNorm eps (no `uint64[1]` mmap per call) | 729 ms | 27.41 | 66.8× |
+| `7b25eb5` | 2-wide AVX2 matmul (independent FMA accumulators) | 703 ms | 28.44 | 69.3× |
+| `ef27a56` | Fuse Q/K/V + gate/up matmuls at load time | **684 ms** | **29.24** | **71.2×** |
 
 ## Reproduce
 
