@@ -889,6 +889,36 @@ fn asm_s_and_b32_exec_vcc_lo() {
     asm_u32(word)
 }
 
+// v_cmp_eq_u32_e32 vcc_lo, <inline imm>, v<vgpr>  — VOPC op 0x4A.
+//   Sets VCC[lane] = (imm == u32(v[vgpr])) per active lane. src0 is
+//   an inline literal (0..64 encoded as 0x80+K). Used for the
+//   ref == 0 guard in mt_lif_full.
+//   Verified: `v_cmp_eq_u32_e32 vcc_lo, 0, v12` → 0x7C941880.
+fn asm_v_cmp_eq_u32_imm_vgpr(uint64 imm, uint64 vgpr) {
+    uint64 src0_enc = 0x80 + (imm & 0x3F)
+    uint64 word = (0x3E << 25)
+                  | (0x4A << 17)
+                  | ((vgpr & 0xFF) << 9)
+                  | (src0_enc & 0x1FF)
+    asm_u32(word)
+}
+
+// s_xor_b32 exec_lo, exec_lo, s<ssrc1>  — SOP2 op s_xor_b32 (gfx11).
+//   Flips EXEC by XORing with a saved SGPR. Used to transition from
+//   the "then" EXEC mask to the "else" mask (complementary lanes)
+//   inside an if/else guarded by s_and_saveexec_b32.
+//   Verified via llvm-mc: `s_xor_b32 exec_lo, exec_lo, s46` encodes
+//   as bytes [0x7e,0x2e,0x7e,0x8d] → word 0x8D7E2E7E. That puts the
+//   gfx11 op field at 0x1A (not 0x18).
+fn asm_s_xor_b32_exec_sgpr(uint64 ssrc1) {
+    uint64 word = (0x2 << 30)
+                  | (0x1A << 23)
+                  | (0x7E << 16)
+                  | ((ssrc1 & 0xFF) << 8)
+                  | 0x7E
+    asm_u32(word)
+}
+
 // v_add_nc_u32_e32 vdst, vsrc0, vsrc1  — VOP2 op 0x25, no-carry
 // 32-bit vector integer add.
 //   Clang reference: v_add_nc_u32_e32 v2, v0, v2 → 0x4A040500.
