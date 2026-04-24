@@ -1,0 +1,252 @@
+// Qwen3 Phase 3 — KV-cache autoregressive greedy decode on Qwen3-0.6B.
+//
+// Seeds with token 14990 "hello" at position 0, then runs a greedy decode
+// loop. Each iteration:
+//   1. Run all 28 transformer layers at the current position (each layer
+//      writes this step's K and V into its cache slot).
+//   2. Final RMSNorm + lm_head (matmul vs embed_tokens.weight, tie=true).
+//   3. Argmax over the 151 936-vocab logits — that's the next token.
+//   4. Embed the new token into x_cur and increment pos.
+//
+// Stops after MAX_NEW tokens (no EOS check — base model rarely emits EOS
+// anyway). Prints the full sequence of token ids.
+//
+// PyTorch greedy reference (do_sample=False, max_new_tokens=20):
+//   [14990, 14582, 284, 330, 9707, 11, 4337, 17199, 1350, 3203,
+//    4791, 14582, 692, 2, 1173, 279, 1156, 3409, 198, 1350, 3203]
+
+import "../std/qwen3.mlr"
+import "../std/safetensors.mlr"
+import "../std/inference.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/thread.mlr"
+
+static u64 g_fd = 0
+fn eout(u64 s) {
+    print_str(s)
+    if g_fd != 0 {
+        u64 n = str_len(s)
+        file_write(g_fd, s, n)
+    }
+}
+fn eu64(u64 v) {
+    u64 s = fmt_dec(v)
+    eout(s)
+    dealloc(s)
+}
+
+fn main() {
+    u64 num_workers = 16
+    thread_pool_init(num_workers)
+    g_fd = file_open("/tmp/qw3_gen.out", 1)
+
+    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-0.6B/model.safetensors"
+    eout("[qwen3_generate] loading weights\n")
+    SafetensorFile st = safetensors_open(path)
+    if st.file_size == 0 {
+        eout("open fail\n")
+        thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+
+    u64 hidden = QWEN3_HIDDEN
+    u64 kv_dim = QWEN3_KV_DIM
+    u64 n_layers = 28
+    u64 vocab = 151936
+    u64 max_seq = 64
+    u64 max_new = 20
+
+    SafetensorView embed_v = safetensors_get(st, "model.embed_tokens.weight")
+    u64 embed_ptr = embed_v.ptr
+    SafetensorView norm_v = safetensors_get(st, "model.norm.weight")
+    u64 norm_ptr = norm_v.ptr
+    if embed_ptr == 0 || norm_ptr == 0 {
+        eout("missing embed or final norm\n")
+        safetensors_free(st); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+
+    // Per-layer weight pointer table (see qwen3_forward.mlr for field layout).
+    // 11 u64 pointers × 8 bytes = 88 bytes per layer.
+    u64 layers_arr = alloc(n_layers * 88)
+    u64 li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * 88
+        u64 li_s = fmt_dec(li)
+        u64 pre0 = str_cat("model.layers.", li_s)
+        u64 prefix = str_cat(pre0, ".")
+        dealloc(li_s); dealloc(pre0)
+
+        u64 n01 = str_cat(prefix, "input_layernorm.weight")
+        SafetensorView v01 = safetensors_get(st, n01)
+        unsafe { *((base + 0 * 8) as u64) = v01.ptr }
+        dealloc(n01)
+
+        u64 n02 = str_cat(prefix, "self_attn.q_proj.weight")
+        SafetensorView v02 = safetensors_get(st, n02)
+        unsafe { *((base + 1 * 8) as u64) = v02.ptr }
+        dealloc(n02)
+
+        u64 n03 = str_cat(prefix, "self_attn.k_proj.weight")
+        SafetensorView v03 = safetensors_get(st, n03)
+        unsafe { *((base + 2 * 8) as u64) = v03.ptr }
+        dealloc(n03)
+
+        u64 n04 = str_cat(prefix, "self_attn.v_proj.weight")
+        SafetensorView v04 = safetensors_get(st, n04)
+        unsafe { *((base + 3 * 8) as u64) = v04.ptr }
+        dealloc(n04)
+
+        u64 n05 = str_cat(prefix, "self_attn.q_norm.weight")
+        SafetensorView v05 = safetensors_get(st, n05)
+        unsafe { *((base + 4 * 8) as u64) = v05.ptr }
+        dealloc(n05)
+
+        u64 n06 = str_cat(prefix, "self_attn.k_norm.weight")
+        SafetensorView v06 = safetensors_get(st, n06)
+        unsafe { *((base + 5 * 8) as u64) = v06.ptr }
+        dealloc(n06)
+
+        u64 n07 = str_cat(prefix, "self_attn.o_proj.weight")
+        SafetensorView v07 = safetensors_get(st, n07)
+        unsafe { *((base + 6 * 8) as u64) = v07.ptr }
+        dealloc(n07)
+
+        u64 n08 = str_cat(prefix, "post_attention_layernorm.weight")
+        SafetensorView v08 = safetensors_get(st, n08)
+        unsafe { *((base + 7 * 8) as u64) = v08.ptr }
+        dealloc(n08)
+
+        u64 n09 = str_cat(prefix, "mlp.gate_proj.weight")
+        SafetensorView v09 = safetensors_get(st, n09)
+        unsafe { *((base + 8 * 8) as u64) = v09.ptr }
+        dealloc(n09)
+
+        u64 n10 = str_cat(prefix, "mlp.up_proj.weight")
+        SafetensorView v10 = safetensors_get(st, n10)
+        unsafe { *((base + 9 * 8) as u64) = v10.ptr }
+        dealloc(n10)
+
+        u64 n11 = str_cat(prefix, "mlp.down_proj.weight")
+        SafetensorView v11 = safetensors_get(st, n11)
+        unsafe { *((base + 10 * 8) as u64) = v11.ptr }
+        dealloc(n11)
+
+        dealloc(prefix)
+        li = li + 1
+    }
+    eout("[qwen3_generate] 28 layers indexed\n")
+
+    // KV cache — one big slab each for K and V, with per-layer stride.
+    //   shape per layer: [max_seq, n_kv_heads, head_dim] f32
+    //   bytes per layer: max_seq * kv_dim * 4 = max_seq * 4096 at Qwen3-0.6B
+    u64 kv_row_bytes   = kv_dim * 4
+    u64 layer_stride   = max_seq * kv_row_bytes
+    u64 total_cache    = n_layers * layer_stride
+    u64 k_cache = alloc(total_cache)
+    u64 v_cache = alloc(total_cache)
+    eout("[qwen3_generate] KV cache allocated ("); eu64(total_cache * 2); eout(" bytes total)\n")
+
+    // Per-step working buffers. Allocated once, reused every step.
+    u64 x_cur    = alloc(hidden * 4)
+    u64 x_nxt    = alloc(hidden * 4)
+    u64 final_out = alloc(hidden * 4)
+    u64 logits   = alloc(vocab * 4)
+
+    // Sequence of generated token ids — u64 one per step. Includes the seed
+    // token so we have a full self-contained record.
+    u64 seq_cap = max_new + 1
+    u64 seq_ids = alloc(seq_cap * 8)
+
+    u64 tok = 14990
+    unsafe { *((seq_ids + 0 * 8) as u64) = tok }
+    u64 seq_len = 1
+
+    eout("[qwen3_generate] seed token = "); eu64(tok); eout("\n")
+
+    // Embed seed token into x_cur
+    u64 row = embed_ptr + tok * hidden * 2
+    u64 i0 = 0
+    while i0 < hidden {
+        f32 v = bf16_to_f32(row + i0 * 2)
+        unsafe { *((x_cur + i0 * 4) as f32) = v }
+        i0 = i0 + 1
+    }
+
+    u64 pos = 0
+    u64 step = 0
+    while step < max_new {
+        eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
+
+        // Sweep 28 layers at this position; each writes K/V into cache[layer][pos].
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen3LayerWeights w = layers_arr + layer * 88
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+            u64 tmp = x_cur
+            x_cur = x_nxt
+            x_nxt = tmp
+            layer = layer + 1
+        }
+
+        // Final RMSNorm → lm_head (tied to embed_tokens) → greedy argmax.
+        qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
+        matmul_bf16_weights_f32_mt(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers)
+
+        u64 best_id = 0
+        f32 best_val = 0.0f
+        u64 first = 1
+        u64 j = 0
+        while j < vocab {
+            f32 v = 0.0f
+            unsafe { *((logits + j * 4) as f32) -> v }
+            if first == 1 {
+                best_val = v; best_id = j; first = 0
+            } else {
+                if v > best_val { best_val = v; best_id = j }
+            }
+            j = j + 1
+        }
+        eout("  -> next_id = "); eu64(best_id); eout(" logit=")
+        u64 lvs = fmt_f32(best_val, 4); eout(lvs); dealloc(lvs); eout("\n")
+
+        unsafe { *((seq_ids + seq_len * 8) as u64) = best_id }
+        seq_len = seq_len + 1
+
+        // Embed the new token into x_cur for the next iteration.
+        row = embed_ptr + best_id * hidden * 2
+        u64 i1 = 0
+        while i1 < hidden {
+            f32 v = bf16_to_f32(row + i1 * 2)
+            unsafe { *((x_cur + i1 * 4) as f32) = v }
+            i1 = i1 + 1
+        }
+        tok = best_id
+        pos = pos + 1
+        step = step + 1
+    }
+
+    // Print final sequence
+    eout("\n=== GENERATED SEQUENCE ===\n")
+    u64 si = 0
+    while si < seq_len {
+        if si != 0 { eout(", ") }
+        u64 id = 0
+        unsafe { *((seq_ids + si * 8) as u64) -> id }
+        eu64(id)
+        si = si + 1
+    }
+    eout("\n")
+    eout("=== PYTORCH REF (for eyeball diff) ===\n")
+    eout("14990, 14582, 284, 330, 9707, 11, 4337, 17199, 1350, 3203, 4791, 14582, 692, 2, 1173, 279, 1156, 3409, 198, 1350, 3203\n")
+
+    dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits)
+    dealloc(seq_ids); dealloc(layers_arr)
+    dealloc(k_cache); dealloc(v_cache)
+    safetensors_free(st)
+    thread_pool_shutdown()
+    file_close(g_fd)
+    exit(0)
+}

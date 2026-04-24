@@ -133,6 +133,13 @@ fn main() {
     }
     eout("[qwen3_forward] 28 layers indexed\n")
 
+    // Per-layer KV cache (single-token Phase-2 regression: max_seq = 1).
+    // Each "row" is n_kv_heads * head_dim f32 = 1024 * 4 = 4096 bytes.
+    u64 kv_row_bytes = QWEN3_KV_DIM * 4
+    u64 max_seq = 1
+    u64 k_cache = alloc(n_layers * max_seq * kv_row_bytes)
+    u64 v_cache = alloc(n_layers * max_seq * kv_row_bytes)
+
     // ------------------------------------------------------------------
     // Embed token 14990 into x_cur.
     // ------------------------------------------------------------------
@@ -156,7 +163,9 @@ fn main() {
         eout("  layer "); eu64(layer); eout(" start\n")
         Qwen3LayerWeights w = layers_arr + layer * 88
         eout("    in_norm_w="); eu64(w.input_norm_w); eout(" q_proj_w="); eu64(w.q_proj_w); eout("\n")
-        qwen3_forward_layer(x_nxt, x_cur, w, 0, num_workers)
+        u64 kc = k_cache + layer * max_seq * kv_row_bytes
+        u64 vc = v_cache + layer * max_seq * kv_row_bytes
+        qwen3_forward_layer(x_nxt, x_cur, w, 0, kc, vc, num_workers)
         u64 tmp = x_cur
         x_cur = x_nxt
         x_nxt = tmp
@@ -242,6 +251,7 @@ fn main() {
     eout("(Python argmax = 14582)\n")
 
     dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits); dealloc(layers_arr)
+    dealloc(k_cache); dealloc(v_cache)
     safetensors_free(st)
     thread_pool_shutdown()
     file_close(g_fd)

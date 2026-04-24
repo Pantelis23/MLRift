@@ -1,0 +1,68 @@
+// RoPE numerical probe — dumps cos/sin for a few positions, compares to
+// the PyTorch reference values captured from qwen3_greedy_reference.py.
+//
+// PyTorch reference (head_dim=128, theta=1e6):
+//   pos=1:  cos[:5] = [0.5403, 0.6925, 0.7965, 0.8662, 0.9124]
+//           sin[:5] = [0.8415, 0.7214, 0.6047, 0.4997, 0.4093]
+//   pos=10: cos[:5] = [-0.8391, -0.2030, 0.9779, 0.4974, -0.4754]
+//           sin[:5] = [-0.5440, 0.9792, 0.2091, -0.8675, -0.8798]
+//   pos=100: cos[:5] = [0.8623, 0.4561, -0.5103, -0.4738, -0.2395]
+//            sin[:5] = [-0.5064, -0.8899, 0.8600, 0.8806, -0.9709]
+
+import "../std/qwen3.mlr"
+import "../std/math_float.mlr"
+import "../std/fmt.mlr"
+import "../std/io.mlr"
+
+fn put(u64 s) { print_str(s) }
+
+fn dump(u64 pos) {
+    u64 hd = 128
+    u64 half = hd / 2
+    f64 theta = 1000000.0
+
+    u64 cos_buf = alloc(half * 4)
+    u64 sin_buf = alloc(half * 4)
+    qwen3_rope_compute(cos_buf, sin_buf, pos, hd, theta)
+
+    put("pos=")
+    u64 ps = fmt_dec(pos); put(ps); dealloc(ps)
+    put(" cos[:5] = [")
+    u64 i = 0
+    while i < 5 {
+        if i != 0 { put(", ") }
+        f32 v = 0.0f
+        unsafe { *((cos_buf + i * 4) as f32) -> v }
+        u64 vs = fmt_f32(v, 4); put(vs); dealloc(vs)
+        i = i + 1
+    }
+    put("]\n       sin[:5] = [")
+    i = 0
+    while i < 5 {
+        if i != 0 { put(", ") }
+        f32 v = 0.0f
+        unsafe { *((sin_buf + i * 4) as f32) -> v }
+        u64 vs = fmt_f32(v, 4); put(vs); dealloc(vs)
+        i = i + 1
+    }
+    put("]\n")
+
+    dealloc(cos_buf)
+    dealloc(sin_buf)
+}
+
+fn main() {
+    put("== MLRift RoPE probe ==\n")
+    dump(0)
+    dump(1)
+    dump(10)
+    dump(100)
+    put("\n== PyTorch reference ==\n")
+    put("pos=1   cos=[0.5403, 0.6925, 0.7965, 0.8662, 0.9124]\n")
+    put("        sin=[0.8415, 0.7214, 0.6047, 0.4997, 0.4093]\n")
+    put("pos=10  cos=[-0.8391, -0.2030, 0.9779, 0.4974, -0.4754]\n")
+    put("        sin=[-0.5440, 0.9792, 0.2091, -0.8675, -0.8798]\n")
+    put("pos=100 cos=[0.8623, 0.4561, -0.5103, -0.4738, -0.2395]\n")
+    put("        sin=[-0.5064, -0.8899, 0.8600, 0.8806, -0.9709]\n")
+    exit(0)
+}

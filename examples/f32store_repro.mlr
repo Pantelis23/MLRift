@@ -1,0 +1,71 @@
+// Minimal reproducer for the f32-store-writes-8-bytes bug.
+// Allocates 16 bytes pre-filled with 0xDEADBEEF markers, writes one f32 value
+// at offset 0 via `unsafe { *(addr as f32) = v }`, then prints all 16 bytes.
+
+import "../std/alloc.mlr"
+import "../std/mem.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/math_float.mlr"
+
+fn main() {
+    u64 buf = alloc(16)
+    // Fill all 16 bytes with 0xAA so any untouched byte shows as 170.
+    u64 i = 0
+    u8 mark = 0xAA
+    while i < 16 {
+        store8(buf + i, mark)
+        i = i + 1
+    }
+
+    // Write a single f32 at buf+0. Expected: only bytes 0..3 change.
+    f32 v = 1.5f
+    unsafe { *(buf as f32) = v }
+
+    // Dump bytes
+    print_str("bytes=[")
+    i = 0
+    while i < 16 {
+        if i != 0 { print_str(",") }
+        u8 b = load8(buf + i)
+        u64 bb = b
+        u64 s = fmt_dec(bb); print_str(s); dealloc(s)
+        i = i + 1
+    }
+    print_str("]\n")
+
+    // Same test via a local computation of `v` in an unsafe block that ALSO
+    // has a prior load — matches the rope_apply pattern more closely.
+    i = 0
+    while i < 16 {
+        store8(buf + i, mark)
+        i = i + 1
+    }
+    f32 a = 0.0f
+    u64 addr_a = buf + 0
+    u64 addr_b = buf + 8
+    // Pre-populate addr_b with bytes of 1.873 (bit pattern 0x3FEFC7FE)
+    store8(buf + 8, 0xFE)
+    store8(buf + 9, 0xC7)
+    store8(buf + 10, 0xEF)
+    store8(buf + 11, 0x3F)
+    unsafe { *(addr_b as f32) -> a }
+    // Now write an f32 (a different value) at addr_a — should NOT touch addr_b
+    f32 y = 0.9f
+    unsafe { *(addr_a as f32) = y }
+    print_str("post=[")
+    i = 0
+    while i < 16 {
+        if i != 0 { print_str(",") }
+        u8 b = load8(buf + i)
+        u64 bb = b
+        u64 s = fmt_dec(bb); print_str(s); dealloc(s)
+        i = i + 1
+    }
+    print_str("]  a=")
+    u64 as_ = fmt_f32(a, 4); print_str(as_); dealloc(as_)
+    print_str("\n")
+
+    dealloc(buf)
+    exit(0)
+}

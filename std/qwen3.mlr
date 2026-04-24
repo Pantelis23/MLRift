@@ -139,6 +139,7 @@ fn qwen3_bf16_row_to_f32(u64 out_ptr, u64 src_ptr, u64 dim) {
     }
 }
 
+
 // -----------------------------------------------------------------------------
 // RoPE (rotary positional embedding)
 //
@@ -216,51 +217,112 @@ fn qwen3_rope_apply(u64 x_ptr, u64 cos_ptr, u64 sin_ptr, u64 n_heads, u64 head_d
 }
 
 // -----------------------------------------------------------------------------
-// Single-token scaled-dot-product attention with grouped-query broadcast.
+// Cached scaled-dot-product attention with grouped-query broadcast.
 //
-// For position 0, seq_len = 1, so Q·Kᵀ is a single scalar and softmax is 1.0.
-// The output collapses to V, one row per query head. We still run the code
-// path (sum, softmax, weighted sum) so the shapes are right for Phase 2.
+// For each query head h: scores[t] = (q[h] · K_cache[t, kvh]) * scale for
+// t in [0, seq_len), softmax with max-subtraction (numerically stable),
+// then out[h] = sum_t softmax[t] * V_cache[t, kvh].
 //
-// q_ptr: f32 [n_heads, head_dim]    (after RoPE)
-// k_ptr: f32 [n_kv_heads, head_dim] (after RoPE)
-// v_ptr: f32 [n_kv_heads, head_dim]
+// Cache layout (per layer, f32):
+//   K_cache: [max_seq, n_kv_heads, head_dim] row-major
+//   V_cache: same shape
+// Offset to K_cache[t, kvh, 0] = (t * n_kv_heads + kvh) * head_dim * 4 bytes.
+//
+// The caller is expected to have written the current token's K and V into
+// K_cache[pos] / V_cache[pos] already (post QK-norm + RoPE for K). Then call
+// here with seq_len = pos + 1. Causal masking is implicit — we only attend
+// over positions 0..seq_len-1, which are exactly the ones written so far.
+//
+// q_ptr: f32 [n_heads, head_dim]    (current token's Q, post QK-norm + RoPE)
 // out:   f32 [n_heads, head_dim]
-// GQA: each query head maps to kv head (h * n_kv_heads) / n_heads.
+// GQA: kvh = (h * n_kv_heads) / n_heads.
 // -----------------------------------------------------------------------------
-fn qwen3_attn_single_token(u64 out_ptr,
-                           u64 q_ptr, u64 k_ptr, u64 v_ptr,
-                           u64 n_heads, u64 n_kv_heads, u64 head_dim) {
-    // 1/sqrt(head_dim)
+fn qwen3_attn_cached(u64 out_ptr,
+                     u64 q_ptr, u64 k_cache, u64 v_cache,
+                     u64 seq_len,
+                     u64 n_heads, u64 n_kv_heads, u64 head_dim) {
     f32 scale = 1.0f / sqrt_f32(int_to_f32(head_dim))
+    u64 kv_row_bytes = n_kv_heads * head_dim * 4
 
     u64 h = 0
     while h < n_heads {
-        // Map query head to kv head (GQA broadcast).
         u64 kvh = (h * n_kv_heads) / n_heads
-        u64 q_row = q_ptr + h   * head_dim * 4
-        u64 k_row = k_ptr + kvh * head_dim * 4
-        u64 v_row = v_ptr + kvh * head_dim * 4
+        u64 q_row = q_ptr   + h * head_dim * 4
         u64 o_row = out_ptr + h * head_dim * 4
 
-        // score = (q · k) * scale — kept live so Phase 2 (multi-token)
-        // slots right in without rewriting the kernel. For seq_len = 1
-        // softmax is 1.0 and output collapses to V.
-        f32 _score = 0.0f
-        u64 d = 0
-        while d < head_dim {
-            f32 qv = 0.0f; unsafe { *((q_row + d * 4) as f32) -> qv }
-            f32 kv = 0.0f; unsafe { *((k_row + d * 4) as f32) -> kv }
-            _score = _score + qv * kv
-            d = d + 1
+        // Pass 1: find max raw score across positions. Scores computed on the
+        // fly (no scratch buffer — a tiny MLRift codegen bug was corrupting
+        // a 2-entry f32[] scratch here).
+        f32 max_score = 0.0f
+        u64 first = 1
+        u64 t = 0
+        while t < seq_len {
+            u64 k_row = k_cache + t * kv_row_bytes + kvh * head_dim * 4
+            f32 s = 0.0f
+            u64 d = 0
+            while d < head_dim {
+                f32 qv = 0.0f; unsafe { *((q_row + d * 4) as f32) -> qv }
+                f32 kv = 0.0f; unsafe { *((k_row + d * 4) as f32) -> kv }
+                s = s + qv * kv
+                d = d + 1
+            }
+            s = s * scale
+            if first == 1 {
+                max_score = s
+                first = 0
+            } else {
+                if s > max_score { max_score = s }
+            }
+            t = t + 1
         }
-        _score = _score * scale
-        d = 0
-        while d < head_dim {
-            f32 vv = 0.0f; unsafe { *((v_row + d * 4) as f32) -> vv }
-            unsafe { *((o_row + d * 4) as f32) = vv }
-            d = d + 1
+
+        // Zero output row. We accumulate e*V[t] into it in pass 2, then
+        // divide by sum_exp at the end.
+        f32 zero = 0.0f
+        u64 d0 = 0
+        while d0 < head_dim {
+            unsafe { *((o_row + d0 * 4) as f32) = zero }
+            d0 = d0 + 1
         }
+
+        // Pass 2: recompute each score, e = exp(score - max), accumulate
+        // e*V[t] into o_row, and accumulate sum_exp. Recomputing scores
+        // costs one extra Q·K dot per position (tiny vs V accumulate).
+        f32 sum_exp = 0.0f
+        t = 0
+        while t < seq_len {
+            u64 k_row = k_cache + t * kv_row_bytes + kvh * head_dim * 4
+            u64 v_row = v_cache + t * kv_row_bytes + kvh * head_dim * 4
+            f32 s = 0.0f
+            u64 d = 0
+            while d < head_dim {
+                f32 qv = 0.0f; unsafe { *((q_row + d * 4) as f32) -> qv }
+                f32 kv = 0.0f; unsafe { *((k_row + d * 4) as f32) -> kv }
+                s = s + qv * kv
+                d = d + 1
+            }
+            s = s * scale
+            f32 e = exp_f32_fast(s - max_score)
+            sum_exp = sum_exp + e
+            u64 d2 = 0
+            while d2 < head_dim {
+                f32 vv = 0.0f; unsafe { *((v_row + d2 * 4) as f32) -> vv }
+                f32 ov = 0.0f; unsafe { *((o_row + d2 * 4) as f32) -> ov }
+                unsafe { *((o_row + d2 * 4) as f32) = ov + e * vv }
+                d2 = d2 + 1
+            }
+            t = t + 1
+        }
+
+        // Normalize: out /= sum_exp
+        f32 inv_sum = 1.0f / sum_exp
+        u64 dn = 0
+        while dn < head_dim {
+            f32 ov = 0.0f; unsafe { *((o_row + dn * 4) as f32) -> ov }
+            unsafe { *((o_row + dn * 4) as f32) = ov * inv_sum }
+            dn = dn + 1
+        }
+
         h = h + 1
     }
 }
@@ -366,7 +428,9 @@ fn qwen3_dump5(u64 label, u64 ptr) {
 
 fn qwen3_forward_layer(u64 x_out, u64 x_in,
                        Qwen3LayerWeights w,
-                       u64 pos, u64 num_workers) {
+                       u64 pos,
+                       u64 k_cache_layer, u64 v_cache_layer,
+                       u64 num_workers) {
     u64 hidden = QWEN3_HIDDEN
     u64 hd     = QWEN3_HEAD_DIM
     u64 nh     = QWEN3_N_HEADS
@@ -375,24 +439,30 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     u64 kv_dim = QWEN3_KV_DIM
     u64 ff     = QWEN3_INTERMEDIATE
 
-    // dump disabled for phase 2:  qwen3_dump5("x_in",   x_in)
+    u64 kv_row_bytes = nkv * hd * 4
+    u64 k_row = k_cache_layer + pos * kv_row_bytes
+    u64 v_row = v_cache_layer + pos * kv_row_bytes
+
+    // qwen3_dump5("x_in",   x_in)
     u64 resid = alloc(hidden * 4)
     memcpy(resid, x_in, hidden * 4)
 
     u64 x_norm = alloc(hidden * 4)
     qwen3_rmsnorm_bf16(x_norm, x_in, w.input_norm_w, hidden)
-    // dump disabled for phase 2:  qwen3_dump5("x_norm", x_norm)
+    // qwen3_dump5("x_norm", x_norm)
 
-    // Q / K / V projections
+    // Q / K / V projections. K and V target the cache slot at `pos` directly;
+    // downstream QK-norm and RoPE mutate the cache in place. V is stored raw
+    // (no norm, no RoPE — Qwen3 only rotates Q and K).
     u64 q_buf = alloc(q_dim * 4)
-    u64 k_buf = alloc(kv_dim * 4)
-    u64 v_buf = alloc(kv_dim * 4)
     matmul_bf16_weights_f32_mt(q_buf, x_norm, w.q_proj_w, 1, q_dim,  hidden, num_workers)
-    // dump disabled for phase 2:  qwen3_dump5("q_raw",  q_buf)
-    matmul_bf16_weights_f32_mt(k_buf, x_norm, w.k_proj_w, 1, kv_dim, hidden, num_workers)
-    // dump disabled for phase 2:  qwen3_dump5("k_raw",  k_buf)
-    matmul_bf16_weights_f32_mt(v_buf, x_norm, w.v_proj_w, 1, kv_dim, hidden, num_workers)
-    // dump disabled for phase 2:  qwen3_dump5("v_raw",  v_buf)
+    matmul_bf16_weights_f32_mt(k_row, x_norm, w.k_proj_w, 1, kv_dim, hidden, num_workers)
+    matmul_bf16_weights_f32_mt(v_row, x_norm, w.v_proj_w, 1, kv_dim, hidden, num_workers)
+    // qwen3_dump5("q_raw", q_buf)
+    // qwen3_dump5("q_raw_h1", q_buf + 128 * 4)
+    // qwen3_dump5("k_raw", k_row)
+    // qwen3_dump5("k_raw_64", k_row + 64 * 4)
+    // qwen3_dump5("v_raw", v_row)
 
     u64 qk_w_f32 = alloc(hd * 4)
     qwen3_bf16_row_to_f32(qk_w_f32, w.q_norm_w, hd)
@@ -405,30 +475,40 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     qwen3_bf16_row_to_f32(qk_w_f32, w.k_norm_w, hd)
     h = 0
     while h < nkv {
-        u64 k_slice = k_buf + h * hd * 4
+        u64 k_slice = k_row + h * hd * 4
         qwen3_rmsnorm_f32_weights(k_slice, k_slice, qk_w_f32, hd)
         h = h + 1
     }
     dealloc(qk_w_f32)
-    // dump disabled for phase 2:  qwen3_dump5("q_norm", q_buf)
-    // dump disabled for phase 2:  qwen3_dump5("k_norm", k_buf)
+    // qwen3_dump5("q_norm", q_buf)
+    // qwen3_dump5("q_norm_h0_64", q_buf + 64 * 4)
+    // qwen3_dump5("q_norm_h1", q_buf + 128 * 4)
+    // qwen3_dump5("k_norm", k_row)
+    // qwen3_dump5("k_norm_h0_64", k_row + 64 * 4)
 
     u64 cos_buf = alloc((hd / 2) * 4)
     u64 sin_buf = alloc((hd / 2) * 4)
     f64 theta = 1000000.0
     qwen3_rope_compute(cos_buf, sin_buf, pos, hd, theta)
     qwen3_rope_apply(q_buf, cos_buf, sin_buf, nh,  hd)
-    qwen3_rope_apply(k_buf, cos_buf, sin_buf, nkv, hd)
+    qwen3_rope_apply(k_row, cos_buf, sin_buf, nkv, hd)
     dealloc(cos_buf)
     dealloc(sin_buf)
+    // qwen3_dump5("q_rope", q_buf)
+    // qwen3_dump5("k_rope_cur", k_row)
+    // qwen3_dump5("k_rope_pos0", k_cache_layer)
 
+    // Cache-aware attention over positions 0..pos (inclusive). V_cache is
+    // already populated at index `pos` by the matmul above.
     u64 attn_out = alloc(q_dim * 4)
-    qwen3_attn_single_token(attn_out, q_buf, k_buf, v_buf, nh, nkv, hd)
-    // dump disabled for phase 2:  qwen3_dump5("attn",   attn_out)
+    qwen3_attn_cached(attn_out, q_buf,
+                      k_cache_layer, v_cache_layer,
+                      pos + 1, nh, nkv, hd)
+    // qwen3_dump5("attn",   attn_out)
 
     u64 o_buf = alloc(hidden * 4)
     matmul_bf16_weights_f32_mt(o_buf, attn_out, w.o_proj_w, 1, hidden, q_dim, num_workers)
-    // dump disabled for phase 2:  qwen3_dump5("o_out",  o_buf)
+    // qwen3_dump5("o_out",  o_buf)
 
     // Residual add: x = resid + o_buf
     u64 mid = alloc(hidden * 4)
@@ -441,20 +521,20 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
         i = i + 1
     }
 
-    // dump disabled for phase 2:  qwen3_dump5("mid",    mid)
+    // qwen3_dump5("mid",    mid)
     u64 mid_norm = alloc(hidden * 4)
     qwen3_rmsnorm_bf16(mid_norm, mid, w.post_norm_w, hidden)
-    // dump disabled for phase 2:  qwen3_dump5("mid_norm", mid_norm)
+    // qwen3_dump5("mid_norm", mid_norm)
 
     u64 gate_buf = alloc(ff * 4)
     u64 up_buf   = alloc(ff * 4)
     matmul_bf16_weights_f32_mt(gate_buf, mid_norm, w.gate_proj_w, 1, ff, hidden, num_workers)
-    // dump disabled for phase 2:  qwen3_dump5("gate",   gate_buf)
+    // qwen3_dump5("gate",   gate_buf)
     matmul_bf16_weights_f32_mt(up_buf,   mid_norm, w.up_proj_w,   1, ff, hidden, num_workers)
-    // dump disabled for phase 2:  qwen3_dump5("up",     up_buf)
+    // qwen3_dump5("up",     up_buf)
     u64 ff_buf = alloc(ff * 4)
     qwen3_silu_mul(ff_buf, gate_buf, up_buf, ff)
-    // dump disabled for phase 2:  qwen3_dump5("silu",   ff_buf)
+    // qwen3_dump5("silu",   ff_buf)
     // Full down_proj, single-threaded (MT path was flaky on repeated submit).
     // ff_buf: [1, ff] × down_proj_w: [hidden, ff] (bf16 row-major) → [1, hidden]
     u64 ff_out = alloc(hidden * 4)
@@ -494,7 +574,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
         mm_n = mm_n + 1
     }
     dealloc(dw_scratch)
-    // dump disabled for phase 2:  qwen3_dump5("ff_out", ff_out)
+    // qwen3_dump5("ff_out", ff_out)
 
     // Second residual add: x_out = mid + ff_out
     i = 0
@@ -507,7 +587,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     }
 
     dealloc(resid); dealloc(x_norm)
-    dealloc(q_buf); dealloc(k_buf); dealloc(v_buf)
+    dealloc(q_buf)
     dealloc(attn_out); dealloc(o_buf)
     dealloc(mid); dealloc(mid_norm)
     dealloc(gate_buf); dealloc(up_buf); dealloc(ff_buf); dealloc(ff_out)
