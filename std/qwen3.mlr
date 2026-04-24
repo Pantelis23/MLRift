@@ -535,45 +535,12 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     u64 ff_buf = alloc(ff * 4)
     qwen3_silu_mul(ff_buf, gate_buf, up_buf, ff)
     // qwen3_dump5("silu",   ff_buf)
-    // Full down_proj, single-threaded (MT path was flaky on repeated submit).
-    // ff_buf: [1, ff] × down_proj_w: [hidden, ff] (bf16 row-major) → [1, hidden]
+    // down_proj via the shared MT matmul. The old hand-inlined single-thread
+    // loop was kept while the IR-store-8-byte bug was still in the compiler;
+    // that's fixed now, so the MT path works and parallelises the 3M-element
+    // hotspot.
     u64 ff_out = alloc(hidden * 4)
-    u64 dw = w.down_proj_w
-    // Same per-element BF16 decode inlining as infer_matmul_worker —
-    // reuses one 4-byte scratch across the whole 3 M-element loop.
-    u64 dw_scratch = alloc(4)
-    u8 dw_zero = 0
-    store8(dw_scratch + 0, dw_zero)
-    store8(dw_scratch + 1, dw_zero)
-    // Same Kahan-summation pattern as std/inference.mlr's worker (comment there
-    // explains why — without compensation the residual stream drifts too far
-    // after 28 layers and argmax flips to the wrong token).
-    u64 mm_n = 0
-    while mm_n < hidden {
-        f32 mm_sum = 0.0f
-        f32 mm_c = 0.0f
-        u64 mm_k = 0
-        while mm_k < ff {
-            f32 mm_x = 0.0f
-            unsafe { *((ff_buf + mm_k * 4) as f32) -> mm_x }
-            u64 wo = (mm_n * ff + mm_k) * 2
-            u8 b0u = load8(dw + wo)
-            u8 b1u = load8(dw + wo + 1)
-            store8(dw_scratch + 2, b0u)
-            store8(dw_scratch + 3, b1u)
-            f32 mm_w = 0.0f
-            unsafe { *(dw_scratch as f32) -> mm_w }
-            f32 prod = mm_x * mm_w
-            f32 y = prod - mm_c
-            f32 t = mm_sum + y
-            mm_c = (t - mm_sum) - y
-            mm_sum = t
-            mm_k = mm_k + 1
-        }
-        unsafe { *((ff_out + mm_n * 4) as f32) = mm_sum }
-        mm_n = mm_n + 1
-    }
-    dealloc(dw_scratch)
+    matmul_bf16_weights_f32_mt(ff_out, ff_buf, w.down_proj_w, 1, hidden, ff, num_workers)
     // qwen3_dump5("ff_out", ff_out)
 
     // Second residual add: x_out = mid + ff_out

@@ -22,6 +22,7 @@ import "../std/io.mlr"
 import "../std/fmt.mlr"
 import "../std/string.mlr"
 import "../std/thread.mlr"
+import "../std/time.mlr"
 
 static u64 g_fd = 0
 fn eout(u64 s) {
@@ -44,6 +45,7 @@ fn main() {
 
     u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-0.6B/model.safetensors"
     eout("[qwen3_generate] loading weights\n")
+    u64 load_start_ns = time_now()
     SafetensorFile st = safetensors_open(path)
     if st.file_size == 0 {
         eout("open fail\n")
@@ -135,7 +137,9 @@ fn main() {
         dealloc(prefix)
         li = li + 1
     }
-    eout("[qwen3_generate] 28 layers indexed\n")
+    u64 load_elapsed_ns = time_elapsed(load_start_ns)
+    eout("[qwen3_generate] 28 layers indexed; load_ms=")
+    eu64(load_elapsed_ns / 1000000); eout("\n")
 
     // KV cache — one big slab each for K and V, with per-layer stride.
     //   shape per layer: [max_seq, n_kv_heads, head_dim] f32
@@ -175,7 +179,10 @@ fn main() {
 
     u64 pos = 0
     u64 step = 0
+    u64 decode_start_ns = time_now()
+    u64 sum_decode_ns = 0
     while step < max_new {
+        u64 step_start_ns = time_now()
         eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
 
         // Sweep 28 layers at this position; each writes K/V into cache[layer][pos].
@@ -225,8 +232,24 @@ fn main() {
         }
         tok = best_id
         pos = pos + 1
+        u64 step_elapsed_ns = time_elapsed(step_start_ns)
+        sum_decode_ns = sum_decode_ns + step_elapsed_ns
+        u64 step_ms = step_elapsed_ns / 1000000
+        eout("  step "); eu64(step); eout(" took "); eu64(step_ms); eout(" ms\n")
         step = step + 1
     }
+    u64 total_decode_ns = time_elapsed(decode_start_ns)
+    u64 total_ms = total_decode_ns / 1000000
+    eout("\n=== TIMING ===\n")
+    eout("total_decode_ms=");  eu64(total_ms); eout("\n")
+    eout("sum_per_step_ms=");  eu64(sum_decode_ns / 1000000); eout("\n")
+    eout("mean_step_ms=");     eu64(total_decode_ns / max_new / 1000000); eout("\n")
+    // tokens/sec * 1000 (fixed-point, integer math only)
+    u64 tokps_milli = 0
+    if total_decode_ns != 0 {
+        tokps_milli = (max_new * 1000 * 1000000000) / total_decode_ns
+    }
+    eout("tokens_per_sec_x1000="); eu64(tokps_milli); eout("\n")
 
     // Print final sequence
     eout("\n=== GENERATED SEQUENCE ===\n")
