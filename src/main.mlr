@@ -4687,6 +4687,19 @@ fn main() {
                 write(1, mf_path, mfpl)
                 write(1, " (amdgpu mt-lif-full code object)\n", 34)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-mt-csr-i-deliver=", 31) != 0 {
+                // Path B3: multi-thread inhibitory CSR delivery.
+                uint64 mci_path = arg + 31
+                uint64 mci_rc = emit_amdgpu_mt_csr_i_deliver_blob(mci_path)
+                if mci_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-mt-csr-i-deliver failed\n", 44)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 mcipl = str_len(mci_path)
+                write(1, mci_path, mcipl)
+                write(1, " (amdgpu mt-csr-i-deliver code object)\n", 39)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-per-lane-loop=", 28) != 0 {
                 // Stage-1 M1n smoke: hand-crafted kernel using the
                 // VALU divergent-loop primitives (v_cmp_lt_u32 per

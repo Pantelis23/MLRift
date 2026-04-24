@@ -4516,6 +4516,98 @@ fn emit_amdgpu_mt_lif_full_blob(uint64 out_path) -> uint64 {
 }
 
 // ---------------------------------------------------------------------------
+// B3 mt_csr_i_deliver: multi-thread inhibitory CSR delivery. Per-synapse
+// dispatch — each lane handles one edge. Branches from the single-thread
+// s_cmp + inner row loop become: coalesced VMEM loads of per-edge state
+// + predicate-gated EXEC mask + f64 CAS-retry atomic add.
+//
+// Launch convention: block_x = total_edges, grid_x = 1.
+//
+// Kernargs (9 entries, 72 bytes):
+//   [0x00] rpi_tgt_ptr        (u64*)
+//   [0x08] rpi_w_ptr          (f64*)
+//   [0x10] edge_to_src_ptr    (u64*)  — built host-side
+//   [0x18] cell_type_ptr      (u64*)
+//   [0x20] release_ptr        (f64*)
+//   [0x28] s_inh_ptr          (f64*)
+//   [0x30] n_pre              (u64 by-value, reserved)
+//   [0x38] total_edges        (u64 by-value, reserved)
+//   [0x40] _reserved          (u64)
+//
+// THIS IS THE SCAFFOLD STAGE. Predicates + atomic scatter land in the
+// next commit.
+@export
+fn emit_amdgpu_mt_csr_i_deliver_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "mt_csr_i_deliver"
+    uint64 klen  = 16
+
+    asm_init()
+
+    // --- Prologue: 9 kernarg SMEM loads ---
+    asm_s_load_b64(1, 0)                            // s[2:3]   rpi_tgt_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5]   rpi_w_ptr
+    asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7]   edge_to_src_ptr
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9]   cell_type_ptr
+    asm_s_load_b64_off(5, 0, 0x20)                  // s[10:11] release_ptr
+    asm_s_load_b64_off(6, 0, 0x28)                  // s[12:13] s_inh_ptr
+    asm_s_load_b64_off(7, 0, 0x30)                  // s[14:15] n_pre (unused)
+    asm_s_load_b64_off(8, 0, 0x38)                  // s[16:17] total_edges (unused)
+    asm_s_load_b64_off(9, 0, 0x40)                  // s[18:19] _reserved
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Per-lane byte offset: v2 = tid * 8.
+    asm_v_lshlrev_b32_imm(2, 3, 0)
+    asm_s_delay_alu(0x01)
+
+    // --- Per-lane VMEM loads (saddr = raw SGPR index of pair low half) ---
+    // Encoding: [word1=0xDC560000, word2=(vdst<<24) | (saddr<<16) | v_addr]
+    // Outputs: v[4:5]=rpi_tgt, v[6:7]=rpi_w, v[8:9]=edge_to_src
+    asm_u32(0xDC560000); asm_u32(0x04020002)        // rpi_tgt      → v[4:5]   saddr=s2
+    asm_u32(0xDC560000); asm_u32(0x06040002)        // rpi_w        → v[6:7]   saddr=s4
+    asm_u32(0xDC560000); asm_u32(0x08060002)        // edge_to_src  → v[8:9]   saddr=s6
+    asm_s_waitcnt_vmcnt_zero()
+
+    asm_s_endpgm()
+
+    uint64 rsrc1 = 0xE0AF0002                       // VGPR granule=2 → 24 VGPRs
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000030
+    uint64 props = 0x0408
+
+    // 9 kernargs: 6 GLOBAL_BUFFER + 3 BY_VALUE.
+    uint64[18] args_desc
+    uint64 ai = 0
+    while ai < 6 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        ai = ai + 1
+    }
+    while ai < 9 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        ai = ai + 1
+    }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           72,      // kernarg_size (9 × 8)
+                                           8,       // kernarg_align
+                                           24,      // sgpr_count (reserves s20..s23 for later EXEC saves + scratch)
+                                           24,      // vgpr_count
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 9)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_mt_csr_i_deliver_blob: cannot open output\n", 54)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
 // M1m loop-demo: hand-crafted kernel that exercises the SALU while-
 // loop primitives (s_add_u32, s_cmp_lt_u32, s_cbranch_scc0,
 // s_branch backward) before any AST-lowerer shape wires them in.
