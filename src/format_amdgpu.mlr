@@ -891,8 +891,8 @@ fn asm_s_and_b32_exec_vcc_lo() {
 
 // v_cmp_eq_u32_e32 vcc_lo, <inline imm>, v<vgpr>  — VOPC op 0x4A.
 //   Sets VCC[lane] = (imm == u32(v[vgpr])) per active lane. src0 is
-//   an inline literal (0..64 encoded as 0x80+K). Used for the
-//   ref == 0 guard in mt_lif_full.
+//   an inline literal (0..63 encoded as 0x80+K; mask is &0x3F). Used
+//   for the ref == 0 guard in mt_lif_full.
 //   Verified: `v_cmp_eq_u32_e32 vcc_lo, 0, v12` → 0x7C941880.
 fn asm_v_cmp_eq_u32_imm_vgpr(uint64 imm, uint64 vgpr) {
     uint64 src0_enc = 0x80 + (imm & 0x3F)
