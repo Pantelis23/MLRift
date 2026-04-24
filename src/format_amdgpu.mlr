@@ -4218,6 +4218,122 @@ fn emit_amdgpu_mt_lif_integrate_blob(uint64 out_path) -> uint64 {
 }
 
 // ---------------------------------------------------------------------------
+// M1u-2 mt_lif_full: multi-thread LIF + spike + traces + STP + ring-
+// buffer scatter. Each lane processes neuron i = tid. Branches from
+// single-thread lif_full (ref==0, V>=Vth, ct==0) become per-lane
+// EXEC-mask branches: v_cmp → s_and_saveexec → body → s_xor exec,sN
+// → else-body → s_mov exec,sN.
+//
+// Launch convention: block_x = N, grid_x = 1. Kernargs identical to
+// lif_full (22 entries, 176 bytes), but pointer args now reference
+// N-entry arrays instead of single slots. Ring buffer `buf_delay`
+// is 2D: delay_slots × N, indexed buf_delay[w_base*N + tid].
+//
+// THIS IS THE SCAFFOLD STAGE. Prologue + state loads + S→V broadcasts
+// only; the arithmetic, EXEC-mask branches, and stores land in
+// subsequent commits.
+@export
+fn emit_amdgpu_mt_lif_full_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "mt_lif_full"
+    uint64 klen  = 11
+
+    asm_init()
+
+    // --- Prologue: load all 22 kernargs (same layout as ST lif_full) ---
+    asm_s_load_b64(1, 0)                            // s[2:3]   V_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5]   ref_ptr
+    asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7]   RI_ptr
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9]   s_exc_ptr
+    asm_s_load_b64_off(5, 0, 0x20)                  // s[10:11] s_inh_ptr
+    asm_s_load_b64_off(6, 0, 0x28)                  // s[12:13] spike_ptr
+    asm_s_load_b64_off(7, 0, 0x30)                  // s[14:15] x_pre_ptr
+    asm_s_load_b64_off(8, 0, 0x38)                  // s[16:17] x_post_ptr
+    asm_s_load_b64_off(9, 0, 0x40)                  // s[18:19] u_stp_ptr
+    asm_s_load_b64_off(10, 0, 0x48)                 // s[20:21] x_stp_ptr
+    asm_s_load_b64_off(11, 0, 0x50)                 // s[22:23] release_ptr
+    asm_s_load_b64_off(12, 0, 0x58)                 // s[24:25] dt_over_tau
+    asm_s_load_b64_off(13, 0, 0x60)                 // s[26:27] V_rest
+    asm_s_load_b64_off(14, 0, 0x68)                 // s[28:29] J_E
+    asm_s_load_b64_off(15, 0, 0x70)                 // s[30:31] J_I
+    asm_s_load_b64_off(16, 0, 0x78)                 // s[32:33] V_reset
+    asm_s_load_b64_off(17, 0, 0x80)                 // s[34:35] V_thresh
+    asm_s_load_b64_off(18, 0, 0x88)                 // s[36:37] ref_steps
+    asm_s_load_b64_off(19, 0, 0x90)                 // s[38:39] U_baseline
+    asm_s_load_b64_off(20, 0, 0x98)                 // s[40:41] cell_type_ptr
+    asm_s_load_b64_off(21, 0, 0xA0)                 // s[42:43] buf_delay_ptr
+    asm_s_load_b64_off(22, 0, 0xA8)                 // s[44:45] w_base
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Per-lane byte offset: v2 = tid * 8.
+    asm_v_lshlrev_b32_imm(2, 3, 0)
+    asm_s_delay_alu(0x01)
+
+    // --- Per-lane VMEM loads (saddr = raw SGPR index of pair low half) ---
+    // Encoding: [word1=0xDC560000, word2=(vdst<<24) | (saddr<<16) | v_addr]
+    asm_u32(0xDC560000); asm_u32(0x04020002)        // V        → v[4:5]   saddr=s2
+    asm_u32(0xDC560000); asm_u32(0x0C040002)        // ref      → v[12:13] saddr=s4
+    asm_u32(0xDC560000); asm_u32(0x06060002)        // RI       → v[6:7]   saddr=s6
+    asm_u32(0xDC560000); asm_u32(0x08080002)        // s_exc    → v[8:9]   saddr=s8
+    asm_u32(0xDC560000); asm_u32(0x0A0A0002)        // s_inh    → v[10:11] saddr=s10
+    asm_u32(0xDC560000); asm_u32(0x0E0C0002)        // spike    → v[14:15] saddr=s12
+    asm_u32(0xDC560000); asm_u32(0x100E0002)        // x_pre    → v[16:17] saddr=s14
+    asm_u32(0xDC560000); asm_u32(0x12100002)        // x_post   → v[18:19] saddr=s16
+    asm_u32(0xDC560000); asm_u32(0x14120002)        // u_stp    → v[20:21] saddr=s18
+    asm_u32(0xDC560000); asm_u32(0x16140002)        // x_stp    → v[22:23] saddr=s20
+    asm_u32(0xDC560000); asm_u32(0x18280002)        // cell_type→ v[24:25] saddr=s40
+    asm_s_waitcnt_vmcnt_zero()
+
+    // SGPR→VGPR broadcast of all f64 by-value constants.
+    asm_v_mov_b32(44, 24); asm_v_mov_b32(45, 25)    // v[44:45] dt_over_tau
+    asm_v_mov_b32(32, 26); asm_v_mov_b32(33, 27)    // v[32:33] V_rest
+    asm_v_mov_b32(34, 28); asm_v_mov_b32(35, 29)    // v[34:35] J_E
+    asm_v_mov_b32(36, 30); asm_v_mov_b32(37, 31)    // v[36:37] J_I
+    asm_v_mov_b32(38, 32); asm_v_mov_b32(39, 33)    // v[38:39] V_reset
+    asm_v_mov_b32(40, 34); asm_v_mov_b32(41, 35)    // v[40:41] V_thresh
+    asm_v_mov_b32(42, 38); asm_v_mov_b32(43, 39)    // v[42:43] U_baseline
+    asm_s_delay_alu(0x04)
+
+    asm_s_endpgm()
+
+    uint64 rsrc1 = 0xE0AF0005                       // VGPR granule=5: (5+1)*8 = 48 VGPRs
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000030
+    uint64 props = 0x0408
+
+    // 22 kernargs: 13 GLOBAL_BUFFER + 9 BY_VALUE.
+    uint64[44] args_desc
+    uint64 ai = 0
+    while ai < 13 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        ai = ai + 1
+    }
+    while ai < 22 {
+        uint64 p0 = args_desc + ai * 16;      unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8;  unsafe { *(p1 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        ai = ai + 1
+    }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           176,     // kernarg_size
+                                           8,       // kernarg_align
+                                           50,      // sgpr_count
+                                           48,      // vgpr_count (granule 5)
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 22)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_mt_lif_full_blob: cannot open output\n", 49)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
 // M1m loop-demo: hand-crafted kernel that exercises the SALU while-
 // loop primitives (s_add_u32, s_cmp_lt_u32, s_cbranch_scc0,
 // s_branch backward) before any AST-lowerer shape wires them in.
