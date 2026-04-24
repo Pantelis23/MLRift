@@ -4293,6 +4293,10 @@ fn emit_amdgpu_mt_lif_full_blob(uint64 out_path) -> uint64 {
     asm_v_mov_b32(42, 38); asm_v_mov_b32(43, 39)    // v[42:43] U_baseline
     asm_s_delay_alu(0x04)
 
+    // --- Outer branch: if ref == 0 { integrate + spike } else { refractory } ---
+    asm_v_cmp_eq_u32_imm_vgpr(0, 12)                // vcc_lo = (v12 == 0)
+    asm_s_and_saveexec_b32_vcc_lo(46)               // s46 = outer EXEC, EXEC &= (ref==0)
+
     // --- Integrate arithmetic: v_new = V + dt_over_tau * (V_rest - V + drive) ---
     // drive    = RI + s_exc*J_E - s_inh*J_I
     // Uses v[26:27], v[28:29], v[30:31] as reusable f64 scratch.
@@ -4414,6 +4418,23 @@ fn emit_amdgpu_mt_lif_full_blob(uint64 out_path) -> uint64 {
 
     // Restore outer EXEC.
     asm_s_mov_b32(0x7E, 47)
+
+    // ---- refractory-path lanes ----
+    asm_s_xor_b32_exec_sgpr(46)                     // EXEC = outer ^ (ref==0) = refractory lanes
+
+    // Decrement ref per-lane: v12 -= 1 (v_sub_nc_u32_e64 v12, v12, 1).
+    // llvm-mc verified: word1 = 0xD526000C, word2 = 0x0001030C.
+    asm_u32(0xD526000C); asm_u32(0x0001030C)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6E0000); asm_u32(0x00040C02)        // global_store_b64 v2, v[12:13], s[4:5]
+    asm_s_waitcnt_vscnt_zero()
+
+    // V = V_reset (same encoding as the spike-path reset).
+    asm_u32(0xDC6E0000); asm_u32(0x00022602)        // global_store_b64 v2, v[38:39], s[2:3]
+    asm_s_waitcnt_vscnt_zero()
+
+    // Restore kernel-initial EXEC mask.
+    asm_s_mov_b32(0x7E, 46)
 
     asm_s_endpgm()
 
