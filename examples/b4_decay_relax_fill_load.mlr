@@ -1,0 +1,245 @@
+// B4 device gate: test decay_step, relax_step, fill_step individually
+// at N=16. Integer-stepped inputs so results are f64-exact.
+//
+// decay test: buf[i] = i+1 (as f64), factor = 0.5.
+//   Expected: buf[i] = (i+1) - (i+1)*0.5 = (i+1)/2.
+// relax test: buf[i] = i (as f64), target = 10.0, factor = 0.5.
+//   Expected: buf[i] = i + (10 - i)*0.5 = (i + 10)/2.
+// fill test: buf[i] = 999.0 initially, value = 42.0.
+//   Expected: buf[i] = 42.0 for all i.
+
+import "../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+static uint64 N = 16
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+fn hmalloc_copy(uint64 host_buf, uint64 nbytes) -> uint64 {
+    uint64 dslot = alloc(8)
+    uint32 err = hipMalloc(dslot, nbytes); if err != 0 { die("hipMalloc", err) }
+    uint64 dptr = 0; unsafe { *(dslot as uint64) -> dptr }
+    err = hipMemcpy(dptr, host_buf, nbytes, 1); if err != 0 { die("H2D", err) }
+    return dptr
+}
+
+fn load_module(uint64 co_path) -> uint64 {
+    uint64 fd = file_open(co_path, 0); if fd > 0xFFFFFFFFFFFFF000 { die("open", 1) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    uint32 err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("loadmod", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    return mod
+}
+
+fn get_fn(uint64 mod, uint64 name) -> uint64 {
+    uint64 fn_slot = alloc(8)
+    uint32 err = hipModuleGetFunction(fn_slot, mod, name); if err != 0 { die("getFn", err) }
+    uint64 fn_handle = 0; unsafe { *(fn_slot as uint64) -> fn_handle }
+    return fn_handle
+}
+
+fn test_decay(uint64 fn_handle) -> uint64 {
+    uint64 nb = N * 8
+    uint64 h_buf = alloc(nb)
+    uint64 i = 0
+    while i < N {
+        uint64 ifv = i + 1; f64 v = 0.0; v = ifv
+        uint64 p = h_buf + i * 8; unsafe { *(p as f64) = v }
+        i = i + 1
+    }
+    uint64 d_buf = hmalloc_copy(h_buf, nb)
+    uint64 a0 = alloc(8); unsafe { *(a0 as uint64) = d_buf }
+    uint64 a1 = alloc(8); unsafe { *(a1 as uint64) = N }
+    uint64 a2 = alloc(8); f64 factor = 0.5; unsafe { *(a2 as f64) = factor }
+    uint64 a3 = alloc(8); unsafe { *(a3 as uint64) = 0 }
+
+    uint64 pt = alloc(4 * 8)
+    uint64 p0 = pt + 0;  unsafe { *(p0 as uint64) = a0 }
+    uint64 p1 = pt + 8;  unsafe { *(p1 as uint64) = a1 }
+    uint64 p2 = pt + 16; unsafe { *(p2 as uint64) = a2 }
+    uint64 p3 = pt + 24; unsafe { *(p3 as uint64) = a3 }
+
+    uint32 block_x = N
+    uint32 err = hipModuleLaunchKernel(fn_handle, 1, 1, 1, block_x, 1, 1, 0, 0, pt, 0)
+    if err != 0 { die("launch decay", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 r = alloc(nb); hipMemcpy(r, d_buf, nb, 2)
+    uint64 fails = 0
+    uint64 exp_slot = alloc(8)
+    i = 0
+    while i < N {
+        uint64 ifv = i + 1; f64 initv = 0.0; initv = ifv
+        f64 expv = initv - initv * 0.5
+        unsafe { *(exp_slot as f64) = expv }
+        uint64 eb = 0; unsafe { *(exp_slot as uint64) -> eb }
+        uint64 pg = r + i * 8
+        uint64 gb = 0; unsafe { *(pg as uint64) -> gb }
+        if gb != eb { fails = fails + 1 }
+        i = i + 1
+    }
+    hipFree(d_buf)
+    print_label_val("decay fails", 11, fails)
+    if fails == 0 { return 1 }
+    return 0
+}
+
+fn test_relax(uint64 fn_handle) -> uint64 {
+    uint64 nb = N * 8
+    uint64 h_buf = alloc(nb)
+    uint64 i = 0
+    while i < N {
+        uint64 ifv = i; f64 v = 0.0; v = ifv
+        uint64 p = h_buf + i * 8; unsafe { *(p as f64) = v }
+        i = i + 1
+    }
+    uint64 d_buf = hmalloc_copy(h_buf, nb)
+    uint64 a0 = alloc(8); unsafe { *(a0 as uint64) = d_buf }
+    uint64 a1 = alloc(8); unsafe { *(a1 as uint64) = N }
+    uint64 a2 = alloc(8); f64 target = 10.0; unsafe { *(a2 as f64) = target }
+    uint64 a3 = alloc(8); f64 factor = 0.5; unsafe { *(a3 as f64) = factor }
+    uint64 a4 = alloc(8); unsafe { *(a4 as uint64) = 0 }
+
+    uint64 pt = alloc(5 * 8)
+    uint64 p0 = pt + 0;  unsafe { *(p0 as uint64) = a0 }
+    uint64 p1 = pt + 8;  unsafe { *(p1 as uint64) = a1 }
+    uint64 p2 = pt + 16; unsafe { *(p2 as uint64) = a2 }
+    uint64 p3 = pt + 24; unsafe { *(p3 as uint64) = a3 }
+    uint64 p4 = pt + 32; unsafe { *(p4 as uint64) = a4 }
+
+    uint32 block_x = N
+    uint32 err = hipModuleLaunchKernel(fn_handle, 1, 1, 1, block_x, 1, 1, 0, 0, pt, 0)
+    if err != 0 { die("launch relax", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 r = alloc(nb); hipMemcpy(r, d_buf, nb, 2)
+    uint64 fails = 0
+    uint64 exp_slot = alloc(8)
+    i = 0
+    while i < N {
+        uint64 ifv = i; f64 initv = 0.0; initv = ifv
+        f64 expv = initv + (10.0 - initv) * 0.5
+        unsafe { *(exp_slot as f64) = expv }
+        uint64 eb = 0; unsafe { *(exp_slot as uint64) -> eb }
+        uint64 pg = r + i * 8
+        uint64 gb = 0; unsafe { *(pg as uint64) -> gb }
+        if gb != eb { fails = fails + 1 }
+        i = i + 1
+    }
+    hipFree(d_buf)
+    print_label_val("relax fails", 11, fails)
+    if fails == 0 { return 1 }
+    return 0
+}
+
+fn test_fill(uint64 fn_handle) -> uint64 {
+    uint64 nb = N * 8
+    uint64 h_buf = alloc(nb)
+    uint64 i = 0
+    while i < N {
+        uint64 p = h_buf + i * 8; f64 v = 999.0; unsafe { *(p as f64) = v }
+        i = i + 1
+    }
+    uint64 d_buf = hmalloc_copy(h_buf, nb)
+    uint64 a0 = alloc(8); unsafe { *(a0 as uint64) = d_buf }
+    uint64 a1 = alloc(8); unsafe { *(a1 as uint64) = N }
+    uint64 a2 = alloc(8); f64 value = 42.0; unsafe { *(a2 as f64) = value }
+
+    uint64 pt = alloc(3 * 8)
+    uint64 p0 = pt + 0;  unsafe { *(p0 as uint64) = a0 }
+    uint64 p1 = pt + 8;  unsafe { *(p1 as uint64) = a1 }
+    uint64 p2 = pt + 16; unsafe { *(p2 as uint64) = a2 }
+
+    uint32 block_x = N
+    uint32 err = hipModuleLaunchKernel(fn_handle, 1, 1, 1, block_x, 1, 1, 0, 0, pt, 0)
+    if err != 0 { die("launch fill", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 r = alloc(nb); hipMemcpy(r, d_buf, nb, 2)
+    uint64 fails = 0
+    uint64 exp_slot = alloc(8)
+    f64 expv = 42.0; unsafe { *(exp_slot as f64) = expv }
+    uint64 eb = 0; unsafe { *(exp_slot as uint64) -> eb }
+    i = 0
+    while i < N {
+        uint64 pg = r + i * 8
+        uint64 gb = 0; unsafe { *(pg as uint64) -> gb }
+        if gb != eb { fails = fails + 1 }
+        i = i + 1
+    }
+    hipFree(d_buf)
+    print_label_val("fill fails", 10, fails)
+    if fails == 0 { return 1 }
+    return 0
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("hipSetDevice", err) }
+
+    uint64 mod_decay = load_module("/tmp/decay.co")
+    uint64 fh_decay = get_fn(mod_decay, "decay_step")
+    uint64 okD = test_decay(fh_decay)
+
+    uint64 mod_relax = load_module("/tmp/relax.co")
+    uint64 fh_relax = get_fn(mod_relax, "relax_step")
+    uint64 okR = test_relax(fh_relax)
+
+    uint64 mod_fill = load_module("/tmp/fill.co")
+    uint64 fh_fill = get_fn(mod_fill, "fill_step")
+    uint64 okF = test_fill(fh_fill)
+
+    if okD == 1 {
+        if okR == 1 {
+            if okF == 1 {
+                puts("B4a gate: GREEN — decay/relax/fill all pass")
+                exit(0)
+            }
+        }
+    }
+    puts("FAIL: one or more of decay/relax/fill mismatched")
+    exit(1)
+}
