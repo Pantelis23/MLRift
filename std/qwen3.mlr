@@ -58,45 +58,59 @@ static u64 QWEN3_ROPE_DIM       = 128    // head_dim (full RoPE across the head)
 // RMSNorm without the (1 + w) shift used by Gemma. Standard Qwen/Llama form:
 //   y = x * rsqrt(mean(x²) + eps) * w
 // -----------------------------------------------------------------------------
+// AVX2 helper: widen 8 bf16 weights to 8 f32, then out[i] = scale*v[i]*w[i].
+// The bf16 decode is the same trick as the matmul kernel: vpmovzxwd to
+// u32 lanes + vpslld 16 to align into f32 high bits.
+static u64 qwen3_rsq_bf16_scratch = 0
+
+fn qwen3_scale_vv_bf16w_avx2(u64 out_ptr, u64 v_ptr, u64 w_ptr, f32 scale, u64 n) {
+    if qwen3_rsq_bf16_scratch == 0 { qwen3_rsq_bf16_scratch = alloc(4) }
+    u64 sp = qwen3_rsq_bf16_scratch
+    unsafe { *(sp as f32) = scale }
+    u64 n8 = n & 0xFFFFFFFFFFFFFFF8
+    u64 i = 0
+    while i < n8 {
+        u64 v_addr = v_ptr   + i * 4
+        u64 w_addr = w_ptr   + i * 2
+        u64 o_addr = out_ptr + i * 4
+        asm {
+            // vbroadcastss ymm3, [rcx]      ; rsq broadcast
+            "0xC4 0xE2 0x7D 0x18 0x19"
+            // vmovups ymm0, [rsi]           ; v (f32)
+            "0xC5 0xFC 0x10 0x06"
+            // vmovdqu xmm1, [rdi]           ; 8 bf16 (16 B)
+            "0xC5 0xFA 0x6F 0x0F"
+            // vpmovzxwd ymm1, xmm1          ; widen to 8 × u32
+            "0xC4 0xE2 0x7D 0x33 0xC9"
+            // vpslld ymm1, ymm1, 16         ; bf16 bits → upper 16 of f32
+            "0xC5 0xF5 0x72 0xF1 0x10"
+            // vmulps  ymm0, ymm0, ymm1      ; v * w
+            "0xC5 0xFC 0x59 0xC1"
+            // vmulps  ymm0, ymm0, ymm3      ; * rsq
+            "0xC5 0xFC 0x59 0xC3"
+            // vmovups [r8], ymm0
+            "0xC4 0xC1 0x7C 0x11 0x00"
+            // vzeroupper
+            "0xC5 0xF8 0x77"
+        } in(v_addr -> rsi, w_addr -> rdi, o_addr -> r8, sp -> rcx)
+        i = i + 8
+    }
+    // Scalar tail (shouldn't trigger for Qwen3: hidden=1024 is /8).
+    while i < n {
+        f32 v = 0.0f; unsafe { *((v_ptr + i * 4) as f32) -> v }
+        f32 w = bf16_to_f32(w_ptr + i * 2)
+        unsafe { *((out_ptr + i * 4) as f32) = v * scale * w }
+        i = i + 1
+    }
+}
+
 fn qwen3_rmsnorm_bf16(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
     qwen3_rmsnorm_eps_init()
-    // sum of squares in f32
-    f32 sum_sq = 0.0f
-    u64 i = 0
-    while i < dim {
-        f32 v = 0.0f
-        unsafe { *((in_ptr + i * 4) as f32) -> v }
-        sum_sq = sum_sq + v * v
-        i = i + 1
-    }
+    f32 sum_sq = qwen3_dot_avx2(in_ptr, in_ptr, dim)
     f32 mean_sq = sum_sq / int_to_f32(dim)
-
     f32 one  = 1.0f
     f32 rsq  = one / sqrt_f32(mean_sq + qwen3_rmsnorm_eps)
-
-    // Inline BF16 weight decode — avoids the per-element bf16_to_f32()
-    // function-call overhead (~1024 call+load/store+ret per rmsnorm,
-    // 1120 rmsnorm calls per 20-token decode). Reuses one 4-byte scratch
-    // across all elements in this call.
-    u64 ws = alloc(4)
-    u8 wz = 0
-    store8(ws + 0, wz)
-    store8(ws + 1, wz)
-    i = 0
-    while i < dim {
-        f32 v = 0.0f
-        unsafe { *((in_ptr + i * 4) as f32) -> v }
-        u8 wb0 = load8(w_ptr + i * 2)
-        u8 wb1 = load8(w_ptr + i * 2 + 1)
-        store8(ws + 2, wb0)
-        store8(ws + 3, wb1)
-        f32 w = 0.0f
-        unsafe { *(ws as f32) -> w }
-        f32 y = v * rsq * w
-        unsafe { *((out_ptr + i * 4) as f32) = y }
-        i = i + 1
-    }
-    dealloc(ws)
+    qwen3_scale_vv_bf16w_avx2(out_ptr, in_ptr, w_ptr, rsq, dim)
 }
 
 // Module-level f32 1e-6 eps, bit-set once. Replaces the per-call
@@ -120,33 +134,61 @@ fn qwen3_rmsnorm_eps_init() {
     qwen3_rmsnorm_eps = e
 }
 
+// Static scratch for the rsq broadcast in qwen3_scale_vvw_avx2.
+static u64 qwen3_rsq_scratch = 0
+
+// AVX2 helper: out[i] = scale * v[i] * w[i], 8 f32 lanes per iter, n
+// must be multiple of 8. Used by qwen3_rmsnorm_f32_weights' output
+// pass. Outer 8-step loop lives in MLRift so the asm stays straight
+// line (no rel8 jumps).
+fn qwen3_scale_vvw_avx2(u64 out_ptr, u64 v_ptr, u64 w_ptr, f32 scale, u64 n) {
+    if qwen3_rsq_scratch == 0 { qwen3_rsq_scratch = alloc(4) }
+    u64 sp = qwen3_rsq_scratch
+    unsafe { *(sp as f32) = scale }
+    u64 n8 = n & 0xFFFFFFFFFFFFFFF8
+    u64 i = 0
+    while i < n8 {
+        u64 v_addr = v_ptr   + i * 4
+        u64 w_addr = w_ptr   + i * 4
+        u64 o_addr = out_ptr + i * 4
+        asm {
+            // vbroadcastss ymm3, [rcx]    ; rsq broadcast
+            "0xC4 0xE2 0x7D 0x18 0x19"
+            // vmovups ymm0, [rsi]         ; v
+            "0xC5 0xFC 0x10 0x06"
+            // vmovups ymm1, [rdi]         ; w
+            "0xC5 0xFC 0x10 0x0F"
+            // vmulps  ymm0, ymm0, ymm1    ; v*w
+            "0xC5 0xFC 0x59 0xC1"
+            // vmulps  ymm0, ymm0, ymm3    ; * rsq
+            "0xC5 0xFC 0x59 0xC3"
+            // vmovups [r8], ymm0
+            "0xC4 0xC1 0x7C 0x11 0x00"
+            // vzeroupper
+            "0xC5 0xF8 0x77"
+        } in(v_addr -> rsi, w_addr -> rdi, o_addr -> r8, sp -> rcx)
+        i = i + 8
+    }
+    // Scalar tail (should never hit for Qwen3; head_dim=128, n=128).
+    while i < n {
+        f32 v = 0.0f; unsafe { *((v_ptr + i * 4) as f32) -> v }
+        f32 w = 0.0f; unsafe { *((w_ptr + i * 4) as f32) -> w }
+        unsafe { *((out_ptr + i * 4) as f32) = v * scale * w }
+        i = i + 1
+    }
+}
+
 // Same RMSNorm but the weight is already in f32. Used when QK-Norm's
-// 128-entry weight has been widened once into a scratch buffer.
+// 128-entry weight has been widened once into a scratch buffer. AVX2
+// sum-of-squares (via qwen3_dot_avx2 with a = b) + AVX2 scale-and-apply.
 fn qwen3_rmsnorm_f32_weights(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
     qwen3_rmsnorm_eps_init()
-    f32 sum_sq = 0.0f
-    u64 i = 0
-    while i < dim {
-        f32 v = 0.0f
-        unsafe { *((in_ptr + i * 4) as f32) -> v }
-        sum_sq = sum_sq + v * v
-        i = i + 1
-    }
+    // sum_sq = <in, in>
+    f32 sum_sq = qwen3_dot_avx2(in_ptr, in_ptr, dim)
     f32 mean_sq = sum_sq / int_to_f32(dim)
-
     f32 one = 1.0f
     f32 rsq = one / sqrt_f32(mean_sq + qwen3_rmsnorm_eps)
-
-    i = 0
-    while i < dim {
-        f32 v = 0.0f
-        unsafe { *((in_ptr + i * 4) as f32) -> v }
-        f32 w = 0.0f
-        unsafe { *((w_ptr + i * 4) as f32) -> w }
-        f32 y = v * rsq * w
-        unsafe { *((out_ptr + i * 4) as f32) = y }
-        i = i + 1
-    }
+    qwen3_scale_vvw_avx2(out_ptr, in_ptr, w_ptr, rsq, dim)
 }
 
 // Widen a BF16 weight row of `dim` elements into an f32 scratch buffer.
