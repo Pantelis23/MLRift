@@ -31,25 +31,29 @@ fn int_to_f32(u64 val) -> f32 {
     return f
 }
 
-// BF16 -> F32. INTENDED to use `uint64[1]` stack-local scratch per the
-// v2.8.17 upstream fix — but MLRift's src/ir.mlr does NOT yet emit the
-// IR_STACK_ADDR path (it's declared, not generated). Every `uint64[1]`
-// inside a function therefore lowers to IR_ALLOC = mmap, leaking a 4 KB
-// page per call. At 3 M calls per projection × 6 projections per layer
-// that's 12 GB of leak. Until the stack-array IR port lands in MLRift,
-// alloc/dealloc the scratch explicitly so the page returns each call.
+// BF16 -> F32 using a process-wide scratch slot. Called ~1.3 M times per
+// 20-token Qwen3-0.6B decode from inside single-threaded helpers
+// (qwen3_rmsnorm_bf16, qwen3_bf16_row_to_f32, embed_bf16_scaled_f32).
+// The old per-call alloc(4)/dealloc(4) was ~2.6 M mmap/munmap syscalls
+// per run and showed up as most of the user-CPU time left after the
+// matmul went AVX2. The matmul workers inline their own BF16 decode so
+// the static here is only written from serial code paths.
+static u64 bf16_to_f32_scratch = 0
+
 fn bf16_to_f32(u64 ptr) -> f32 {
-    u64 tp = alloc(4)
-    u8 z = 0
+    if bf16_to_f32_scratch == 0 {
+        bf16_to_f32_scratch = alloc(4)
+        u8 z = 0
+        store8(bf16_to_f32_scratch + 0, z)
+        store8(bf16_to_f32_scratch + 1, z)
+    }
+    u64 tp = bf16_to_f32_scratch
     u8 b0u = load8(ptr)
     u8 b1u = load8(ptr + 1)
-    store8(tp + 0, z)
-    store8(tp + 1, z)
     store8(tp + 2, b0u)
     store8(tp + 3, b1u)
     f32 val = 0.0f
     unsafe { *(tp as f32) -> val }
-    dealloc(tp)
     return val
 }
 
