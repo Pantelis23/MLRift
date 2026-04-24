@@ -36,16 +36,16 @@ arithmetic.
 
 | Config | Wall | tok/s | vs PyTorch F32 | vs PyTorch BF16 |
 |---|---:|---:|---:|---:|
-| **MLRift safetensors** | **770 ms** | **25.96** | **2.79×** | **1.04×** |
-| **MLRift GGUF** | **781 ms** | **25.58** | **2.75×** | **1.03×** |
+| **MLRift safetensors** | **729 ms** | **27.41** | **2.94×** | **1.10×** |
+| **MLRift GGUF** | ~745 ms | ~26.9 | ~2.88× | ~1.07× |
 | PyTorch BF16 (bf16 weights, f32 GEMM) | 801 ms | 24.94 | 2.68× | 1.00× |
 | PyTorch F32 (f32 weights, f32 GEMM) | 2 146 ms | 9.32 | 1.00× | 0.37× |
 
 Reference frame that makes the most sense arithmetically is **MLRift
 vs PyTorch F32**: same FMA dtype, same accumulator dtype, same CPU.
-We're **2.79× faster**.
+We're **2.94× faster**.
 
-## Per-op breakdown (MLRift safetensors, 20-token run)
+## Per-op breakdown (MLRift safetensors, 20-token run at 729 ms)
 
 Per-run totals (ms), captured by `qwen3_profile_dump()` in
 `std/qwen3.mlr`. Adds to more than wall because some of the "matmul
@@ -53,20 +53,21 @@ submit" cost overlaps with MLRift's synchronous `thread_pool_wait`.
 
 | Op | ms | % of layer_sweep |
 |---|---:|---:|
-| qkv_proj (matmul, 3 per layer) | 131 | 17.5 |
-| gate_up (matmul, 2 per layer) | 169 | 22.6 |
-| down_res2 (matmul + residual, 1 per layer) | 86 | 11.5 |
-| oproj_res1 (matmul + residual, 1 per layer) | 67 | 9.0 |
-| qknorm_rope (scalar) | 62 | 8.3 |
-| attn (AVX2 dot + AVX2 axpy) | 24 | 3.2 |
-| post_norm (scalar) | 16 | 2.1 |
-| input_norm (scalar) | 15 | 2.0 |
-| silu (AVX2) | 7 | 0.9 |
+| qkv_proj (matmul, 3 per layer) | 131 | 18 |
+| gate_up (matmul, 2 per layer) | 169 | 23 |
+| down_res2 (matmul + residual, 1 per layer) | 86 | 12 |
+| oproj_res1 (matmul + residual, 1 per layer) | 67 | 9 |
+| qknorm_rope (scalar, now without eps mmap) | 31 | 4 |
+| attn (AVX2 dot + AVX2 axpy) | 24 | 3 |
+| post_norm (scalar) | 14 | 2 |
+| input_norm (scalar) | 13 | 2 |
+| silu (AVX2) | 7 | 1 |
 
 Plus `lm_head` = 118 ms and argmax = 7 ms outside `layer_sweep`.
 
-**Matmul accounts for ~74 % of wall now.** Everything else was dragged
-down to the low single digits once the AVX2 kernels landed.
+**Matmul accounts for ~80 % of wall now.** Everything else was dragged
+down to the low single digits once the AVX2 kernels landed and the
+RMSNorm mmap leak was fixed.
 
 ## How we got here
 
@@ -81,7 +82,8 @@ Each row correctness-verified bit-identical to PyTorch before commit:
 | `4c40e58` | Static `bf16_to_f32` scratch (no alloc per call) | 1 032 ms | 19.4 | 47× |
 | `55af77e` | Rope cache + polynomial `exp_f32_fast` + profiling | 996 ms | 20.1 | 49× |
 | `7e24197` | AVX2 SiLU (mul+add poly, dual clamp) | 876 ms | 22.8 | 55.6× |
-| `d61f0d7` | AVX2 attention (dot + axpy with static scratch) | **770 ms** | **25.96** | **63×** |
+| `d61f0d7` | AVX2 attention (dot + axpy with static scratch) | 770 ms | 25.96 | 63× |
+| `68d517b` | Static RMSNorm eps (no `uint64[1]` mmap per call) | **729 ms** | **27.41** | **66.8×** |
 
 ## Reproduce
 
