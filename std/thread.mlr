@@ -164,6 +164,12 @@ fn tp_worker_loop(uint64 wid) {
 
 fn thread_pool_init(uint64 n) {
     if n > TP_MAX { n = TP_MAX }
+    // Idempotent: if the pool already has at least n workers, return
+    // unchanged. Without this, second callers (e.g. the noesis tally
+    // path after the KFD shim's H2D path already inited 4 workers)
+    // double-spawn workers on the same state slots and deadlock the
+    // futex hand-off.
+    if tp_n >= n { return }
     // First call: allocate the seven TP_MAX-sized slot arrays on the
     // heap. alloc() hands back page-aligned memory, which is the
     // trivial fix for futex-uaddr alignment (see note above).
@@ -177,7 +183,7 @@ fn thread_pool_init(uint64 n) {
         tp_state    = alloc(TP_MAX * 8)
     }
     uint64 worker_entry = fn_addr("tp_worker_loop")
-    uint64 i = 0
+    uint64 i = tp_n                                 // resume from current count
     while i < n {
         uint64 stk = alloc(TP_STACK_SIZE)
         uint64 stk_slot = tp_stk_base + i * 8
