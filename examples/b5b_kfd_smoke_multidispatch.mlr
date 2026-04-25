@@ -1,0 +1,44 @@
+// Stage 2b sanity test: dispatch M1o atomic_cas_demo many times on the
+// same KFD queue. Each iteration:
+//   host primes *d_out = 0
+//   dispatch grid=1 block=1 (single-thread CAS(0 -> 7))
+//   kfd_wait (busy-poll signal)
+//   verify *d_out == 7
+//
+// Catches bugs in wp-tracking, signal reuse, or queue state across
+// back-to-back dispatches BEFORE the 40-dispatch stage-13 simulation.
+
+import "../std/kfd.mlr"
+
+fn main() {
+    kfd_init()
+
+    uint64 q = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 signal = kfd_signal_alloc()
+
+    uint64 mod = kernel_load("/tmp/m1o.co")
+    uint64 kn = "atomic_cas_demo"
+    uint64 kernel = kernel_get_function(mod, kn)
+
+    uint64 d_out = dev_alloc_host_visible(8)
+    uint64 d_out_host = dev_host_ptr(d_out)
+    uint64 kernarg = dev_alloc_host_visible(8)
+    uint64 kernarg_host = dev_host_ptr(kernarg)
+    unsafe { *(kernarg_host as uint64) = d_out }
+
+    uint64 iter = 0
+    while iter < 50 {
+        unsafe { *(d_out_host as uint64) = 0 }
+        kfd_dispatch(q, kernel, 1, 1, 1, 1, 1, 1, kernarg, 8, signal)
+        kfd_wait(q, signal)
+        uint64 result = 0; unsafe { *(d_out_host as uint64) -> result }
+        if result != 7 {
+            puts("FAIL: result != 7")
+            exit(1)
+        }
+        iter = iter + 1
+    }
+
+    puts("b5b multi-dispatch (50 iters): GREEN")
+    exit(0)
+}

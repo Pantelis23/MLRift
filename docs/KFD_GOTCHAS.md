@@ -1,9 +1,12 @@
 # AMDKFD Direct-Dispatch Gotchas
 
 Notes captured during Stage 2a (first MLRift kernel dispatched on gfx1100 via
-raw AMDKFD ioctls, zero ROCm userspace). Each item below was a hard-won
+raw AMDKFD ioctls, zero ROCm userspace) and revised during Stage 2b (back-to-back
+multi-dispatch on a single queue). Each item below was a hard-won
 discovery — none of them appear in AMD's user-facing documentation or the
-`kfd_ioctl.h` comments. They came from reading the kernel driver source,
+`kfd_ioctl.h` comments. They came from reading the kernel driver source
+(`drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v11.c` and `kfd_queue.c`),
+reading the tinygrad bare-KFD backend (`tinygrad/runtime/ops_amd.py`),
 LD_PRELOAD-tracing `libhsa-runtime64`, and reading `journalctl -k` GPU-fault
 logs after each hang.
 
@@ -11,8 +14,9 @@ If you're implementing your own KFD-direct path or porting to a new GPU
 generation, start here.
 
 **Tested target:** gfx1100 (RDNA3, Radeon 7900 XTX-class) on Linux 6.17 with
-KFD v1.18. Items 1-3 and 6 may apply to other generations; items 4-5 are
-gfx11-specific.
+KFD v1.18. Items 1-3, 6, 7, 8 apply to gfx10/11 in general; items 4-5 are
+gfx11-specific. Item 8 is AQL-specific (PM4 queues use a different
+doorbell convention).
 
 ---
 
@@ -63,30 +67,64 @@ docstring just says "mmap a render node" without making clear which fd.
 
 ---
 
-## 3. AQL queue write/read pointers must be SEPARATE 4 KiB BOs
+## 3. wp/rp must live INSIDE an `amd_queue_t` struct (not standalone BOs)
 
 The `kfd_ioctl_create_queue_args` documentation says the kernel returns
 `write_pointer_address` and `read_pointer_address` as "from KFD" out-fields.
-The natural interpretation is that these are pointers into the AQL ring
-allocation.
+The natural interpretation is that these are pointers into the AQL ring,
+or — second-natural — that they are the start of dedicated 4 KiB BOs.
 
-**Reality:** the kernel runs `access_ok()` on the values you pass IN as
-`write_pointer_address` and `read_pointer_address`, AND requires each to be
-the start of a separately KFD-allocated BO of exactly `PAGE_SIZE` (4 KiB).
+**Reality:** for AQL queues the CP firmware on gfx10/11 sets
+`cp_hqd_pq_wptr_poll_addr_lo/hi = q->write_ptr` and
+`cp_hqd_pq_rptr_report_addr_lo/hi = q->read_ptr` with
+`SLOT_BASED_WPTR=2` (see `kfd_mqd_manager_v11.c::update_mqd`). The CP
+treats those addresses as `&amd_queue_t.write_dispatch_id` and
+`&amd_queue_t.read_dispatch_id` respectively — fields at fixed offsets
+within an `amd_queue_t` struct (per `ROCR-Runtime/src/inc/amd_hsa_queue.h`).
 
-You must allocate two separate 4 KiB host-visible BOs (via
-`ALLOC_MEMORY_OF_GPU` + `MAP_MEMORY_TO_GPU` + mmap), pass their VAs as the
-in-args, and use the same VAs at GPU-side and host-side for the wp/rp.
+**Symptom of getting this wrong:** the *first* dispatch on the queue
+appears to work — CP picks up packet 0 because the doorbell-write path
+primes the HQD with the initial wp value. But the *second* and any
+subsequent dispatch on the same queue hangs forever in busy-poll: CP
+re-polls `wptr_poll_addr` looking for a new write_dispatch_id and reads
+garbage from a standalone BO that has no semantic meaning to firmware.
+
+**Fix:** allocate one host-visible BO for an `amd_queue_t` struct
+(0x100 bytes; we use a 4 KiB page). Initialize the fields the firmware
+reads, and pass field-offsets as the wp/rp pointers:
 
 ```c
-uint64_t wp_va = dev_alloc_host_visible(4096);  // page-aligned BO
-uint64_t rp_va = dev_alloc_host_visible(4096);
-// Pass wp_va, rp_va as write_pointer_address, read_pointer_address.
-// Host writes new write index by writing to *wp_host (= mmap'd host ptr to wp BO).
+// Layout (offsets stable across gfx10/11/12):
+//   amd_queue_t.hsa_queue                       at 0x00 (size 0x28)
+//   amd_queue_t.write_dispatch_id (u64)         at 0x38   <-- wp_va
+//   amd_queue_t.max_cu_id (u32)                 at 0x48
+//   amd_queue_t.max_wave_id (u32)               at 0x4C
+//   amd_queue_t.read_dispatch_id  (u64)         at 0x80   <-- rp_va
+//   amd_queue_t.read_dispatch_id_field_base     at 0x88
+//   amd_queue_t.queue_properties (u32)          at 0xB4
+
+uint64_t qdesc_va = dev_alloc_host_visible(4096);  // GTT|COHERENT|UNCACHED
+uint8_t* qd = host_ptr(qdesc_va);
+*(uint32_t*)(qd + 0xB4) = 0x0A;     // IS_PTR64(2) | ENABLE_PROFILING(8)
+*(uint32_t*)(qd + 0x48) = cu_count - 1;
+*(uint32_t*)(qd + 0x4C) = waves_per_cu - 1;
+*(uint32_t*)(qd + 0x88) = 0x80;     // read_dispatch_id offset
+// Pass these to CREATE_QUEUE:
+args.write_pointer_address = qdesc_va + 0x38;
+args.read_pointer_address  = qdesc_va + 0x80;
 ```
 
-**Where:** queue handle layout in `std/kfd.mlr` — note offsets `[0x30] write_ptr_va`
-and `[0x40] write_ptr_host` are different fields tracking the same BO.
+`AMD_QUEUE_PROPERTIES_IS_PTR64` is **2**, not 1 — easy to mis-read; setting
+this field to a wrong bit pattern causes silent firmware misbehavior.
+
+Recent kernels' `kfd_queue_buffer_get` only checks the BO covers
+`[user_addr, user_addr + 8)`; non-page-aligned offsets into a single BO
+are accepted. (Older kernels may have differed; the Stage-2a-era claim
+that wp/rp had to be *separate* page-sized BOs was empirically derived
+from a different failure mode and was wrong.)
+
+**Where:** `kfd_create_queue` in `std/kfd.mlr` — `qdesc_va`/`qdesc_host`
+locals carry the descriptor; `wp_va`/`rp_va` are computed as offsets.
 
 ---
 
@@ -201,6 +239,41 @@ doorbell.
 inline asm before the header write. None of our targets need this today.
 
 **Where:** `_kfd_fence()` in `std/kfd.mlr` is a no-op.
+
+---
+
+## 8. AQL doorbell value is `last_packet_index`, not `new_wp`
+
+After writing an AQL packet at slot `S`, ring the doorbell to wake CP. The
+"obvious" doorbell value, and the one ROCT-Thunk uses for **PM4** queues,
+is `new_wp` (= `S + 1`, the next slot to be filled). For **AQL** queues
+on gfx10/11 this is wrong.
+
+**Reality:** the AQL doorbell on gfx10+ uses *last-valid-packet-index*
+semantics (`= new_wp - 1 = S`). Writing `new_wp` tells CP "wait until
+packet at index `new_wp` becomes valid" — that packet does not exist
+yet, so the queue stalls.
+
+**Symptom:** identical to gotcha #3's symptom (first dispatch works,
+back-to-back dispatches hang). On the *first* dispatch after queue
+creation, CP appears to ignore the off-by-one (the queue is in a fresh
+state; CP processes whatever packets are present up to the index given,
+inclusive or exclusive doesn't matter). On the *second* dispatch CP is
+running and the off-by-one matters.
+
+**Fix:**
+
+```c
+*(uint64_t *)doorbell_host = new_wp - 1;
+//                                   ^^^ packet *index*, not the next-slot pointer
+```
+
+**Source:** tinygrad's bare-KFD AMD backend (`tinygrad/runtime/ops_amd.py`,
+`AMDComputeAQLQueue::_submit` — `signal_doorbell(dev, doorbell_value=put_value-1)`).
+HSA-Runtime's `amd_aql_queue.cpp` uses the same convention, hidden behind
+the `kAql` queue-format branch.
+
+**Where:** `kfd_dispatch` in `std/kfd.mlr`.
 
 ---
 

@@ -113,15 +113,15 @@ static uint32 KFD_MMAP_FLAGS = 0x1       // MAP_SHARED
 static uint32 KFD_VA_PROT     = 0x0      // PROT_NONE
 static uint32 KFD_VA_FLAGS    = 0x4022   // MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE
 
-// --- Allocation tracking (small static table; max 64 outstanding allocs) ---
+// --- Allocation tracking (small static table; max 256 outstanding allocs) ---
 static uint64 _kfd_alloc_tab_n = 0
-static uint64[64] _kfd_alloc_va
-static uint64[64] _kfd_alloc_handle
-static uint64[64] _kfd_alloc_size
-static uint64[64] _kfd_alloc_host
+static uint64[256] _kfd_alloc_va
+static uint64[256] _kfd_alloc_handle
+static uint64[256] _kfd_alloc_size
+static uint64[256] _kfd_alloc_host
 
 fn _kfd_alloc_track(uint64 va, uint64 handle, uint64 size, uint64 host_ptr) {
-    if _kfd_alloc_tab_n >= 64 { kfd_die("kfd: alloc table full (max 64)", _kfd_alloc_tab_n) }
+    if _kfd_alloc_tab_n >= 256 { kfd_die("kfd: alloc table full (max 256)", _kfd_alloc_tab_n) }
     uint64 i = _kfd_alloc_tab_n
     uint64 p_va  = _kfd_alloc_va     + i * 8; unsafe { *(p_va as uint64) = va }
     uint64 p_h   = _kfd_alloc_handle + i * 8; unsafe { *(p_h as uint64) = handle }
@@ -206,6 +206,30 @@ fn dev_alloc_vram_exec(uint64 nbytes) -> uint64 {
     r = raw_kfd_map_memory_to_gpu(_kfd_fd, handle, _kfd_gpu_id)
     if r != 0 { kfd_die("dev_alloc_vram_exec: MAP_MEMORY_TO_GPU failed", r) }
     _kfd_alloc_track(va, handle, nbytes, 0)
+    return va
+}
+
+// amd_queue_t descriptor allocation: GTT host-visible + COHERENT + UNCACHED.
+// CP firmware on gfx11 polls cp_hqd_pq_wptr_poll_addr (= write_dispatch_id
+// inside this struct) on every dispatch attempt; without COHERENT/UNCACHED,
+// host updates to write_dispatch_id may live in CPU caches that the GPU
+// MMU does not snoop, so the CP keeps reading a stale value and never
+// processes packets after the first one.
+fn dev_alloc_qdesc(uint64 nbytes) -> uint64 {
+    if _kfd_initialized == 0 { kfd_init() }
+    uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC | KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED
+    uint64 va_pref = _kfd_reserve_va(nbytes)
+    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
+    if r != 0 { kfd_die("dev_alloc_qdesc: ALLOC_MEMORY_OF_GPU failed", r) }
+    uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
+    uint64 va = 0;     unsafe { *(va_slot as uint64) -> va }
+    uint64 mm = 0;     unsafe { *(mm_slot as uint64) -> mm }
+    r = raw_kfd_map_memory_to_gpu(_kfd_fd, handle, _kfd_gpu_id)
+    if r != 0 { kfd_die("dev_alloc_qdesc: MAP failed", r) }
+    uint64 host = mmap(0, nbytes, KFD_MMAP_PROT, KFD_MMAP_FLAGS, _kfd_drm_fd, mm)
+    if host > 0xFFFFFFFFFFFFF000 { kfd_die("dev_alloc_qdesc: mmap failed", host) }
+    _kfd_alloc_track(va, handle, nbytes, host)
     return va
 }
 
@@ -361,20 +385,59 @@ fn kfd_create_queue(uint32 wait_mode) -> uint64 {
     uint64 cwsr_total = 28839936
     uint64 ctx_va = dev_alloc_vram(cwsr_total)
 
-    // wp/rp pointers: undocumented gotcha — despite the header comment
-    // saying "from KFD", the kernel actually validates these as user
-    // pointers AND requires them to be the start of a KFD-mapped BO of
-    // exactly PAGE_SIZE (kfd_queue_acquire_buffers in kfd_queue.c). A
-    // plain anonymous mmap is not enough; we must allocate via KFD's
-    // ALLOC_MEMORY_OF_GPU and map to the GPU. Use a host-visible BO so
-    // we can read the indices from userspace without copy.
-    uint64 wp_va = dev_alloc_host_visible(4096)
-    uint64 rp_va = dev_alloc_host_visible(4096)
-    uint64 wp_host = dev_host_ptr(wp_va)
-    uint64 rp_host = dev_host_ptr(rp_va)
-    // Zero them.
-    unsafe { *(wp_host as uint64) = 0 }
-    unsafe { *(rp_host as uint64) = 0 }
+    // wp/rp must be embedded in an amd_queue_t struct. Stage 2a's gotcha
+    // doc claimed wp/rp had to be SEPARATE 4 KiB BOs; that produced a
+    // working *first* dispatch but back-to-back dispatches hung because
+    // the gfx11 CP firmware programs `cp_hqd_pq_wptr_poll_addr` with the
+    // user-passed `write_pointer_address` AND sets `SLOT_BASED_WPTR=2`,
+    // which makes the CP poll write_dispatch_id at a fixed offset within
+    // an amd_queue_t struct (per kfd_mqd_manager_v11.c). So the wp_va we
+    // pass to CREATE_QUEUE is interpreted as `&amd_queue->write_dispatch_id`,
+    // not as a free-standing index pointer. Standalone wp BO -> CP reads
+    // garbage on every dispatch after the first; iter 0 succeeds because
+    // queue setup primes the HQD, but iter 1+ never sees a wp update.
+    //
+    // Layout (per ROCR-Runtime amd_hsa_queue.h):
+    //   amd_queue_t.hsa_queue                       at 0x00 (size 0x28)
+    //   amd_queue_t.reserved1[4]                    at 0x28
+    //   amd_queue_t.write_dispatch_id (u64)         at 0x38   <-- wp
+    //   amd_queue_t.read_dispatch_id  (u64)         at 0x80   <-- rp
+    //   amd_queue_t.read_dispatch_id_field_base     at 0x88
+    //   amd_queue_t.queue_properties (u32)          at 0xB4
+    //   amd_queue_t.max_cu_id (u32)                 at 0x48
+    //   amd_queue_t.max_wave_id (u32)               at 0x4C
+    //
+    // Recent kernels' kfd_queue_buffer_get only checks the BO covers
+    // [user_addr, user_addr+8) — non-page-aligned offsets into a single
+    // BO are accepted.
+    uint64 qdesc_va = dev_alloc_qdesc(4096)
+    uint64 qdesc_host = dev_host_ptr(qdesc_va)
+    // Zero the whole struct.
+    uint64 zi = 0
+    while zi < 256 { uint64 zp = qdesc_host + zi; unsafe { *(zp as uint64) = 0 }; zi = zi + 8 }
+    // hsa_queue.type = MULTI(0), features = KERNEL_DISPATCH(1)
+    uint32 qtype = 0; unsafe { *((qdesc_host + 0x00) as uint32) = qtype }
+    uint32 qfeat = 1; unsafe { *((qdesc_host + 0x04) as uint32) = qfeat }
+    // hsa_queue.base_address = ring_va
+    unsafe { *((qdesc_host + 0x08) as uint64) = ring_va }
+    // hsa_queue.size = ring_capacity in packets
+    uint32 qsize = KFD_QUEUE_RING_BYTES / 64
+    unsafe { *((qdesc_host + 0x18) as uint32) = qsize }
+    // amd_queue.queue_properties = IS_PTR64 (= 2) | ENABLE_PROFILING (= 8) = 0x0A.
+    // Tinygrad's hsa.py: AMD_QUEUE_PROPERTIES_IS_PTR64 = 2 (not 1!). Setting
+    // it to 1 yields garbage; firmware reads this as a malformed properties
+    // mask and may decline to dispatch.
+    uint32 qprops = 0x0A; unsafe { *((qdesc_host + 0xB4) as uint32) = qprops }
+    // max_cu_id, max_wave_id — informational, set to safe defaults for
+    // gfx1100 (96 CUs, 32 waves/CU on wave32).
+    uint32 mcu = 95;  unsafe { *((qdesc_host + 0x48) as uint32) = mcu }
+    uint32 mwv = 31;  unsafe { *((qdesc_host + 0x4C) as uint32) = mwv }
+    // read_dispatch_id_field_base_byte_offset = 0x80 (offset of read_dispatch_id)
+    uint32 rd_off = 0x80; unsafe { *((qdesc_host + 0x88) as uint32) = rd_off }
+    uint64 wp_va = qdesc_va + 0x38
+    uint64 rp_va = qdesc_va + 0x80
+    uint64 wp_host = qdesc_host + 0x38
+    uint64 rp_host = qdesc_host + 0x80
 
     uint64 qid_slot = alloc(4); uint64 db_slot = alloc(8)
     uint64 wp_out_slot = alloc(8); uint64 rp_out_slot = alloc(8)
@@ -386,7 +449,10 @@ fn kfd_create_queue(uint32 wait_mode) -> uint64 {
                                      ctx_va, KFD_CTX_SAVE_BYTES, KFD_CTL_STACK_BYTES,
                                      wp_va, rp_va,
                                      qid_slot, db_slot, wp_out_slot, rp_out_slot)
-    if r != 0 { kfd_die("kfd_create_queue: CREATE_QUEUE failed", r) }
+    if r != 0 {
+        uint64 r64 = r
+        kfd_die("kfd_create_queue: CREATE_QUEUE failed", r64)
+    }
 
     uint32 qid = 0; unsafe { *(qid_slot as uint32) -> qid }
     uint64 db_off = 0; unsafe { *(db_slot as uint64) -> db_off }
@@ -674,7 +740,17 @@ fn kfd_signal_value(uint64 signal_va) -> uint64 {
 // architecture, replace this no-op with a real mfence via inline asm.
 // (Originally tried `@dynamic extern fn _kfd_fence()` but that
 // is a GCC compiler builtin, not a libc symbol — link error at runtime.)
-fn _kfd_fence() { return }
+fn _kfd_fence() {
+    // Emit `mfence` (0F AE F0). Even though x86 has strong WB ordering,
+    // the doorbell page is mapped UC/WC by the kernel — the AQL packet
+    // body (cacheable) and doorbell write (uncached) can otherwise be
+    // observed out of order. Without a real fence, back-to-back
+    // dispatches hang on iter 1 because the CP rings before the new
+    // packet is visible to the GPU.
+    asm {
+        "0x0F 0xAE 0xF0"   // mfence
+    }
+}
 
 fn kfd_dispatch(uint64 q, uint64 kernel,
                  uint64 grid_x, uint64 grid_y, uint64 grid_z,
@@ -735,24 +811,39 @@ fn kfd_dispatch(uint64 q, uint64 kernel,
     // Increment wp, write doorbell.
     uint64 new_wp = wp + 1
     unsafe { *(wp_host as uint64) = new_wp }
-    // Doorbell write -- 8-byte WC store of the new write_index.
-    // Doorbell page is mmap'd at db_host; specific doorbell within
-    // page is at db_host + (db_off & 0xFFF) on most KFD versions,
-    // OR at db_host + 0 if KFD already returned the per-queue
-    // doorbell offset (likely on this KFD). Try the latter first;
-    // if dispatch hangs, switch to the former pattern.
-    unsafe { *(db_host as uint64) = new_wp }
+    _kfd_fence()
+    // Doorbell semantics on gfx11 AQL queues: the value written is the
+    // index of the LAST VALID packet (= put_value − 1 = new_wp − 1), NOT
+    // the new write-pointer. Writing `new_wp` tells the CP "wait for
+    // packet new_wp to be ready" — packet new_wp does not exist, so the
+    // CP stalls forever on the second dispatch (the first happens to
+    // succeed because CP is in a fresh state and processes packets
+    // 0..put_value−1 regardless of whether the doorbell value is N or
+    // N−1, but on a re-arm the doorbell value is gating).
+    // Source: tinygrad ops_amd.py (signal_doorbell, AMDComputeAQLQueue).
+    uint64 db_value = new_wp - 1
+    unsafe { *(db_host as uint64) = db_value }
 }
 
 fn kfd_wait(uint64 q, uint64 signal_va) {
     uint32 wait_mode = 0; unsafe { *((q + 0x58) as uint32) -> wait_mode }
     if wait_mode == KFD_WAIT_BUSY_POLL {
+        // Cache the signal's host pointer ONCE before the spin loop.
+        // Calling kfd_signal_value() per iteration would invoke
+        // dev_host_ptr() which alloc()s 16 bytes per call — under a
+        // long busy-poll (millions of spins on a hung dispatch) this
+        // leaks gigabytes and OOM-kills the process.
+        uint64 sig_host = dev_host_ptr(signal_va)
+        uint64 sig_value_addr = sig_host + 0x08
+        uint64 v = 0
+        unsafe { *(sig_value_addr as uint64) -> v }
         uint64 spin = 0
-        while kfd_signal_value(signal_va) != 0 {
+        while v != 0 {
             spin = spin + 1
             if spin > 1000000000 {
                 kfd_die("kfd_wait: timeout busy-polling signal", spin)
             }
+            unsafe { *(sig_value_addr as uint64) -> v }
         }
     }
     if wait_mode == KFD_WAIT_EVENTS {
