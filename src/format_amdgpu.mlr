@@ -5367,7 +5367,10 @@ fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> u
         if k == 2 {
             if ast_fn_is_kernel(wc) != 0 {
                 uint64 lrc = amdgpu_lower_kernel_to_table(wc, source)
-                if lrc != 0 { return lrc }
+                // 0 = success, 1 = unsupported (hard error),
+                // 2 = skip-this-kernel (soft, drop it from the .co
+                //     and resolve from a fallback module at launch).
+                if lrc == 1 { return lrc }
             }
         }
         uint32 nxt = ast_next(wc)
@@ -5534,18 +5537,24 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     if tok_matches(name_tok, "decay_step", 10) != 0 {
         return amdgpu_lower_noesis_decay(kname_ptr, nl)
     }
+    // For the three not-yet-native kernels we emit a warning and
+    // return 2 (= "skip"). emit_amdgpu_from_module turns that into a
+    // continue, so the .co contains only the kernels that DO lower.
+    // The launcher resolves unsupported kernels from a fallback .co
+    // via NOESIS_CSR_CO_PATH (see examples/noesis_60m_gpu_launch.mlr).
+    // This dual-.co strategy lets us land the kernels one-by-one
+    // without blocking the bench writeup on full coverage.
     if tok_matches(name_tok, "lif_step", 8) != 0 {
-        write(2, "mlrc: amdgpu-native: lif_step not yet supported (TODO).\n", 56)
-        write(2, "  needs f64 division (Newton+fixup), v_add_co_u32 carry,\n", 57)
-        write(2, "  global_store_b8. Build .co with --target=hip-amd.\n", 52)
-        return 1
+        write(2, "mlrc: amdgpu-native: skipping lif_step (not yet native).\n", 57)
+        write(2, "  Build a fallback .co with --target=hip-amd and set\n", 53)
+        write(2, "  NOESIS_CSR_CO_PATH at launch time.\n", 37)
+        return 2
     }
     if tok_matches(name_tok, "delivery_step", 13) != 0 {
-        write(2, "mlrc: amdgpu-native: delivery_step not yet supported (TODO).\n", 61)
-        write(2, "  needs v_mul_lo_u32, v_lshlrev_b64, v_add_co_u32 carry,\n", 57)
-        write(2, "  v_cndmask_b32, CAS-retry with backwards-branch patching,\n", 59)
-        write(2, "  global_load_u8. Build .co with --target=hip-amd.\n", 51)
-        return 1
+        write(2, "mlrc: amdgpu-native: skipping delivery_step (not yet native).\n", 62)
+        write(2, "  Build a fallback .co with --target=hip-amd and set\n", 53)
+        write(2, "  NOESIS_CSR_CO_PATH at launch time.\n", 37)
+        return 2
     }
     if tok_matches(name_tok, "csr_build", 9) != 0 {
         // csr_build needs splitmix64 (4× 64-bit multiply) and a 64-bit
@@ -5553,13 +5562,11 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         // encoder yet; implementing them is multi-day work and only
         // amortises across one launch (csr_build runs once at sim
         // start). csr_build is a one-shot startup kernel, so this does
-        // not block hot-path benchmarking once the other three lower
-        // natively.
-        write(2, "mlrc: amdgpu-native: csr_build not yet supported (TODO).\n", 57)
-        write(2, "  needs v_mul_lo_u64 + 64-bit unsigned modulo helpers.\n", 55)
-        write(2, "  Build the .co with --target=hip-amd. csr_build is\n", 52)
-        write(2, "  a one-shot startup kernel — not on the hot path.\n", 51)
-        return 1
+        // not block hot-path benchmarking.
+        write(2, "mlrc: amdgpu-native: skipping csr_build (not yet native).\n", 58)
+        write(2, "  Build a fallback .co with --target=hip-amd and set\n", 53)
+        write(2, "  NOESIS_CSR_CO_PATH at launch time.\n", 37)
+        return 2
     }
 
     // Param list — 1 or 2 params. If there are 2, the 2nd is taken

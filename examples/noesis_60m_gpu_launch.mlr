@@ -16,6 +16,7 @@ import "../std/hip.mlr"
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
 @dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
 
 static uint64 N         = 60000000
 static uint64 N_E       = 48000000
@@ -121,22 +122,61 @@ fn main() {
     uint64 mod = 0
     unsafe { *(mod_slot as uint64) -> mod }
 
+    // Optional fallback module for kernels not present in the primary
+    // .co — used while individual kernels migrate from hipcc to the
+    // native emitter. When NOESIS_CSR_CO_PATH is set, every kernel
+    // symbol is first looked up in the primary module; on miss
+    // (hipErrorNotFound = 500) the lookup retries against the
+    // fallback module. With env unset, behaviour is unchanged
+    // (single .co supplies all four kernels).
+    uint64 fb_mod = 0
+    uint64 fb_loaded = 0
+    uint64 fallback_path = getenv("NOESIS_CSR_CO_PATH")
+    if fallback_path != 0 {
+        uint64 fd2 = file_open(fallback_path, 0)
+        if fd2 > 0xFFFFFFFFFFFFF000 {
+            puts("NOESIS_CSR_CO_PATH set but file unreadable")
+            exit(1)
+        }
+        uint64 fb_size = file_size(fd2)
+        uint64 fb_blob = alloc(fb_size)
+        file_read(fd2, fb_blob, fb_size)
+        file_close(fd2)
+        uint64 fb_slot = alloc(8)
+        err = hipModuleLoadData(fb_slot, fb_blob)
+        if err != 0 { die("hipModuleLoadData fallback", err) }
+        unsafe { *(fb_slot as uint64) -> fb_mod }
+        fb_loaded = 1
+    }
+
     // Resolve kernel handles
     uint64 fh_csr      = 0
     uint64 fh_decay    = 0
     uint64 fh_lif      = 0
     uint64 fh_delivery = 0
     uint64 slot = alloc(8)
-    err = hipModuleGetFunction(slot, mod, "csr_build"); if err != 0 { die("getFn csr_build", err) }
+
+    err = hipModuleGetFunction(slot, mod, "csr_build")
+    if err == 500 && fb_loaded != 0 { err = hipModuleGetFunction(slot, fb_mod, "csr_build") }
+    if err != 0 { die("getFn csr_build", err) }
     unsafe { *(slot as uint64) -> fh_csr }
+
     slot = alloc(8)
-    err = hipModuleGetFunction(slot, mod, "decay_step"); if err != 0 { die("getFn decay_step", err) }
+    err = hipModuleGetFunction(slot, mod, "decay_step")
+    if err == 500 && fb_loaded != 0 { err = hipModuleGetFunction(slot, fb_mod, "decay_step") }
+    if err != 0 { die("getFn decay_step", err) }
     unsafe { *(slot as uint64) -> fh_decay }
+
     slot = alloc(8)
-    err = hipModuleGetFunction(slot, mod, "lif_step"); if err != 0 { die("getFn lif_step", err) }
+    err = hipModuleGetFunction(slot, mod, "lif_step")
+    if err == 500 && fb_loaded != 0 { err = hipModuleGetFunction(slot, fb_mod, "lif_step") }
+    if err != 0 { die("getFn lif_step", err) }
     unsafe { *(slot as uint64) -> fh_lif }
+
     slot = alloc(8)
-    err = hipModuleGetFunction(slot, mod, "delivery_step"); if err != 0 { die("getFn delivery_step", err) }
+    err = hipModuleGetFunction(slot, mod, "delivery_step")
+    if err == 500 && fb_loaded != 0 { err = hipModuleGetFunction(slot, fb_mod, "delivery_step") }
+    if err != 0 { die("getFn delivery_step", err) }
     unsafe { *(slot as uint64) -> fh_delivery }
 
     uint64 t_start = time_ns()
