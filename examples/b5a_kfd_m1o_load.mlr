@@ -1,8 +1,9 @@
 // Stage 2a device gate: M1o atomic-demo via raw KFD. Identical
 // numerical output to examples/m1o_atomic_load.mlr (HIP path).
 //
-// The kernel atomically adds 1 to *out from each lane in a single
-// 32-lane wave. Expected final value: 32.
+// The kernel is a single-thread global_atomic_cmpswap_b64 that
+// swaps 0 -> 7 at *out. Host primes *out=0, dispatches with
+// grid=1, block=1 (one thread). Expected final value: 7.
 
 import "../std/kfd.mlr"
 
@@ -61,17 +62,17 @@ fn main() {
     uint64 kernarg_host = dev_host_ptr(kernarg)
     unsafe { *(kernarg_host as uint64) = d_out }
 
-    // Dispatch: grid 1×1×1, block 32×1×1 — one full wave.
-    kfd_dispatch(q, kernel, 1, 1, 1, 32, 1, 1, kernarg, 8, signal)
+    // Dispatch: grid=1, block=1 — single-thread CAS(0 -> 7).
+    kfd_dispatch(q, kernel, 1, 1, 1, 1, 1, 1, kernarg, 8, signal)
     kfd_wait(q, signal)
 
     uint64 result = 0; unsafe { *(d_out_host as uint64) -> result }
     print_label_val("atomic_result", 13, result)
 
-    if result == 32 {
+    if result == 7 {
         puts("M1o gate (KFD): GREEN")
         exit(0)
     }
-    puts("FAIL: atomic_result != 32")
+    puts("FAIL: atomic_result != 7")
     exit(1)
 }
