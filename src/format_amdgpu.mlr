@@ -5574,6 +5574,252 @@ fn asm_v_cmp_ne_u32_imm0_vgpr(uint64 vgpr) {
     asm_u32(word)
 }
 
+// ─── ISA helpers used by the noesis lif_step lowering ──────────────
+// All encodings verified against llvm-mc -triple=amdgcn -mcpu=gfx1100.
+
+// v_cmp_lt_u64_e32 vcc_lo, 0, v[src1:+1]  — VOPC op 0x59.
+//   vcc_lo = (0 < v[src1]) per active lane. With src1=ref pair, this
+//   is the "ref > 0" guard at the head of lif_step's main branch.
+//   Verified: `v_cmp_lt_u64_e32 vcc_lo, 0, v[2:3]` → 0x7CB20480.
+fn asm_v_cmp_lt_u64_imm0_vgpr_pair(uint64 vsrc1_pair) {
+    uint64 src0_enc = 0x80                                   // inline 0
+    uint64 word = (0x3E << 25)
+                  | (0x59 << 17)
+                  | ((vsrc1_pair & 0xFF) << 9)
+                  | (src0_enc & 0x1FF)
+    asm_u32(word)
+}
+
+// global_store_b8 v[v_addr_pair:+1], v_data, off  — GLOBAL op 0x18,
+//   off-saddr form (saddr = OFF/0x7C). Stores the low byte of v_data
+//   to the byte at v[v_addr_pair]. Used by lif_step to write
+//   fired[i] = 0 / 1 (u8). Verified:
+//     global_store_b8 v[2:3], v0, off → 0xDC620000 0x00007C02.
+fn asm_global_store_b8_offvaddr(uint64 vaddr_pair, uint64 vdata) {
+    asm_u32(0xDC620000)
+    uint64 word2 = (0x7C << 16)                              // saddr = OFF
+                   | ((vdata     & 0xFF) << 8)
+                   | (vaddr_pair & 0xFF)
+    asm_u32(word2)
+}
+
+// global_store_b8 v_addr_u32, v_data, s[saddr:+1]  — GLOBAL op 0x18.
+//   With sbase form (saddr is a raw SGPR pair), v_addr is a single
+//   VGPR with a 32-bit byte offset. Used by lif_step's "fired[i]=0"
+//   write at function entry (cheap since the byte offset is just gid).
+//   Encoding for `global_store_b8 v0, v0, s[14:15]`: word1=0xDC620000,
+//   word2 = (saddr_pair_raw_lo<<16) | (vdata<<8) | vaddr  with
+//   saddr=14 → 0x000E0000 (NOT pair-halved like SMEM; saddr is a raw
+//   SGPR index, same as the existing global_load_b64's saddr_pair arg).
+fn asm_global_store_b8_saddr(uint64 vaddr, uint64 vdata, uint64 saddr_pair) {
+    asm_u32(0xDC620000)
+    uint64 word2 = ((saddr_pair & 0x7F) << 16)
+                   | ((vdata     & 0xFF) << 8)
+                   | (vaddr      & 0xFF)
+    asm_u32(word2)
+}
+
+// v_rcp_f64 v[vdst:+1], v[vsrc:+1]  — VOP1 op 0x2F (gfx11 b3 → 0x18 e32 form).
+//   Initial reciprocal estimate (~14 bits of accuracy) for f64 division.
+//   Verified: `v_rcp_f64_e32 v[12:13], v[10:11]` → 0x7E185F0A.
+fn asm_v_rcp_f64(uint64 vdst_pair, uint64 vsrc_pair) {
+    uint64 src0_enc = 0x100 | (vsrc_pair & 0xFF)             // VGPR
+    uint64 word = (0x3F << 25)                                // VOP1 prefix
+                  | ((vdst_pair & 0xFF) << 17)
+                  | (0x2F << 9)                               // op
+                  | (src0_enc & 0x1FF)
+    asm_u32(word)
+}
+
+// v_div_scale_f64 v[vdst:+1], <sdst>, v[s0:+1], v[s1:+1], v[s2:+1]
+//   VOP3B op 0x0FD. Scales operands of f64 division to avoid
+//   underflow / overflow. sdst gets a scale flag (0x7C=null to discard,
+//   0x6A=vcc_lo to feed v_div_fmas_f64's implicit shift control).
+//   Verified:
+//     v[4:5], null, v[2:3], v[2:3], v[0:1] → 0xD6FD7C04 0x04020502.
+//     v[8:9], vcc_lo, v[0:1], v[2:3], v[0:1] → 0xD6FD6A08 0x04020500.
+//   word1 = 0xD6FD0000 | (sdst << 8) | vdst.
+//   word2 = (src2_enc<<18) | (src1_enc<<9) | src0_enc, no neg/abs.
+fn asm_v_div_scale_f64(uint64 vdst_pair, uint64 sdst,
+                       uint64 vsrc0_pair, uint64 vsrc1_pair, uint64 vsrc2_pair) {
+    uint64 word1 = 0xD6FD0000 | ((sdst & 0xFF) << 8) | (vdst_pair & 0xFF)
+    uint64 src0_enc = 0x100 | (vsrc0_pair & 0xFF)
+    uint64 src1_enc = 0x100 | (vsrc1_pair & 0xFF)
+    uint64 src2_enc = 0x100 | (vsrc2_pair & 0xFF)
+    uint64 word2 = ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_fma_f64 v[vdst:+1], -v[s0:+1], v[s1:+1], 1.0  — VOP3 op 0x014, neg src0.
+//   Computes vdst = -src0 * src1 + 1.0  (f64 inline literal 1.0 = 0xF2).
+//   Verified: `v_fma_f64 v[16:17], -v[10:11], v[12:13], 1.0`
+//             → 0xD6140010 0x23CA190A.
+fn asm_v_fma_f64_neg_v_v_lit1(uint64 vdst_pair, uint64 v_src0_pair,
+                               uint64 v_src1_pair) {
+    uint64 word1 = (0x6B << 25) | (0x014 << 16) | (vdst_pair & 0xFF)
+    asm_u32(word1)
+    uint64 src0_enc = 0x100 | (v_src0_pair & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1_pair & 0xFF)
+    uint64 src2_enc = 0xF2                                    // inline 1.0
+    uint64 neg = 0x1                                          // neg[0] = 1 → -src0
+    uint64 word2 = (neg << 29)
+                   | ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word2)
+}
+
+// v_fma_f64 v[vdst:+1], v[s0:+1], v[s1:+1], v[s2:+1]  — VOP3 op 0x014, no neg.
+//   All-VGPR three-source FMA. Verified:
+//     v_fma_f64 v[12:13], v[16:17], v[12:13], v[12:13] → 0xD614000C 0x04321910.
+//     v_fma_f64 v[16:17], v[10:11], v[12:13], v[14:15] → 0xD6140010 0x041A190A.
+fn asm_v_fma_f64_v_v_v(uint64 vdst_pair, uint64 v_src0_pair,
+                       uint64 v_src1_pair, uint64 v_src2_pair) {
+    uint64 word1 = (0x6B << 25) | (0x014 << 16) | (vdst_pair & 0xFF)
+    asm_u32(word1)
+    uint64 src0_enc = 0x100 | (v_src0_pair & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1_pair & 0xFF)
+    uint64 src2_enc = 0x100 | (v_src2_pair & 0xFF)
+    uint64 word2 = ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word2)
+}
+
+// v_fma_f64 v[vdst:+1], -v[s0:+1], v[s1:+1], v[s2:+1]  — VOP3 op 0x014, neg src0.
+//   All-VGPR three-source FMA, src0 negated.
+//   Verified: `v_fma_f64 v[18:19], -v[16:17], v[12:13], v[14:15]`
+//             → 0xD6140012 0x243A1910.
+fn asm_v_fma_f64_negv_v_v(uint64 vdst_pair, uint64 v_src0_pair,
+                          uint64 v_src1_pair, uint64 v_src2_pair) {
+    uint64 word1 = (0x6B << 25) | (0x014 << 16) | (vdst_pair & 0xFF)
+    asm_u32(word1)
+    uint64 src0_enc = 0x100 | (v_src0_pair & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1_pair & 0xFF)
+    uint64 src2_enc = 0x100 | (v_src2_pair & 0xFF)
+    uint64 neg = 0x1                                          // neg[0] = 1
+    uint64 word2 = (neg << 29)
+                   | ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word2)
+}
+
+// v_div_fmas_f64 v[vdst:+1], v[s0:+1], v[s1:+1], v[s2:+1]  — VOP3 op 0x038.
+//   FMA with implicit shift control from VCC; used in IEEE-correct f64
+//   division to compute the rounded quotient.
+//   Verified: v_div_fmas_f64 v[16:17], v[12:13], v[10:11], v[14:15]
+//             → 0xD6380010 0x043A150C.
+fn asm_v_div_fmas_f64(uint64 vdst_pair, uint64 v_src0_pair,
+                      uint64 v_src1_pair, uint64 v_src2_pair) {
+    uint64 word1 = (0x6B << 25) | (0x038 << 16) | (vdst_pair & 0xFF)
+    asm_u32(word1)
+    uint64 src0_enc = 0x100 | (v_src0_pair & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1_pair & 0xFF)
+    uint64 src2_enc = 0x100 | (v_src2_pair & 0xFF)
+    uint64 word2 = ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word2)
+}
+
+// v_div_fmas_f64 v[vdst:+1], -v[s0:+1], v[s1:+1], v[s2:+1] — neg src0 form.
+//   Verified: v_div_fmas_f64 v[16:17], -v[12:13], v[10:11], v[14:15]
+//             → 0xD6380010 0x243A150C.
+fn asm_v_div_fmas_f64_neg(uint64 vdst_pair, uint64 v_src0_pair,
+                          uint64 v_src1_pair, uint64 v_src2_pair) {
+    uint64 word1 = (0x6B << 25) | (0x038 << 16) | (vdst_pair & 0xFF)
+    asm_u32(word1)
+    uint64 src0_enc = 0x100 | (v_src0_pair & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1_pair & 0xFF)
+    uint64 src2_enc = 0x100 | (v_src2_pair & 0xFF)
+    uint64 neg = 0x1                                          // neg[0] = 1
+    uint64 word2 = (neg << 29)
+                   | ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word2)
+}
+
+// v_div_fixup_f64 v[vdst:+1], v[s0:+1], v[s1:+1], v[s2:+1]  — VOP3 op 0x028.
+//   Final IEEE rounding fixup for f64 division. src0 = quotient,
+//   src1 = denominator, src2 = numerator.
+//   Verified: v_div_fixup_f64 v[18:19], v[16:17], v[2:3], v[0:1]
+//             → 0xD6280012 0x04020510.
+fn asm_v_div_fixup_f64(uint64 vdst_pair, uint64 v_src0_pair,
+                       uint64 v_src1_pair, uint64 v_src2_pair) {
+    uint64 word1 = (0x6B << 25) | (0x028 << 16) | (vdst_pair & 0xFF)
+    asm_u32(word1)
+    uint64 src0_enc = 0x100 | (v_src0_pair & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1_pair & 0xFF)
+    uint64 src2_enc = 0x100 | (v_src2_pair & 0xFF)
+    uint64 word2 = ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word2)
+}
+
+// f64 division helper: v[r:r+1] = v[n:n+1] / v[d:d+1], using IEEE-correct
+// gfx11 sequence (10 instructions). Scratch VGPR pairs s0=scaled_d,
+// s1=scaled_n, t=reciprocal, u=correction term. Caller must reserve
+// 8 contiguous VGPRs for {s0,s1,t,u} (each is a pair) — we accept them
+// as 4 pair indices.
+//
+// Sequence (per AMD ISA + LLVM AMDGPU codegen):
+//   scaled_d = div_scale_f64(d, d, n)         ; vcc gets scale flag
+//   t        = rcp_f64(scaled_d)              ; ~14 bits
+//   u        = -scaled_d * t + 1              ; e0
+//   t        = u * t + t                      ; r += e0*r
+//   u        = -scaled_d * t + 1              ; e1
+//   t        = u * t + t                      ; r += e1*r (~52 bits)
+//   scaled_n = div_scale_f64(n, d, n)
+//   u        = div_fmas_f64(t, scaled_d, 0)   ; rounded q*d (no, actually...)
+//   ...
+// LLVM-correct sequence (cross-checked against AMDGPU backend codegen):
+//   scaled_d = div_scale_f64(vcc, d, d, n)     ; vdst pair, vcc gets flag
+//   rcp      = v_rcp_f64(scaled_d)
+//   u0       = v_fma_f64(-scaled_d, rcp, 1.0)
+//   t1       = v_fma_f64(u0, rcp, rcp)
+//   u1       = v_fma_f64(-scaled_d, t1, 1.0)
+//   t2       = v_fma_f64(u1, t1, t1)
+//   scaled_n = div_scale_f64(vcc, n, d, n)
+//   q1       = v_div_fmas_f64(t2, scaled_n, 0)   ; can't use 0 directly
+// On gfx11, the canonical LLVM sequence is:
+//   scaled_d = div_scale_f64(vcc, d, d, n)
+//   rcp      = v_rcp_f64(scaled_d)
+//   u0       = v_fma_f64(-scaled_d, rcp, 1.0)
+//   rcp1     = v_fma_f64(u0, rcp, rcp)
+//   u1       = v_fma_f64(-scaled_d, rcp1, 1.0)
+//   rcp2     = v_fma_f64(u1, rcp1, rcp1)
+//   scaled_n = div_scale_f64(vcc, n, d, n)        ; reset vcc to numerator scale
+//   q        = v_mul_f64(scaled_n, rcp2)          ; OR div_fmas_f64 trick
+//   r        = v_fma_f64(-scaled_d, q, scaled_n)  ; residual
+//   q1       = v_div_fmas_f64(r, rcp2, q)         ; corrected q with shift
+//   result   = v_div_fixup_f64(q1, d, n)
+//
+// Total: 11 VOP3 instructions. Caller passes:
+//   v_n_pair, v_d_pair, v_r_pair  (numerator, denominator, result; can alias)
+//   sd_pair = scaled_d scratch; sn_pair = scaled_n scratch;
+//   t_pair = reciprocal scratch; u_pair = correction scratch.
+// Result lands in v_r_pair.
+fn asm_lif_div_f64(uint64 v_n, uint64 v_d, uint64 v_r,
+                   uint64 sd, uint64 sn, uint64 t, uint64 u) {
+    asm_v_div_scale_f64(sd, 0x7C, v_d, v_d, v_n)       // sd = scaled_d, sdst=null
+    asm_v_rcp_f64(t, sd)                               // t = 1/scaled_d (rough)
+    asm_v_fma_f64_neg_v_v_lit1(u, sd, t)               // u = -sd*t + 1
+    asm_v_fma_f64_v_v_v(t, u, t, t)                    // t = u*t + t
+    asm_v_fma_f64_neg_v_v_lit1(u, sd, t)               // u = -sd*t + 1
+    asm_v_fma_f64_v_v_v(t, u, t, t)                    // t ≈ 1/sd accurate
+    asm_v_div_scale_f64(sn, 0x6A, v_n, v_d, v_n)       // sn = scaled_n, sdst=vcc_lo
+    asm_v_mul_f64_vv(u, sn, t)                         // u = sn * t (rough q)
+    asm_v_fma_f64_negv_v_v(v_r, sd, u, sn)             // r_scratch = -sd*u + sn
+    asm_v_div_fmas_f64(u, v_r, t, u)                   // u = r*t + u  (corrected)
+    asm_v_div_fixup_f64(v_r, u, v_d, v_n)              // result = fixup(u, d, n)
+}
+
 // gid = wg_id_x * 256 + tid_in_wg, written into v1.
 //   v_mov_b32 v1, s15            ; v1 = wg_id_x
 //   v_lshlrev_b32 v1, 8, v1      ; v1 = wg_id_x << 8
@@ -5935,6 +6181,309 @@ fn amdgpu_lower_noesis_delivery(uint64 kname_ptr, uint64 nl) -> uint64 {
     return 0
 }
 
+// noesis lif_step lowering.
+//
+//   @kernel fn lif_step(
+//       uint64 V_ptr, uint64 ref_ptr, uint64 RI_ptr,
+//       uint64 s_exc_ptr, uint64 s_inh_ptr, uint64 spike_ptr,
+//       uint64 fired_ptr, uint64 n,
+//       f64 dt, f64 V_rest, f64 V_reset, f64 V_thresh,
+//       f64 tau_m, f64 J_E, f64 J_I, uint64 ref_steps
+//   ) {
+//       i = tid_x()
+//       if i < n {
+//           fired[i] = 0  (u8)
+//           rc = ref[i]
+//           if rc > 0 {
+//               ref[i] = rc - 1
+//               V[i] = V_reset
+//           } else {
+//               v = V[i]; ri = RI[i]; se = s_exc[i]; si = s_inh[i]
+//               drive = ri + se*J_E - si*J_I
+//               dv    = dt * (V_rest - v + drive) / tau_m
+//               v_new = v + dv
+//               if v_new >= V_thresh {
+//                   V[i] = V_reset; ref[i] = ref_steps; spike[i]++; fired[i]=1
+//               } else {
+//                   V[i] = v_new
+//               }
+//           }
+//       }
+//   }
+//
+// Kernarg layout (16 args × 8 bytes = 128 bytes total, matches launcher
+// kp_lif byte-for-byte). Per the lesson from the delivery_step session,
+// every kernarg is declared as size=8 — the launcher writes 8 bytes per
+// slot regardless of declared type, and HIP runtime auto-alignment from
+// declared sizes can slip the offset of a downstream f64 if a u32 sneaks
+// in (caused the session-3 illegal-address bug). With size=8 across the
+// board, offsets land at 0,8,16,...,120 byte-for-byte.
+//
+//   [0x00] V_ptr      (u64*)  → s[2:3]
+//   [0x08] ref_ptr    (u64*)  → s[4:5]
+//   [0x10] RI_ptr     (f64*)  → s[6:7]
+//   [0x18] s_exc_ptr  (f64*)  → s[8:9]
+//   [0x20] s_inh_ptr  (f64*)  → s[10:11]
+//   [0x28] spike_ptr  (u64*)  → s[12:13]
+//   [0x30] fired_ptr  (u8*)   → s[16:17]   (skip s[14:15] — s15 = wg_id_x)
+//   [0x38] n          (u32 lo)→ s14
+//   [0x40] dt         (f64)   → s[18:19]
+//   [0x48] V_rest     (f64)   → s[20:21]
+//   [0x50] V_reset    (f64)   → s[22:23]
+//   [0x58] V_thresh   (f64)   → s[24:25]
+//   [0x60] tau_m      (f64)   → s[26:27]
+//   [0x68] J_E        (f64)   → s[28:29]
+//   [0x70] J_I        (f64)   → s[30:31]
+//   [0x78] ref_steps  (u32 lo)→ s32
+//
+// EXEC saves: s33 = outer (gid<n), s34 = refractory, s35 = spike.
+//
+// VGPR plan:
+//   v0  = tid_in_wg (kernel input)
+//   v1  = gid (= wg_id_x*256 + v0)
+//   v2  = byte offset (= gid*8) for f64/u64 stores
+//   v3  = byte offset (= gid) for the u8 fired store
+//   v4  = scratch (0 / 1 inline for fired writes)
+//   v[10:11] = V (active) / V_reset splat (refractory + spike)
+//   v[12:13] = rc (refractory test) / ref_steps splat (spike)
+//   v[14:15] = RI (active) / dt splat / tau_m splat / spike[i] (spike)
+//   v[16:17] = se (active) / div scratch sd (active div)
+//   v[18:19] = si (active) / div scratch sn
+//   v[20:21] = drive accumulator / div scratch t (rcp)
+//   v[22:23] = dv_num = (V_rest - V + drive) * dt
+//   v[24:25] = div scratch u
+//   v[26:27] = dv (= num/den)
+//   v[28:29] = v_new (= V + dv)
+//   v[30:31] = V_thresh splat
+//
+// VGPR count: 32 → granule=3 (rsrc1 = 0xE0AF0003).
+fn amdgpu_lower_noesis_lif(uint64 kname_ptr, uint64 nl) -> uint64 {
+    asm_init()
+
+    // ── Phase 1: gid in v1 = wg_id_x*256 + tid_in_wg ──
+    asm_noesis_compute_gid_v1()
+
+    // ── Phase 2: prologue, load all 16 kernargs into SGPRs ──
+    asm_s_load_b64(1, 0)                        // s[2:3]   = V_ptr
+    asm_s_load_b64_off(2, 0, 0x08)              // s[4:5]   = ref_ptr
+    asm_s_load_b64_off(3, 0, 0x10)              // s[6:7]   = RI_ptr
+    asm_s_load_b64_off(4, 0, 0x18)              // s[8:9]   = s_exc_ptr
+    asm_s_load_b64_off(5, 0, 0x20)              // s[10:11] = s_inh_ptr
+    asm_s_load_b64_off(6, 0, 0x28)              // s[12:13] = spike_ptr
+    // sdata_pair=8 → s[16:17] (skipping s[14:15] which holds wg_id_x's
+    // upper half + n).
+    asm_s_load_b64_off(8, 0, 0x30)              // s[16:17] = fired_ptr
+    asm_s_load_b32(7, 0, 0x38)                  // s14 = n (low 32 bits)
+    asm_s_load_b64_off(9, 0, 0x40)              // s[18:19] = dt
+    asm_s_load_b64_off(10, 0, 0x48)             // s[20:21] = V_rest
+    asm_s_load_b64_off(11, 0, 0x50)             // s[22:23] = V_reset
+    asm_s_load_b64_off(12, 0, 0x58)             // s[24:25] = V_thresh
+    asm_s_load_b64_off(13, 0, 0x60)             // s[26:27] = tau_m
+    asm_s_load_b64_off(14, 0, 0x68)             // s[28:29] = J_E
+    asm_s_load_b64_off(15, 0, 0x70)             // s[30:31] = J_I
+    asm_s_load_b32(16, 0, 0x78)                 // s32 = ref_steps (low 32 bits)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Phase 3: outer bounds check (gid < n) ──
+    asm_v_cmp_gt_u32_sgpr_vgpr(14, 1)           // vcc_lo = (s14 > v1)
+    asm_s_and_saveexec_b32_vcc_lo(33)           // s33 = old EXEC; EXEC &= bounds
+    uint64 outer_skip_off = asm_text_len / 4
+    asm_s_cbranch_execz(0)                      // (placeholder, patched to s_endpgm)
+
+    // Compute byte offsets used throughout:
+    //   v2 = gid*8   (for u64/f64 strided arrays)
+    //   v3 = gid     (for u8 fired array)
+    asm_v_lshlrev_b32_imm(2, 3, 1)              // v2 = v1 << 3
+    asm_v_mov_b32(3, 0x100 | 1)                 // v3 = v1
+    asm_s_delay_alu(0x01)
+
+    // ── Phase 4: unconditional fired[i] = 0 (only for active outer lanes) ──
+    asm_v_mov_b32_inline_u(4, 0)                // v4 = 0
+    asm_global_store_b8_saddr(3, 4, 16)         // store_b8 (s[16:17]+v3) = v4
+
+    // ── Phase 5: load rc = ref[i] into v[12:13] ──
+    asm_global_load_b64(12, 2, 4)               // v[12:13] = ref[gid]
+    asm_s_waitcnt_vmcnt_zero()
+
+    // ── Phase 6: refractory test (rc > 0) ──
+    asm_v_cmp_lt_u64_imm0_vgpr_pair(12)         // vcc = (0 < rc) = (rc > 0)
+    asm_s_and_saveexec_b32_vcc_lo(34)           // s34 = bounded EXEC; EXEC &= rc>0
+    uint64 ref_then_skip_off = asm_text_len / 4
+    asm_s_cbranch_execz(0)                      // (placeholder, patched to ref_else_label)
+
+    // ── Phase 7: refractory body ──
+    //   ref[i] = rc - 1 (u64 with carry chain)
+    //   V[i]   = V_reset
+    asm_v_add_co_u32_vcc_sv(12, 0xC1, 12)       // v12 = -1 + v12 (low, sets vcc)
+    asm_v_add_co_ci_u32_null_sv_vcc(13, 0xC1, 13)  // v13 = -1 + v13 + carry-in
+    asm_s_delay_alu(0x01)
+    asm_global_store_b64(2, 12, 4)              // ref[gid] = v[12:13]
+
+    // V[i] = V_reset:
+    //   splat V_reset (s[22:23]) into v[10:11], then store.
+    asm_v_mov_b32(10, 22)                       // v10 = s22
+    asm_v_mov_b32(11, 23)                       // v11 = s23
+    asm_s_delay_alu(0x01)
+    asm_global_store_b64(2, 10, 2)              // V[gid] = v[10:11]
+
+    // ── Phase 8: flip EXEC to active branch (bounded ∩ rc==0) ──
+    uint64 ref_else_label_off = asm_text_len / 4
+    // Back-patch ref_then_skip's execz target → ref_else_label.
+    uint64 ref_then_dwords = ref_else_label_off - (ref_then_skip_off + 1)
+    uint64 ref_then_patch_byte = asm_text_buf + ref_then_skip_off * 4
+    uint32 ref_then_word = 0xBFA50000 | (ref_then_dwords & 0xFFFF)
+    unsafe { *(ref_then_patch_byte as uint32) = ref_then_word }
+    // exec = exec ^ s34 = (bounded ∩ rc>0) ^ bounded = bounded ∩ rc==0
+    asm_s_xor_b32_exec_sgpr(34)
+
+    // Skip the active body if no lanes are active:
+    uint64 active_skip_off = asm_text_len / 4
+    asm_s_cbranch_execz(0)                      // (placeholder, patched to outer_end)
+
+    // ── Phase 9: active body — load V, RI, se, si ──
+    asm_global_load_b64(10, 2, 2)               // v[10:11] = V[gid]
+    asm_global_load_b64(14, 2, 6)               // v[14:15] = RI[gid]
+    asm_global_load_b64(16, 2, 8)               // v[16:17] = se[gid]
+    asm_global_load_b64(18, 2, 10)              // v[18:19] = si[gid]
+    asm_s_waitcnt_vmcnt_zero()
+
+    // ── Phase 10: drive = ri + se*J_E - si*J_I ──
+    //   v[20:21] = J_E*se + ri  (fma_f64_s_v_v with s_src=s[28:29], v1=v[16:17], v2=v[14:15])
+    asm_v_fma_f64_s_v_v(20, 28, 16, 14)
+    asm_s_delay_alu(0x01)
+    //   v[20:21] = -J_I*si + drive
+    asm_v_fma_f64_neg_s_v_v(20, 30, 18, 20)
+    asm_s_delay_alu(0x01)
+
+    // ── Phase 11: dv_num = (V_rest - V + drive) ──
+    //   v[22:23] = V_rest + (-V) [V in v[10:11]]
+    asm_v_add_f64_s_negv(22, 20, 10)            // s[20:21] = V_rest, -v[10:11] = -V
+    asm_s_delay_alu(0x01)
+    //   v[22:23] = (V_rest - V) + drive [drive in v[20:21]]
+    asm_v_add_f64_vv(22, 22, 20)
+    asm_s_delay_alu(0x01)
+
+    // ── Phase 12: numerator = dt * dv_num ──
+    //   Splat dt (s[18:19]) into v[14:15], then v_mul_f64.
+    asm_v_mov_b32(14, 18)                       // v14 = s18
+    asm_v_mov_b32(15, 19)                       // v15 = s19
+    asm_s_delay_alu(0x01)
+    asm_v_mul_f64_vv(22, 14, 22)                // v[22:23] = dt * dv_num
+
+    // ── Phase 13: dv = numerator / tau_m ──
+    //   Splat tau_m (s[26:27]) into v[14:15] (reuse).
+    asm_v_mov_b32(14, 26)                       // v14 = s26
+    asm_v_mov_b32(15, 27)                       // v15 = s27
+    asm_s_delay_alu(0x01)
+    //   IEEE-correct f64 div: scratch sd=v[16:17], sn=v[18:19],
+    //   t=v[20:21], u=v[24:25]. Result in v[26:27].
+    asm_lif_div_f64(22, 14, 26, 16, 18, 20, 24)
+
+    // ── Phase 14: v_new = V + dv ──
+    asm_v_add_f64_vv(28, 10, 26)                // v[28:29] = V + dv
+    asm_s_delay_alu(0x01)
+
+    // ── Phase 15: spike test (v_new >= V_thresh) ──
+    //   Splat V_thresh (s[24:25]) into v[30:31] for v_cmp_ge_f64_vv.
+    asm_v_mov_b32(30, 24)                       // v30 = s24
+    asm_v_mov_b32(31, 25)                       // v31 = s25
+    asm_s_delay_alu(0x01)
+    asm_v_cmp_ge_f64_vv(28, 30)                 // vcc = (v_new >= V_thresh)
+    asm_s_and_saveexec_b32_vcc_lo(35)           // s35 = active EXEC; EXEC &= spike
+    uint64 spike_then_skip_off = asm_text_len / 4
+    asm_s_cbranch_execz(0)                      // (placeholder, patched to spike_else_label)
+
+    // ── Phase 16: spike body ──
+    //   V[i] = V_reset
+    asm_v_mov_b32(10, 22)                       // v10 = s22 (V_reset lo)
+    asm_v_mov_b32(11, 23)                       // v11 = s23 (V_reset hi)
+    asm_s_delay_alu(0x01)
+    asm_global_store_b64(2, 10, 2)              // V[gid] = V_reset
+    //   ref[i] = ref_steps (u64 with high half = 0)
+    asm_v_mov_b32(12, 32)                       // v12 = s32 (ref_steps lo)
+    asm_v_mov_b32_inline_u(13, 0)               // v13 = 0
+    asm_s_delay_alu(0x01)
+    asm_global_store_b64(2, 12, 4)              // ref[gid] = ref_steps
+    //   spike[i] += 1 (per-neuron, no race because i is unique)
+    asm_global_load_b64(14, 2, 12)              // v[14:15] = spike[gid]
+    asm_s_waitcnt_vmcnt_zero()
+    asm_v_add_co_u32_vcc_sv(14, 0x81, 14)       // v14 = 1 + v14 (sets vcc carry)
+    asm_v_add_co_ci_u32_null_sv_vcc(15, 0x80, 15)  // v15 = 0 + v15 + carry
+    asm_s_delay_alu(0x01)
+    asm_global_store_b64(2, 14, 12)             // spike[gid] = incremented
+    //   fired[i] = 1
+    asm_v_mov_b32_inline_u(4, 1)                // v4 = 1
+    asm_global_store_b8_saddr(3, 4, 16)
+
+    // ── Phase 17: flip to no-spike (active ∩ v_new < V_thresh) ──
+    uint64 spike_else_label_off = asm_text_len / 4
+    // Back-patch spike_then_skip → spike_else_label.
+    uint64 spike_then_dwords = spike_else_label_off - (spike_then_skip_off + 1)
+    uint64 spike_then_patch_byte = asm_text_buf + spike_then_skip_off * 4
+    uint32 spike_then_word = 0xBFA50000 | (spike_then_dwords & 0xFFFF)
+    unsafe { *(spike_then_patch_byte as uint32) = spike_then_word }
+    asm_s_xor_b32_exec_sgpr(35)                 // exec = active ∩ no-spike
+
+    // ── Phase 18: no-spike body: V[i] = v_new ──
+    asm_global_store_b64(2, 28, 2)              // V[gid] = v_new
+
+    // ── Phase 19: outer end ──
+    uint64 outer_end_off = asm_text_len / 4
+    // Back-patch outer execz (skip whole body if all lanes failed bounds).
+    uint64 outer_dwords = outer_end_off - (outer_skip_off + 1)
+    uint64 outer_patch_byte = asm_text_buf + outer_skip_off * 4
+    uint32 outer_word = 0xBFA50000 | (outer_dwords & 0xFFFF)
+    unsafe { *(outer_patch_byte as uint32) = outer_word }
+    // Back-patch active execz (skip active body if all bounded lanes are refractory).
+    uint64 active_dwords = outer_end_off - (active_skip_off + 1)
+    uint64 active_patch_byte = asm_text_buf + active_skip_off * 4
+    uint32 active_word = 0xBFA50000 | (active_dwords & 0xFFFF)
+    unsafe { *(active_patch_byte as uint32) = active_word }
+    asm_s_endpgm()
+
+    // ── Args desc: 16 entries, all size=8. The first 7 are pointers
+    //   (GLOBAL_BUFFER); n is BY_VALUE (u64); 7 f64s are BY_VALUE; the
+    //   last (ref_steps) is BY_VALUE. ──
+    uint64 args_desc = alloc(16 * 16)
+    uint64 ai = 0
+    while ai < 7 {                              // 7 pointers
+        uint64 p0 = args_desc + ai * 16;     unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8; unsafe { *(p1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        ai = ai + 1
+    }
+    while ai < 16 {                             // n + dt + V_rest + V_reset + V_thresh + tau_m + J_E + J_I + ref_steps = 9 by-values
+        uint64 p0 = args_desc + ai * 16;     unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8; unsafe { *(p1 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        ai = ai + 1
+    }
+
+    // Snapshot text into private buffer (asm_init clobbers asm_text_buf).
+    uint64 k_text_size = asm_text_len
+    uint64 k_text_buf  = alloc(k_text_size)
+    uint64 ci = 0
+    while ci < k_text_size {
+        uint64 sp = asm_text_buf + ci
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        uint64 dp = k_text_buf + ci
+        uint8 b8 = b
+        unsafe { *(dp as uint8) = b8 }
+        ci = ci + 1
+    }
+
+    uint64 rsrc1 = 0xE0AF0003                   // VGPR granule=3 → 32 VGPRs
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    // sgpr_count: s0..s35 = 36 SGPRs.
+    kt_push(kname_ptr, nl, k_text_buf, k_text_size,
+            args_desc, 16, 128,
+            36, 32,
+            rsrc1, rsrc2, rsrc3, props)
+    return 0
+}
+
 // Lower one @kernel fn_node into the kernel table. Returns 0 on
 // success, 1 on unsupported shape. Recognises the same two shapes
 // the M1d/M1e lowerer already handled:
@@ -5982,10 +6531,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     // This dual-.co strategy lets us land the kernels one-by-one
     // without blocking the bench writeup on full coverage.
     if tok_matches(name_tok, "lif_step", 8) != 0 {
-        write(2, "mlrc: amdgpu-native: skipping lif_step (not yet native).\n", 57)
-        write(2, "  Build a fallback .co with --target=hip-amd and set\n", 53)
-        write(2, "  NOESIS_CSR_CO_PATH at launch time.\n", 37)
-        return 2
+        return amdgpu_lower_noesis_lif(kname_ptr, nl)
     }
     if tok_matches(name_tok, "delivery_step", 13) != 0 {
         return amdgpu_lower_noesis_delivery(kname_ptr, nl)
