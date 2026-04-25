@@ -1,0 +1,164 @@
+// Stage 2c port of M1s (csr_e_deliver) to raw KFD. Single-thread,
+// 3 outgoing synapses with mixed is_ee, scatter into s_exc + STDP LTD
+// + ltd_events counter.
+//
+// Emit: ./build/mlrc --emit-amdgpu-csr-e-deliver=/tmp/m1s.co
+// Compile: ./build/mlrc --arch=x86_64 examples/b5c_kfd_m1s_load.mlr -o /tmp/b5c_m1s
+
+import "../std/kfd.mlr"
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn main() {
+    kfd_init()
+    uint64 q = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 signal = kfd_signal_alloc()
+
+    uint64 mod = kernel_load("/tmp/m1s.co")
+    uint64 kernel = kernel_get_function(mod, "csr_e_deliver")
+
+    uint64 d_rpi_ptr = dev_alloc_host_visible(16)
+    uint64 d_rpi_ptr_h = dev_host_ptr(d_rpi_ptr)
+    uint64 z = 0; uint64 three = 3
+    unsafe { *((d_rpi_ptr_h + 0) as uint64) = z }
+    unsafe { *((d_rpi_ptr_h + 8) as uint64) = three }
+
+    uint64 d_rpi_tgt = dev_alloc_host_visible(24)
+    uint64 d_rpi_tgt_h = dev_host_ptr(d_rpi_tgt)
+    uint64 ti = 0
+    while ti < 3 {
+        uint64 tp = d_rpi_tgt_h + ti * 8
+        unsafe { *(tp as uint64) = ti }
+        ti = ti + 1
+    }
+
+    uint64 d_rpi_w = dev_alloc_host_visible(24)
+    uint64 d_rpi_w_h = dev_host_ptr(d_rpi_w)
+    f64 w0 = 2.0; unsafe { *((d_rpi_w_h +  0) as f64) = w0 }
+    f64 w1 = 4.0; unsafe { *((d_rpi_w_h +  8) as f64) = w1 }
+    f64 w2 = 6.0; unsafe { *((d_rpi_w_h + 16) as f64) = w2 }
+
+    uint64 d_rpi_is_ee = dev_alloc_host_visible(24)
+    uint64 d_is_ee_h = dev_host_ptr(d_rpi_is_ee)
+    uint64 ee_yes = 1; uint64 ee_no = 0
+    unsafe { *((d_is_ee_h +  0) as uint64) = ee_yes }
+    unsafe { *((d_is_ee_h +  8) as uint64) = ee_no }
+    unsafe { *((d_is_ee_h + 16) as uint64) = ee_yes }
+
+    uint64 d_x_post = dev_alloc_host_visible(32)
+    uint64 d_x_post_h = dev_host_ptr(d_x_post)
+    f64 xv0 = 0.1; unsafe { *((d_x_post_h +  0) as f64) = xv0 }
+    f64 xv1 = 0.2; unsafe { *((d_x_post_h +  8) as f64) = xv1 }
+    f64 xv2 = 0.3; unsafe { *((d_x_post_h + 16) as f64) = xv2 }
+    f64 xv3 = 0.4; unsafe { *((d_x_post_h + 24) as f64) = xv3 }
+
+    uint64 d_release = dev_alloc_host_visible(8)
+    uint64 d_release_h = dev_host_ptr(d_release)
+    f64 rel = 0.5; unsafe { *(d_release_h as f64) = rel }
+
+    uint64 d_sexc = dev_alloc_host_visible(32)
+    uint64 d_sexc_h = dev_host_ptr(d_sexc)
+    uint64 si = 0
+    while si < 4 {
+        uint64 sp = d_sexc_h + si * 8
+        f64 zf = 0.0; unsafe { *(sp as f64) = zf }
+        si = si + 1
+    }
+
+    uint64 d_ltd = dev_alloc_host_visible(8)
+    uint64 d_ltd_h = dev_host_ptr(d_ltd)
+    uint64 zl = 0; unsafe { *(d_ltd_h as uint64) = zl }
+
+    // Kernargs: 11 × 8 = 88 bytes. (8 ptrs + n + A_minus + w_max).
+    uint64 kernarg = dev_alloc_host_visible(88)
+    uint64 kh = dev_host_ptr(kernarg)
+    unsafe { *((kh + 0x00) as uint64) = d_rpi_ptr }
+    unsafe { *((kh + 0x08) as uint64) = d_rpi_tgt }
+    unsafe { *((kh + 0x10) as uint64) = d_rpi_w }
+    unsafe { *((kh + 0x18) as uint64) = d_rpi_is_ee }
+    unsafe { *((kh + 0x20) as uint64) = d_x_post }
+    unsafe { *((kh + 0x28) as uint64) = d_release }
+    unsafe { *((kh + 0x30) as uint64) = d_sexc }
+    unsafe { *((kh + 0x38) as uint64) = d_ltd }
+    uint64 n = 1; unsafe { *((kh + 0x40) as uint64) = n }
+    f64 am = -0.25; unsafe { *((kh + 0x48) as f64) = am }
+    f64 wm =  10.0; unsafe { *((kh + 0x50) as f64) = wm }
+
+    kfd_dispatch(q, kernel, 1, 1, 1, 1, 1, 1, kernarg, 88, signal)
+    kfd_wait(q, signal)
+
+    uint64 exp_slot = alloc(8)
+    f64 e_s0 = 1.0;   unsafe { *(exp_slot as f64) = e_s0 };   uint64 eb_s0 = 0; unsafe { *(exp_slot as uint64) -> eb_s0 }
+    f64 e_s1 = 2.0;   unsafe { *(exp_slot as f64) = e_s1 };   uint64 eb_s1 = 0; unsafe { *(exp_slot as uint64) -> eb_s1 }
+    f64 e_s2 = 3.0;   unsafe { *(exp_slot as f64) = e_s2 };   uint64 eb_s2 = 0; unsafe { *(exp_slot as uint64) -> eb_s2 }
+    f64 e_s3 = 0.0;   unsafe { *(exp_slot as f64) = e_s3 };   uint64 eb_s3 = 0; unsafe { *(exp_slot as uint64) -> eb_s3 }
+    f64 e_w0 = 1.975; unsafe { *(exp_slot as f64) = e_w0 };   uint64 eb_w0 = 0; unsafe { *(exp_slot as uint64) -> eb_w0 }
+    f64 e_w1 = 4.0;   unsafe { *(exp_slot as f64) = e_w1 };   uint64 eb_w1 = 0; unsafe { *(exp_slot as uint64) -> eb_w1 }
+    f64 e_w2 = 5.925; unsafe { *(exp_slot as f64) = e_w2 };   uint64 eb_w2 = 0; unsafe { *(exp_slot as uint64) -> eb_w2 }
+
+    uint64 b_s0 = 0; unsafe { *((d_sexc_h +  0) as uint64) -> b_s0 }
+    uint64 b_s1 = 0; unsafe { *((d_sexc_h +  8) as uint64) -> b_s1 }
+    uint64 b_s2 = 0; unsafe { *((d_sexc_h + 16) as uint64) -> b_s2 }
+    uint64 b_s3 = 0; unsafe { *((d_sexc_h + 24) as uint64) -> b_s3 }
+    uint64 b_w0 = 0; unsafe { *((d_rpi_w_h +  0) as uint64) -> b_w0 }
+    uint64 b_w1 = 0; unsafe { *((d_rpi_w_h +  8) as uint64) -> b_w1 }
+    uint64 b_w2 = 0; unsafe { *((d_rpi_w_h + 16) as uint64) -> b_w2 }
+    uint64 ltd_got = 0; unsafe { *(d_ltd_h as uint64) -> ltd_got }
+
+    print_label_val("s_exc[0] (bits)", 15, b_s0)
+    print_label_val("s_exc[1] (bits)", 15, b_s1)
+    print_label_val("s_exc[2] (bits)", 15, b_s2)
+    print_label_val("s_exc[3] (bits)", 15, b_s3)
+    print_label_val("rpe_w[0] (bits)", 15, b_w0)
+    print_label_val("rpe_w[1] (bits)", 15, b_w1)
+    print_label_val("rpe_w[2] (bits)", 15, b_w2)
+    print_label_val("ltd_events     ", 15, ltd_got)
+
+    uint64 ok = 1
+    if b_s0 != eb_s0 { ok = 0 }
+    if b_s1 != eb_s1 { ok = 0 }
+    if b_s2 != eb_s2 { ok = 0 }
+    if b_s3 != eb_s3 { ok = 0 }
+    if b_w0 != eb_w0 { ok = 0 }
+    if b_w1 != eb_w1 { ok = 0 }
+    if b_w2 != eb_w2 { ok = 0 }
+    if ltd_got != 2 { ok = 0 }
+
+    if ok == 1 { puts("M1s gate (KFD): GREEN"); exit(0) }
+    puts("FAIL: csr_e_deliver output did not match expected")
+    exit(1)
+}
