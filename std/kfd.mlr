@@ -1,0 +1,99 @@
+// Stage 2 user-facing AMDKFD library.
+//
+// Imports std/kfd_raw.mlr for ioctl wrappers. Composes them into
+// process init, allocator, queue, dispatch, wait. Aborts on any
+// ioctl error via kfd_die() — no recoverable error handling.
+
+import "kfd_raw.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn write(uint32 fd, uint64 buf, uint64 nbytes) -> uint64
+
+// --- Cached process state (single-threaded) ---
+static uint32 _kfd_initialized = 0
+static uint32 _kfd_fd = 0
+static uint32 _kfd_drm_fd = 0
+static uint32 _kfd_gpu_id = 0
+static uint64 _kfd_lds_base = 0
+static uint64 _kfd_lds_limit = 0
+static uint64 _kfd_gpuvm_base = 0
+static uint64 _kfd_gpuvm_limit = 0
+static uint64 _kfd_scratch_base = 0
+static uint64 _kfd_scratch_limit = 0
+
+fn kfd_die(uint64 msg, uint64 code) {
+    write(2, msg, 100)
+    write(2, " errno=", 7)
+    uint64 buf = alloc(32)
+    uint64 n = 0; uint64 tmp = code
+    if tmp == 0 { unsafe { *(buf as uint8) = 48 }; n = 1 }
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = code
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i; uint8 c = d + 48; unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    write(2, buf, n)
+    write(2, "\n", 1)
+    exit(1)
+}
+
+fn kfd_init() -> uint32 {
+    if _kfd_initialized != 0 { return 0 }
+
+    uint64 path_kfd = "/dev/kfd"
+    uint32 fd = open(path_kfd, KFD_OPEN_FLAGS, 0)
+    if fd > 0xFFFFFFF0 { kfd_die("kfd_init: open /dev/kfd failed", fd) }
+    _kfd_fd = fd
+
+    uint64 path_drm = "/dev/dri/renderD128"
+    uint32 drm = open(path_drm, KFD_OPEN_FLAGS, 0)
+    if drm > 0xFFFFFFF0 { kfd_die("kfd_init: open /dev/dri/renderD128 failed", drm) }
+    _kfd_drm_fd = drm
+
+    // GET_VERSION sanity check (no minimum version assertion here — smoke
+    // launcher already verified ≥ 1.14 on this dev box; minor versions are
+    // backward-compatible at the ioctl ABI level).
+    uint64 mb = alloc(4); uint64 nb = alloc(4)
+    uint32 r = raw_kfd_get_version(fd, mb, nb)
+    if r != 0 { kfd_die("kfd_init: GET_VERSION failed", r) }
+
+    // GET_PROCESS_APERTURES_NEW — buffer for up to 8 GPUs.
+    uint64 apertures = alloc(KFD_APERTURE_ENTRY_SIZE * 8)
+    uint64 nn_slot = alloc(4)
+    r = raw_kfd_get_process_apertures_new(fd, apertures, 8, nn_slot)
+    if r != 0 { kfd_die("kfd_init: GET_PROCESS_APERTURES_NEW failed", r) }
+    uint32 nn = 0; unsafe { *(nn_slot as uint32) -> nn }
+    if nn == 0 { kfd_die("kfd_init: no GPUs", 0) }
+
+    // Cache the FIRST GPU's apertures.
+    uint64 e = apertures
+    uint64 lb = 0; unsafe { *((e + 0x00) as uint64) -> lb }; _kfd_lds_base = lb
+    uint64 ll = 0; unsafe { *((e + 0x08) as uint64) -> ll }; _kfd_lds_limit = ll
+    uint64 sb = 0; unsafe { *((e + 0x10) as uint64) -> sb }; _kfd_scratch_base = sb
+    uint64 sl = 0; unsafe { *((e + 0x18) as uint64) -> sl }; _kfd_scratch_limit = sl
+    uint64 gb = 0; unsafe { *((e + 0x20) as uint64) -> gb }; _kfd_gpuvm_base = gb
+    uint64 gl = 0; unsafe { *((e + 0x28) as uint64) -> gl }; _kfd_gpuvm_limit = gl
+    uint32 gid = 0; unsafe { *((e + KFD_APERTURE_GPU_ID_OFFSET) as uint32) -> gid }
+    _kfd_gpu_id = gid
+
+    // ACQUIRE_VM
+    r = raw_kfd_acquire_vm(fd, drm, gid)
+    if r != 0 { kfd_die("kfd_init: ACQUIRE_VM failed", r) }
+
+    // RUNTIME_ENABLE (mode 1 = enable)
+    r = raw_kfd_runtime_enable(fd, 1)
+    if r != 0 { kfd_die("kfd_init: RUNTIME_ENABLE failed", r) }
+
+    _kfd_initialized = 1
+    return 0
+}
+
+fn kfd_gpu_id() -> uint32 { return _kfd_gpu_id }
+fn kfd_fd() -> uint32 { return _kfd_fd }
+fn kfd_drm_fd() -> uint32 { return _kfd_drm_fd }
+fn kfd_gpuvm_base() -> uint64 { return _kfd_gpuvm_base }
+fn kfd_gpuvm_limit() -> uint64 { return _kfd_gpuvm_limit }

@@ -3,10 +3,7 @@
 // No kernel dispatch. No ACQUIRE_VM. No RUNTIME_ENABLE.
 // Catches: device file present? open() works? KFD v1.14+?
 
-import "../std/kfd_raw.mlr"
-
-@dynamic extern fn puts(uint64 s) -> uint32
-@dynamic extern fn exit(uint64 code)
+import "../std/kfd.mlr"
 
 fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
     if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
@@ -51,26 +48,15 @@ fn die(uint64 msg, uint64 code) {
 }
 
 fn main() {
-    uint64 path_kfd = "/dev/kfd"
-    uint32 fd_kfd = open(path_kfd, KFD_OPEN_FLAGS, 0)
-    if fd_kfd > 0xFFFFFFF0 { die("open /dev/kfd failed", fd_kfd) }
-    print_label_val("kfd_fd", 6, fd_kfd)
+    uint32 r = kfd_init()
+    if r != 0 { die("kfd_init failed", r) }
 
-    uint32 major = 0; uint32 minor = 0
-    uint64 m_slot = alloc(4); uint64 n_slot = alloc(4)
-    uint32 r = raw_kfd_get_version(fd_kfd, m_slot, n_slot)
-    if r != 0 { die("GET_VERSION failed", r) }
-    unsafe { *(m_slot as uint32) -> major }
-    unsafe { *(n_slot as uint32) -> minor }
-    print_label_val("kfd_major", 9, major)
-    print_label_val("kfd_minor", 9, minor)
+    print_label_val("kfd_fd",      6, kfd_fd())
+    print_label_val("drm_fd",      6, kfd_drm_fd())
+    print_label_val("gpu_id",      6, kfd_gpu_id())
+    print_label_val("gpuvm_base", 10, kfd_gpuvm_base())
+    print_label_val("gpuvm_limit",11, kfd_gpuvm_limit())
 
-    if major < 1 { die("KFD major < 1", major) }
-    if major == 1 {
-        if minor < 14 { die("KFD < 1.14 (need 1.14+)", minor) }
-    }
-
-    close(fd_kfd)
     puts("b5a_kfd_init_smoke: OK")
     exit(0)
 }

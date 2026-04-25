@@ -98,3 +98,35 @@ fn raw_kfd_runtime_enable(uint32 fd, uint32 mode_mask) -> uint32 {
     uint32 r = _kfd_ioctl(fd, AMDKFD_IOC_RUNTIME_ENABLE, buf)
     return r
 }
+
+// kfd_ioctl_get_process_apertures_new_args (kfd_ioctl.h:200-211):
+//   [0x00] kfd_process_device_apertures_ptr  (u64, user-allocated array)
+//   [0x08] num_of_nodes                      (u32, in/out)
+//   [0x0C] pad                               (u32)
+//
+// kfd_process_device_apertures (kfd_ioctl.h:188-198): one entry per GPU.
+//   [0x00] lds_base    (u64)
+//   [0x08] lds_limit   (u64)
+//   [0x10] scratch_base (u64)
+//   [0x18] scratch_limit (u64)
+//   [0x20] gpuvm_base  (u64)
+//   [0x28] gpuvm_limit (u64)
+//   [0x30] gpu_id      (u32)
+//   [0x34] pad         (u32)
+//   total 0x38 = 56 bytes per entry.
+fn raw_kfd_get_process_apertures_new(uint32 fd, uint64 apertures_buf,
+                                      uint64 in_max_nodes, uint64 out_num_nodes_slot) -> uint32 {
+    uint64 args = alloc(16)
+    uint64 p_ptr = args + 0;  unsafe { *(p_ptr as uint64) = apertures_buf }
+    uint64 p_num = args + 8;  unsafe { *(p_num as uint32) = in_max_nodes }
+    uint64 p_pad = args + 12; unsafe { *(p_pad as uint32) = 0 }
+    uint32 r = _kfd_ioctl(fd, AMDKFD_IOC_GET_PROCESS_APERTURES_NEW, args)
+    if r == 0 {
+        uint32 nn = 0; unsafe { *(p_num as uint32) -> nn }
+        unsafe { *(out_num_nodes_slot as uint32) = nn }
+    }
+    return r
+}
+
+static uint64 KFD_APERTURE_ENTRY_SIZE = 56
+static uint64 KFD_APERTURE_GPU_ID_OFFSET = 0x30
