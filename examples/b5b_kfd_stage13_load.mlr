@@ -1,0 +1,707 @@
+// B5b stage-13 end-to-end gate via raw AMDKFD ioctls. Mechanical port of
+// b4_native_stage13_load.mlr to std/kfd.mlr — same CPU reference, same
+// per-step kernel ordering, same kernarg layouts. Loads 6 native .co files
+// (decay, relax, fill, mt_csr_e_delayed, mt_csr_i_deliver, mt_lif_full)
+// and runs N=16, N_STEPS=4 simulation. Compares GPU vs CPU reference.
+// Bit-exact gate: 15 spikes, 48 LTD events, 0 per-neuron mismatch.
+//
+// Single AQL queue, busy-poll wait between every dispatch. Zero ROCm
+// userspace linkage (no libhsa, libhip, libamd, libdrm). Six .co files
+// produced by:
+//   ./build/mlrc --emit-amdgpu-decay-step=/tmp/decay.co
+//   ./build/mlrc --emit-amdgpu-relax-step=/tmp/relax.co
+//   ./build/mlrc --emit-amdgpu-fill-step=/tmp/fill.co
+//   ./build/mlrc --emit-amdgpu-mt-csr-e-delayed=/tmp/mtce.co
+//   ./build/mlrc --emit-amdgpu-mt-csr-i-deliver=/tmp/mtci.co
+//   ./build/mlrc --emit-amdgpu-mt-lif-full=/tmp/m1u2.co
+
+import "../std/kfd.mlr"
+
+static uint64 N = 16
+static uint64 N_STEPS = 4
+static uint64 BUF_SIZE = 4
+
+// ---------------------------------------------------------------------------
+// Pretty-printing helpers (same shape as b4 launcher).
+// ---------------------------------------------------------------------------
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+// ---------------------------------------------------------------------------
+// Host-side CSR auxiliary builders.
+// ---------------------------------------------------------------------------
+
+fn build_edge_to_src(uint64 n_pre, uint64 edges_per_src, uint64 out_edge_to_src, uint64 out_is_first) {
+    uint64 src = 0
+    while src < n_pre {
+        uint64 e = 0
+        while e < edges_per_src {
+            uint64 edge_idx = src * edges_per_src + e
+            uint64 p1 = out_edge_to_src + edge_idx * 8
+            unsafe { *(p1 as uint64) = src }
+            uint64 p2 = out_is_first + edge_idx * 8
+            uint64 fv = 0
+            if e == 0 { fv = 1 }
+            unsafe { *(p2 as uint64) = fv }
+            e = e + 1
+        }
+        src = src + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel init of host state for CPU+GPU tracks. Identical to b4 launcher.
+// ---------------------------------------------------------------------------
+
+fn init_neurons(
+    uint64 V, uint64 ref, uint64 RI, uint64 ct,
+    uint64 se, uint64 si, uint64 xpre, uint64 xpost,
+    uint64 u, uint64 x, uint64 rel, uint64 sc
+) {
+    uint64 i = 0
+    while i < N {
+        uint64 p
+        f64 vf = 0.0; uint64 iu = i; vf = iu
+        f64 V0 = 0.5 * vf; p = V + i * 8; unsafe { *(p as f64) = V0 }
+        uint64 r0 = 0;     p = ref + i * 8; unsafe { *(p as uint64) = r0 }
+        f64 RIv = 2.0 * vf; p = RI + i * 8; unsafe { *(p as f64) = RIv }
+        uint64 ctv = i - (i / 2) * 2; p = ct + i * 8; unsafe { *(p as uint64) = ctv }
+        f64 zf = 0.0
+        p = se    + i * 8; unsafe { *(p as f64) = zf }
+        p = si    + i * 8; unsafe { *(p as f64) = zf }
+        p = xpre  + i * 8; unsafe { *(p as f64) = zf }
+        p = xpost + i * 8; unsafe { *(p as f64) = zf }
+        f64 u0 = 0.4;  p = u   + i * 8; unsafe { *(p as f64) = u0 }
+        f64 x0 = 0.8;  p = x   + i * 8; unsafe { *(p as f64) = x0 }
+        p = rel   + i * 8; unsafe { *(p as f64) = zf }
+        uint64 sc0 = 0; p = sc + i * 8; unsafe { *(p as uint64) = sc0 }
+        i = i + 1
+    }
+}
+
+fn init_csr_e(uint64 rpet, uint64 rpew, uint64 rpeee) {
+    uint64 src = 0
+    while src < N {
+        uint64 tgt = 0
+        while tgt < N {
+            uint64 e = src * N + tgt
+            uint64 p_tgt = rpet + e * 8; unsafe { *(p_tgt as uint64) = tgt }
+            f64 sf = 0.0; uint64 sfi = src; sf = sfi
+            f64 tf = 0.0; uint64 tfi = tgt; tf = tfi
+            f64 wv = sf + tf
+            uint64 p_w = rpew + e * 8; unsafe { *(p_w as f64) = wv }
+            uint64 srcE = 0; if src - (src / 2) * 2 == 0 { srcE = 1 }
+            uint64 tgtE = 0; if tgt - (tgt / 2) * 2 == 0 { tgtE = 1 }
+            uint64 ieev = 0
+            if srcE == 1 { if tgtE == 1 { ieev = 1 } }
+            uint64 p_ee = rpeee + e * 8; unsafe { *(p_ee as uint64) = ieev }
+            tgt = tgt + 1
+        }
+        src = src + 1
+    }
+}
+
+fn init_csr_i(uint64 rpit, uint64 rpiw) {
+    uint64 src = 0
+    while src < N {
+        uint64 tgt = 0
+        while tgt < N {
+            uint64 e = src * N + tgt
+            uint64 p_tgt = rpit + e * 8; unsafe { *(p_tgt as uint64) = tgt }
+            f64 sf = 0.0; uint64 sfi = src; sf = sfi
+            f64 tf = 0.0; uint64 tfi = tgt; tf = tfi
+            f64 wv = sf + tf
+            uint64 p_w = rpiw + e * 8; unsafe { *(p_w as f64) = wv }
+            tgt = tgt + 1
+        }
+        src = src + 1
+    }
+}
+
+fn init_buf_delay(uint64 bd) {
+    uint64 total = BUF_SIZE * N
+    uint64 j = 0
+    while j < total {
+        uint64 p = bd + j * 8; f64 zf = 0.0
+        unsafe { *(p as f64) = zf }
+        j = j + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CPU reference kernels — straight-line implementations of the six @kernels
+// in examples/gpu_stage13_full.mlr. Identical to b4 launcher.
+// ---------------------------------------------------------------------------
+
+fn cpu_decay(uint64 buf, f64 factor) {
+    uint64 i = 0
+    while i < N {
+        uint64 p = buf + i * 8
+        f64 v = 0.0; unsafe { *(p as f64) -> v }
+        v = v - v * factor
+        unsafe { *(p as f64) = v }
+        i = i + 1
+    }
+}
+
+fn cpu_relax(uint64 buf, f64 target, f64 factor) {
+    uint64 i = 0
+    while i < N {
+        uint64 p = buf + i * 8
+        f64 v = 0.0; unsafe { *(p as f64) -> v }
+        f64 nv = v + (target - v) * factor
+        unsafe { *(p as f64) = nv }
+        i = i + 1
+    }
+}
+
+fn cpu_fill(uint64 buf, f64 value) {
+    uint64 i = 0
+    while i < N {
+        uint64 p = buf + i * 8
+        unsafe { *(p as f64) = value }
+        i = i + 1
+    }
+}
+
+fn cpu_csr_e_delayed(
+    uint64 rpet, uint64 rpew, uint64 rpeee,
+    uint64 bd, uint64 row_base,
+    uint64 xpost, uint64 se, uint64 ltd,
+    f64 A_minus, f64 w_max
+) {
+    uint64 src = 0
+    while src < N {
+        uint64 bd_p = bd + (row_base + src) * 8
+        f64 rel = 0.0; unsafe { *(bd_p as f64) -> rel }
+        if rel > 0.0 {
+            uint64 syn = src * N
+            uint64 end = syn + N
+            while syn < end {
+                uint64 tp = rpet + syn * 8
+                uint64 tgt = 0; unsafe { *(tp as uint64) -> tgt }
+                uint64 wp = rpew + syn * 8
+                f64 w = 0.0; unsafe { *(wp as f64) -> w }
+                f64 eff = w * rel
+                uint64 sep = se + tgt * 8
+                f64 cur = 0.0; unsafe { *(sep as f64) -> cur }
+                f64 nv = cur + eff
+                unsafe { *(sep as f64) = nv }
+
+                uint64 iep = rpeee + syn * 8
+                uint64 is_ee = 0; unsafe { *(iep as uint64) -> is_ee }
+                if is_ee > 0 {
+                    uint64 xpp = xpost + tgt * 8
+                    f64 xq = 0.0; unsafe { *(xpp as f64) -> xq }
+                    f64 wn = w + A_minus * xq
+                    if wn < 0.0 { wn = 0.0 }
+                    if wn > w_max { wn = w_max }
+                    unsafe { *(wp as f64) = wn }
+                    uint64 lv = 0; unsafe { *(ltd as uint64) -> lv }
+                    uint64 lvn = lv + 1
+                    unsafe { *(ltd as uint64) = lvn }
+                }
+                syn = syn + 1
+            }
+            f64 zf = 0.0
+            unsafe { *(bd_p as f64) = zf }
+        }
+        src = src + 1
+    }
+}
+
+fn cpu_csr_i(uint64 rpit, uint64 rpiw, uint64 ct, uint64 rel, uint64 si) {
+    uint64 src = 0
+    while src < N {
+        uint64 ctp = ct + src * 8
+        uint64 ctv = 0; unsafe { *(ctp as uint64) -> ctv }
+        if ctv == 1 {
+            uint64 rp = rel + src * 8
+            f64 rv = 0.0; unsafe { *(rp as f64) -> rv }
+            if rv > 0.0 {
+                uint64 syn = src * N
+                uint64 end = syn + N
+                while syn < end {
+                    uint64 tp = rpit + syn * 8
+                    uint64 tgt = 0; unsafe { *(tp as uint64) -> tgt }
+                    uint64 wp = rpiw + syn * 8
+                    f64 w = 0.0; unsafe { *(wp as f64) -> w }
+                    f64 eff = w * rv
+                    uint64 sip = si + tgt * 8
+                    f64 cur = 0.0; unsafe { *(sip as f64) -> cur }
+                    f64 nv = cur + eff
+                    unsafe { *(sip as f64) = nv }
+                    syn = syn + 1
+                }
+            }
+        }
+        src = src + 1
+    }
+}
+
+fn cpu_lif_full(
+    uint64 V, uint64 ref, uint64 RI,
+    uint64 se, uint64 si,
+    uint64 xpre, uint64 xpost,
+    uint64 u, uint64 x, uint64 rel, uint64 sc,
+    uint64 ct, uint64 bd, uint64 w_base,
+    f64 dt_over_tau, f64 V_rest, f64 J_E, f64 J_I,
+    f64 V_reset, f64 V_thresh, uint64 ref_steps, f64 U_baseline
+) {
+    uint64 i = 0
+    while i < N {
+        uint64 Vp = V + i * 8
+        uint64 refp = ref + i * 8
+        uint64 spp = sc + i * 8
+        uint64 rc = 0; unsafe { *(refp as uint64) -> rc }
+        if rc > 0 {
+            uint64 rcn = rc - 1
+            unsafe { *(refp as uint64) = rcn }
+            unsafe { *(Vp as f64) = V_reset }
+        } else {
+            f64 v = 0.0; unsafe { *(Vp as f64) -> v }
+            f64 ri = 0.0; uint64 RIp = RI + i * 8; unsafe { *(RIp as f64) -> ri }
+            f64 sev = 0.0; uint64 sep = se + i * 8; unsafe { *(sep as f64) -> sev }
+            f64 siv = 0.0; uint64 sip = si + i * 8; unsafe { *(sip as f64) -> siv }
+            f64 drive = ri + sev * J_E - siv * J_I
+            f64 dv = dt_over_tau * (V_rest - v + drive)
+            f64 vnew = v + dv
+            if vnew >= V_thresh {
+                unsafe { *(Vp as f64) = V_reset }
+                unsafe { *(refp as uint64) = ref_steps }
+                uint64 scv = 0; unsafe { *(spp as uint64) -> scv }
+                uint64 scn = scv + 1
+                unsafe { *(spp as uint64) = scn }
+                uint64 xprep = xpre + i * 8
+                f64 xp = 0.0; unsafe { *(xprep as f64) -> xp }
+                f64 onev = 1.0
+                f64 xpn = xp + onev
+                unsafe { *(xprep as f64) = xpn }
+                uint64 xpostp = xpost + i * 8
+                f64 xq = 0.0; unsafe { *(xpostp as f64) -> xq }
+                f64 xqn = xq + onev
+                unsafe { *(xpostp as f64) = xqn }
+                uint64 up = u + i * 8
+                uint64 xp2 = x + i * 8
+                f64 uv = 0.0; unsafe { *(up as f64) -> uv }
+                f64 xv = 0.0; unsafe { *(xp2 as f64) -> xv }
+                f64 relv = uv * xv
+                uint64 relp = rel + i * 8
+                unsafe { *(relp as f64) = relv }
+                f64 xvn = xv - relv
+                unsafe { *(xp2 as f64) = xvn }
+                f64 uvn = uv + U_baseline * (onev - uv)
+                unsafe { *(up as f64) = uvn }
+                uint64 ctp = ct + i * 8
+                uint64 ctv = 0; unsafe { *(ctp as uint64) -> ctv }
+                if ctv == 0 {
+                    uint64 bdp = bd + (w_base + i) * 8
+                    unsafe { *(bdp as f64) = relv }
+                }
+            } else {
+                unsafe { *(Vp as f64) = vnew }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KFD H2D helper: allocate host-visible device memory + copy from host buffer.
+// ---------------------------------------------------------------------------
+
+fn dev_h2d_new(uint64 host_buf, uint64 nbytes) -> uint64 {
+    uint64 dptr = dev_alloc_host_visible(nbytes)
+    dev_copy_h2d(host_buf, dptr, nbytes)
+    return dptr
+}
+
+// ---------------------------------------------------------------------------
+// Main launcher.
+// ---------------------------------------------------------------------------
+
+fn main() {
+    kfd_init()
+    uint64 q = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 signal = kfd_signal_alloc()
+
+    // Load 6 modules.
+    uint64 mod_dec  = kernel_load("/tmp/decay.co")
+    uint64 mod_rlx  = kernel_load("/tmp/relax.co")
+    uint64 mod_fil  = kernel_load("/tmp/fill.co")
+    uint64 mod_csre = kernel_load("/tmp/mtce.co")
+    uint64 mod_csri = kernel_load("/tmp/mtci.co")
+    uint64 mod_lif  = kernel_load("/tmp/m1u2.co")
+
+    uint64 fh_dec  = kernel_get_function(mod_dec,  "decay_step")
+    uint64 fh_rlx  = kernel_get_function(mod_rlx,  "relax_step")
+    uint64 fh_fil  = kernel_get_function(mod_fil,  "fill_step")
+    uint64 fh_csre = kernel_get_function(mod_csre, "mt_csr_e_delayed")
+    uint64 fh_csri = kernel_get_function(mod_csri, "mt_csr_i_deliver")
+    uint64 fh_lif  = kernel_get_function(mod_lif,  "mt_lif_full")
+
+    // ---- Byte sizes ----
+    uint64 nb_f    = N * 8
+    uint64 nb_u    = N * 8
+    uint64 total_e = N * N
+    uint64 nb_edges = total_e * 8
+    uint64 nb_bd   = BUF_SIZE * N * 8
+
+    // ---- Host GPU-mirror + CPU-ref buffers ----
+    uint64 h_V    = alloc(nb_f)
+    uint64 h_ref  = alloc(nb_u)
+    uint64 h_RI   = alloc(nb_f)
+    uint64 h_ct   = alloc(nb_u)
+    uint64 h_se   = alloc(nb_f)
+    uint64 h_si   = alloc(nb_f)
+    uint64 h_xpre = alloc(nb_f)
+    uint64 h_xpost = alloc(nb_f)
+    uint64 h_u    = alloc(nb_f)
+    uint64 h_x    = alloc(nb_f)
+    uint64 h_rel  = alloc(nb_f)
+    uint64 h_sc   = alloc(nb_u)
+    uint64 h_rpet = alloc(nb_edges)
+    uint64 h_rpew = alloc(nb_edges)
+    uint64 h_rpeee = alloc(nb_edges)
+    uint64 h_rpit = alloc(nb_edges)
+    uint64 h_rpiw = alloc(nb_edges)
+    uint64 h_bd   = alloc(nb_bd)
+    uint64 h_ets_e = alloc(nb_edges)
+    uint64 h_first_e = alloc(nb_edges)
+    uint64 h_ets_i = alloc(nb_edges)
+    uint64 h_first_i = alloc(nb_edges)
+
+    uint64 c_V    = alloc(nb_f)
+    uint64 c_ref  = alloc(nb_u)
+    uint64 c_RI   = alloc(nb_f)
+    uint64 c_ct   = alloc(nb_u)
+    uint64 c_se   = alloc(nb_f)
+    uint64 c_si   = alloc(nb_f)
+    uint64 c_xpre = alloc(nb_f)
+    uint64 c_xpost = alloc(nb_f)
+    uint64 c_u    = alloc(nb_f)
+    uint64 c_x    = alloc(nb_f)
+    uint64 c_rel  = alloc(nb_f)
+    uint64 c_sc   = alloc(nb_u)
+    uint64 c_rpet = alloc(nb_edges)
+    uint64 c_rpew = alloc(nb_edges)
+    uint64 c_rpeee = alloc(nb_edges)
+    uint64 c_rpit = alloc(nb_edges)
+    uint64 c_rpiw = alloc(nb_edges)
+    uint64 c_bd   = alloc(nb_bd)
+
+    init_neurons(h_V, h_ref, h_RI, h_ct, h_se, h_si, h_xpre, h_xpost, h_u, h_x, h_rel, h_sc)
+    init_csr_e(h_rpet, h_rpew, h_rpeee)
+    init_csr_i(h_rpit, h_rpiw)
+    init_buf_delay(h_bd)
+    build_edge_to_src(N, N, h_ets_e, h_first_e)
+    build_edge_to_src(N, N, h_ets_i, h_first_i)
+
+    init_neurons(c_V, c_ref, c_RI, c_ct, c_se, c_si, c_xpre, c_xpost, c_u, c_x, c_rel, c_sc)
+    init_csr_e(c_rpet, c_rpew, c_rpeee)
+    init_csr_i(c_rpit, c_rpiw)
+    init_buf_delay(c_bd)
+
+    // ---- Constants ----
+    f64 dt_over_tau = 0.5
+    f64 V_rest_v    = 0.0
+    f64 J_E_v       = 0.5
+    f64 J_I_v       = 0.25
+    f64 V_reset_v   = -99.0
+    f64 V_thresh_v  = 3.0
+    uint64 ref_steps_v = 7
+    f64 U_baseline_v = 0.5
+    f64 A_minus_v   = 0.25
+    f64 w_max_v     = 1024.0
+    f64 dec_f_exc   = 0.2
+    f64 dec_f_inh   = 0.2
+    f64 dec_f_xpre  = 0.1
+    f64 dec_f_xpost = 0.1
+    f64 relax_x_tgt = 1.0
+    f64 relax_f_u   = 0.1
+    f64 relax_f_x   = 0.1
+
+    // ---- CPU reference simulation ----
+    uint64 c_ltd = alloc(8)
+    uint64 lz = 0; unsafe { *(c_ltd as uint64) = lz }
+    uint64 cstep = 0
+    while cstep < N_STEPS {
+        cpu_decay(c_se,    dec_f_exc)
+        cpu_decay(c_si,    dec_f_inh)
+        cpu_decay(c_xpre,  dec_f_xpre)
+        cpu_decay(c_xpost, dec_f_xpost)
+        cpu_relax(c_u, U_baseline_v, relax_f_u)
+        cpu_relax(c_x, relax_x_tgt,  relax_f_x)
+        cpu_fill(c_rel, 0.0)
+        uint64 read_slot_c = (cstep + 1) - ((cstep + 1) / BUF_SIZE) * BUF_SIZE
+        uint64 rb_r_c = read_slot_c * N
+        cpu_csr_e_delayed(c_rpet, c_rpew, c_rpeee, c_bd, rb_r_c,
+                           c_xpost, c_se, c_ltd, A_minus_v, w_max_v)
+        uint64 write_slot_c = cstep - (cstep / BUF_SIZE) * BUF_SIZE
+        uint64 rb_w_c = write_slot_c * N
+        cpu_lif_full(c_V, c_ref, c_RI, c_se, c_si,
+                      c_xpre, c_xpost, c_u, c_x, c_rel, c_sc,
+                      c_ct, c_bd, rb_w_c,
+                      dt_over_tau, V_rest_v, J_E_v, J_I_v,
+                      V_reset_v, V_thresh_v, ref_steps_v, U_baseline_v)
+        cpu_csr_i(c_rpit, c_rpiw, c_ct, c_rel, c_si)
+        cstep = cstep + 1
+    }
+
+    // ---- GPU: H2D copies via dev_alloc_host_visible + dev_copy_h2d ----
+    uint64 d_V     = dev_h2d_new(h_V, nb_f)
+    uint64 d_ref   = dev_h2d_new(h_ref, nb_u)
+    uint64 d_RI    = dev_h2d_new(h_RI, nb_f)
+    uint64 d_ct    = dev_h2d_new(h_ct, nb_u)
+    uint64 d_se    = dev_h2d_new(h_se, nb_f)
+    uint64 d_si    = dev_h2d_new(h_si, nb_f)
+    uint64 d_xpre  = dev_h2d_new(h_xpre, nb_f)
+    uint64 d_xpost = dev_h2d_new(h_xpost, nb_f)
+    uint64 d_u     = dev_h2d_new(h_u, nb_f)
+    uint64 d_x     = dev_h2d_new(h_x, nb_f)
+    uint64 d_rel   = dev_h2d_new(h_rel, nb_f)
+    uint64 d_sc    = dev_h2d_new(h_sc, nb_u)
+    uint64 d_rpet  = dev_h2d_new(h_rpet, nb_edges)
+    uint64 d_rpew  = dev_h2d_new(h_rpew, nb_edges)
+    uint64 d_rpeee = dev_h2d_new(h_rpeee, nb_edges)
+    uint64 d_rpit  = dev_h2d_new(h_rpit, nb_edges)
+    uint64 d_rpiw  = dev_h2d_new(h_rpiw, nb_edges)
+    uint64 d_bd    = dev_h2d_new(h_bd, nb_bd)
+    uint64 d_ets_e = dev_h2d_new(h_ets_e, nb_edges)
+    uint64 d_first_e = dev_h2d_new(h_first_e, nb_edges)
+    uint64 d_ets_i = dev_h2d_new(h_ets_i, nb_edges)
+
+    // ltd_events device slot, zeroed via host-mapped pointer.
+    uint64 d_ltd = dev_alloc_host_visible(8)
+    uint64 d_ltd_host = dev_host_ptr(d_ltd)
+    uint64 zv = 0; unsafe { *(d_ltd_host as uint64) = zv }
+
+    // ---- Kernarg blobs (one per kernel call site, contiguous values) ----
+    // decay_step layout (32 bytes): buf (u64) + n (u64) + factor (f64) + _reserved (u64)
+    uint64 zk = 0
+    uint64 kp_dec_se = dev_alloc_host_visible(32)
+    uint64 kp_dec_se_h = dev_host_ptr(kp_dec_se)
+    unsafe { *((kp_dec_se_h + 0x00) as uint64) = d_se }
+    unsafe { *((kp_dec_se_h + 0x08) as uint64) = N }
+    unsafe { *((kp_dec_se_h + 0x10) as f64)    = dec_f_exc }
+    unsafe { *((kp_dec_se_h + 0x18) as uint64) = zk }
+
+    uint64 kp_dec_si = dev_alloc_host_visible(32)
+    uint64 kp_dec_si_h = dev_host_ptr(kp_dec_si)
+    unsafe { *((kp_dec_si_h + 0x00) as uint64) = d_si }
+    unsafe { *((kp_dec_si_h + 0x08) as uint64) = N }
+    unsafe { *((kp_dec_si_h + 0x10) as f64)    = dec_f_inh }
+    unsafe { *((kp_dec_si_h + 0x18) as uint64) = zk }
+
+    uint64 kp_dec_xpre = dev_alloc_host_visible(32)
+    uint64 kp_dec_xpre_h = dev_host_ptr(kp_dec_xpre)
+    unsafe { *((kp_dec_xpre_h + 0x00) as uint64) = d_xpre }
+    unsafe { *((kp_dec_xpre_h + 0x08) as uint64) = N }
+    unsafe { *((kp_dec_xpre_h + 0x10) as f64)    = dec_f_xpre }
+    unsafe { *((kp_dec_xpre_h + 0x18) as uint64) = zk }
+
+    uint64 kp_dec_xpost = dev_alloc_host_visible(32)
+    uint64 kp_dec_xpost_h = dev_host_ptr(kp_dec_xpost)
+    unsafe { *((kp_dec_xpost_h + 0x00) as uint64) = d_xpost }
+    unsafe { *((kp_dec_xpost_h + 0x08) as uint64) = N }
+    unsafe { *((kp_dec_xpost_h + 0x10) as f64)    = dec_f_xpost }
+    unsafe { *((kp_dec_xpost_h + 0x18) as uint64) = zk }
+
+    // relax_step layout (40 bytes): buf (u64) + n (u64) + target (f64) + factor (f64) + _reserved (u64)
+    uint64 kp_rlx_u = dev_alloc_host_visible(40)
+    uint64 kp_rlx_u_h = dev_host_ptr(kp_rlx_u)
+    unsafe { *((kp_rlx_u_h + 0x00) as uint64) = d_u }
+    unsafe { *((kp_rlx_u_h + 0x08) as uint64) = N }
+    unsafe { *((kp_rlx_u_h + 0x10) as f64)    = U_baseline_v }
+    unsafe { *((kp_rlx_u_h + 0x18) as f64)    = relax_f_u }
+    unsafe { *((kp_rlx_u_h + 0x20) as uint64) = zk }
+
+    uint64 kp_rlx_x = dev_alloc_host_visible(40)
+    uint64 kp_rlx_x_h = dev_host_ptr(kp_rlx_x)
+    unsafe { *((kp_rlx_x_h + 0x00) as uint64) = d_x }
+    unsafe { *((kp_rlx_x_h + 0x08) as uint64) = N }
+    unsafe { *((kp_rlx_x_h + 0x10) as f64)    = relax_x_tgt }
+    unsafe { *((kp_rlx_x_h + 0x18) as f64)    = relax_f_x }
+    unsafe { *((kp_rlx_x_h + 0x20) as uint64) = zk }
+
+    // fill_step layout (24 bytes): buf (u64) + n (u64) + value (f64)
+    uint64 kp_fill_rel = dev_alloc_host_visible(24)
+    uint64 kp_fill_rel_h = dev_host_ptr(kp_fill_rel)
+    unsafe { *((kp_fill_rel_h + 0x00) as uint64) = d_rel }
+    unsafe { *((kp_fill_rel_h + 0x08) as uint64) = N }
+    f64 zerov = 0.0; unsafe { *((kp_fill_rel_h + 0x10) as f64) = zerov }
+
+    // mt_csr_e_delayed layout (112 bytes, 14 slots × 8): rpet, rpew, rpeee, ets_e, first_e,
+    // bd, row_base, xpost, se, ltd, n, A_minus, w_max, _reserved.
+    // Per-step varying field: row_base at offset 0x30.
+    uint64 kp_csre = dev_alloc_host_visible(112)
+    uint64 kp_csre_h = dev_host_ptr(kp_csre)
+    unsafe { *((kp_csre_h + 0x00) as uint64) = d_rpet }
+    unsafe { *((kp_csre_h + 0x08) as uint64) = d_rpew }
+    unsafe { *((kp_csre_h + 0x10) as uint64) = d_rpeee }
+    unsafe { *((kp_csre_h + 0x18) as uint64) = d_ets_e }
+    unsafe { *((kp_csre_h + 0x20) as uint64) = d_first_e }
+    unsafe { *((kp_csre_h + 0x28) as uint64) = d_bd }
+    unsafe { *((kp_csre_h + 0x30) as uint64) = zk }   // row_base — rewritten per step
+    unsafe { *((kp_csre_h + 0x38) as uint64) = d_xpost }
+    unsafe { *((kp_csre_h + 0x40) as uint64) = d_se }
+    unsafe { *((kp_csre_h + 0x48) as uint64) = d_ltd }
+    unsafe { *((kp_csre_h + 0x50) as uint64) = N }
+    unsafe { *((kp_csre_h + 0x58) as f64)    = A_minus_v }
+    unsafe { *((kp_csre_h + 0x60) as f64)    = w_max_v }
+    unsafe { *((kp_csre_h + 0x68) as uint64) = zk }
+
+    // mt_csr_i_deliver layout (72 bytes, 9 slots × 8): rpit, rpiw, ets_i, ct, rel, si, n, ne_edges, _reserved.
+    uint64 kp_csri = dev_alloc_host_visible(72)
+    uint64 kp_csri_h = dev_host_ptr(kp_csri)
+    unsafe { *((kp_csri_h + 0x00) as uint64) = d_rpit }
+    unsafe { *((kp_csri_h + 0x08) as uint64) = d_rpiw }
+    unsafe { *((kp_csri_h + 0x10) as uint64) = d_ets_i }
+    unsafe { *((kp_csri_h + 0x18) as uint64) = d_ct }
+    unsafe { *((kp_csri_h + 0x20) as uint64) = d_rel }
+    unsafe { *((kp_csri_h + 0x28) as uint64) = d_si }
+    unsafe { *((kp_csri_h + 0x30) as uint64) = N }
+    unsafe { *((kp_csri_h + 0x38) as uint64) = total_e }
+    unsafe { *((kp_csri_h + 0x40) as uint64) = zk }
+
+    // mt_lif_full layout (176 bytes, 22 slots × 8): V, ref, RI, se, si, sc, xpre, xpost,
+    // u, x, rel, dt_over_tau, V_rest, J_E, J_I, V_reset, V_thresh, ref_steps, U_baseline,
+    // ct, bd, w_base.
+    // Per-step varying field: w_base at offset 0xA8.
+    uint64 kp_lif = dev_alloc_host_visible(176)
+    uint64 kp_lif_h = dev_host_ptr(kp_lif)
+    unsafe { *((kp_lif_h + 0x00) as uint64) = d_V }
+    unsafe { *((kp_lif_h + 0x08) as uint64) = d_ref }
+    unsafe { *((kp_lif_h + 0x10) as uint64) = d_RI }
+    unsafe { *((kp_lif_h + 0x18) as uint64) = d_se }
+    unsafe { *((kp_lif_h + 0x20) as uint64) = d_si }
+    unsafe { *((kp_lif_h + 0x28) as uint64) = d_sc }
+    unsafe { *((kp_lif_h + 0x30) as uint64) = d_xpre }
+    unsafe { *((kp_lif_h + 0x38) as uint64) = d_xpost }
+    unsafe { *((kp_lif_h + 0x40) as uint64) = d_u }
+    unsafe { *((kp_lif_h + 0x48) as uint64) = d_x }
+    unsafe { *((kp_lif_h + 0x50) as uint64) = d_rel }
+    unsafe { *((kp_lif_h + 0x58) as f64)    = dt_over_tau }
+    unsafe { *((kp_lif_h + 0x60) as f64)    = V_rest_v }
+    unsafe { *((kp_lif_h + 0x68) as f64)    = J_E_v }
+    unsafe { *((kp_lif_h + 0x70) as f64)    = J_I_v }
+    unsafe { *((kp_lif_h + 0x78) as f64)    = V_reset_v }
+    unsafe { *((kp_lif_h + 0x80) as f64)    = V_thresh_v }
+    unsafe { *((kp_lif_h + 0x88) as uint64) = ref_steps_v }
+    unsafe { *((kp_lif_h + 0x90) as f64)    = U_baseline_v }
+    unsafe { *((kp_lif_h + 0x98) as uint64) = d_ct }
+    unsafe { *((kp_lif_h + 0xA0) as uint64) = d_bd }
+    unsafe { *((kp_lif_h + 0xA8) as uint64) = zk }   // w_base — rewritten per step
+
+    // ---- Run GPU simulation ----
+    uint64 step = 0
+    while step < N_STEPS {
+        uint64 write_slot = step - (step / BUF_SIZE) * BUF_SIZE
+        uint64 read_slot  = (step + 1) - ((step + 1) / BUF_SIZE) * BUF_SIZE
+        uint64 rb_r = read_slot  * N
+        // Kernel ABI mismatch: csre treats row_base as ENTRY index (bd+(row_base+src)*8,
+        // lshl 3), but lif treats w_base as SLOT index (bd+(w_base*N+tid)*8, lshl 7 =
+        // *N*8 for N=16). Pass entry-index for csre, slot-index for lif. The b4 HIP
+        // launcher passed entry-index to both; HIP's pooled allocations silently
+        // absorbed the out-of-bounds writes — KFD's per-buffer page reservations
+        // don't, so we have to feed each kernel its own native units.
+        unsafe { *((kp_csre_h + 0x30) as uint64) = rb_r }
+        unsafe { *((kp_lif_h  + 0xA8) as uint64) = write_slot }
+
+        uint64 block_x = N
+        uint64 edges_bx = total_e
+
+        kfd_dispatch(q, fh_dec, 1, 1, 1, block_x, 1, 1, kp_dec_se,    32, signal); kfd_wait(q, signal)
+        kfd_dispatch(q, fh_dec, 1, 1, 1, block_x, 1, 1, kp_dec_si,    32, signal); kfd_wait(q, signal)
+        kfd_dispatch(q, fh_dec, 1, 1, 1, block_x, 1, 1, kp_dec_xpre,  32, signal); kfd_wait(q, signal)
+        kfd_dispatch(q, fh_dec, 1, 1, 1, block_x, 1, 1, kp_dec_xpost, 32, signal); kfd_wait(q, signal)
+        kfd_dispatch(q, fh_rlx, 1, 1, 1, block_x, 1, 1, kp_rlx_u,     40, signal); kfd_wait(q, signal)
+        kfd_dispatch(q, fh_rlx, 1, 1, 1, block_x, 1, 1, kp_rlx_x,     40, signal); kfd_wait(q, signal)
+        kfd_dispatch(q, fh_fil, 1, 1, 1, block_x, 1, 1, kp_fill_rel,  24, signal); kfd_wait(q, signal)
+
+        kfd_dispatch(q, fh_csre, 1, 1, 1, edges_bx, 1, 1, kp_csre,   112, signal); kfd_wait(q, signal)
+        kfd_dispatch(q, fh_lif,  1, 1, 1, block_x,  1, 1, kp_lif,    176, signal); kfd_wait(q, signal)
+        kfd_dispatch(q, fh_csri, 1, 1, 1, edges_bx, 1, 1, kp_csri,    72, signal); kfd_wait(q, signal)
+
+        step = step + 1
+    }
+
+    // ---- D2H spike_count + ltd_events ----
+    dev_copy_d2h(d_sc, h_sc, nb_u)
+    uint64 g_ltd = 0; unsafe { *(d_ltd_host as uint64) -> g_ltd }
+
+    // ---- Compare ----
+    uint64 cpu_total = 0; uint64 gpu_total = 0
+    uint64 mismatch = 0
+    uint64 i = 0
+    while i < N {
+        uint64 gp = h_sc + i * 8
+        uint64 cp = c_sc + i * 8
+        uint64 gv = 0; unsafe { *(gp as uint64) -> gv }
+        uint64 cv = 0; unsafe { *(cp as uint64) -> cv }
+        cpu_total = cpu_total + cv
+        gpu_total = gpu_total + gv
+        if gv != cv { mismatch = mismatch + 1 }
+        i = i + 1
+    }
+
+    uint64 c_ltd_v = 0
+    unsafe { *(c_ltd as uint64) -> c_ltd_v }
+
+    print_label_val("CPU total spikes   ", 19, cpu_total)
+    print_label_val("GPU total spikes   ", 19, gpu_total)
+    print_label_val("per-neuron mismatch", 19, mismatch)
+    print_label_val("CPU ltd events     ", 19, c_ltd_v)
+    print_label_val("GPU ltd events     ", 19, g_ltd)
+
+    uint64 diff = 0
+    if cpu_total > gpu_total { diff = cpu_total - gpu_total }
+    if gpu_total > cpu_total { diff = gpu_total - cpu_total }
+    uint64 tol = (cpu_total + 999) / 1000
+    if cpu_total == 0 { tol = 1 }
+
+    if diff <= tol {
+        if c_ltd_v == g_ltd {
+            puts("B5b gate (KFD): GREEN - native stage-13 within 0.1% of CPU reference")
+            exit(0)
+        }
+        puts("FAIL: GPU ltd_events != CPU ltd_events (exact match required)")
+        exit(1)
+    }
+    puts("FAIL: native stage-13 outside 0.1% tolerance")
+    exit(1)
+}
