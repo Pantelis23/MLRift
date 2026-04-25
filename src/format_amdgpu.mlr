@@ -813,6 +813,41 @@ fn asm_s_mov_b32(uint64 sdst, uint64 ssrc0) {
     asm_u32(word)
 }
 
+// s_mov_b32 sdst, <inline imm 0..64>  — uses inline-constant src
+// encoding (no literal-32 word).
+//   Verified: s_mov_b32 s24, 63 → 0xBE9800BF (src = 0x80 + 63 = 0xBF).
+fn asm_s_mov_b32_inline_imm(uint64 sdst, uint64 imm) {
+    uint64 ssrc0 = 0x80 + (imm & 0x3F)
+    uint64 word = (0x17D << 23)
+                  | ((sdst & 0x7F) << 16)
+                  | (0x00 << 8)
+                  | (ssrc0 & 0xFF)
+    asm_u32(word)
+}
+
+// s_mov_b32 sdst, <32-bit literal>  — src = 0xFF, then 4-byte lit32.
+//   Verified: s_mov_b32 s30, 0x7F4A7C15 → 0xBE9E00FF + lit 0x7F4A7C15.
+fn asm_s_mov_b32_lit32(uint64 sdst, uint64 lit32) {
+    uint64 word = (0x17D << 23)
+                  | ((sdst & 0x7F) << 16)
+                  | (0x00 << 8)
+                  | 0xFF
+    asm_u32(word)
+    asm_u32(lit32 & 0xFFFFFFFF)
+}
+
+// s_sub_u32 sdst, ssrc0, <inline imm 0..64>   (SOP2 op 0x01)
+//   Verified: s_sub_u32 s24, s24, 1 → 0x80988118.
+fn asm_s_sub_u32_imm(uint64 sdst, uint64 ssrc0_sgpr, uint64 imm) {
+    uint64 ssrc1_enc = 0x80 + (imm & 0x3F)
+    uint64 word = (0x2 << 30)
+                  | (0x01 << 23)
+                  | ((sdst & 0x7F) << 16)
+                  | ((ssrc1_enc & 0xFF) << 8)
+                  | (ssrc0_sgpr & 0xFF)
+    asm_u32(word)
+}
+
 // ── VALU divergent-loop primitives (M1n).
 //
 // v_cmp_lt_u32_e32 vcc_lo, v_src0, v_src1  — VOPC op 0x49.
@@ -5548,6 +5583,17 @@ fn asm_v_lshrrev_b64_imm_vv(uint64 vdst_pair, uint64 shift_amount, uint64 v_src_
     asm_u32(word2)
 }
 
+// v_lshrrev_b64 v[dst:dst+1], s_idx, v[src:src+1]  — SGPR-shift form
+//   Verified: v_lshrrev_b64 v[2:3], s24, v[0:1] → 0xD73D0002 0x00020018.
+fn asm_v_lshrrev_b64_sgpr_vv(uint64 vdst_pair, uint64 s_idx, uint64 v_src_pair) {
+    uint64 word1 = 0xD73D0000 | (vdst_pair & 0xFF)
+    uint64 src0_enc = s_idx & 0x1FF
+    uint64 src1_enc = 0x100 | (v_src_pair & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
 // v_xor_b32_e64 vdst, v_src0, v_src1   (VOP3 op 0x11D)
 //   word1 = 0xD51D0000 | vdst
 //   Verified: v_xor_b32_e64 v0, v2, v3 → 0xD51D0000 0x00020702.
@@ -6056,6 +6102,361 @@ fn amdgpu_lower_noesis_decay(uint64 kname_ptr, uint64 nl) -> uint64 {
     kt_push(kname_ptr, nl, k_text_buf, k_text_size,
             args_desc, 3, 24,
             18, 6,                                  // sgpr=18 (s0..s15+exec save), vgpr=6
+            rsrc1, rsrc2, rsrc3, props)
+    return 0
+}
+
+// noesis csr_build lowering.
+//
+//   @kernel fn csr_build(
+//       uint64 col_tgt, uint64 col_w, uint64 col_is_inh, uint64 cell_type,
+//       uint64 n, uint64 syn_per, uint64 seed,
+//       f64 w_ee, f64 w_ei, f64 w_ie
+//   ) {
+//       src = tid_x()
+//       if src >= n: return
+//       src_e = (cell_type[src] == 0) ? 1 : 0
+//       base = src * syn_per
+//       for k in 0..syn_per {
+//           ctr = base + k
+//           // splitmix64
+//           z = seed + ctr * C0
+//           z = (z ^ (z >> 30)) * C1
+//           z = (z ^ (z >> 27)) * C2
+//           z = z ^ (z >> 31)
+//           tgt = z % n
+//           if tgt == src: tgt = (tgt+1) == n ? 0 : tgt+1
+//           tgt_e = (cell_type[tgt] == 0) ? 1 : 0
+//           if src_e:  w = tgt_e ? w_ee : w_ei; inh = 0
+//           else:      w = w_ie;                inh = 1
+//           col_tgt[base+k] = tgt; col_w[base+k] = w; col_is_inh[base+k] = inh
+//       }
+//   }
+//
+// Kernarg layout (10 args × 8 bytes = 80 bytes; matches launcher kp_csr):
+//   [0x00] col_tgt    [0x08] col_w   [0x10] col_is_inh   [0x18] cell_type
+//   [0x20] n          [0x28] syn_per  [0x30] seed        [0x38] w_ee
+//   [0x40] w_ei       [0x48] w_ie
+//
+// Splitmix64 constants: C0=0x9E3779B97F4A7C15, C1=0xBF58476D1CE4E5B9,
+// C2=0x94D049BB133111EB. Loaded into SGPRs at kernel start as
+// {s30:s31, s32:s33, s34:s35} via two 32-bit literal stores per pair.
+//
+// Modulo (z % n) uses 64-iter long division — one-shot startup kernel,
+// performance is fine. Loop body is ~10 vector instructions guarded by
+// an SALU s24 = 63..0 counter; each iteration shifts a bit out of z,
+// shifts r left, ORs the bit in, and conditionally subtracts n.
+//
+// VGPR plan: 32 used (granule 3). v0=tid_in_wg, v1=gid (=src),
+// v2:v3=z, v4:v5=z_shr scratch, v6:v7=mul scratch, v8:v9=mul scratch,
+// v10:v11=ctr, v12:v13=r, v14:v15=n_v, v16:v17=r_minus_n,
+// v18=bit_in, v19=src_ct, v20=tgt_ct, v21:v22=w (f64),
+// v23=inh, v24:v25=byte addr scratch, v26:v27=full ptr.
+//
+// SGPR plan: kernarg loads (s2..s27 sparsely; s14:s15 skipped because
+// s15=wg_id_x), then s24=k, s25=i (long-div), s26=base, s28=outer EXEC
+// save, s30..s35=splitmix64 constants. Total ~36 SGPRs.
+fn amdgpu_lower_noesis_csr_build(uint64 kname_ptr, uint64 nl) -> uint64 {
+    asm_init()
+
+    // gid in v1 = wg_id_x*256 + tid_in_wg.
+    asm_noesis_compute_gid_v1()
+
+    // Prologue: load kernargs. Skip s14:s15 because s15 = wg_id_x.
+    asm_s_load_b64(1, 0)                            // s[2:3]   col_tgt
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5]   col_w
+    asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7]   col_is_inh
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9]   cell_type
+    asm_s_load_b64_off(5, 0, 0x20)                  // s[10:11] n  (only s10 used)
+    asm_s_load_b64_off(6, 0, 0x28)                  // s[12:13] syn_per (only s12 used)
+    asm_s_load_b64_off(8, 0, 0x30)                  // s[16:17] seed
+    asm_s_load_b64_off(9, 0, 0x38)                  // s[18:19] w_ee
+    asm_s_load_b64_off(10, 0, 0x40)                 // s[20:21] w_ei
+    asm_s_load_b64_off(11, 0, 0x48)                 // s[22:23] w_ie
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Splitmix64 constants into SGPRs: s30:s31=C0, s32:s33=C1, s34:s35=C2.
+    asm_s_mov_b32_lit32(30, 0x7F4A7C15)             // C0_lo
+    asm_s_mov_b32_lit32(31, 0x9E3779B9)             // C0_hi
+    asm_s_mov_b32_lit32(32, 0x1CE4E5B9)             // C1_lo
+    asm_s_mov_b32_lit32(33, 0xBF58476D)             // C1_hi
+    asm_s_mov_b32_lit32(34, 0x133111EB)             // C2_lo
+    asm_s_mov_b32_lit32(35, 0x94D049BB)             // C2_hi
+
+    // Bounds check: gid < n (vcc_lo = (s10 > v1)).
+    asm_v_cmp_gt_u32_sgpr_vgpr(10, 1)
+    asm_s_and_saveexec_b32_vcc_lo(28)               // s28 = old EXEC
+    uint64 outer_skip_off = asm_text_len / 4
+    asm_s_cbranch_execz(0)                          // patched at end
+
+    // src_e = (cell_type[src] == 0) ? 1 : 0.
+    // Compute byte address: v24:v25 = s8:s9 + v1*8.
+    asm_v_lshlrev_b32_imm(24, 3, 1)                 // v24 = v1 * 8 (low)
+    asm_v_mov_b32_inline_u(25, 0)                   // v25 = 0 (high)
+    asm_v_add_co_u32_vcc_sv(24, 8, 24)              // v24 += s8
+    asm_v_add_co_ci_u32_null_sv_vcc(25, 9, 25)      // v25 += s9 + carry
+
+    asm_global_load_b64_offvaddr(26, 24)            // v[26:27] = cell_type[src]
+    asm_s_waitcnt_vmcnt_zero()
+    asm_v_cmp_eq_u32_imm_vgpr(0, 26)                  // vcc_lo = (v26 == 0)
+    asm_v_mov_b32_inline_u(19, 0)                   // v19 = 0
+    asm_v_mov_b32_inline_u(28, 1)                   // v28 = 1 (scratch literal)
+    asm_v_cndmask_b32_e64_vv_vcc(19, 19, 28)        // v19 = vcc ? 1 : 0  (src_e)
+
+    // base = src * syn_per (u32). v_mul_lo_u32 v_base, v1, s12.
+    // We keep base in v_base = v25 (was 0; reuse).
+    asm_v_mul_lo_u32_vs(25, 1, 12)                  // v25 = src * syn_per
+
+    // Initialise k counter in s24 = 0; loop while k < syn_per (s12).
+    asm_s_mov_b32_inline_imm(24, 0)                 // s24 = 0
+
+    // ── k loop top ──
+    uint64 k_loop_top_off = asm_text_len / 4
+    asm_s_cmp_lt_u32(24, 12)                        // SCC = (k < syn_per)
+    uint64 k_scc_patch_off = asm_text_len / 4
+    asm_s_cbranch_scc0(0)                           // patched to k_loop_end
+
+    // ctr = base + k as u64. v_add_nc_u32 v_ctr_lo = v25 + s24, v_ctr_hi = 0.
+    // Need v_add_nc_u32 with SGPR src — use the inline pattern from delivery.
+    // Encoding: word = (0x25<<25) | (vdst<<17) | (vsrc1<<9) | (sgpr_src0)
+    uint64 add_word = (0x25 << 25)
+                      | ((10 & 0xFF) << 17)            // vdst = v10
+                      | ((25 & 0xFF) << 9)             // vsrc1 = v25
+                      | (24 & 0x1FF)                    // src0 = s24 raw
+    asm_u32(add_word)
+    asm_v_mov_b32_inline_u(11, 0)                   // v11 = 0  (ctr_hi)
+
+    // ── splitmix64 step 1: z = seed + ctr * C0 ──
+    // z (v[2:3]) = seed (s[16:17]) + (ctr_lo (v10) * C0 (s[30:31])) low 64.
+    // Since ctr_hi = 0:
+    //   ll_lo = mul_lo(v10, s30)        → bits 0..31
+    //   ll_hi = mul_hi(v10, s30)        → bits 32..63 (low part)
+    //   lh_lo = mul_lo(v10, s31)        → bits 32..63 (cross part)
+    //   z_hi = ll_hi + lh_lo  (carry dropped)
+    asm_v_mul_lo_u32_vs(2, 10, 30)                  // v2 = ll_lo
+    asm_v_mul_hi_u32_vs(6, 10, 30)                  // v6 = ll_hi
+    asm_v_mul_lo_u32_vs(7, 10, 31)                  // v7 = lh_lo
+    asm_v_add_nc_u32_vv(3, 6, 7)                    // v3 = ll_hi + lh_lo
+
+    // z += seed (s[16:17]). v_add_co_u32 / v_add_co_ci_u32 with SGPR src0.
+    asm_v_add_co_u32_vcc_sv(2, 16, 2)               // v2 += s16 (carry → vcc)
+    asm_v_add_co_ci_u32_null_sv_vcc(3, 17, 3)       // v3 += s17 + carry
+
+    // ── splitmix64 step 2: z = (z ^ (z >> 30)) * C1 ──
+    asm_v_lshrrev_b64_imm_vv(4, 30, 2)              // v[4:5] = z >> 30
+    asm_v_xor_b32_e64_vv(2, 2, 4)                   // z_lo ^= shr_lo
+    asm_v_xor_b32_e64_vv(3, 3, 5)                   // z_hi ^= shr_hi
+
+    // z (v[2:3]) = z * C1 (s[32:33]) — full u64×u64 → low 64.
+    //   ll_lo = mul_lo(z_lo, C1_lo)
+    //   ll_hi = mul_hi(z_lo, C1_lo)
+    //   lh_lo = mul_lo(z_lo, C1_hi)
+    //   hl_lo = mul_lo(z_hi, C1_lo)
+    //   z_lo' = ll_lo
+    //   z_hi' = ll_hi + lh_lo + hl_lo
+    asm_v_mul_lo_u32_vs(4, 2, 32)                   // v4 = ll_lo
+    asm_v_mul_hi_u32_vs(6, 2, 32)                   // v6 = ll_hi
+    asm_v_mul_lo_u32_vs(7, 2, 33)                   // v7 = lh_lo
+    asm_v_mul_lo_u32_vs(8, 3, 32)                   // v8 = hl_lo
+    asm_v_add_nc_u32_vv(6, 6, 7)                    // v6 = ll_hi + lh_lo
+    asm_v_add_nc_u32_vv(6, 6, 8)                    // v6 += hl_lo  → z_hi'
+    asm_v_mov_b32(2, 0x100 | 4)                     // v2 = v4   (z_lo')
+    asm_v_mov_b32(3, 0x100 | 6)                     // v3 = v6   (z_hi')
+
+    // ── splitmix64 step 3: z = (z ^ (z >> 27)) * C2 ──
+    asm_v_lshrrev_b64_imm_vv(4, 27, 2)
+    asm_v_xor_b32_e64_vv(2, 2, 4)
+    asm_v_xor_b32_e64_vv(3, 3, 5)
+
+    asm_v_mul_lo_u32_vs(4, 2, 34)                   // ll_lo
+    asm_v_mul_hi_u32_vs(6, 2, 34)                   // ll_hi
+    asm_v_mul_lo_u32_vs(7, 2, 35)                   // lh_lo
+    asm_v_mul_lo_u32_vs(8, 3, 34)                   // hl_lo
+    asm_v_add_nc_u32_vv(6, 6, 7)
+    asm_v_add_nc_u32_vv(6, 6, 8)
+    asm_v_mov_b32(2, 0x100 | 4)
+    asm_v_mov_b32(3, 0x100 | 6)
+
+    // ── splitmix64 step 4: z ^= z >> 31 ──
+    asm_v_lshrrev_b64_imm_vv(4, 31, 2)
+    asm_v_xor_b32_e64_vv(2, 2, 4)
+    asm_v_xor_b32_e64_vv(3, 3, 5)
+
+    // ── Modulo: tgt = z % n via 64-iter long division ──
+    // r (v[12:13]) = 0; n_v (v[14:15]) = (s10, 0); s25 = 63 (i counter).
+    asm_v_mov_b32_inline_u(12, 0)                   // r_lo = 0
+    asm_v_mov_b32_inline_u(13, 0)                   // r_hi = 0
+    asm_v_mov_b32(14, 10)                           // n_v_lo = s10
+    asm_v_mov_b32_inline_u(15, 0)                   // n_v_hi = 0  (n < 2^32)
+    asm_s_mov_b32_inline_imm(25, 63)                // i = 63
+
+    uint64 div_loop_top_off = asm_text_len / 4
+    // bit_in = (z >> i) & 1  (shifted goes into v[4:5])
+    asm_v_lshrrev_b64_sgpr_vv(4, 25, 2)             // v[4:5] = z >> i
+    asm_v_and_b32_imm_e64(18, 4, 1)                 // v18 = (shifted_lo) & 1
+
+    // r = (r << 1) | bit_in
+    asm_v_lshlrev_b64_imm_vv(12, 1, 12)             // r <<= 1
+    asm_v_or_b32_e64_vv(12, 12, 18)                 // r_lo |= bit_in
+
+    // r_minus_n = r - n  (v[16:17])
+    asm_v_sub_co_u32_vcc_vv(16, 12, 14)             // v16 = r_lo - n_lo (sets vcc borrow)
+    asm_v_sub_co_ci_u32_null_vv_vcc(17, 13, 15)     // v17 = r_hi - n_hi - borrow
+
+    // vcc = (r >= n)
+    asm_v_cmp_ge_u64_vv(12, 14)
+
+    // r = vcc ? r_minus_n : r
+    asm_v_cndmask_b32_e64_vv_vcc(12, 12, 16)        // r_lo = vcc ? r_minus_lo : r_lo
+    asm_v_cndmask_b32_e64_vv_vcc(13, 13, 17)        // r_hi = vcc ? r_minus_hi : r_hi
+
+    // SALU loop control: if i == 0 break, else i--, branch top.
+    asm_s_cmp_eq_u32(25, 0x80)                      // SCC = (s25 == inline 0)
+    uint64 div_exit_patch_off = asm_text_len / 4
+    asm_s_cbranch_scc1(0)                           // patched to div_loop_end
+    asm_s_sub_u32_imm(25, 25, 1)                    // i = i - 1
+    uint64 div_back_branch_off = asm_text_len / 4
+    uint64 div_back_delta = div_loop_top_off - (div_back_branch_off + 1)
+    asm_s_branch(div_back_delta & 0xFFFF)
+
+    uint64 div_loop_end_off = asm_text_len / 4
+    uint64 div_exit_skip = div_loop_end_off - (div_exit_patch_off + 1)
+    uint64 div_exit_byte = asm_text_buf + div_exit_patch_off * 4
+    uint32 div_exit_word = 0xBFA20000 | (div_exit_skip & 0xFFFF)   // s_cbranch_scc1 op 0x22
+    unsafe { *(div_exit_byte as uint32) = div_exit_word }
+
+    // tgt is in v[12:13] (r at end of long division).
+    // NOTE: the (tgt == src) self-loop fixup that the HIP version
+    // applies is omitted in this initial native landing. Probability
+    // of collision per edge = 1/n ≈ 1.7e-8 for n = 60M, so <1 in
+    // every 60M edges differs vs the HIP reference. Self-loops are
+    // legal in the runtime CSR delivery (a neuron firing into itself
+    // adds its own release back into s_exc) and therefore preserve
+    // simulation correctness within statistical noise.
+    // Adding the fixup needs a v_cmp_eq_u32 vv-to-vcc helper plus a
+    // chained "if vcc then conditional-add-1-with-rollover" — staged
+    // for a follow-up so this emitter lands cleanly.
+
+    // tgt_e = (cell_type[tgt] == 0) ? 1 : 0
+    // Compute byte address: v24:v25 = s8:s9 + tgt*8.
+    asm_v_lshlrev_b64_imm_vv(24, 3, 12)             // v[24:25] = tgt * 8
+    asm_v_add_co_u32_vcc_sv(24, 8, 24)              // v24 += s8
+    asm_v_add_co_ci_u32_null_sv_vcc(25, 9, 25)      // v25 += s9 + carry
+    asm_global_load_b64_offvaddr(26, 24)            // v[26:27] = cell_type[tgt]
+    asm_s_waitcnt_vmcnt_zero()
+    asm_v_cmp_eq_u32_imm_vgpr(0, 26)                  // vcc = (tgt_ct == 0)
+    asm_v_mov_b32_inline_u(20, 0)
+    asm_v_cndmask_b32_e64_vv_vcc(20, 20, 28)        // v20 = vcc ? 1 : 0  (tgt_e). v28 still = 1.
+
+    // Compute (w, inh):
+    //   if src_e (v19) == 1: w = tgt_e ? w_ee : w_ei; inh = 0
+    //   else:                w = w_ie;               inh = 1
+    //
+    // Branch-free: build w_pair from (src_e, tgt_e):
+    //   v[21:22] = w_ie (default for src_e = 0)
+    //   if src_e == 1: v[21:22] = tgt_e ? w_ee : w_ei
+    //
+    // Use cndmask on the full 64-bit value (two 32-bit cndmasks).
+    asm_v_mov_b32(21, 22)                           // v21 = s22 (w_ie lo)
+    asm_v_mov_b32(22, 23)                           // v22 = s23 (w_ie hi)
+
+    // Compute w_e = tgt_e ? w_ee : w_ei  in v[26:27], then if src_e cndmask
+    // v[21:22] = w_e.
+    asm_v_mov_b32(26, 20)                           // v26 = s20 (w_ei lo)
+    asm_v_mov_b32(27, 21)                           // v27 = s21 (w_ei hi)
+    // vcc = (tgt_e == 1)
+    asm_v_cmp_eq_u32_imm_vgpr(1, 20)                // vcc = (v20 == 1)
+    asm_v_mov_b32(28, 18)                           // v28 = s18 (w_ee lo)
+    asm_v_mov_b32(29, 19)                           // v29 = s19 (w_ee hi)
+    asm_v_cndmask_b32_e64_vv_vcc(26, 26, 28)        // v26 = vcc ? w_ee_lo : w_ei_lo
+    asm_v_cndmask_b32_e64_vv_vcc(27, 27, 29)        // v27 = vcc ? w_ee_hi : w_ei_hi
+
+    // vcc = (src_e == 1)
+    asm_v_cmp_eq_u32_imm_vgpr(1, 19)                // vcc = (v19 == 1)
+    asm_v_cndmask_b32_e64_vv_vcc(21, 21, 26)        // v21 = src_e ? w_e_lo : w_ie_lo
+    asm_v_cndmask_b32_e64_vv_vcc(22, 22, 27)        // v22 = src_e ? w_e_hi : w_ie_hi
+
+    // inh = src_e ? 0 : 1   = !src_e
+    asm_v_mov_b32_inline_u(23, 1)
+    asm_v_mov_b32_inline_u(26, 0)
+    asm_v_cmp_eq_u32_imm_vgpr(1, 19)                // vcc = (src_e == 1)
+    asm_v_cndmask_b32_e64_vv_vcc(23, 23, 26)        // v23 = src_e ? 0 : 1
+
+    // ── stores to col_tgt[ctr], col_w[ctr], col_is_inh[ctr] ──
+    // ctr (= base+k) is in v10. Byte offset = ctr * 8.
+    asm_v_lshlrev_b32_imm(24, 3, 10)                // v24 = ctr * 8 (low)
+    asm_v_mov_b32_inline_u(25, 0)                   // v25 = 0 (high)
+
+    // col_tgt[ctr] = tgt (u64): saddr=s2, vaddr=v24.
+    // global_store_b64 saddr form. Use the existing helper.
+    asm_global_store_b64(24, 12, 2)                 // saddr=s[2:3], vdata=v[12:13]
+
+    // col_w[ctr] = w (f64): saddr=s4, vaddr=v24, vdata=v[21:22].
+    asm_global_store_b64(24, 21, 4)
+
+    // col_is_inh[ctr] = inh (u64): saddr=s6, vaddr=v24, vdata pair v[28:29].
+    asm_v_mov_b32(28, 0x100 | 23)                   // v28 = v23 (inh lo)
+    asm_v_mov_b32_inline_u(29, 0)                   // v29 = 0 (inh hi)
+    asm_global_store_b64(24, 28, 6)
+    asm_s_waitcnt_vscnt_zero()
+
+    // k = k + 1; branch top.
+    asm_s_add_u32_imm(24, 24, 1)
+    uint64 k_back_branch_off = asm_text_len / 4
+    uint64 k_back_delta = k_loop_top_off - (k_back_branch_off + 1)
+    asm_s_branch(k_back_delta & 0xFFFF)
+
+    // ── k_loop_end ── back-patch the scc0 cbranch.
+    uint64 k_loop_end_off = asm_text_len / 4
+    uint64 k_scc_skip = k_loop_end_off - (k_scc_patch_off + 1)
+    uint64 k_scc_patch_byte = asm_text_buf + k_scc_patch_off * 4
+    uint32 k_scc_word = 0xBFA10000 | (k_scc_skip & 0xFFFF)
+    unsafe { *(k_scc_patch_byte as uint32) = k_scc_word }
+
+    // Back-patch the outer s_cbranch_execz too.
+    uint64 outer_skip_target = asm_text_len / 4
+    uint64 outer_skip_dwords = outer_skip_target - (outer_skip_off + 1)
+    uint64 outer_skip_byte = asm_text_buf + outer_skip_off * 4
+    uint32 outer_skip_word = 0xBFA50000 | (outer_skip_dwords & 0xFFFF)
+    unsafe { *(outer_skip_byte as uint32) = outer_skip_word }
+
+    asm_s_endpgm()
+
+    // 10 args, all size=8 declared. 4 GLOBAL_BUFFER + 6 BY_VALUE
+    // (n, syn_per, seed, w_ee, w_ei, w_ie).
+    uint64 args_desc = alloc(10 * 16)
+    uint64 ai = 0
+    while ai < 4 {
+        uint64 p0 = args_desc + ai * 16;     unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8; unsafe { *(p1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        ai = ai + 1
+    }
+    while ai < 10 {
+        uint64 p0 = args_desc + ai * 16;     unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8; unsafe { *(p1 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        ai = ai + 1
+    }
+
+    uint64 k_text_size = asm_text_len
+    uint64 k_text_buf  = alloc(k_text_size)
+    uint64 ci = 0
+    while ci < k_text_size {
+        uint64 sp = asm_text_buf + ci
+        uint64 b = 0; unsafe { *(sp as uint8) -> b }
+        uint64 dp = k_text_buf + ci
+        uint8 b8 = b; unsafe { *(dp as uint8) = b8 }
+        ci = ci + 1
+    }
+
+    uint64 rsrc1 = 0xE0AF0003                       // VGPR granule=3 → 32 VGPRs
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    // sgpr_count: s0..s35 = 36; round up.
+    kt_push(kname_ptr, nl, k_text_buf, k_text_size,
+            args_desc, 10, 80,
+            40, 32,
             rsrc1, rsrc2, rsrc3, props)
     return 0
 }
@@ -6682,15 +7083,19 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         return amdgpu_lower_noesis_delivery(kname_ptr, nl)
     }
     if tok_matches(name_tok, "csr_build", 9) != 0 {
-        // csr_build needs splitmix64 (4× 64-bit multiply) and a 64-bit
-        // unsigned modulo. Neither has a primitive in our gfx1100
-        // encoder yet; implementing them is multi-day work and only
-        // amortises across one launch (csr_build runs once at sim
-        // start). csr_build is a one-shot startup kernel, so this does
-        // not block hot-path benchmarking.
-        write(2, "mlrc: amdgpu-native: skipping csr_build (not yet native).\n", 58)
-        write(2, "  Build a fallback .co with --target=hip-amd and set\n", 53)
-        write(2, "  NOESIS_CSR_CO_PATH at launch time.\n", 37)
+        // amdgpu_lower_noesis_csr_build() is fully written and the
+        // emitted ISA disassembles cleanly via llvm-objdump, but it
+        // hangs the GPU at runtime — needs per-block hardware
+        // bisection (splitmix64-only kernel, then mod-only kernel,
+        // then full integration). Until that's done, fall through
+        // to the hipcc fallback to keep the .co bring-up safe.
+        // Emitter source is preserved earlier in this file; toggling
+        // this call back on is the only change needed to re-enable
+        // the native path once verified.
+        // return amdgpu_lower_noesis_csr_build(kname_ptr, nl)
+        write(2, "mlrc: amdgpu-native: skipping csr_build (emitter staged,\n", 57)
+        write(2, "  runtime bisection deferred). Build a fallback .co with\n", 57)
+        write(2, "  --target=hip-amd and set NOESIS_CSR_CO_PATH at launch time.\n", 62)
         return 2
     }
 
