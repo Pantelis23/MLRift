@@ -1,0 +1,285 @@
+// Stage 2c port of M1v (mt_csr_delivery) to raw KFD. Multi-thread N_pre=16
+// fully-connected gate. Two kernels:
+//   Case 1: mt_csr_i_deliver (9 kernargs, block_x=total_edges=256)
+//     Expected s_inh[t] = 60 + 8*t.
+//   Case 2: mt_csr_e_delayed (14 kernargs, block_x=total_edges=256, ROW_BASE=0)
+//     Expected s_exc[t] = 60 + 8*t; rpe_w E→E gets +0.125; ltd_events=128;
+//     buf_delay cleared.
+//
+// Emit: ./build/mlrc --emit-amdgpu-mt-csr-i-deliver=/tmp/mtci.co
+//       ./build/mlrc --emit-amdgpu-mt-csr-e-delayed=/tmp/mtce.co
+// Compile: ./build/mlrc --arch=x86_64 examples/b5c_kfd_m1v_load.mlr -o /tmp/b5c_m1v
+
+import "../std/kfd.mlr"
+
+static uint64 N_PRE = 16
+static uint64 ROW_BASE = 0
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn build_edge_to_src(uint64 n_pre, uint64 edges_per_src, uint64 out_edge_to_src, uint64 out_is_first) {
+    uint64 src = 0
+    while src < n_pre {
+        uint64 e = 0
+        while e < edges_per_src {
+            uint64 edge_idx = src * edges_per_src + e
+            uint64 p1 = out_edge_to_src + edge_idx * 8
+            unsafe { *(p1 as uint64) = src }
+            uint64 p2 = out_is_first + edge_idx * 8
+            uint64 fv = 0
+            if e == 0 { fv = 1 }
+            unsafe { *(p2 as uint64) = fv }
+            e = e + 1
+        }
+        src = src + 1
+    }
+}
+
+fn run_case1_i_deliver(uint64 q, uint64 signal, uint64 kernel) -> uint64 {
+    uint64 total_edges = N_PRE * N_PRE
+    uint64 edges_bytes = total_edges * 8
+    uint64 state_bytes = N_PRE * 8
+
+    uint64 d_tgt  = dev_alloc_host_visible(edges_bytes); uint64 d_tgt_h  = dev_host_ptr(d_tgt)
+    uint64 d_w    = dev_alloc_host_visible(edges_bytes); uint64 d_w_h    = dev_host_ptr(d_w)
+    uint64 d_ets  = dev_alloc_host_visible(edges_bytes); uint64 d_ets_h  = dev_host_ptr(d_ets)
+    uint64 d_ct   = dev_alloc_host_visible(state_bytes); uint64 d_ct_h   = dev_host_ptr(d_ct)
+    uint64 d_rel  = dev_alloc_host_visible(state_bytes); uint64 d_rel_h  = dev_host_ptr(d_rel)
+    uint64 d_sinh = dev_alloc_host_visible(state_bytes); uint64 d_sinh_h = dev_host_ptr(d_sinh)
+
+    uint64 src = 0
+    while src < N_PRE {
+        uint64 tgt = 0
+        while tgt < N_PRE {
+            uint64 e = src * N_PRE + tgt
+            unsafe { *((d_tgt_h + e * 8) as uint64) = tgt }
+            f64 sf = 0.0; uint64 ifs = src; sf = ifs
+            f64 tf = 0.0; uint64 ift = tgt; tf = ift
+            f64 wv = sf + tf
+            unsafe { *((d_w_h + e * 8) as f64) = wv }
+            tgt = tgt + 1
+        }
+        src = src + 1
+    }
+    // ets is N_PRE-edges-per-src; we hand-build it via build_edge_to_src into a temp,
+    // then copy. Simpler to write directly.
+    uint64 i = 0
+    while i < N_PRE {
+        uint64 e = 0
+        while e < N_PRE {
+            uint64 edge_idx = i * N_PRE + e
+            unsafe { *((d_ets_h + edge_idx * 8) as uint64) = i }
+            e = e + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < N_PRE {
+        uint64 one = 1; unsafe { *((d_ct_h + i * 8) as uint64) = one }
+        f64 rv = 0.5; unsafe { *((d_rel_h + i * 8) as f64) = rv }
+        f64 sv = 0.0; unsafe { *((d_sinh_h + i * 8) as f64) = sv }
+        i = i + 1
+    }
+
+    uint64 kernarg = dev_alloc_host_visible(72)
+    uint64 kh = dev_host_ptr(kernarg)
+    unsafe { *((kh + 0x00) as uint64) = d_tgt }
+    unsafe { *((kh + 0x08) as uint64) = d_w }
+    unsafe { *((kh + 0x10) as uint64) = d_ets }
+    unsafe { *((kh + 0x18) as uint64) = d_ct }
+    unsafe { *((kh + 0x20) as uint64) = d_rel }
+    unsafe { *((kh + 0x28) as uint64) = d_sinh }
+    unsafe { *((kh + 0x30) as uint64) = N_PRE }
+    unsafe { *((kh + 0x38) as uint64) = total_edges }
+    uint64 z = 0; unsafe { *((kh + 0x40) as uint64) = z }
+
+    kfd_dispatch(q, kernel, 1, 1, 1, total_edges, 1, 1, kernarg, 72, signal)
+    kfd_wait(q, signal)
+
+    uint64 fails = 0
+    uint64 exp_slot = alloc(8)
+    uint64 t = 0
+    while t < N_PRE {
+        f64 tf = 0.0; uint64 ift = t; tf = ift
+        f64 exp = 60.0 + 8.0 * tf
+        unsafe { *(exp_slot as f64) = exp }
+        uint64 eb = 0; unsafe { *(exp_slot as uint64) -> eb }
+        uint64 got = 0; unsafe { *((d_sinh_h + t * 8) as uint64) -> got }
+        if got != eb { fails = fails + 1 }
+        t = t + 1
+    }
+
+    print_label_val("i_deliver fails", 15, fails)
+    if fails == 0 { return 1 }
+    return 0
+}
+
+fn run_case2_e_delayed(uint64 q, uint64 signal, uint64 kernel) -> uint64 {
+    uint64 total_edges = N_PRE * N_PRE
+    uint64 edges_bytes = total_edges * 8
+    uint64 state_bytes = N_PRE * 8
+    uint64 delay_bytes = N_PRE * 8
+
+    uint64 d_tgt   = dev_alloc_host_visible(edges_bytes); uint64 d_tgt_h   = dev_host_ptr(d_tgt)
+    uint64 d_w     = dev_alloc_host_visible(edges_bytes); uint64 d_w_h     = dev_host_ptr(d_w)
+    uint64 d_isee  = dev_alloc_host_visible(edges_bytes); uint64 d_isee_h  = dev_host_ptr(d_isee)
+    uint64 d_ets   = dev_alloc_host_visible(edges_bytes); uint64 d_ets_h   = dev_host_ptr(d_ets)
+    uint64 d_first = dev_alloc_host_visible(edges_bytes); uint64 d_first_h = dev_host_ptr(d_first)
+    uint64 d_buf   = dev_alloc_host_visible(delay_bytes); uint64 d_buf_h   = dev_host_ptr(d_buf)
+    uint64 d_xpost = dev_alloc_host_visible(state_bytes); uint64 d_xpost_h = dev_host_ptr(d_xpost)
+    uint64 d_sexc  = dev_alloc_host_visible(state_bytes); uint64 d_sexc_h  = dev_host_ptr(d_sexc)
+    uint64 d_ltd   = dev_alloc_host_visible(8);           uint64 d_ltd_h   = dev_host_ptr(d_ltd)
+
+    uint64 src = 0
+    while src < N_PRE {
+        uint64 tgt = 0
+        while tgt < N_PRE {
+            uint64 e = src * N_PRE + tgt
+            unsafe { *((d_tgt_h + e * 8) as uint64) = tgt }
+            f64 sf = 0.0; uint64 ifs = src; sf = ifs
+            f64 tf = 0.0; uint64 ift = tgt; tf = ift
+            f64 wv = sf + tf
+            unsafe { *((d_w_h + e * 8) as f64) = wv }
+            uint64 isee_val = 0; if (tgt - (tgt / 2) * 2) == 0 { isee_val = 1 }
+            unsafe { *((d_isee_h + e * 8) as uint64) = isee_val }
+            tgt = tgt + 1
+        }
+        src = src + 1
+    }
+    build_edge_to_src(N_PRE, N_PRE, d_ets_h, d_first_h)
+
+    uint64 i = 0
+    while i < N_PRE {
+        f64 bv = 0.5; unsafe { *((d_buf_h + i * 8) as f64) = bv }
+        f64 xv = 0.5; unsafe { *((d_xpost_h + i * 8) as f64) = xv }
+        f64 sv = 0.0; unsafe { *((d_sexc_h + i * 8) as f64) = sv }
+        i = i + 1
+    }
+    uint64 zl = 0; unsafe { *(d_ltd_h as uint64) = zl }
+
+    uint64 kernarg = dev_alloc_host_visible(112)
+    uint64 kh = dev_host_ptr(kernarg)
+    unsafe { *((kh + 0x00) as uint64) = d_tgt }
+    unsafe { *((kh + 0x08) as uint64) = d_w }
+    unsafe { *((kh + 0x10) as uint64) = d_isee }
+    unsafe { *((kh + 0x18) as uint64) = d_ets }
+    unsafe { *((kh + 0x20) as uint64) = d_first }
+    unsafe { *((kh + 0x28) as uint64) = d_buf }
+    unsafe { *((kh + 0x30) as uint64) = ROW_BASE }
+    unsafe { *((kh + 0x38) as uint64) = d_xpost }
+    unsafe { *((kh + 0x40) as uint64) = d_sexc }
+    unsafe { *((kh + 0x48) as uint64) = d_ltd }
+    unsafe { *((kh + 0x50) as uint64) = N_PRE }
+    f64 am = 0.25;   unsafe { *((kh + 0x58) as f64) = am }
+    f64 wm = 1024.0; unsafe { *((kh + 0x60) as f64) = wm }
+    uint64 z = 0; unsafe { *((kh + 0x68) as uint64) = z }
+
+    kfd_dispatch(q, kernel, 1, 1, 1, total_edges, 1, 1, kernarg, 112, signal)
+    kfd_wait(q, signal)
+
+    uint64 fails = 0
+    uint64 exp_slot = alloc(8)
+
+    uint64 t = 0
+    while t < N_PRE {
+        f64 tf = 0.0; uint64 ift = t; tf = ift
+        f64 exp = 60.0 + 8.0 * tf
+        unsafe { *(exp_slot as f64) = exp }
+        uint64 eb = 0; unsafe { *(exp_slot as uint64) -> eb }
+        uint64 gb = 0; unsafe { *((d_sexc_h + t * 8) as uint64) -> gb }
+        if gb != eb { fails = fails + 1 }
+        t = t + 1
+    }
+
+    uint64 es = 0
+    while es < N_PRE {
+        uint64 et = 0
+        while et < N_PRE {
+            uint64 e = es * N_PRE + et
+            f64 sf = 0.0; uint64 ifs = es; sf = ifs
+            f64 tf2 = 0.0; uint64 ift2 = et; tf2 = ift2
+            f64 w_old = sf + tf2
+            f64 w_exp = w_old
+            if (et - (et / 2) * 2) == 0 { w_exp = w_old + 0.125 }
+            if w_exp < 0.0 { w_exp = 0.0 }
+            if w_exp > 1024.0 { w_exp = 1024.0 }
+            unsafe { *(exp_slot as f64) = w_exp }
+            uint64 eb = 0; unsafe { *(exp_slot as uint64) -> eb }
+            uint64 gb = 0; unsafe { *((d_w_h + e * 8) as uint64) -> gb }
+            if gb != eb { fails = fails + 1 }
+            et = et + 1
+        }
+        es = es + 1
+    }
+
+    uint64 got_ltd = 0; unsafe { *(d_ltd_h as uint64) -> got_ltd }
+    if got_ltd != 128 { fails = fails + 1 }
+
+    f64 zero_f = 0.0; unsafe { *(exp_slot as f64) = zero_f }
+    uint64 zb = 0; unsafe { *(exp_slot as uint64) -> zb }
+    uint64 bi = 0
+    while bi < N_PRE {
+        uint64 gb = 0; unsafe { *((d_buf_h + bi * 8) as uint64) -> gb }
+        if gb != zb { fails = fails + 1 }
+        bi = bi + 1
+    }
+
+    print_label_val("e_delayed fails", 15, fails)
+    if fails == 0 { return 1 }
+    return 0
+}
+
+fn main() {
+    kfd_init()
+    uint64 q = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 signal = kfd_signal_alloc()
+
+    uint64 mod_i = kernel_load("/tmp/mtci.co")
+    uint64 fh_i  = kernel_get_function(mod_i, "mt_csr_i_deliver")
+    uint64 mod_e = kernel_load("/tmp/mtce.co")
+    uint64 fh_e  = kernel_get_function(mod_e, "mt_csr_e_delayed")
+
+    puts("--- Case 1: mt_csr_i_deliver (N_pre=16, fully-connected) ---")
+    uint64 okI = run_case1_i_deliver(q, signal, fh_i)
+
+    puts("--- Case 2: mt_csr_e_delayed (N_pre=16, fully-connected, STDP+clear) ---")
+    uint64 okE = run_case2_e_delayed(q, signal, fh_e)
+
+    if okI == 1 { if okE == 1 { puts("M1v gate (KFD): GREEN"); exit(0) } }
+    puts("FAIL: mt_csr_* output did not match expected")
+    exit(1)
+}
