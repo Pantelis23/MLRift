@@ -1,0 +1,76 @@
+// Stage 2a smoke test: open /dev/kfd, GET_VERSION, exit 0.
+//
+// No kernel dispatch. No ACQUIRE_VM. No RUNTIME_ENABLE.
+// Catches: device file present? open() works? KFD v1.14+?
+
+import "../std/kfd_raw.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("errno", 5, code)
+    exit(1)
+}
+
+fn main() {
+    uint64 path_kfd = "/dev/kfd"
+    uint32 fd_kfd = open(path_kfd, KFD_OPEN_FLAGS, 0)
+    if fd_kfd > 0xFFFFFFF0 { die("open /dev/kfd failed", fd_kfd) }
+    print_label_val("kfd_fd", 6, fd_kfd)
+
+    uint32 major = 0; uint32 minor = 0
+    uint64 m_slot = alloc(4); uint64 n_slot = alloc(4)
+    uint32 r = raw_kfd_get_version(fd_kfd, m_slot, n_slot)
+    if r != 0 { die("GET_VERSION failed", r) }
+    unsafe { *(m_slot as uint32) -> major }
+    unsafe { *(n_slot as uint32) -> minor }
+    print_label_val("kfd_major", 9, major)
+    print_label_val("kfd_minor", 9, minor)
+
+    if major < 1 { die("KFD major < 1", major) }
+    if major == 1 {
+        if minor < 14 { die("KFD < 1.14 (need 1.14+)", minor) }
+    }
+
+    close(fd_kfd)
+    puts("b5a_kfd_init_smoke: OK")
+    exit(0)
+}
