@@ -27,23 +27,54 @@
 
 import "kfd.mlr"
 
-// --- Lazily-initialised global queue + signal ---
-// One queue + one signal serves all launches. kfd_dispatch resets the
-// signal value at the head of each dispatch; the immediate kfd_wait
-// below ensures the next launch sees a fresh signal.
+// --- Lazily-initialised global queue + kernarg ring + drain signal ---
+//
+// One queue serves all launches. Async pattern (matches HIP):
+//   * hipModuleLaunchKernel: enqueue an AQL packet without waiting.
+//   * hipDeviceSynchronize : wait for the queue to drain.
+//
+// Drain uses ONE shared completion signal initialised to 0. Every
+// dispatched packet has its completion_signal field pointing to it;
+// the GPU atomic-decrements by 1 when the kernel retires. CPU side
+// keeps a "pending" counter (0 - launched, wraps in u64). Sync
+// busy-polls until signal == pending (i.e. all launched kernels
+// retired). Avoids the per-launch CPU reset+wait round-trip that
+// dominated the old shim's runtime, and avoids the kernarg-ring race
+// you'd get with rp/wp polling alone (CP advances rp on packet
+// fetch, not retire).
+//
+// Kernarg ring: 1024 slots × 256 bytes = 256 KiB. 1024 >> AQL ring's
+// 64 capacity so old kernels never see their kernarg slot overwritten
+// even if back-pressure is loose — the AQL barrier=1 bit serialises
+// dispatches so by the time we re-use slot N, all kernels at the same
+// slot index from the previous lap have been launched, and with the
+// drain signal we ensure they've also retired before sync.
 
-static uint64 _hipkfd_q       = 0
-static uint64 _hipkfd_signal  = 0
-static uint64 _hipkfd_kernarg = 0   // scratch kernarg blob (4 KiB)
-static uint64 _hipkfd_kernarg_h = 0
+static uint64 _HIPKFD_KARG_SLOTS    = 1024
+static uint64 _HIPKFD_KARG_SLOT_SZ  = 256
+
+static uint64 _hipkfd_q              = 0
+static uint64 _hipkfd_signal         = 0
+static uint64 _hipkfd_signal_h       = 0     // host pointer to amd_signal_t
+static uint64 _hipkfd_pending        = 0     // (0 - launched) in u64, wraps
+static uint64 _hipkfd_kernarg_ring   = 0
+static uint64 _hipkfd_kernarg_ring_h = 0
+static uint64 _hipkfd_karg_slot      = 0     // round-robin index
 
 fn _hipkfd_lazy_init() {
     if _hipkfd_q != 0 { return }
     kfd_init()
-    _hipkfd_q       = kfd_create_queue(KFD_WAIT_BUSY_POLL)
-    _hipkfd_signal  = kfd_signal_alloc()
-    _hipkfd_kernarg = dev_alloc_host_visible(4096)
-    _hipkfd_kernarg_h = dev_host_ptr(_hipkfd_kernarg)
+    _hipkfd_q              = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    _hipkfd_signal         = kfd_signal_alloc()
+    // kfd_signal_alloc inits value=1 (HSA "in flight" default).
+    // For our subtract-on-retire counter we need value=0.
+    _hipkfd_signal_h       = dev_host_ptr(_hipkfd_signal)
+    uint64 zero = 0
+    unsafe { *((_hipkfd_signal_h + 0x08) as uint64) = zero }
+    _hipkfd_pending        = 0
+    _hipkfd_kernarg_ring   = dev_alloc_host_visible(_HIPKFD_KARG_SLOTS * _HIPKFD_KARG_SLOT_SZ)
+    _hipkfd_kernarg_ring_h = dev_host_ptr(_hipkfd_kernarg_ring)
+    _hipkfd_karg_slot      = 0
 }
 
 // --- Error handling ---
@@ -74,16 +105,20 @@ fn hipSetDevice(uint32 dev_id) -> uint32 {
 // HIP semantics: dev_ptr_ptr is a pointer to a uint64 slot the caller
 // owns; on success we write the device VA there.
 //
-// Backed by dev_alloc_host_visible (GTT) so hipMemcpy can route
-// through dev_host_ptr for the H2D / D2H paths. Multi-GB launchers
-// (e.g. noesis_60m_gpu_launch with ~5 GiB of state buffers) pay
-// ~1 s per GiB of GTT mapping at allocation time but the per-copy
-// memory bandwidth is then host-RAM-class (PCIe/IFCLK). For pure-
-// device working sets where the host never reads back, switch to
-// dev_alloc_vram + a copy kernel — not yet wired through this shim.
+// Backed by dev_alloc_smart_hostvis: try host-visible VRAM first
+// (HBM bandwidth for the device side, ReBar-mapped on host), then
+// host-visible GTT. Always returns a buffer with a real host
+// pointer, so hipMemcpy keeps working through dev_host_ptr.
+//
+// Performance impact for noesis_60m_gpu_launch (5 GiB working set):
+// VRAM-side ~960 GB/s instead of ~32 GB/s GTT, expected to drop
+// sim_us from 425s into the same ballpark as ROCm/HIP (~28s) when
+// ReBar is enabled and the working set fits in VRAM. Allocations
+// that exceed BAR / VRAM headroom transparently spill to GTT.
 fn hipMalloc(uint64 dev_ptr_ptr, uint64 size) -> uint32 {
     _hipkfd_lazy_init()
-    uint64 dptr = dev_alloc_host_visible(size)
+    uint64 dptr = dev_alloc_smart_hostvis(size)
+    if dptr == 0 { return 2 }                                // hipErrorOutOfMemory
     unsafe { *(dev_ptr_ptr as uint64) = dptr }
     return 0
 }
@@ -113,10 +148,24 @@ fn hipMemcpy(uint64 dst, uint64 src, uint64 size, uint32 kind) -> uint32 {
 }
 
 // --- Synchronisation ---
-// No-op: hipModuleLaunchKernel already waits before returning, so by
-// the time the user's code calls hipDeviceSynchronize there is nothing
-// outstanding on the GPU.
+// hipModuleLaunchKernel is ASYNC; hipDeviceSynchronize drains via the
+// shared signal counter (signal value == _hipkfd_pending iff all
+// launched kernels have retired). _hipkfd_pending is the negative of
+// the launch count in unsigned wrap-around — equivalent to "after
+// every dispatched kernel atomic-decrements by 1, we expect this".
 fn hipDeviceSynchronize() -> uint32 {
+    if _hipkfd_q == 0 { return 0 }
+    if _hipkfd_signal_h == 0 { return 0 }
+    uint64 sig_addr = _hipkfd_signal_h + 0x08
+    uint64 v = 0; unsafe { *(sig_addr as uint64) -> v }
+    uint64 spin = 0
+    while v != _hipkfd_pending {
+        spin = spin + 1
+        if spin > 30000000000 {
+            kfd_die("hipDeviceSynchronize: timeout draining queue", spin)
+        }
+        unsafe { *(sig_addr as uint64) -> v }
+    }
     return 0
 }
 
@@ -174,54 +223,54 @@ fn hipModuleLaunchKernel(
     _hipkfd_lazy_init()
     uint64 kd_va = 0; unsafe { *((fn_handle + 0x00) as uint64) -> kd_va }
     uint64 ks    = 0; unsafe { *((fn_handle + 0x08) as uint64) -> ks }
-    if ks > 4096 {
-        kfd_die("hipModuleLaunchKernel: kernarg_size > 4096 (shim limit)", ks)
+    if ks > _HIPKFD_KARG_SLOT_SZ {
+        kfd_die("hipModuleLaunchKernel: kernarg_size > 256 (shim slot)", ks)
     }
 
-    // Pre-zero the kernarg buffer (Tier 2a defensive baseline). COv5
-    // kernels reserve trailing slots for hidden kernargs the runtime
-    // is supposed to populate (block_count, group_size, remainder,
-    // grid_dims, printf_buffer, hostcall_buffer, etc.). We don't parse
-    // msgpack metadata to discover which slots are which — when a
-    // launcher hits a kernel that *uses* hidden args, it will read
-    // back zero, which is the safe default for everything except
-    // block_count_* and group_size_*. None of the current MLRift
-    // launchers (Stage 1 + Stage 2) use those, so zero-fill works.
-    // Full hidden-kernarg-from-msgpack lookup is staged in the
-    // tier-1-2-3 roadmap for when a kernel actually needs it.
+    // Grab the next kernarg-ring slot (round-robin). 64 slots × 256
+    // bytes; the AQL ring's own back-pressure (in _kfd_dispatch_core)
+    // guarantees no in-flight kernel still owns the slot we're about
+    // to overwrite — both rings are sized 64.
+    uint64 slot_idx = _hipkfd_karg_slot
+    uint64 slot_off = slot_idx * _HIPKFD_KARG_SLOT_SZ
+    uint64 karg_va  = _hipkfd_kernarg_ring + slot_off
+    uint64 karg_h   = _hipkfd_kernarg_ring_h + slot_off
+    _hipkfd_karg_slot = slot_idx + 1
+    if _hipkfd_karg_slot >= _HIPKFD_KARG_SLOTS { _hipkfd_karg_slot = 0 }
+
+    // Pre-zero up to ks bytes (defensive baseline for COv5 hidden
+    // args; current launchers don't use them).
     uint64 zi = 0
     while zi < ks {
-        uint64 zp = _hipkfd_kernarg_h + zi
+        uint64 zp = karg_h + zi
         uint64 zero = 0
         unsafe { *(zp as uint64) = zero }
         zi = zi + 8
     }
 
-    // Unmarshal HIP ptr_table (array of u64*) into a contiguous KFD
-    // kernarg blob. nargs = kernarg_size / 8: every MLRift @kernel
-    // emitter declares size=8 for every arg (see args_desc init in
-    // src/format_amdgpu.mlr), and the HIP convention is one slot per
-    // 8-byte argument value. f64 and uint64 share the slot layout.
+    // Unmarshal HIP ptr_table → contiguous KFD kernarg blob.
     uint64 nargs = ks / 8
     uint64 i = 0
     while i < nargs {
         uint64 slot_ptr = 0
         unsafe { *((kernel_params + i * 8) as uint64) -> slot_ptr }
-        // Stop when ptr_table exhausted (caller's null sentinel) — a
-        // safety net that lets us coexist with COv5 trailing hidden
-        // args before the proper msgpack-driven fill lands. Without
-        // this, we'd dereference garbage past the launcher's ptr_table.
         if slot_ptr == 0 { break }
         uint64 v = 0
         unsafe { *(slot_ptr as uint64) -> v }
-        unsafe { *((_hipkfd_kernarg_h + i * 8) as uint64) = v }
+        unsafe { *((karg_h + i * 8) as uint64) = v }
         i = i + 1
     }
 
     uint64 gx = grid_x;  uint64 gy = grid_y;  uint64 gz = grid_z
     uint64 bx = block_x; uint64 by = block_y; uint64 bz = block_z
-    kfd_dispatch(_hipkfd_q, kd_va, gx, gy, gz, bx, by, bz,
-                 _hipkfd_kernarg, ks, _hipkfd_signal)
-    kfd_wait(_hipkfd_q, _hipkfd_signal)
+
+    // Async dispatch with shared completion signal. We bump the
+    // expected-pending counter (in u64 wrap, "0 - launched") and
+    // hand the same signal_va to every dispatch. The GPU subtracts
+    // 1 from the signal when the kernel retires, so when all are
+    // done signal value == _hipkfd_pending.
+    uint64 one = 1
+    _hipkfd_pending = _hipkfd_pending - one
+    _kfd_dispatch_core(_hipkfd_q, kd_va, gx, gy, gz, bx, by, bz, karg_va, ks, _hipkfd_signal)
     return 0
 }

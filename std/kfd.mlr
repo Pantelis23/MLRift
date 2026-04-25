@@ -231,6 +231,54 @@ fn dev_alloc_host_visible(uint64 nbytes) -> uint64 {
     return va
 }
 
+// Host-visible VRAM allocation. Uses the PUBLIC flag with VRAM, then
+// mmap's the result on the DRM render-node fd. Works on systems with
+// resizable BAR (ReBar / Smart Access Memory) where the GPU's full
+// VRAM is exposed via PCI BAR1 to the host. On non-ReBar systems
+// only ~256 MiB of VRAM is host-mappable; this allocator returns 0
+// for larger requests, in which case dev_alloc_smart_hostvis falls
+// back to GTT.
+//
+// Returns the device VA, with the host pointer recorded in the alloc
+// table so dev_host_ptr / dev_copy_h2d / dev_copy_d2h work as if it
+// were a GTT allocation. Bandwidth on the host side: PCIe lane width
+// (~32 GB/s for x16 PCIe4); device side: full HBM (~960 GB/s on
+// gfx1100).
+fn dev_try_alloc_vram_hostvis(uint64 nbytes) -> uint64 {
+    if _kfd_initialized == 0 { kfd_init() }
+    uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
+    uint64 va_pref = _kfd_reserve_va(nbytes)
+    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
+    if r != 0 { return 0 }
+    uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
+    uint64 va = 0;     unsafe { *(va_slot as uint64) -> va }
+    uint64 mm = 0;     unsafe { *(mm_slot as uint64) -> mm }
+    r = raw_kfd_map_memory_to_gpu(_kfd_fd, handle, _kfd_gpu_id)
+    if r != 0 {
+        raw_kfd_free_memory_of_gpu(_kfd_fd, handle)
+        return 0
+    }
+    uint64 host = mmap(0, nbytes, KFD_MMAP_PROT, KFD_MMAP_FLAGS, _kfd_drm_fd, mm)
+    if host > 0xFFFFFFFFFFFFF000 {
+        raw_kfd_unmap_memory_from_gpu(_kfd_fd, handle, _kfd_gpu_id)
+        raw_kfd_free_memory_of_gpu(_kfd_fd, handle)
+        return 0
+    }
+    _kfd_alloc_track(va, handle, nbytes, host)
+    return va
+}
+
+// Smart allocator with host-visible preference: try host-visible VRAM
+// first (HBM bandwidth on device, ReBar-mapped on host), then host-
+// visible GTT (system RAM mapped to GPU). Always returns a buffer
+// with a real host pointer, so hipMemcpy keeps working.
+fn dev_alloc_smart_hostvis(uint64 nbytes) -> uint64 {
+    uint64 va = dev_try_alloc_vram_hostvis(nbytes)
+    if va != 0 { return va }
+    return dev_try_alloc_host_visible(nbytes)
+}
+
 // Smart allocator: try VRAM first, fall back to host-visible GTT (i.e.
 // spill into system RAM, mapped into the GPU's address space) when the
 // card is short on VRAM. Returns the device VA in either case; the
@@ -557,6 +605,7 @@ fn kfd_create_queue(uint32 wait_mode) -> uint64 {
     unsafe { *((q + 0x48) as uint64) = eop_va }
     unsafe { *((q + 0x50) as uint64) = ctx_va }
     unsafe { *((q + 0x58) as uint32) = wait_mode }
+    unsafe { *((q + 0x60) as uint64) = rp_host }   // CP-updated read pointer
 
     return q
 }
@@ -928,23 +977,49 @@ fn _kfd_fence() {
     }
 }
 
-fn kfd_dispatch(uint64 q, uint64 kernel,
-                 uint64 grid_x, uint64 grid_y, uint64 grid_z,
-                 uint64 block_x, uint64 block_y, uint64 block_z,
-                 uint64 kernarg_ptr, uint64 kernarg_size, uint64 signal_va) {
+// Internal core: enqueue one AQL kernel-dispatch packet. If signal_va
+// is non-zero the caller's per-kernel completion signal is wired up
+// (and reset to 1 here so the GPU's atomic-decrement-on-completion
+// makes it 0). If signal_va == 0 the AQL packet's completion-signal
+// field is set to 0 and the GPU does not touch any signal — the only
+// way to know the dispatch finished is to compare wp (queue write
+// pointer) against rp (read pointer, updated by the CP firmware as
+// each packet is processed).
+//
+// Also blocks (busy-poll) when the ring is full so back-to-back
+// async dispatches don't overwrite an in-flight packet.
+fn _kfd_dispatch_core(uint64 q, uint64 kernel,
+                       uint64 grid_x, uint64 grid_y, uint64 grid_z,
+                       uint64 block_x, uint64 block_y, uint64 block_z,
+                       uint64 kernarg_ptr, uint64 kernarg_size, uint64 signal_va) {
     uint64 ring_host = 0;     unsafe { *((q + 0x18) as uint64) -> ring_host }
     uint64 ring_capacity = 0; unsafe { *((q + 0x10) as uint64) -> ring_capacity }
     uint64 wp_host = 0;       unsafe { *((q + 0x40) as uint64) -> wp_host }
     uint64 db_host = 0;       unsafe { *((q + 0x28) as uint64) -> db_host }
     uint64 db_off = 0;        unsafe { *((q + 0x20) as uint64) -> db_off }
+    uint64 rp_host = 0;       unsafe { *((q + 0x60) as uint64) -> rp_host }
 
     // Read current wp (kernel sees writes via separate wp BO).
     uint64 wp = 0; unsafe { *(wp_host as uint64) -> wp }
+
+    // Ring-full back-pressure: if (wp - rp) == ring_capacity, the slot
+    // we'd write to still holds an in-flight packet. Spin until at
+    // least one slot drains. Without this, async dispatch streams
+    // (Stage-2 sim loop, LLM forward) silently overwrite live packets.
+    uint64 rp = 0
+    unsafe { *(rp_host as uint64) -> rp }
+    while (wp - rp) >= ring_capacity {
+        unsafe { *(rp_host as uint64) -> rp }
+    }
+
     uint64 slot = wp - (wp / ring_capacity) * ring_capacity   // wp % capacity
     uint64 packet = ring_host + slot * 64
 
-    // Reset signal value to 1.
-    kfd_signal_reset(signal_va)
+    // NB: caller is responsible for the signal value. The synchronous
+    // wrapper (kfd_dispatch) calls kfd_signal_reset(signal_va) before
+    // entering this core. The async path (kfd_dispatch_async or the
+    // hip_kfd shim's hipModuleLaunchKernel) keeps a long-lived
+    // counter signal and never resets between launches.
 
     // Determine setup (number of dimensions).
     uint32 setup = 1
@@ -1004,6 +1079,51 @@ fn kfd_dispatch(uint64 q, uint64 kernel,
     // Source: tinygrad ops_amd.py (signal_doorbell, AMDComputeAQLQueue).
     uint64 db_value = new_wp - 1
     unsafe { *(db_host as uint64) = db_value }
+}
+
+// Original synchronous dispatch — resets the per-kernel signal to 1
+// before entering the core, so the immediate kfd_wait that callers
+// pair with this sees value=1 → 0 on completion.
+fn kfd_dispatch(uint64 q, uint64 kernel,
+                 uint64 grid_x, uint64 grid_y, uint64 grid_z,
+                 uint64 block_x, uint64 block_y, uint64 block_z,
+                 uint64 kernarg_ptr, uint64 kernarg_size, uint64 signal_va) {
+    if signal_va != 0 { kfd_signal_reset(signal_va) }
+    _kfd_dispatch_core(q, kernel, grid_x, grid_y, grid_z,
+                        block_x, block_y, block_z,
+                        kernarg_ptr, kernarg_size, signal_va)
+}
+
+// Async dispatch: enqueue without arming a per-kernel completion
+// signal. Caller drains the queue via kfd_wait_idle when ready.
+fn kfd_dispatch_async(uint64 q, uint64 kernel,
+                       uint64 grid_x, uint64 grid_y, uint64 grid_z,
+                       uint64 block_x, uint64 block_y, uint64 block_z,
+                       uint64 kernarg_ptr, uint64 kernarg_size) {
+    uint64 zero = 0
+    _kfd_dispatch_core(q, kernel, grid_x, grid_y, grid_z,
+                        block_x, block_y, block_z,
+                        kernarg_ptr, kernarg_size, zero)
+}
+
+// Wait until every dispatched packet has been consumed by the CP
+// (rp >= wp). Use after a batch of kfd_dispatch_async calls. This is
+// strictly cheaper than per-kernel signal waits — one mfence-equivalent
+// poll instead of N — and is the basis for the async-launch fast path
+// in the HIP shim.
+fn kfd_wait_idle(uint64 q) {
+    uint64 wp_host = 0; unsafe { *((q + 0x40) as uint64) -> wp_host }
+    uint64 rp_host = 0; unsafe { *((q + 0x60) as uint64) -> rp_host }
+    uint64 wp = 0; unsafe { *(wp_host as uint64) -> wp }
+    uint64 rp = 0; unsafe { *(rp_host as uint64) -> rp }
+    uint64 spin = 0
+    while rp < wp {
+        spin = spin + 1
+        if spin > 30000000000 {
+            kfd_die("kfd_wait_idle: timeout waiting for queue drain", spin)
+        }
+        unsafe { *(rp_host as uint64) -> rp }
+    }
 }
 
 fn kfd_wait(uint64 q, uint64 signal_va) {
