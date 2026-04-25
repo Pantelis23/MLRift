@@ -1,9 +1,22 @@
 # MLRift GPU backend — kickoff spec
 
-Status: **design-approved, implementation not started.** This document
-is the starting point for a new parallel session that implements the
-GPU backend. The CPU track continues independently (BSS + SIMD
-builtins) and is not blocked on GPU work.
+Status: **historical kickoff document.** Stage 1 (HIP source emission)
+and Stage 2 (raw KFD direct-dispatch) have both shipped. For the
+current GPU paths see:
+
+* `docs/AMDGPU_NATIVE.md` — `--target=amdgpu-native`, the
+  KFD-backed runtime that produces ROCm-free launcher binaries.
+* `docs/KFD_GOTCHAS.md` — 10 undocumented AMDKFD ioctl gotchas
+  collected while bringing up the direct-dispatch path on gfx1100.
+* `std/kfd.mlr`, `std/kfd_raw.mlr`, `std/hip_kfd.mlr` — the runtime
+  library + HIP-API shim.
+* `examples/b5a_*.mlr`, `examples/b5b_*.mlr`, `examples/b5c_*.mlr` —
+  KFD-native launchers (the "b5c" set are direct ports of every
+  Stage-1 HIP launcher to the KFD library API).
+
+The kickoff spec below is preserved for context.
+
+---
 
 ## Priority & scope
 

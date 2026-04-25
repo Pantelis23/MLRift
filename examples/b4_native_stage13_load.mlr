@@ -736,10 +736,20 @@ fn main() {
     while step < N_STEPS {
         uint64 write_slot = step - (step / BUF_SIZE) * BUF_SIZE
         uint64 read_slot  = (step + 1) - ((step + 1) / BUF_SIZE) * BUF_SIZE
-        uint64 rb_w = write_slot * N
-        uint64 rb_r = read_slot  * N
+        uint64 rb_r = read_slot * N
+        // mt_csr_e_delayed: row_base is an ENTRY index (kernel does
+        // bd + (row_base + src) * 8). mt_lif_full: w_base is a SLOT
+        // index (kernel does bd + (w_base * N + tid) * 8). Pass each
+        // kernel its native unit. Pre-shim, this launcher passed
+        // write_slot * N to BOTH and was "accidentally GREEN" — HIP
+        // pooled allocations silently absorbed the resulting OOB
+        // writes, and step 0's writes happened to be correct because
+        // w_base=0 makes both formulas coincide. Under
+        // --target=amdgpu-native the per-buffer page mappings are
+        // strict and OOB writes page-fault; b5b_kfd_stage13_load.mlr
+        // documents the same fix.
         unsafe { *(a_row_r as uint64) = rb_r }
-        unsafe { *(a_row_w as uint64) = rb_w }
+        unsafe { *(a_row_w as uint64) = write_slot }
 
         uint32 block_x = N
         uint32 edges_bx = total_e

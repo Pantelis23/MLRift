@@ -16,7 +16,8 @@ generation, start here.
 **Tested target:** gfx1100 (RDNA3, Radeon 7900 XTX-class) on Linux 6.17 with
 KFD v1.18. Items 1-3, 6, 7, 8 apply to gfx10/11 in general; items 4-5 are
 gfx11-specific. Item 8 is AQL-specific (PM4 queues use a different
-doorbell convention).
+doorbell convention). Items 9-10 were uncovered during Stage 2b
+(launcher fleet — see `docs/AMDGPU_NATIVE.md`).
 
 ---
 
@@ -300,3 +301,77 @@ the `kAql` queue-format branch.
    `kfd_chardev.c` is the ioctl entry point; follow the `validate_*`
    functions for size/alignment checks; follow `kfd_queue_buffer_get` for
    wp/rp BO requirements (#3 came from there).
+
+---
+
+## 9. AQL `grid_size_*` is total work items, not num_workgroups
+
+The HSA AQL kernel-dispatch packet has three `grid_size_x/y/z` fields
+in addition to three `workgroup_size_x/y/z` fields. The natural
+interpretation, especially after years of HIP/CUDA, is that
+`grid_size = num_workgroups` (analogous to `gridDim`).
+
+**Reality:** for AQL, `grid_size = num_workgroups × workgroup_size` —
+the **total** number of work items. Setting `grid_size_x=1` and
+`workgroup_size_x=16` doesn't launch one workgroup of 16 lanes; it
+launches at most 1 lane (the CP scales EXEC by `min(grid_size,
+workgroup_size)` — and `min(1, 16) = 1`).
+
+**Symptom:** kernel runs without faulting, completion signal fires,
+but the kernel produces no output. With `block_x = 1` (every Stage-2a
+KFD launcher) the bug is invisible because `1 × 1 == 1`. The
+Stage-13 launcher (`block_x = 16` and `block_x = 256`) was the first
+to hit it — every dispatch was effectively single-lane and `d_sc`
+came back all zeros.
+
+**Fix:** in `kfd_dispatch`, take HIP-style parameters (`grid_x =
+num_workgroups`) and multiply for the AQL field:
+
+```mlr
+uint32 gx = grid_x * block_x; unsafe { *((packet + 0x0C) as uint32) = gx }
+uint32 gy = grid_y * block_y; unsafe { *((packet + 0x10) as uint32) = gy }
+uint32 gz = grid_z * block_z; unsafe { *((packet + 0x14) as uint32) = gz }
+```
+
+**Source:** tinygrad's `_submit_aql` passes `gl.x*l.x` for the same
+reason. HSA-Runtime's `aql_queue.cpp` does the same multiplication
+inside `enqueue_kernel`.
+
+**Where:** `kfd_dispatch` in `std/kfd.mlr`.
+
+---
+
+## 10. MLRift Stage-13 kernel ABI: `w_base` is slot, `row_base` is entry
+
+The two CSR-aware Stage-13 kernels disagree on the unit of their
+per-step "base" kernarg:
+
+| Kernel              | Address formula              | Encoding                | Unit        |
+|---------------------|------------------------------|-------------------------|-------------|
+| `mt_csr_e_delayed`  | `bd + (row_base + src) * 8`  | `s_lshl_b64 ..., 3`     | entry index |
+| `mt_lif_full`       | `bd + (w_base * N + tid) * 8`| `s_lshl_b64 ..., 7` (= ×N×8 for N=16) | slot index |
+
+Pass each kernel its native unit:
+```mlr
+unsafe { *((kp_csre_h + 0x30) as uint64) = read_slot * N }   // entry idx
+unsafe { *((kp_lif_h  + 0xA8) as uint64) = write_slot }      // slot idx
+```
+
+**Symptom of getting it wrong:** under HIP nothing visible — pooled
+allocations silently absorb the resulting out-of-bounds writes from
+LIF (only step 0 lands in `bd` since `0 * N == 0` makes both formulas
+coincide). Under raw KFD the per-buffer page reservation is strict;
+step 1's LIF dispatch page-faults on a TCP-write to one page past the
+end of `d_bd`.
+
+**Source of confusion:** the b4 launcher (`b4_native_stage13_load.mlr`)
+passed `write_slot * N` to both kernels and was "accidentally GREEN"
+under HIP for the reason above. The bug went undetected until the
+Stage-2b KFD port. The b4 launcher has since been fixed and the new
+KFD-native launcher (`b5b_kfd_stage13_load.mlr`) was written with the
+correct units from the start.
+
+**Where:** kernel emitters in `src/format_amdgpu.mlr`
+(`emit_amdgpu_mt_lif_full_blob` and `emit_amdgpu_mt_csr_e_delayed_blob`);
+launchers in `examples/b4_native_stage13_load.mlr` and
+`examples/b5b_kfd_stage13_load.mlr`.
