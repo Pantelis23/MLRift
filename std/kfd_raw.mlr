@@ -55,4 +55,46 @@ fn _kfd_ioctl(uint32 fd, uint64 cmd, uint64 args_ptr) -> uint32 {
     return r
 }
 
-// fn raw_kfd_get_version, raw_kfd_acquire_vm, etc. — added in subsequent tasks.
+// kfd_ioctl_get_version_args (kfd_ioctl.h:47-50): two u32, 8 bytes total.
+//   [0x00] major_version  (u32, from KFD)
+//   [0x04] minor_version  (u32, from KFD)
+fn raw_kfd_get_version(uint32 fd, uint64 out_major_slot, uint64 out_minor_slot) -> uint32 {
+    uint64 buf = alloc(8)
+    unsafe { *(buf as uint64) = 0 }
+    uint32 r = _kfd_ioctl(fd, AMDKFD_IOC_GET_VERSION, buf)
+    if r == 0 {
+        uint32 major = 0; uint32 minor = 0
+        uint64 p_major = buf + 0; unsafe { *(p_major as uint32) -> major }
+        uint64 p_minor = buf + 4; unsafe { *(p_minor as uint32) -> minor }
+        unsafe { *(out_major_slot as uint32) = major }
+        unsafe { *(out_minor_slot as uint32) = minor }
+    }
+    return r
+}
+
+// kfd_ioctl_acquire_vm_args (kfd_ioctl.h:391-394): two u32, 8 bytes.
+//   [0x00] drm_fd  (u32, to KFD)
+//   [0x04] gpu_id  (u32, to KFD)
+fn raw_kfd_acquire_vm(uint32 kfd_fd, uint32 drm_fd, uint32 gpu_id) -> uint32 {
+    uint64 buf = alloc(8)
+    uint64 p_drm = buf + 0; unsafe { *(p_drm as uint32) = drm_fd }
+    uint64 p_gpu = buf + 4; unsafe { *(p_gpu as uint32) = gpu_id }
+    uint32 r = _kfd_ioctl(kfd_fd, AMDKFD_IOC_ACQUIRE_VM, buf)
+    return r
+}
+
+// kfd_ioctl_runtime_enable_args (kfd_ioctl.h:976-980): u64 + 2 u32, 16 bytes.
+//   [0x00] r_debug          (u64, to KFD - debug r_debug pointer; 0 for normal use)
+//   [0x08] mode_mask        (u32, to KFD)
+//   [0x0C] capabilities_mask (u32, to KFD)
+//
+// mode_mask = 1 enables runtime; 0 disables. Required on Linux 6.17+
+// before CREATE_QUEUE.
+fn raw_kfd_runtime_enable(uint32 fd, uint32 mode_mask) -> uint32 {
+    uint64 buf = alloc(16)
+    uint64 p0 = buf + 0;  unsafe { *(p0 as uint64) = 0 }       // r_debug
+    uint64 p8 = buf + 8;  unsafe { *(p8 as uint32) = mode_mask }
+    uint64 pC = buf + 12; unsafe { *(pC as uint32) = 0 }       // capabilities
+    uint32 r = _kfd_ioctl(fd, AMDKFD_IOC_RUNTIME_ENABLE, buf)
+    return r
+}
