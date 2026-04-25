@@ -1,0 +1,83 @@
+// Stage 2c port of M1p (f64_atomic_add_demo) to raw KFD. Host primes
+// *out = 2.0, kernel adds delta = 0.5 via f64 CAS-loop atomic, expected
+// *out == 2.5 (single-thread, no contention — bit-exact in f64).
+//
+// Emit kernel: ./build/mlrc --emit-amdgpu-f64-atomic-add=/tmp/m1p.co
+// Compile launcher: ./build/mlrc --arch=x86_64 examples/b5c_kfd_m1p_load.mlr -o /tmp/b5c_m1p
+// Run: /tmp/b5c_m1p — expect "M1p gate (KFD): GREEN" exit 0.
+// ldd /tmp/b5c_m1p must show only libc + ld-linux + vdso.
+
+import "../std/kfd.mlr"
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn main() {
+    kfd_init()
+    uint64 q = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 signal = kfd_signal_alloc()
+
+    uint64 mod = kernel_load("/tmp/m1p.co")
+    uint64 kernel = kernel_get_function(mod, "f64_atomic_add_demo")
+
+    // One f64 on device, primed to 2.0.
+    uint64 d_out = dev_alloc_host_visible(8)
+    uint64 d_out_host = dev_host_ptr(d_out)
+    f64 start = 2.0; unsafe { *(d_out_host as f64) = start }
+
+    // Kernargs (16 bytes): out_ptr (u64) + delta (f64).
+    uint64 kernarg = dev_alloc_host_visible(16)
+    uint64 kernarg_host = dev_host_ptr(kernarg)
+    unsafe { *((kernarg_host + 0x00) as uint64) = d_out }
+    f64 delta = 0.5; unsafe { *((kernarg_host + 0x08) as f64) = delta }
+
+    kfd_dispatch(q, kernel, 1, 1, 1, 1, 1, 1, kernarg, 16, signal)
+    kfd_wait(q, signal)
+
+    f64 expected_f = 2.5
+    uint64 exp_slot = alloc(8); unsafe { *(exp_slot as f64) = expected_f }
+    uint64 exp_bits = 0; unsafe { *(exp_slot as uint64) -> exp_bits }
+    uint64 got_bits = 0; unsafe { *(d_out_host as uint64) -> got_bits }
+
+    print_label_val("expected (bits)", 15, exp_bits)
+    print_label_val("got      (bits)", 15, got_bits)
+    if got_bits == exp_bits {
+        puts("M1p gate (KFD): GREEN")
+        exit(0)
+    }
+    puts("FAIL: f64 atomic add did not converge to expected")
+    exit(1)
+}
