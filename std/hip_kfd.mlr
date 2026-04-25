@@ -52,6 +52,7 @@ import "kfd.mlr"
 
 static uint64 _HIPKFD_KARG_SLOTS    = 1024
 static uint64 _HIPKFD_KARG_SLOT_SZ  = 256
+static uint64 _HIPKFD_KARG_SLOT_MASK = 1023      // power-of-two — bitmask wrap
 
 static uint64 _hipkfd_q              = 0
 static uint64 _hipkfd_signal         = 0
@@ -60,6 +61,15 @@ static uint64 _hipkfd_pending        = 0     // (0 - launched) in u64, wraps
 static uint64 _hipkfd_kernarg_ring   = 0
 static uint64 _hipkfd_kernarg_ring_h = 0
 static uint64 _hipkfd_karg_slot      = 0     // round-robin index
+
+// Cached queue-descriptor fields (read once at lazy_init, never change).
+// Avoids 6 loads per launch from the queue struct.
+static uint64 _hipkfd_q_ring_host    = 0
+static uint64 _hipkfd_q_ring_cap     = 0
+static uint64 _hipkfd_q_wp_host      = 0
+static uint64 _hipkfd_q_db_host      = 0
+static uint64 _hipkfd_q_rp_host      = 0
+static uint64 _hipkfd_q_signal_va    = 0     // = _hipkfd_signal, hoisted
 
 // Optional device-side u64-copy kernel handle. Auto-detected the
 // first time hipModuleLoadData sees a module containing the
@@ -83,6 +93,19 @@ fn _hipkfd_lazy_init() {
     _hipkfd_kernarg_ring   = dev_alloc_host_visible(_HIPKFD_KARG_SLOTS * _HIPKFD_KARG_SLOT_SZ)
     _hipkfd_kernarg_ring_h = dev_host_ptr(_hipkfd_kernarg_ring)
     _hipkfd_karg_slot      = 0
+
+    // Hoist queue-descriptor fields out of the hot path. These are
+    // read on every launch in the original _kfd_dispatch_core; with
+    // 4 dispatches × 2000 steps that's 48K SMEM loads we can replace
+    // with 6 cached statics. (MLRift's `*(p) -> dst` deref-store form
+    // doesn't accept a static as dst, so we go through locals.)
+    uint64 q = _hipkfd_q
+    uint64 t_rh = 0; unsafe { *((q + 0x18) as uint64) -> t_rh }; _hipkfd_q_ring_host = t_rh
+    uint64 t_rc = 0; unsafe { *((q + 0x10) as uint64) -> t_rc }; _hipkfd_q_ring_cap  = t_rc
+    uint64 t_wh = 0; unsafe { *((q + 0x40) as uint64) -> t_wh }; _hipkfd_q_wp_host   = t_wh
+    uint64 t_dh = 0; unsafe { *((q + 0x28) as uint64) -> t_dh }; _hipkfd_q_db_host   = t_dh
+    uint64 t_ph = 0; unsafe { *((q + 0x60) as uint64) -> t_ph }; _hipkfd_q_rp_host   = t_ph
+    _hipkfd_q_signal_va = _hipkfd_signal
 }
 
 // --- Error handling ---
@@ -284,9 +307,13 @@ fn hipModuleGetFunction(uint64 fn_out, uint64 mod, uint64 name_cstr) -> uint32 {
         return 500
     }
     uint64 ks    = kernel_kernarg_size(mod, kd_va)
-    uint64 wrap  = alloc(16)
+    // 24-byte handle: kd_va, kernarg_size, nargs (= ks/8 precomputed,
+    // saves one division per launch in the hot loop).
+    uint64 wrap  = alloc(24)
     unsafe { *((wrap + 0x00) as uint64) = kd_va }
     unsafe { *((wrap + 0x08) as uint64) = ks }
+    uint64 nargs = ks / 8
+    unsafe { *((wrap + 0x10) as uint64) = nargs }
     unsafe { *(fn_out as uint64) = wrap }
     return 0
 }
@@ -307,31 +334,26 @@ fn hipModuleLaunchKernel(
     uint64 kernel_params,
     uint64 extra
 ) -> uint32 {
-    _hipkfd_lazy_init()
+    // Hot path: noesis_60m_gpu_launch hits this 8000 times per run.
+    // Everything that can be hoisted out has been.
+    _hipkfd_lazy_init()                           // fast path: 1 load + branch
     uint64 kd_va = 0; unsafe { *((fn_handle + 0x00) as uint64) -> kd_va }
     uint64 ks    = 0; unsafe { *((fn_handle + 0x08) as uint64) -> ks }
+    uint64 nargs = 0; unsafe { *((fn_handle + 0x10) as uint64) -> nargs }
     if ks > _HIPKFD_KARG_SLOT_SZ {
         kfd_die("hipModuleLaunchKernel: kernarg_size > 256 (shim slot)", ks)
     }
 
-    // Grab the next kernarg-ring slot (round-robin). 64 slots × 256
-    // bytes; the AQL ring's own back-pressure (in _kfd_dispatch_core)
-    // guarantees no in-flight kernel still owns the slot we're about
-    // to overwrite — both rings are sized 64.
+    // Kernarg-ring slot (bitmask wrap; SLOT_MASK = SLOTS - 1, requires
+    // SLOTS to be a power of two — 1024 is).
     uint64 slot_idx = _hipkfd_karg_slot
     uint64 slot_off = slot_idx * _HIPKFD_KARG_SLOT_SZ
     uint64 karg_va  = _hipkfd_kernarg_ring + slot_off
     uint64 karg_h   = _hipkfd_kernarg_ring_h + slot_off
-    _hipkfd_karg_slot = slot_idx + 1
-    if _hipkfd_karg_slot >= _HIPKFD_KARG_SLOTS { _hipkfd_karg_slot = 0 }
+    _hipkfd_karg_slot = (slot_idx + 1) & _HIPKFD_KARG_SLOT_MASK
 
-    // Unmarshal HIP ptr_table → contiguous KFD kernarg blob. We used
-    // to pre-zero the slot first (defensive against COv5 hidden args
-    // and short kernel_params arrays), but for the noesis hot loop
-    // every launch fully fills nargs entries — pre-zero shaved nothing
-    // and added 16 PCIe-mapped writes per launch. If a launcher needs
-    // zero-padding, it must fill those slots itself.
-    uint64 nargs = ks / 8
+    // Unmarshal HIP ptr_table → contiguous KFD kernarg blob. nargs is
+    // pre-computed in fn_handle so we avoid the ks/8 div per launch.
     uint64 i = 0
     while i < nargs {
         uint64 slot_ptr = 0
@@ -343,16 +365,62 @@ fn hipModuleLaunchKernel(
         i = i + 1
     }
 
-    uint64 gx = grid_x;  uint64 gy = grid_y;  uint64 gz = grid_z
-    uint64 bx = block_x; uint64 by = block_y; uint64 bz = block_z
-
-    // Async dispatch with shared completion signal. We bump the
-    // expected-pending counter (in u64 wrap, "0 - launched") and
-    // hand the same signal_va to every dispatch. The GPU subtracts
-    // 1 from the signal when the kernel retires, so when all are
-    // done signal value == _hipkfd_pending.
+    // Async dispatch with shared completion signal.
     uint64 one = 1
     _hipkfd_pending = _hipkfd_pending - one
-    _kfd_dispatch_core(_hipkfd_q, kd_va, gx, gy, gz, bx, by, bz, karg_va, ks, _hipkfd_signal)
+
+    // Inline _kfd_dispatch_core: avoid the function-call frame setup
+    // (which on noesis_60m hits 8000 times). Body is identical to
+    // std/kfd.mlr's _kfd_dispatch_core; queue-descriptor fields are
+    // read from cached statics (lazy_init pulled them once from the
+    // queue struct), so we skip 6 SMEM loads per launch.
+    uint64 ring_host     = _hipkfd_q_ring_host
+    uint64 ring_capacity = _hipkfd_q_ring_cap
+    uint64 wp_host       = _hipkfd_q_wp_host
+    uint64 db_host       = _hipkfd_q_db_host
+    uint64 rp_host       = _hipkfd_q_rp_host
+
+    uint64 wp = 0; unsafe { *(wp_host as uint64) -> wp }
+
+    uint64 rp = 0
+    unsafe { *(rp_host as uint64) -> rp }
+    while (wp - rp) >= ring_capacity {
+        unsafe { *(rp_host as uint64) -> rp }
+    }
+
+    uint64 slot = wp - (wp / ring_capacity) * ring_capacity
+    uint64 packet = ring_host + slot * 64
+
+    uint32 setup = 1
+    if grid_y > 1 { setup = 2 }
+    if grid_z > 1 { setup = 3 }
+
+    uint16 bx16 = block_x; unsafe { *((packet + 0x04) as uint16) = bx16 }
+    uint16 by16 = block_y; unsafe { *((packet + 0x06) as uint16) = by16 }
+    uint16 bz16 = block_z; unsafe { *((packet + 0x08) as uint16) = bz16 }
+    uint16 r0 = 0;         unsafe { *((packet + 0x0A) as uint16) = r0 }
+    uint32 g_x = grid_x * block_x; unsafe { *((packet + 0x0C) as uint32) = g_x }
+    uint32 g_y = grid_y * block_y; unsafe { *((packet + 0x10) as uint32) = g_y }
+    uint32 g_z = grid_z * block_z; unsafe { *((packet + 0x14) as uint32) = g_z }
+    uint32 priv0 = 0;    unsafe { *((packet + 0x18) as uint32) = priv0 }
+    uint32 grp0  = 0;    unsafe { *((packet + 0x1C) as uint32) = grp0  }
+    unsafe { *((packet + 0x20) as uint64) = kd_va }
+    unsafe { *((packet + 0x28) as uint64) = karg_va }
+    uint64 r2 = 0;       unsafe { *((packet + 0x30) as uint64) = r2 }
+    unsafe { *((packet + 0x38) as uint64) = _hipkfd_signal }
+
+    _kfd_fence()
+
+    uint32 header_setup = (setup << 16) | 0x1502
+    unsafe { *((packet + 0x00) as uint32) = header_setup }
+
+    _kfd_fence()
+
+    uint64 new_wp = wp + 1
+    unsafe { *(wp_host as uint64) = new_wp }
+    _kfd_fence()
+    uint64 db_value = new_wp - 1
+    unsafe { *(db_host as uint64) = db_value }
+
     return 0
 }
