@@ -5403,6 +5403,177 @@ fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> u
 //
 // rsrc2 = 0x9E enables 15 user SGPRs; this puts wg_id_x at s15.
 
+// ─── ISA helpers used by the noesis delivery_step lowering ──────────
+//
+// Encodings verified against llvm-mc in session 2's report; the
+// derivations (word1/word2 field decomposition) come from the same
+// VOP3/VOP3B/VOP2/VOPC layouts the existing helpers above already
+// document. These thin wrappers are kept right next to the noesis
+// emitters because the existing structural lowerers don't use them.
+
+// v_mul_lo_u32 vdst, v_src0, v_src1  — VOP3B op 0x02C, low 32 bits of u32×u32.
+//   word1 = 0xD72C0000 | (vdst & 0xFF)
+//   word2 = ((0x100 | src1) << 9) | (0x100 | src0)
+//   Verified: v_mul_lo_u32 v0, v1, v2 → 0xD72C0000 0x00020501.
+fn asm_v_mul_lo_u32_vv(uint64 vdst, uint64 v_src0, uint64 v_src1) {
+    uint64 word1 = 0xD72C0000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_mul_lo_u32 vdst, v_src0, s_src1  — same op, src1 is an SGPR.
+//   Verified: v_mul_lo_u32 v3, v0, s4 → 0xD72C0003 0x00000900.
+fn asm_v_mul_lo_u32_vs(uint64 vdst, uint64 v_src0, uint64 s_src1) {
+    uint64 word1 = 0xD72C0000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = s_src1 & 0x1FF                 // SGPR raw
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_lshlrev_b64 v[dst:dst+1], <imm shift 0..63>, v[src:src+1]
+//   word1 = 0xD73C0000 | (dst & 0xFF)
+//   word2 = (0x100 | src) << 9 | (0x80 + shift)
+//   Verified: v_lshlrev_b64 v[2:3], 3, v[0:1]   → 0xD73C0002 0x00020083.
+//             v_lshlrev_b64 v[10:11], 3, v[8:9] → 0xD73C000A 0x00021083.
+fn asm_v_lshlrev_b64_imm_vv(uint64 vdst_pair, uint64 shift_amount, uint64 v_src_pair) {
+    uint64 word1 = 0xD73C0000 | (vdst_pair & 0xFF)
+    uint64 src0_enc = 0x80 + (shift_amount & 0x3F)         // inline const
+    uint64 src1_enc = 0x100 | (v_src_pair & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_add_co_u32 vdst, vcc_lo, s_src0, v_src1   (VOP3B op 0x100, writes vcc_lo)
+//   word1 = 0xD7006A00 | (vdst & 0xFF)
+//   word2 = ((0x100 | v_src1) << 9) | (s_src0 & 0xFF)
+//   Verified: v_add_co_u32 v0, vcc_lo, s2, v4 → 0xD7006A00 0x00020802.
+//             v_add_co_u32 v6, vcc_lo, s8, v4 → 0xD7006A06 0x00020808.
+fn asm_v_add_co_u32_vcc_sv(uint64 vdst, uint64 s_src0, uint64 v_src1) {
+    uint64 word1 = 0xD7006A00 | (vdst & 0xFF)
+    uint64 src0_enc = s_src0 & 0x1FF                       // SGPR raw
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_add_co_ci_u32_e64 vdst, null, s_src0, v_src1, vcc_lo  (op 0x120)
+//   Reads vcc_lo (carry-in) and writes a discarded carry-out (null).
+//   word1 = 0xD5207C00 | (vdst & 0xFF)
+//   word2 = (vcc_lo<<18) | ((0x100|v_src1) << 9) | (s_src0 & 0xFF)
+//   Verified: v_add_co_ci_u32_e64 v1, null, s3, v5, vcc_lo → 0xD5207C01 0x01AA0A03.
+fn asm_v_add_co_ci_u32_null_sv_vcc(uint64 vdst, uint64 s_src0, uint64 v_src1) {
+    uint64 word1 = 0xD5207C00 | (vdst & 0xFF)
+    uint64 src0_enc = s_src0 & 0x1FF                       // SGPR raw
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 src2_enc = 0x6A                                 // vcc_lo
+    uint64 word2 = ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_add_co_u32 vdst, vcc_lo, v_src0, v_src1  — VGPR+VGPR variant.
+//   word1 = 0xD7006A00 | (vdst & 0xFF)
+//   word2 = ((0x100 | v_src1) << 9) | (0x100 | v_src0)
+//   Verified: v_add_co_u32 v0, vcc_lo, v2, v4 → 0xD7006A00 0x00020902.
+fn asm_v_add_co_u32_vcc_vv(uint64 vdst, uint64 v_src0, uint64 v_src1) {
+    uint64 word1 = 0xD7006A00 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_add_co_ci_u32_e64 vdst, null, v_src0, v_src1, vcc_lo — VGPR+VGPR variant.
+//   Verified: v_add_co_ci_u32_e64 v1, null, v3, v5, vcc_lo → 0xD5207C01 0x01AA0B03.
+fn asm_v_add_co_ci_u32_null_vv_vcc(uint64 vdst, uint64 v_src0, uint64 v_src1) {
+    uint64 word1 = 0xD5207C00 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 src2_enc = 0x6A                                 // vcc_lo
+    uint64 word2 = ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_cndmask_b32_e64 vdst, v_src0, v_src1, vcc_lo  — VOP3 op 0x101.
+//   gfx11 rejects an SGPR-pair pair as src0/src1 (verified in session 2).
+//   This helper is for the post-mov VGPR-only operand form.
+//   Verified: v_cndmask_b32_e64 v0, v2, v4, vcc_lo → 0xD5010000 0x01AA0902.
+fn asm_v_cndmask_b32_e64_vv_vcc(uint64 vdst, uint64 v_src0, uint64 v_src1) {
+    uint64 word1 = 0xD5010000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 src2_enc = 0x6A                                 // vcc_lo
+    uint64 word2 = ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// global_load_u8 v_dst, v[v_addr_pair:+1], off  — GLOBAL op 0x10, size=1,
+//   zero-extends to 32 bits. Saddr = OFF (0x7C); v_addr is a 64-bit pair.
+//   Verified: global_load_u8 v3, v[2:3], off → 0xDC420000 0x037C0002.
+fn asm_global_load_u8_offvaddr(uint64 vdst, uint64 v_addr_pair) {
+    asm_u32(0xDC420000)
+    uint64 word2 = ((vdst & 0xFF) << 24)
+                   | (0x7C << 16)                          // saddr = OFF
+                   | (v_addr_pair & 0xFF)
+    asm_u32(word2)
+}
+
+// global_load_b64 v[vdst:vdst+1], v[vaddr_pair:vaddr_pair+1], off
+//   off-saddr form with full 64-bit v_addr (vs the saddr_pair form in
+//   asm_global_load_b64 above which uses a 32-bit v_addr). Used by the
+//   CAS retry loop — the per-lane atomic target address is a 64-bit
+//   pair built by v_add_co_u32 + v_add_co_ci_u32, not a (sgpr_pair +
+//   u32_offset) split.
+//   Verified: global_load_b64 v[2:3], v[20:21], off → 0xDC560000 0x027C0014.
+fn asm_global_load_b64_offvaddr(uint64 vdst_pair, uint64 vaddr_pair) {
+    asm_u32(0xDC560000)
+    uint64 word2 = ((vdst_pair & 0xFF) << 24)
+                   | (0x7C << 16)                          // saddr = OFF
+                   | (vaddr_pair & 0xFF)
+    asm_u32(word2)
+}
+
+// global_atomic_cmpswap_b64 v[vdst:vdst+1], v[vaddr:+1], v[vdata_quad:+3], off glc
+//   Off-saddr form (vs the asm_global_atomic_cmpswap_b64_glc above
+//   which takes saddr_pair). v_addr is a full 64-bit pair.
+//   Verified: v[0:1], v[8:9], v[2:5], off glc → 0xDD0A4000 0x007C0208.
+fn asm_global_atomic_cmpswap_b64_offvaddr(uint64 vdst_pair, uint64 vaddr_pair, uint64 vdata_quad) {
+    asm_u32(0xDD0A4000)
+    uint64 word2 = ((vdst_pair  & 0xFF) << 24)
+                   | (0x7C << 16)                          // saddr = OFF
+                   | ((vdata_quad & 0xFF) << 8)
+                   | (vaddr_pair & 0xFF)
+    asm_u32(word2)
+}
+
+// v_cmp_ne_u32_e32 vcc_lo, 0, v_src — VOPC op 0x4D.
+//   Sets VCC[lane] = (0 != u32(v[src])). The "fired != 0" predicate
+//   in delivery_step. Verified: vcc_lo, 0, v0 → 0x7C9A0080.
+fn asm_v_cmp_ne_u32_imm0_vgpr(uint64 vgpr) {
+    uint64 src0_enc = 0x80                                  // inline 0
+    uint64 word = (0x3E << 25)
+                  | (0x4D << 17)
+                  | ((vgpr & 0xFF) << 9)
+                  | (src0_enc & 0x1FF)
+    asm_u32(word)
+}
+
 // gid = wg_id_x * 256 + tid_in_wg, written into v1.
 //   v_mov_b32 v1, s15            ; v1 = wg_id_x
 //   v_lshlrev_b32 v1, 8, v1      ; v1 = wg_id_x << 8
@@ -5498,6 +5669,272 @@ fn amdgpu_lower_noesis_decay(uint64 kname_ptr, uint64 nl) -> uint64 {
     return 0
 }
 
+// noesis delivery_step lowering.
+//
+//   @kernel fn delivery_step(
+//       uint64 fired_ptr, uint64 col_tgt_ptr, uint64 col_w_ptr,
+//       uint64 col_is_inh_ptr, uint64 s_exc_ptr, uint64 s_inh_ptr,
+//       uint64 n, uint64 syn_per
+//   ) {
+//       uint64 src = tid_x()
+//       if src < n {
+//           if u8(fired[src]) > 0 {
+//               for k in 0..syn_per {
+//                   slot = src * syn_per + k
+//                   tgt  = u64(col_tgt[slot])
+//                   w    = f64(col_w[slot])
+//                   inh  = u64(col_is_inh[slot])
+//                   dst_base = inh > 0 ? s_inh_ptr : s_exc_ptr
+//                   atomic_add_f64(&dst_base[tgt], w)
+//               }
+//           }
+//       }
+//   }
+//
+// Kernarg layout (8 args × 8 bytes = 64 bytes total, matches launcher
+// kp_deliv byte-for-byte; n and syn_per are stored as u64 by-value but
+// HIP runtime size-drives the metadata so we only declare 4 bytes for
+// them — matching decay_step's treatment of `n`).
+//   [0x00] fired_ptr      (u64*) — GLOBAL_BUFFER
+//   [0x08] col_tgt_ptr    (u64*) — GLOBAL_BUFFER
+//   [0x10] col_w_ptr      (f64*) — GLOBAL_BUFFER
+//   [0x18] col_is_inh_ptr (u64*) — GLOBAL_BUFFER
+//   [0x20] s_exc_ptr      (f64*) — GLOBAL_BUFFER
+//   [0x28] s_inh_ptr      (f64*) — GLOBAL_BUFFER
+//   [0x30] n      (u64 by-value, low 32 bits used) — size 4 + 4 pad
+//   [0x38] syn_per (u64 by-value, low 32 bits used) — size 4 + 4 pad
+//   total = 64 bytes (the 4-byte declarations leave 4-byte holes that
+//   the HIP runtime preserves by dispatched-arg copy size; the launcher
+//   writes 8 bytes per slot so the actual segment is 64 bytes regardless
+//   of how we declare the trailing two; matches the kp_deliv = alloc(8*8)
+//   buffer the launcher hands to hipModuleLaunchKernel).
+//
+// Register plan:
+//   SGPRs: s2..s13 = pointer kernargs; s14 = n; s16 = syn_per;
+//          s15 = wg_id_x (rsrc2 reserves it); s18..s21 = EXEC saves +
+//          k loop counter.
+//   VGPRs: v0..v23. v0..v3 = CAS quad (NEW lo, NEW hi, CMP lo, CMP hi);
+//          v4..v5 = scratch byte offset; v6..v7 = fired addr pair;
+//          v8..v9 = s_exc splat; v10..v11 = s_inh splat;
+//          v12..v13 = tgt b64; v14..v15 = w f64; v16..v17 = inh b64;
+//          v18..v19 = dst_base (cndmask result); v20..v21 = tgt*8 pair;
+//          v22..v23 = dst_addr pair (= dst_base + tgt*8).
+fn amdgpu_lower_noesis_delivery(uint64 kname_ptr, uint64 nl) -> uint64 {
+    asm_init()
+
+    // gid in v1 = wg_id_x*256 + tid_in_wg.
+    asm_noesis_compute_gid_v1()
+
+    // Prologue: load all 8 kernargs into SGPRs.
+    asm_s_load_b64(1, 0)                        // s[2:3]   = fired_ptr
+    asm_s_load_b64_off(2, 0, 0x08)              // s[4:5]   = col_tgt_ptr
+    asm_s_load_b64_off(3, 0, 0x10)              // s[6:7]   = col_w_ptr
+    asm_s_load_b64_off(4, 0, 0x18)              // s[8:9]   = col_is_inh_ptr
+    asm_s_load_b64_off(5, 0, 0x20)              // s[10:11] = s_exc_ptr
+    asm_s_load_b64_off(6, 0, 0x28)              // s[12:13] = s_inh_ptr
+    asm_s_load_b32(7, 0, 0x30)                  // s14 = n (low 32 bits)
+    asm_s_load_b32(8, 0, 0x38)                  // s16 = syn_per (low 32 bits)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Bounds check: gid < n  (vcc_lo = (s14 > v1)).
+    asm_v_cmp_gt_u32_sgpr_vgpr(14, 1)
+    asm_s_and_saveexec_b32_vcc_lo(18)           // s18 = old EXEC; EXEC &= bounds
+    // Forward-skip target patched at end of kernel: s_cbranch_execz to s_endpgm.
+    uint64 outer_skip_off = asm_text_len / 4
+    asm_s_cbranch_execz(0)                      // (placeholder, patched)
+
+    // Splat s_exc (s[10:11]) and s_inh (s[12:13]) into VGPR pairs so the
+    // per-lane cndmask in the loop can pick between them. SGPR-pair
+    // operands are not encodable directly in v_cndmask_b32_e64.
+    asm_v_mov_b32(8, 10)                        // v8  = s10 (s_exc lo)
+    asm_v_mov_b32(9, 11)                        // v9  = s11 (s_exc hi)
+    asm_v_mov_b32(10, 12)                       // v10 = s12 (s_inh lo)
+    asm_v_mov_b32(11, 13)                       // v11 = s13 (s_inh hi)
+    asm_s_delay_alu(0x02)
+
+    // Build 64-bit address of fired[gid] = fired_ptr + gid*1.
+    //   v6 = gid (v1) — byte offset low half
+    //   v7 = 0       — byte offset high half
+    //   v[6:7] = s[2:3] + v[6:7]    (32-bit add then carry)
+    asm_v_mov_b32(6, 0x100 | 1)                 // v6 = v1 (gid)
+    asm_v_mov_b32_inline_u(7, 0)                // v7 = 0
+    asm_v_add_co_u32_vcc_sv(6, 2, 6)            // v6 = s2 + v6
+    asm_v_add_co_ci_u32_null_sv_vcc(7, 3, 7)    // v7 = s3 + v7 + carry
+    asm_s_delay_alu(0x01)
+
+    // Load fired[gid] (u8, zero-extended) into v4.
+    asm_global_load_u8_offvaddr(4, 6)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // Fired guard: vcc_lo = (fired != 0). f > 0 with f a u8 ≡ f != 0.
+    asm_v_cmp_ne_u32_imm0_vgpr(4)
+    asm_s_and_saveexec_b32_vcc_lo(19)           // s19 = pre-fired EXEC; EXEC &= fired
+    uint64 fired_skip_off = asm_text_len / 4
+    asm_s_cbranch_execz(0)                      // (placeholder, patched to k-loop end)
+
+    // Per-lane base = src * syn_per. v1 (=gid=src) × s16 (=syn_per).
+    // Result fits in u32: 60M * 4 = 240M < 2^32. v25 (free reg)? Use v5.
+    asm_v_mul_lo_u32_vs(5, 1, 16)               // v5 = gid * syn_per
+
+    // SALU k-loop. k lives in s20; bound is s16 (syn_per).
+    asm_s_mov_b32_imm0(20)                      // s20 = 0 (k)
+
+    // ── loop_top ──
+    uint64 loop_top_off = asm_text_len / 4
+    asm_s_cmp_lt_u32(20, 16)                    // SCC = (k < syn_per)
+    uint64 scc_patch_off = asm_text_len / 4
+    asm_s_cbranch_scc0(0)                       // (placeholder, patched to loop_end)
+
+    // slot = base + k. v4 = (base + k) — base in v5 (per-lane), k in s20 (scalar).
+    // v_add_nc_u32 with src0 = SGPR encodes as raw SGPR index in src0.
+    //   Word: (0x25<<25) | (vdst<<17) | (vsrc1<<9) | (sgpr_src0 & 0x1FF)
+    uint64 add_word = (0x25 << 25)
+                      | ((4 & 0xFF) << 17)        // vdst = v4
+                      | ((5 & 0xFF) << 9)         // vsrc1 = v5
+                      | (20 & 0x1FF)              // src0 = s20 (raw SGPR)
+    asm_u32(add_word)
+
+    // slot_byte_offset_u32 = (base + k) << 3.
+    asm_v_lshlrev_b32_imm(4, 3, 4)              // v4 = v4 * 8
+    asm_s_delay_alu(0x01)
+
+    // Per-lane VMEM loads (saddr=raw SGPR pair index of base ptr; v_addr=v4).
+    //   tgt = col_tgt[slot]   → v[12:13]   saddr=s4
+    //   w   = col_w[slot]     → v[14:15]   saddr=s6
+    //   inh = col_is_inh[slot] → v[16:17]  saddr=s8
+    asm_global_load_b64(12, 4, 4)               // v[12:13] = tgt
+    asm_global_load_b64(14, 4, 6)               // v[14:15] = w
+    asm_global_load_b64(16, 4, 8)               // v[16:17] = inh
+    asm_s_waitcnt_vmcnt_zero()
+
+    // inh predicate: vcc_lo = (inh_lo != 0).
+    asm_v_cmp_ne_u32_imm0_vgpr(16)
+
+    // dst_base = inh ? s_inh : s_exc, per-lane. cndmask src0=false (s_exc=v[8:9]),
+    // src1=true (s_inh=v[10:11]). Result → v[18:19].
+    asm_v_cndmask_b32_e64_vv_vcc(18, 8, 10)     // v18 = inh ? v10 : v8 (lo)
+    asm_v_cndmask_b32_e64_vv_vcc(19, 9, 11)     // v19 = inh ? v11 : v9 (hi)
+    asm_s_delay_alu(0x01)
+
+    // tgt * 8 (per-lane 64-bit) → v[20:21].
+    asm_v_lshlrev_b64_imm_vv(20, 3, 12)         // v[20:21] = v[12:13] << 3
+    asm_s_delay_alu(0x01)
+
+    // dst_addr = dst_base + tgt*8 (per-lane 64-bit) → v[22:23].
+    asm_v_add_co_u32_vcc_vv(22, 18, 20)         // v22 = v18 + v20 (lo, sets vcc carry)
+    asm_v_add_co_ci_u32_null_vv_vcc(23, 19, 21) // v23 = v19 + v21 + carry
+    asm_s_delay_alu(0x01)
+
+    // Prime the CAS: assumed = *dst_addr → v[2:3] (cmp half of CAS quad).
+    // Off-saddr form with v_addr = v[22:23] (per-lane 64-bit pair).
+    asm_global_load_b64_offvaddr(2, 22)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // Save EXEC (= fired-mask intersected with outer-bounds) before the
+    // CAS retry narrows it to retrying lanes only.
+    asm_s_mov_b32(21, 0x7E)                     // s21 = exec_lo
+
+    // ── CAS retry loop (atomic add f64 at *dst_addr += w) ──
+    uint64 cas_head_off = asm_text_len / 4
+    asm_v_add_f64_vv(0, 2, 14)                  // v[0:1] = assumed + w
+    asm_s_delay_alu(0x01)
+    asm_global_atomic_cmpswap_b64_offvaddr(0, 22, 0) // v[0:1] = CAS(*v[22:23], v[2:3], v[0:1])
+    asm_s_waitcnt_vmcnt_zero()
+    asm_s_waitcnt_vscnt_zero()
+    asm_v_cmp_ne_u64_vv(2, 0)                   // vcc = (returned_prev != assumed)
+    asm_v_mov_b32(2, 0x100 | 0)                 // v2 = v0 (assumed = returned_prev lo)
+    asm_v_mov_b32(3, 0x100 | 1)                 // v3 = v1 (assumed hi)
+    asm_s_and_b32_exec_vcc_lo()                 // exec_lo &= vcc_lo (narrow to retrying lanes)
+    uint64 cas_branch_off = asm_text_len / 4
+    uint64 cas_delta = cas_head_off - (cas_branch_off + 1)
+    asm_s_cbranch_execnz(cas_delta & 0xFFFF)
+
+    // Restore EXEC = fired-and-bounds mask for the next k iteration.
+    asm_s_mov_b32(0x7E, 21)                     // exec_lo = s21
+
+    // k += 1; loop back.
+    asm_s_add_u32_imm(20, 20, 1)
+    uint64 outer_branch_off = asm_text_len / 4
+    uint64 outer_delta = loop_top_off - (outer_branch_off + 1)
+    asm_s_branch(outer_delta & 0xFFFF)
+
+    // ── loop_end ── back-patch the scc0 cbranch.
+    uint64 loop_end_off = asm_text_len / 4
+    uint64 scc_skip = loop_end_off - (scc_patch_off + 1)
+    uint64 scc_patch_byte = asm_text_buf + scc_patch_off * 4
+    uint32 scc_word = 0xBFA10000 | (scc_skip & 0xFFFF)
+    unsafe { *(scc_patch_byte as uint32) = scc_word }
+
+    // Back-patch the fired_skip s_cbranch_execz to land here too. (Both
+    // the loop-end and the no-fired-lanes path converge before s_endpgm.)
+    uint64 fired_skip_target = asm_text_len / 4
+    uint64 fired_skip_dwords = fired_skip_target - (fired_skip_off + 1)
+    uint64 fired_skip_byte = asm_text_buf + fired_skip_off * 4
+    uint32 fired_skip_word = 0xBFA50000 | (fired_skip_dwords & 0xFFFF)
+    unsafe { *(fired_skip_byte as uint32) = fired_skip_word }
+
+    // Back-patch the outer s_cbranch_execz to skip to s_endpgm too.
+    uint64 outer_skip_target = asm_text_len / 4
+    uint64 outer_skip_dwords = outer_skip_target - (outer_skip_off + 1)
+    uint64 outer_skip_byte = asm_text_buf + outer_skip_off * 4
+    uint32 outer_skip_word = 0xBFA50000 | (outer_skip_dwords & 0xFFFF)
+    unsafe { *(outer_skip_byte as uint32) = outer_skip_word }
+
+    asm_s_endpgm()
+
+    // 8 args, all GLOBAL_BUFFER for the 6 pointers + 2 BY_VALUE u64 for
+    // n and syn_per. They're declared u64 (size 8) — not u32 (size 4) —
+    // so consecutive 4-byte declarations don't pack tightly into a single
+    // 8-byte slot (which would shift syn_per's offset to 0x34 instead of
+    // the launcher-expected 0x38). The launcher writes 8 bytes per kernarg
+    // slot anyway; the kernel reads only the low 32 bits via s_load_b32.
+    uint64 args_desc = alloc(8 * 16)
+    uint64 ai = 0
+    while ai < 6 {
+        uint64 p0 = args_desc + ai * 16;     unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8; unsafe { *(p1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        ai = ai + 1
+    }
+    while ai < 8 {
+        uint64 p0 = args_desc + ai * 16;     unsafe { *(p0 as uint64) = 8 }
+        uint64 p1 = args_desc + ai * 16 + 8; unsafe { *(p1 as uint64) = AMD_ARG_KIND_BY_VALUE }
+        ai = ai + 1
+    }
+
+    // Snapshot text into private buffer (asm_init clobbers asm_text_buf).
+    uint64 k_text_size = asm_text_len
+    uint64 k_text_buf  = alloc(k_text_size)
+    uint64 ci = 0
+    while ci < k_text_size {
+        uint64 sp = asm_text_buf + ci
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        uint64 dp = k_text_buf + ci
+        uint8 b8 = b
+        unsafe { *(dp as uint8) = b8 }
+        ci = ci + 1
+    }
+
+    uint64 rsrc1 = 0xE0AF0002                   // VGPR granule=2 → 24 VGPRs (v0..v23)
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    // sgpr_count: s0..s21 used = 22, +2 for safety = 24.
+    // The launcher's kernarg buffer is 64 bytes; the metadata declares
+    // 6×8 (ptrs) + 2×4 (u32s) = 56 bytes "payload" but kernarg_segment_size
+    // is rounded up to 8-byte alignment => 56 + padding = ... actually the
+    // HIP runtime computes kernarg_segment_size from arg metadata sizes
+    // with alignment rules. Use 64 to match the launcher's allocated
+    // buffer; ROCm tolerates a slightly larger declared kernarg segment
+    // (the runtime memcpys arg-by-arg into it).
+    kt_push(kname_ptr, nl, k_text_buf, k_text_size,
+            args_desc, 8, 64,
+            24, 24,
+            rsrc1, rsrc2, rsrc3, props)
+    return 0
+}
+
 // Lower one @kernel fn_node into the kernel table. Returns 0 on
 // success, 1 on unsupported shape. Recognises the same two shapes
 // the M1d/M1e lowerer already handled:
@@ -5551,10 +5988,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         return 2
     }
     if tok_matches(name_tok, "delivery_step", 13) != 0 {
-        write(2, "mlrc: amdgpu-native: skipping delivery_step (not yet native).\n", 62)
-        write(2, "  Build a fallback .co with --target=hip-amd and set\n", 53)
-        write(2, "  NOESIS_CSR_CO_PATH at launch time.\n", 37)
-        return 2
+        return amdgpu_lower_noesis_delivery(kname_ptr, nl)
     }
     if tok_matches(name_tok, "csr_build", 9) != 0 {
         // csr_build needs splitmix64 (4× 64-bit multiply) and a 64-bit
