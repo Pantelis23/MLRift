@@ -783,9 +783,14 @@ fn kfd_dispatch(uint64 q, uint64 kernel,
     uint16 by = block_y; unsafe { *((packet + 0x06) as uint16) = by }
     uint16 bz = block_z; unsafe { *((packet + 0x08) as uint16) = bz }
     uint16 r0 = 0;       unsafe { *((packet + 0x0A) as uint16) = r0 }
-    uint32 gx = grid_x;  unsafe { *((packet + 0x0C) as uint32) = gx }
-    uint32 gy = grid_y;  unsafe { *((packet + 0x10) as uint32) = gy }
-    uint32 gz = grid_z;  unsafe { *((packet + 0x14) as uint32) = gz }
+    // HSA AQL grid_size_* is TOTAL work items (= num_workgroups * workgroup_size),
+    // not "number of workgroups" as in HIP/CUDA. We take HIP-style
+    // (grid = num_workgroups, block = workgroup_size) and multiply for AQL.
+    // With grid=1,block=1 (the only pre-Stage-2b case) this is a no-op; for
+    // Stage-2b's block_x=N it is what makes EXEC cover all N lanes.
+    uint32 gx = grid_x * block_x; unsafe { *((packet + 0x0C) as uint32) = gx }
+    uint32 gy = grid_y * block_y; unsafe { *((packet + 0x10) as uint32) = gy }
+    uint32 gz = grid_z * block_z; unsafe { *((packet + 0x14) as uint32) = gz }
     uint32 priv0 = 0;    unsafe { *((packet + 0x18) as uint32) = priv0 }   // private_segment_size
     uint32 grp0  = 0;    unsafe { *((packet + 0x1C) as uint32) = grp0  }   // group_segment_size
     unsafe { *((packet + 0x20) as uint64) = kernel }
