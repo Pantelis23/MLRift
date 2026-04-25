@@ -73,6 +73,14 @@ fn hipSetDevice(uint32 dev_id) -> uint32 {
 // --- Device memory ---
 // HIP semantics: dev_ptr_ptr is a pointer to a uint64 slot the caller
 // owns; on success we write the device VA there.
+//
+// Backed by dev_alloc_host_visible (GTT) so hipMemcpy can route
+// through dev_host_ptr for the H2D / D2H paths. Multi-GB launchers
+// (e.g. noesis_60m_gpu_launch with ~5 GiB of state buffers) pay
+// ~1 s per GiB of GTT mapping at allocation time but the per-copy
+// memory bandwidth is then host-RAM-class (PCIe/IFCLK). For pure-
+// device working sets where the host never reads back, switch to
+// dev_alloc_vram + a copy kernel — not yet wired through this shim.
 fn hipMalloc(uint64 dev_ptr_ptr, uint64 size) -> uint32 {
     _hipkfd_lazy_init()
     uint64 dptr = dev_alloc_host_visible(size)

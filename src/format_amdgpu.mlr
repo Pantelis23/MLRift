@@ -6381,9 +6381,10 @@ fn amdgpu_lower_noesis_csr_build(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_v_mov_b32_inline_u(28, 1)                   // v28 = 1 (scratch literal)
     asm_v_cndmask_b32_e64_vv_vcc(19, 19, 28)        // v19 = vcc ? 1 : 0  (src_e)
 
-    // base = src * syn_per (u32). v_mul_lo_u32 v_base, v1, s12.
-    // We keep base in v_base = v25 (was 0; reuse).
-    asm_v_mul_lo_u32_vs(25, 1, 12)                  // v25 = src * syn_per
+    // base = src * syn_per (u32). Hold in v30 — survives the loop body
+    // (the cell_type[tgt] address computation later writes v[24:25],
+    // so v25 is not safe for cross-iteration storage).
+    asm_v_mul_lo_u32_vs(30, 1, 12)                  // v30 = src * syn_per
 
     // Initialise k counter in s24 = 0; loop while k < syn_per (s12).
     asm_s_mov_b32_inline_imm(24, 0)                 // s24 = 0
@@ -6394,12 +6395,12 @@ fn amdgpu_lower_noesis_csr_build(uint64 kname_ptr, uint64 nl) -> uint64 {
     uint64 k_scc_patch_off = asm_text_len / 4
     asm_s_cbranch_scc0(0)                           // patched to k_loop_end
 
-    // ctr = base + k as u64. v_add_nc_u32 v_ctr_lo = v25 + s24, v_ctr_hi = 0.
+    // ctr = base + k as u64. v_add_nc_u32 v_ctr_lo = v30 + s24, v_ctr_hi = 0.
     // Need v_add_nc_u32 with SGPR src — use the inline pattern from delivery.
     // Encoding: word = (0x25<<25) | (vdst<<17) | (vsrc1<<9) | (sgpr_src0)
     uint64 add_word = (0x25 << 25)
                       | ((10 & 0xFF) << 17)            // vdst = v10
-                      | ((25 & 0xFF) << 9)             // vsrc1 = v25
+                      | ((30 & 0xFF) << 9)             // vsrc1 = v30 (= base, stable)
                       | (24 & 0x1FF)                    // src0 = s24 raw
     asm_u32(add_word)
     asm_v_mov_b32_inline_u(11, 0)                   // v11 = 0  (ctr_hi)
@@ -6524,7 +6525,10 @@ fn amdgpu_lower_noesis_csr_build(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_s_waitcnt_vmcnt_zero()
     asm_v_cmp_eq_u32_imm_vgpr(0, 26)                  // vcc = (tgt_ct == 0)
     asm_v_mov_b32_inline_u(20, 0)
-    asm_v_cndmask_b32_e64_vv_vcc(20, 20, 28)        // v20 = vcc ? 1 : 0  (tgt_e). v28 still = 1.
+    // v28 may have been clobbered by the previous iter's inh store;
+    // restore the literal 1 right before the tgt_e cndmask.
+    asm_v_mov_b32_inline_u(28, 1)
+    asm_v_cndmask_b32_e64_vv_vcc(20, 20, 28)        // v20 = vcc ? 1 : 0  (tgt_e)
 
     // Compute (w, inh):
     //   if src_e (v19) == 1: w = tgt_e ? w_ee : w_ei; inh = 0
@@ -6544,10 +6548,10 @@ fn amdgpu_lower_noesis_csr_build(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_v_mov_b32(27, 21)                           // v27 = s21 (w_ei hi)
     // vcc = (tgt_e == 1)
     asm_v_cmp_eq_u32_imm_vgpr(1, 20)                // vcc = (v20 == 1)
-    asm_v_mov_b32(28, 18)                           // v28 = s18 (w_ee lo)
-    asm_v_mov_b32(29, 19)                           // v29 = s19 (w_ee hi)
-    asm_v_cndmask_b32_e64_vv_vcc(26, 26, 28)        // v26 = vcc ? w_ee_lo : w_ei_lo
-    asm_v_cndmask_b32_e64_vv_vcc(27, 27, 29)        // v27 = vcc ? w_ee_hi : w_ei_hi
+    asm_v_mov_b32(34, 18)                           // v34 = s18 (w_ee lo)
+    asm_v_mov_b32(35, 19)                           // v35 = s19 (w_ee hi)
+    asm_v_cndmask_b32_e64_vv_vcc(26, 26, 34)        // v26 = vcc ? w_ee_lo : w_ei_lo
+    asm_v_cndmask_b32_e64_vv_vcc(27, 27, 35)        // v27 = vcc ? w_ee_hi : w_ei_hi
 
     // vcc = (src_e == 1)
     asm_v_cmp_eq_u32_imm_vgpr(1, 19)                // vcc = (v19 == 1)
@@ -6626,7 +6630,7 @@ fn amdgpu_lower_noesis_csr_build(uint64 kname_ptr, uint64 nl) -> uint64 {
         ci = ci + 1
     }
 
-    uint64 rsrc1 = 0xE0AF0003                       // VGPR granule=3 → 32 VGPRs
+    uint64 rsrc1 = 0xE0AF0004                       // VGPR granule=4 → 40 VGPRs (use v0..v35)
     uint64 rsrc2 = 0x0000009E
     uint64 rsrc3 = 0x00000010
     uint64 props = 0x0408
@@ -6634,7 +6638,7 @@ fn amdgpu_lower_noesis_csr_build(uint64 kname_ptr, uint64 nl) -> uint64 {
     // sgpr_count: s0..s35 = 36; round up.
     kt_push(kname_ptr, nl, k_text_buf, k_text_size,
             args_desc, 10, 80,
-            40, 32,
+            40, 36,
             rsrc1, rsrc2, rsrc3, props)
     return 0
 }
@@ -7261,20 +7265,7 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         return amdgpu_lower_noesis_delivery(kname_ptr, nl)
     }
     if tok_matches(name_tok, "csr_build", 9) != 0 {
-        // amdgpu_lower_noesis_csr_build() is fully written and the
-        // emitted ISA disassembles cleanly via llvm-objdump, but it
-        // hangs the GPU at runtime — needs per-block hardware
-        // bisection (splitmix64-only kernel, then mod-only kernel,
-        // then full integration). Until that's done, fall through
-        // to the hipcc fallback to keep the .co bring-up safe.
-        // Emitter source is preserved earlier in this file; toggling
-        // this call back on is the only change needed to re-enable
-        // the native path once verified.
-        // return amdgpu_lower_noesis_csr_build(kname_ptr, nl)
-        write(2, "mlrc: amdgpu-native: skipping csr_build (emitter staged,\n", 57)
-        write(2, "  runtime bisection deferred). Build a fallback .co with\n", 57)
-        write(2, "  --target=hip-amd and set NOESIS_CSR_CO_PATH at launch time.\n", 62)
-        return 2
+        return amdgpu_lower_noesis_csr_build(kname_ptr, nl)
     }
 
     // Param list — 1 or 2 params. If there are 2, the 2nd is taken

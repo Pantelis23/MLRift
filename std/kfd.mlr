@@ -1021,7 +1021,12 @@ fn kfd_wait(uint64 q, uint64 signal_va) {
         uint64 spin = 0
         while v != 0 {
             spin = spin + 1
-            if spin > 1000000000 {
+            // 30 billion spins ≈ 30s on a modern x86 — long enough for
+            // big multi-billion-thread kernels (e.g. csr_build at
+            // N=60M takes ~1-2s of GPU time, but the busy-poll
+            // counter is CPU-bound so the same kernel triggered the
+            // old 1-billion limit despite the GPU being healthy).
+            if spin > 30000000000 {
                 kfd_die("kfd_wait: timeout busy-polling signal", spin)
             }
             unsafe { *(sig_value_addr as uint64) -> v }
