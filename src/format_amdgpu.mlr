@@ -5583,6 +5583,184 @@ fn asm_v_lshrrev_b64_imm_vv(uint64 vdst_pair, uint64 shift_amount, uint64 v_src_
     asm_u32(word2)
 }
 
+// ── Tier 3a primitives (LLM forward path; llvm-mc gfx1100 verified) ─
+
+// v_max_f32_e64 vdst, v_src0, v_src1   (VOP3 op 0x110)
+//   Verified: v_max_f32_e64 v0, v2, v3 → 0xD5100000 0x00020702.
+fn asm_v_max_f32_e64_vv(uint64 vdst, uint64 v_src0, uint64 v_src1) {
+    uint64 word1 = 0xD5100000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_max_u32_e64 vdst, v_src0, v_src1   (VOP3 op 0x114)
+//   Verified: v_max_u32_e64 v0, v2, v3 → 0xD5140000 0x00020702.
+fn asm_v_max_u32_e64_vv(uint64 vdst, uint64 v_src0, uint64 v_src1) {
+    uint64 word1 = 0xD5140000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_exp_f32_e64 vdst, v_src   (VOP3 op 0x1A5; hardware exp2 approx)
+//   Verified: v_exp_f32_e64 v0, v2 → 0xD5A50000 0x00000102.
+fn asm_v_exp_f32_e64_v(uint64 vdst, uint64 v_src) {
+    uint64 word1 = 0xD5A50000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src & 0xFF)
+    uint64 word2 = src0_enc & 0x1FF
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_log_f32_e64 vdst, v_src   (VOP3 op 0x1A7; log2 approx)
+//   Verified: v_log_f32_e64 v0, v2 → 0xD5A70000 0x00000102.
+fn asm_v_log_f32_e64_v(uint64 vdst, uint64 v_src) {
+    uint64 word1 = 0xD5A70000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src & 0xFF)
+    uint64 word2 = src0_enc & 0x1FF
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_sin_f32_e64 vdst, v_src   (VOP3 op 0x1B5)
+//   Verified: v_sin_f32_e64 v0, v2 → 0xD5B50000 0x00000102.
+fn asm_v_sin_f32_e64_v(uint64 vdst, uint64 v_src) {
+    uint64 word1 = 0xD5B50000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src & 0xFF)
+    uint64 word2 = src0_enc & 0x1FF
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_cos_f32_e64 vdst, v_src   (VOP3 op 0x1B6)
+//   Verified: v_cos_f32_e64 v0, v2 → 0xD5B60000 0x00000102.
+fn asm_v_cos_f32_e64_v(uint64 vdst, uint64 v_src) {
+    uint64 word1 = 0xD5B60000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src & 0xFF)
+    uint64 word2 = src0_enc & 0x1FF
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_rcp_f32_e64 vdst, v_src   (VOP3 op 0x1AA; ~24-bit rcp)
+//   Verified: v_rcp_f32_e64 v0, v2 → 0xD5AA0000 0x00000102.
+fn asm_v_rcp_f32_e64_v(uint64 vdst, uint64 v_src) {
+    uint64 word1 = 0xD5AA0000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src & 0xFF)
+    uint64 word2 = src0_enc & 0x1FF
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_rsq_f32_e64 vdst, v_src   (VOP3 op 0x1AE; ~24-bit rsqrt)
+//   Verified: v_rsq_f32_e64 v0, v2 → 0xD5AE0000 0x00000102.
+fn asm_v_rsq_f32_e64_v(uint64 vdst, uint64 v_src) {
+    uint64 word1 = 0xD5AE0000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src & 0xFF)
+    uint64 word2 = src0_enc & 0x1FF
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_fma_f32 vdst, v_src0, v_src1, v_src2   (VOP3 op 0x113; standard f32 FMA)
+//   Verified: v_fma_f32 v0, v2, v3, v4 → 0xD6130000 0x04120702.
+fn asm_v_fma_f32_e64_vvv(uint64 vdst, uint64 v_src0, uint64 v_src1, uint64 v_src2) {
+    uint64 word1 = 0xD6130000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 src2_enc = 0x100 | (v_src2 & 0xFF)
+    uint64 word2 = ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_fmac_f32_e32 vdst, v_src0, v_src1   (VOP2 op 0x2B; vdst += s0*s1)
+//   The VOP2 form pairs with v_dual_fmac_f32 for RDNA3 dual-issue.
+//   Verified: v_fmac_f32_e32 v0, v2, v3 → 0x56000702.
+fn asm_v_fmac_f32_e32_vv(uint64 vdst, uint64 v_src0, uint64 v_src1) {
+    uint64 word = (0x2B << 25) | ((vdst & 0xFF) << 17)
+                  | ((v_src1 & 0xFF) << 9) | (0x100 | (v_src0 & 0xFF))
+    asm_u32(word)
+}
+
+// v_readfirstlane_b32 sdst, v_src   (VOP1 op 0x02; broadcast lane 0 → SGPR)
+//   Verified: v_readfirstlane_b32 s4, v2 → 0x7E080502.
+fn asm_v_readfirstlane_b32(uint64 sdst, uint64 v_src) {
+    uint64 word = (0x3F << 25) | ((sdst & 0xFF) << 17) | (0x02 << 9) | (0x100 | (v_src & 0xFF))
+    asm_u32(word)
+}
+
+// v_readlane_b32 sdst, v_src, <inline lane 0..63>   (VOP3 op 0x160)
+//   Verified: v_readlane_b32 s4, v2, 0 → 0xD7600004 0x00010102.
+fn asm_v_readlane_b32_imm(uint64 sdst, uint64 v_src, uint64 lane_imm) {
+    uint64 word1 = 0xD7600000 | (sdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src & 0xFF)
+    uint64 src1_enc = 0x80 + (lane_imm & 0x3F)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_writelane_b32 vdst, s_src, <inline lane 0..63>   (VOP3 op 0x161)
+//   Verified: v_writelane_b32 v0, s4, 0 → 0xD7610000 0x00010004.
+fn asm_v_writelane_b32_imm(uint64 vdst, uint64 s_src, uint64 lane_imm) {
+    uint64 word1 = 0xD7610000 | (vdst & 0xFF)
+    uint64 src0_enc = s_src & 0x1FF                          // SGPR raw
+    uint64 src1_enc = 0x80 + (lane_imm & 0x3F)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// ds_bpermute_b32 vdst, v_addr, v_data   (LDS-class, op 0xCC)
+//   Cross-lane permute: vdst[lane] = v_data[v_addr[lane] >> 2].
+//   Verified: ds_bpermute_b32 v0, v2, v3 → 0xDACC0000 0x00000302.
+fn asm_ds_bpermute_b32(uint64 vdst, uint64 v_addr, uint64 v_data) {
+    uint64 word1 = 0xDACC0000
+    uint64 word2 = ((vdst & 0xFF) << 24)
+                   | ((v_data & 0xFF) << 8)
+                   | (v_addr & 0xFF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// ds_read_b128 v[dst:+3], v_addr   (LDS read 16 bytes; op 0xFC)
+//   Verified: ds_read_b128 v[0:3], v4 → 0xDBFC0000 0x00000004.
+fn asm_ds_read_b128(uint64 vdst_quad, uint64 v_addr) {
+    asm_u32(0xDBFC0000)
+    uint64 word2 = ((vdst_quad & 0xFF) << 24) | (v_addr & 0xFF)
+    asm_u32(word2)
+}
+
+// ds_write_b128 v_addr, v[data:+3]   (LDS write 16 bytes; op 0x7C)
+//   Verified: ds_write_b128 v0, v[4:7] → 0xDB7C0000 0x00000400.
+fn asm_ds_write_b128(uint64 v_addr, uint64 vdata_quad) {
+    asm_u32(0xDB7C0000)
+    uint64 word2 = ((vdata_quad & 0xFF) << 8) | (v_addr & 0xFF)
+    asm_u32(word2)
+}
+
+// s_barrier   — workgroup-wide LDS sync (SOPP op 0x3D).
+//   Verified: s_barrier → 0xBFBD0000.
+fn asm_s_barrier() { asm_sopp(0x3D, 0) }
+
+// global_atomic_add_f32 v[addr:+1], vdata, off   (GLOBAL op 0x5A; no return)
+//   Verified: global_atomic_add_f32 v[2:3], v4, off → 0xDD5A0000 0x007C0402.
+fn asm_global_atomic_add_f32_offvaddr(uint64 v_addr_pair, uint64 vdata) {
+    asm_u32(0xDD5A0000)
+    uint64 word2 = (0x7C << 16)                                // saddr=off
+                   | ((vdata & 0xFF) << 8)
+                   | (v_addr_pair & 0xFF)
+    asm_u32(word2)
+}
+
 // v_lshrrev_b64 v[dst:dst+1], s_idx, v[src:src+1]  — SGPR-shift form
 //   Verified: v_lshrrev_b64 v[2:3], s24, v[0:1] → 0xD73D0002 0x00020018.
 fn asm_v_lshrrev_b64_sgpr_vv(uint64 vdst_pair, uint64 s_idx, uint64 v_src_pair) {
