@@ -1,0 +1,189 @@
+// std/hip_kfd.mlr — KFD-backed shim for the std/hip.mlr API surface.
+//
+// Selected by the compiler when --target=amdgpu-native is set:
+// import_resolve() rewrites "../std/hip.mlr" → "../std/hip_kfd.mlr" so
+// every hip* call in the launcher resolves to a concrete MLR function
+// here instead of a @dynamic extern against libamdhip64. Net effect:
+//
+//   1. ldd of the produced binary contains only libc + ld-linux + vdso.
+//   2. Existing launchers (hipMalloc / hipMemcpy / hipModuleLoadData /
+//      hipModuleGetFunction / hipModuleLaunchKernel / hipDeviceSynchronize
+//      / hipFree) keep working unchanged; the dispatch goes through
+//      raw AMDKFD ioctls.
+//
+// What the shim does NOT cover (yet): hipGraph* (deferred until any
+// launcher actually needs graph capture under amdgpu-native — none of
+// the Stage 2c targets do).
+//
+// Semantics differences worth knowing:
+//   * hipModuleLaunchKernel is SYNCHRONOUS (dispatch + busy-poll wait
+//     before returning). HIP itself is async + you sync via
+//     hipDeviceSynchronize; here both are conflated. Matches the
+//     b5b-style "single queue, wait between every dispatch" pattern.
+//   * hipDeviceSynchronize is a no-op for that reason.
+//   * Kernarg unmarshalling assumes every argument is 8 bytes (uint64
+//     or f64). Every MLRift @kernel emitter satisfies this — args_desc
+//     entries declare size=8 in src/format_amdgpu.mlr.
+
+import "kfd.mlr"
+
+// --- Lazily-initialised global queue + signal ---
+// One queue + one signal serves all launches. kfd_dispatch resets the
+// signal value at the head of each dispatch; the immediate kfd_wait
+// below ensures the next launch sees a fresh signal.
+
+static uint64 _hipkfd_q       = 0
+static uint64 _hipkfd_signal  = 0
+static uint64 _hipkfd_kernarg = 0   // scratch kernarg blob (4 KiB)
+static uint64 _hipkfd_kernarg_h = 0
+
+fn _hipkfd_lazy_init() {
+    if _hipkfd_q != 0 { return }
+    kfd_init()
+    _hipkfd_q       = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    _hipkfd_signal  = kfd_signal_alloc()
+    _hipkfd_kernarg = dev_alloc_host_visible(4096)
+    _hipkfd_kernarg_h = dev_host_ptr(_hipkfd_kernarg)
+}
+
+// --- Error handling ---
+// HIP error strings are pointers into libamdhip64 .rodata. We don't
+// have one; return a fixed string so callers that print the message
+// still see something sensible.
+fn hipGetErrorString(uint32 err) -> uint64 {
+    return "<hip-via-kfd: unmapped error>"
+}
+
+// --- Device enumeration + selection ---
+// kfd_init has already discovered the GPU; report 1 device for any
+// query and accept hipSetDevice(0). Other indices fail.
+fn hipGetDeviceCount(uint64 count_ptr) -> uint32 {
+    _hipkfd_lazy_init()
+    uint64 one = 1
+    unsafe { *(count_ptr as uint64) = one }
+    return 0
+}
+
+fn hipSetDevice(uint32 dev_id) -> uint32 {
+    _hipkfd_lazy_init()
+    if dev_id == 0 { return 0 }
+    return 1
+}
+
+// --- Device memory ---
+// HIP semantics: dev_ptr_ptr is a pointer to a uint64 slot the caller
+// owns; on success we write the device VA there.
+fn hipMalloc(uint64 dev_ptr_ptr, uint64 size) -> uint32 {
+    _hipkfd_lazy_init()
+    uint64 dptr = dev_alloc_host_visible(size)
+    unsafe { *(dev_ptr_ptr as uint64) = dptr }
+    return 0
+}
+
+fn hipFree(uint64 dev_ptr) -> uint32 {
+    if dev_ptr == 0 { return 0 }
+    dev_free(dev_ptr)
+    return 0
+}
+
+// hipMemcpy kinds: 0 = H2H, 1 = H2D, 2 = D2H, 3 = D2D, 4 = Default.
+fn hipMemcpy(uint64 dst, uint64 src, uint64 size, uint32 kind) -> uint32 {
+    if kind == 1 {
+        dev_copy_h2d(src, dst, size)
+    } else if kind == 2 {
+        dev_copy_d2h(src, dst, size)
+    } else if kind == 3 {
+        // D2D: both sides are device VAs; copy via host views.
+        uint64 sh = dev_host_ptr(src)
+        uint64 dh = dev_host_ptr(dst)
+        memcpy(dh, sh, size)
+    } else {
+        // H2H (kind 0) or Default (kind 4): treat as plain host memcpy.
+        memcpy(dst, src, size)
+    }
+    return 0
+}
+
+// --- Synchronisation ---
+// No-op: hipModuleLaunchKernel already waits before returning, so by
+// the time the user's code calls hipDeviceSynchronize there is nothing
+// outstanding on the GPU.
+fn hipDeviceSynchronize() -> uint32 {
+    return 0
+}
+
+// --- Module loading ---
+// blob_ptr is host memory the user already loaded (typical pattern is
+// file_open + file_size + file_read into an alloc'd buffer). We don't
+// know the size from the HIP signature; kernel_load_from_blob only
+// reads ELF e_phoff/e_phnum/etc., which lie at fixed offsets, so we
+// pass 0 as a placeholder for the recorded size — it's only stored
+// in the mod handle for diagnostics, not used by KFD itself.
+fn hipModuleLoadData(uint64 mod_out, uint64 blob_ptr) -> uint32 {
+    _hipkfd_lazy_init()
+    uint64 mod = kernel_load_from_blob(blob_ptr, 0)
+    unsafe { *(mod_out as uint64) = mod }
+    return 0
+}
+
+// hipModuleGetFunction returns a function handle. We need to remember
+// kernarg_size for hipModuleLaunchKernel, so the handle is a small
+// wrapper struct (16 bytes):
+//   [0x00] kd_va         (u64)  — what kfd_dispatch wants
+//   [0x08] kernarg_size  (u64)  — read from the kernel descriptor
+fn hipModuleGetFunction(uint64 fn_out, uint64 mod, uint64 name_cstr) -> uint32 {
+    uint64 kd_va = kernel_get_function(mod, name_cstr)
+    uint64 ks    = kernel_kernarg_size(mod, kd_va)
+    uint64 wrap  = alloc(16)
+    unsafe { *((wrap + 0x00) as uint64) = kd_va }
+    unsafe { *((wrap + 0x08) as uint64) = ks }
+    unsafe { *(fn_out as uint64) = wrap }
+    return 0
+}
+
+// hipModuleLaunchKernel:
+//   * fn_handle: wrapper from hipModuleGetFunction.
+//   * grid_*  : workgroup count (HIP/CUDA convention; kfd_dispatch
+//               multiplies by block_* internally for the AQL grid_size).
+//   * shared_bytes / stream / extra: ignored.
+//   * kernel_params: void** — array of pointers to per-arg 8-byte
+//                    storage. Caller already populated each slot.
+fn hipModuleLaunchKernel(
+    uint64 fn_handle,
+    uint32 grid_x, uint32 grid_y, uint32 grid_z,
+    uint32 block_x, uint32 block_y, uint32 block_z,
+    uint32 shared_bytes,
+    uint64 stream,
+    uint64 kernel_params,
+    uint64 extra
+) -> uint32 {
+    _hipkfd_lazy_init()
+    uint64 kd_va = 0; unsafe { *((fn_handle + 0x00) as uint64) -> kd_va }
+    uint64 ks    = 0; unsafe { *((fn_handle + 0x08) as uint64) -> ks }
+    if ks > 4096 {
+        kfd_die("hipModuleLaunchKernel: kernarg_size > 4096 (shim limit)", ks)
+    }
+
+    // Unmarshal HIP ptr_table (array of u64*) into a contiguous KFD
+    // kernarg blob. nargs = kernarg_size / 8: every MLRift @kernel
+    // emitter declares size=8 for every arg (see args_desc init in
+    // src/format_amdgpu.mlr), and the HIP convention is one slot per
+    // 8-byte argument value. f64 and uint64 share the slot layout.
+    uint64 nargs = ks / 8
+    uint64 i = 0
+    while i < nargs {
+        uint64 slot_ptr = 0
+        unsafe { *((kernel_params + i * 8) as uint64) -> slot_ptr }
+        uint64 v = 0
+        unsafe { *(slot_ptr as uint64) -> v }
+        unsafe { *((_hipkfd_kernarg_h + i * 8) as uint64) = v }
+        i = i + 1
+    }
+
+    uint64 gx = grid_x;  uint64 gy = grid_y;  uint64 gz = grid_z
+    uint64 bx = block_x; uint64 by = block_y; uint64 bz = block_z
+    kfd_dispatch(_hipkfd_q, kd_va, gx, gy, gz, bx, by, bz,
+                 _hipkfd_kernarg, ks, _hipkfd_signal)
+    kfd_wait(_hipkfd_q, _hipkfd_signal)
+    return 0
+}

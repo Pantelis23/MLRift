@@ -502,15 +502,16 @@ fn kfd_destroy_queue(uint64 q) {
 //   [0x08] elf_size       (u64)
 //   [0x10] image_base_va  (u64)   GPU VA where the loaded image starts
 //   [0x18] image_size     (u64)   total bytes (vaddr_max - vaddr_min)
-fn kernel_load(uint64 co_path) -> uint64 {
+// Mod handle layout (40 bytes, was 32 pre-shim):
+//   [0x00] elf_blob_host_ptr  (u64) — host pointer to ELF file blob
+//   [0x08] elf_blob_size      (u64)
+//   [0x10] image_base_va      (u64) — GPU VA of loaded image
+//   [0x18] image_size         (u64)
+//   [0x20] image_base_host    (u64) — host pointer to the same image
+//                                     (added so the HIP-via-KFD shim can
+//                                      read kernel descriptors back)
+fn kernel_load_from_blob(uint64 elf, uint64 sz) -> uint64 {
     if _kfd_initialized == 0 { kfd_init() }
-
-    uint64 fd = file_open(co_path, 0)
-    if fd > 0xFFFFFFFFFFFFF000 { kfd_die("kernel_load: open failed", fd) }
-    uint64 sz = file_size(fd)
-    uint64 elf = alloc(sz)
-    file_read(fd, elf, sz)
-    file_close(fd)
 
     // ELF64 program-header table:
     //   e_phoff at [32]    (u64)
@@ -521,14 +522,6 @@ fn kernel_load(uint64 co_path) -> uint64 {
     uint64 e_phnum = 0;     unsafe { *((elf + 56) as uint16) -> e_phnum }
     uint64 ph_off = elf + e_phoff
 
-    // PT_LOAD = 1. Each Elf64_Phdr (56 bytes):
-    //   [0x00] p_type    (u32)
-    //   [0x08] p_offset  (u64)   file offset
-    //   [0x10] p_vaddr   (u64)   virtual address
-    //   [0x20] p_filesz  (u64)
-    //   [0x28] p_memsz   (u64)
-
-    // First pass: vaddr_min, vaddr_max.
     uint64 vaddr_min = 0xFFFFFFFFFFFFFFFF
     uint64 vaddr_max = 0
     uint64 i = 0
@@ -547,22 +540,15 @@ fn kernel_load(uint64 co_path) -> uint64 {
     if vaddr_max == 0 { kfd_die("kernel_load: no PT_LOAD segments", 0) }
     uint64 image_size = vaddr_max - vaddr_min
 
-    // Allocate one host-visible EXECUTABLE buffer covering the full image.
-    // The SQC (Shader instruction Cache) needs execute permission to fetch
-    // kernel instructions; without it the GPU page-faults with
-    // PERMISSION_FAULTS=0x8 from client SQC (inst).
     uint64 image_va = dev_alloc_kernel_image(image_size)
     uint64 image_host = dev_host_ptr(image_va)
 
-    // Zero the image (gap regions between segments).
     uint64 z = 0
     while z < image_size {
         uint64 p = image_host + z; unsafe { *(p as uint64) = 0 }
         z = z + 8
     }
 
-    // Second pass: copy each PT_LOAD into the image buffer at its
-    // (vaddr - vaddr_min) offset.
     i = 0
     while i < e_phnum {
         uint64 ph = ph_off + i * e_phentsize
@@ -579,12 +565,38 @@ fn kernel_load(uint64 co_path) -> uint64 {
         i = i + 1
     }
 
-    uint64 mod = alloc(32)
+    uint64 mod = alloc(40)
     unsafe { *((mod + 0x00) as uint64) = elf }
     unsafe { *((mod + 0x08) as uint64) = sz }
     unsafe { *((mod + 0x10) as uint64) = image_va }
     unsafe { *((mod + 0x18) as uint64) = image_size }
+    unsafe { *((mod + 0x20) as uint64) = image_host }
     return mod
+}
+
+// Read kernarg_segment_byte_size out of the AMDHSA kernel descriptor.
+// `kd_va` is what kernel_get_function returned (image_base_va + .kd
+// symbol offset). The KD field layout is in src/format_amdgpu.mlr —
+// see amd_emit_kernel_descriptor; kernarg_size lives at offset 0x08.
+fn kernel_kernarg_size(uint64 mod, uint64 kd_va) -> uint64 {
+    uint64 image_base_va   = 0; unsafe { *((mod + 0x10) as uint64) -> image_base_va }
+    uint64 image_base_host = 0; unsafe { *((mod + 0x20) as uint64) -> image_base_host }
+    uint64 kd_host = image_base_host + (kd_va - image_base_va)
+    uint64 ks = 0
+    unsafe { *((kd_host + 0x08) as uint32) -> ks }
+    return ks
+}
+
+fn kernel_load(uint64 co_path) -> uint64 {
+    if _kfd_initialized == 0 { kfd_init() }
+
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { kfd_die("kernel_load: open failed", fd) }
+    uint64 sz = file_size(fd)
+    uint64 elf = alloc(sz)
+    file_read(fd, elf, sz)
+    file_close(fd)
+    return kernel_load_from_blob(elf, sz)
 }
 
 // Find a symbol named "<fn_name>.kd" in .dynsym, return its absolute

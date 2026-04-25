@@ -862,11 +862,23 @@ fn sema_collect_signatures(uint64 root) {
                 uint32 pnxt = ast_next(wpchild)
                 wpchild = pnxt
             }
-            // Check for duplicate
+            // Check for duplicate. A duplicate is fine when both decls
+            // are @dynamic extern (data4 flag bits 3 + 5 set, i.e. 0x28)
+            // — happens with the --target=amdgpu-native HIP-via-KFD
+            // shim path where std/kfd.mlr declares puts/exit/write/etc.
+            // and a launcher file (legitimately, pre-shim) re-declares
+            // them locally. Both declarations name the same dlopen
+            // symbol so silently dedupe instead of erroring.
             uint64 existing = fn_sig_lookup(wname)
             if existing != 0xFFFFFFFF {
-                report_error_at(wname, "redefinition of function")
-                sema_errors = sema_errors + 1
+                uint32 cur_flags = ast_data4(wchild)
+                uint64 wcur_flags = cur_flags
+                if (wcur_flags & 0x28) == 0x28 {
+                    // Skip the duplicate @dynamic extern declaration.
+                } else {
+                    report_error_at(wname, "redefinition of function")
+                    sema_errors = sema_errors + 1
+                }
             } else {
                 uint32 ret_tok = ast_data2(wchild)
                 uint64 has_return = 0

@@ -256,6 +256,54 @@ fn import_dir_of(uint64 path) -> uint64 {
     return last_slash
 }
 
+// When --target=amdgpu-native is on, route std/hip.mlr imports to the
+// KFD-backed shim std/hip_kfd.mlr so launchers run with zero ROCm
+// linkage. Match on a "hip.mlr" suffix; leave everything else alone.
+fn _maybe_redirect_hip_to_kfd(uint64 path) -> uint64 {
+    if target_amdgpu_native == 0 { return path }
+    uint64 plen = str_len(path)
+    if plen < 7 { return path }                      // "hip.mlr" is 7 chars
+    // Already redirected? "hip_kfd.mlr" ends in "kfd.mlr" — leave alone.
+    if plen >= 11 {
+        uint64 t11 = path + plen - 11
+        uint64 c = 0; unsafe { *(t11 as uint8) -> c }
+        if c == 104 {                                  // 'h'
+            uint64 c1 = 0; unsafe { *((t11 + 1) as uint8) -> c1 }
+            uint64 c2 = 0; unsafe { *((t11 + 2) as uint8) -> c2 }
+            uint64 c3 = 0; unsafe { *((t11 + 3) as uint8) -> c3 }
+            if c1 == 105 && c2 == 112 && c3 == 95 {    // "hip_"
+                return path
+            }
+        }
+    }
+    uint64 t = path + plen - 7
+    uint64 b0 = 0; unsafe { *(t as uint8) -> b0 }
+    uint64 b1 = 0; unsafe { *((t + 1) as uint8) -> b1 }
+    uint64 b2 = 0; unsafe { *((t + 2) as uint8) -> b2 }
+    uint64 b3 = 0; unsafe { *((t + 3) as uint8) -> b3 }
+    uint64 b4 = 0; unsafe { *((t + 4) as uint8) -> b4 }
+    uint64 b5 = 0; unsafe { *((t + 5) as uint8) -> b5 }
+    uint64 b6 = 0; unsafe { *((t + 6) as uint8) -> b6 }
+    // "hip.mlr" = 104 105 112 46 109 108 114
+    if b0 != 104 { return path }
+    if b1 != 105 { return path }
+    if b2 != 112 { return path }
+    if b3 != 46 { return path }
+    if b4 != 109 { return path }
+    if b5 != 108 { return path }
+    if b6 != 114 { return path }
+    // Build redirected path: <dir>/hip_kfd.mlr.
+    uint64 prefix_len = plen - 7
+    uint64 redirected = alloc(prefix_len + 11 + 1)    // "hip_kfd.mlr" + NUL
+    memcpy(redirected, path, prefix_len)
+    uint64 suffix = "hip_kfd.mlr"
+    memcpy(redirected + prefix_len, suffix, 11)
+    uint64 tp = redirected + prefix_len + 11
+    uint8 z = 0
+    unsafe { *(tp as uint8) = z }
+    return redirected
+}
+
 fn import_resolve(uint64 base_path, uint64 name, uint64 name_len) -> uint64 {
     uint64 dir_len = import_dir_of(base_path)
     uint64 result = alloc(dir_len + name_len + 1)
@@ -282,7 +330,7 @@ fn import_resolve(uint64 base_path, uint64 name, uint64 name_len) -> uint64 {
     uint64 tp = result + dir_len + name_len
     uint8 z = 0
     unsafe { *(tp as uint8) = z }
-    return result
+    return _maybe_redirect_hip_to_kfd(result)
 }
 
 fn import_check_import_line(uint64 buf, uint64 size, uint64 pos) -> uint64 {
@@ -570,7 +618,7 @@ fn import_process(uint64 file_path) {
                 uint8 nz = 0
                 unsafe { *(ntp as uint8) = nz }
                 uint64 stdlib_path = import_resolve_stdlib(name_copy)
-                if stdlib_path != 0 { full_path = stdlib_path }
+                if stdlib_path != 0 { full_path = _maybe_redirect_hip_to_kfd(stdlib_path) }
             }
             // Recurse
             import_process(full_path)
@@ -2257,8 +2305,12 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
 
         uint64 anrc = emit_amdgpu_from_module(root, source, co_path_buf)
         if anrc == 3 {
-            write(2, "mlrc: --target=amdgpu-native but no @kernel functions found\n", 61)
-            exit(1)
+            // No @kernel functions: this is a launcher-only source
+            // (kernel .co is being emitted separately via
+            // --emit-amdgpu-<flag>=). Don't error — the import_resolve
+            // hook has already routed std/hip.mlr through the KFD
+            // shim, so the launcher we are about to compile will
+            // dispatch via raw KFD ioctls regardless.
         } else if anrc == 1 {
             // emit_amdgpu_from_module already printed a pointed-at-shape
             // diagnostic pointing at the offending kernel.
@@ -2267,9 +2319,11 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
             write(2, "mlrc: failed to write .co for --target=amdgpu-native\n", 53)
             exit(1)
         }
-        write(1, "wrote ", 6)
-        write(1, co_path_buf, opl_an + 3)
-        write(1, " (native amdgpu code object)\n", 29)
+        if anrc == 0 {
+            write(1, "wrote ", 6)
+            write(1, co_path_buf, opl_an + 3)
+            write(1, " (native amdgpu code object)\n", 29)
+        }
     }
 
     // Dead code elimination: scan AST for reachable functions
