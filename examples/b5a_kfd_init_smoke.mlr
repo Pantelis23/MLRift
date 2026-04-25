@@ -57,6 +57,30 @@ fn main() {
     print_label_val("gpuvm_base", 10, kfd_gpuvm_base())
     print_label_val("gpuvm_limit",11, kfd_gpuvm_limit())
 
+    // Allocator round-trip.
+    uint64 d = dev_alloc_host_visible(64)
+    print_label_val("dev_va", 6, d)
+
+    uint64 h_in = alloc(64)
+    uint64 i = 0
+    while i < 8 {
+        uint64 p = h_in + i * 8
+        unsafe { *(p as uint64) = i + 1 }
+        i = i + 1
+    }
+    dev_copy_h2d(h_in, d, 64)
+
+    uint64 h_out = alloc(64)
+    dev_copy_d2h(d, h_out, 64)
+    uint64 v0 = 0; unsafe { *(h_out as uint64) -> v0 }
+    print_label_val("rt_v0", 5, v0)
+    if v0 != 1 { die("h2d/d2h round-trip mismatch (v0)", v0) }
+    uint64 v7 = 0; unsafe { *((h_out + 56) as uint64) -> v7 }
+    print_label_val("rt_v7", 5, v7)
+    if v7 != 8 { die("h2d/d2h round-trip mismatch (v7)", v7) }
+
+    dev_free(d)
+
     puts("b5a_kfd_init_smoke: OK")
     exit(0)
 }

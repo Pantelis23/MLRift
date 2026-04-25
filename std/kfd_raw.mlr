@@ -130,3 +130,66 @@ fn raw_kfd_get_process_apertures_new(uint32 fd, uint64 apertures_buf,
 
 static uint64 KFD_APERTURE_ENTRY_SIZE = 56
 static uint64 KFD_APERTURE_GPU_ID_OFFSET = 0x30
+
+// kfd_ioctl_alloc_memory_of_gpu_args (kfd_ioctl.h:424-431):
+//   [0x00] va_addr    (u64, to KFD; 0 to let KFD pick)
+//   [0x08] size       (u64, to KFD)
+//   [0x10] handle     (u64, from KFD)
+//   [0x18] mmap_offset (u64, in/out)
+//   [0x20] gpu_id     (u32, to KFD)
+//   [0x24] flags      (u32, to KFD)
+fn raw_kfd_alloc_memory_of_gpu(uint32 fd, uint32 gpu_id, uint64 size, uint64 va_addr,
+                                uint32 flags, uint64 out_handle_slot,
+                                uint64 out_va_slot, uint64 out_mmap_offset_slot) -> uint32 {
+    uint64 args = alloc(40)
+    uint64 p0 = args + 0x00; unsafe { *(p0 as uint64) = va_addr }
+    uint64 p1 = args + 0x08; unsafe { *(p1 as uint64) = size }
+    uint64 p2 = args + 0x10; unsafe { *(p2 as uint64) = 0 }       // handle
+    uint64 p3 = args + 0x18; unsafe { *(p3 as uint64) = 0 }       // mmap_offset
+    uint64 p4 = args + 0x20; unsafe { *(p4 as uint32) = gpu_id }
+    uint64 p5 = args + 0x24; unsafe { *(p5 as uint32) = flags }
+    uint32 r = _kfd_ioctl(fd, AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, args)
+    if r == 0 {
+        uint64 hh = 0; unsafe { *(p2 as uint64) -> hh }
+        uint64 va = 0; unsafe { *(p0 as uint64) -> va }
+        uint64 mm = 0; unsafe { *(p3 as uint64) -> mm }
+        unsafe { *(out_handle_slot as uint64) = hh }
+        unsafe { *(out_va_slot as uint64) = va }
+        unsafe { *(out_mmap_offset_slot as uint64) = mm }
+    }
+    return r
+}
+
+// kfd_ioctl_free_memory_of_gpu_args (kfd_ioctl.h:437-439): one u64.
+fn raw_kfd_free_memory_of_gpu(uint32 fd, uint64 handle) -> uint32 {
+    uint64 args = alloc(8)
+    unsafe { *(args as uint64) = handle }
+    return _kfd_ioctl(fd, AMDKFD_IOC_FREE_MEMORY_OF_GPU, args)
+}
+
+// kfd_ioctl_map_memory_to_gpu_args (kfd_ioctl.h:456-461):
+//   [0x00] handle              (u64)
+//   [0x08] device_ids_array_ptr (u64)
+//   [0x10] n_devices           (u32)
+//   [0x14] n_success           (u32, in/out)
+fn raw_kfd_map_memory_to_gpu(uint32 fd, uint64 handle, uint32 gpu_id) -> uint32 {
+    uint64 dev_ids = alloc(4)
+    unsafe { *(dev_ids as uint32) = gpu_id }
+    uint64 args = alloc(24)
+    unsafe { *((args + 0x00) as uint64) = handle }
+    unsafe { *((args + 0x08) as uint64) = dev_ids }
+    unsafe { *((args + 0x10) as uint32) = 1 }
+    unsafe { *((args + 0x14) as uint32) = 0 }
+    return _kfd_ioctl(fd, AMDKFD_IOC_MAP_MEMORY_TO_GPU, args)
+}
+
+fn raw_kfd_unmap_memory_from_gpu(uint32 fd, uint64 handle, uint32 gpu_id) -> uint32 {
+    uint64 dev_ids = alloc(4)
+    unsafe { *(dev_ids as uint32) = gpu_id }
+    uint64 args = alloc(24)
+    unsafe { *((args + 0x00) as uint64) = handle }
+    unsafe { *((args + 0x08) as uint64) = dev_ids }
+    unsafe { *((args + 0x10) as uint32) = 1 }
+    unsafe { *((args + 0x14) as uint32) = 0 }
+    return _kfd_ioctl(fd, AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, args)
+}

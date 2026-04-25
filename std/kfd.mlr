@@ -97,3 +97,126 @@ fn kfd_fd() -> uint32 { return _kfd_fd }
 fn kfd_drm_fd() -> uint32 { return _kfd_drm_fd }
 fn kfd_gpuvm_base() -> uint64 { return _kfd_gpuvm_base }
 fn kfd_gpuvm_limit() -> uint64 { return _kfd_gpuvm_limit }
+
+@dynamic extern fn mmap(uint64 addr, uint64 length, uint32 prot, uint32 flags,
+                        uint32 fd, uint64 offset) -> uint64
+@dynamic extern fn memcpy(uint64 dst, uint64 src, uint64 nbytes) -> uint64
+
+// MAP_PRIVATE | MAP_SHARED: KFD's mmap'd buffers want MAP_SHARED.
+static uint32 KFD_MMAP_PROT  = 0x3       // PROT_READ | PROT_WRITE
+static uint32 KFD_MMAP_FLAGS = 0x1       // MAP_SHARED
+
+// VA reservation via anonymous mmap. KFD's ALLOC_MEMORY_OF_GPU
+// requires the user to provide va_addr (it does NOT pick one).
+// We reserve host VA space with MAP_ANONYMOUS|MAP_NORESERVE so the
+// kernel won't reuse that range for unrelated allocations.
+static uint32 KFD_VA_PROT     = 0x0      // PROT_NONE
+static uint32 KFD_VA_FLAGS    = 0x4022   // MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE
+
+// --- Allocation tracking (small static table; max 64 outstanding allocs) ---
+static uint64 _kfd_alloc_tab_n = 0
+static uint64[64] _kfd_alloc_va
+static uint64[64] _kfd_alloc_handle
+static uint64[64] _kfd_alloc_size
+static uint64[64] _kfd_alloc_host
+
+fn _kfd_alloc_track(uint64 va, uint64 handle, uint64 size, uint64 host_ptr) {
+    if _kfd_alloc_tab_n >= 64 { kfd_die("kfd: alloc table full (max 64)", _kfd_alloc_tab_n) }
+    uint64 i = _kfd_alloc_tab_n
+    uint64 p_va  = _kfd_alloc_va     + i * 8; unsafe { *(p_va as uint64) = va }
+    uint64 p_h   = _kfd_alloc_handle + i * 8; unsafe { *(p_h as uint64) = handle }
+    uint64 p_s   = _kfd_alloc_size   + i * 8; unsafe { *(p_s as uint64) = size }
+    uint64 p_hp  = _kfd_alloc_host   + i * 8; unsafe { *(p_hp as uint64) = host_ptr }
+    _kfd_alloc_tab_n = i + 1
+}
+
+fn _kfd_alloc_lookup(uint64 va, uint64 out_handle_slot, uint64 out_host_slot) -> uint32 {
+    uint64 i = 0
+    while i < _kfd_alloc_tab_n {
+        uint64 p_va = _kfd_alloc_va + i * 8
+        uint64 v = 0; unsafe { *(p_va as uint64) -> v }
+        if v == va {
+            uint64 p_h  = _kfd_alloc_handle + i * 8
+            uint64 p_hp = _kfd_alloc_host   + i * 8
+            uint64 hh = 0; unsafe { *(p_h as uint64) -> hh }
+            uint64 hp = 0; unsafe { *(p_hp as uint64) -> hp }
+            unsafe { *(out_handle_slot as uint64) = hh }
+            unsafe { *(out_host_slot as uint64) = hp }
+            return 0
+        }
+        i = i + 1
+    }
+    return 1   // not found
+}
+
+// Reserve a VA range with the kernel before handing it to KFD.
+// MAP_ANONYMOUS|MAP_NORESERVE pins the range so other allocations
+// don't grab it; KFD's ALLOC_MEMORY_OF_GPU then claims the same VA
+// for the GPU side.
+fn _kfd_reserve_va(uint64 nbytes) -> uint64 {
+    uint64 va = mmap(0, nbytes, KFD_VA_PROT, KFD_VA_FLAGS, 0xFFFFFFFF, 0)
+    if va > 0xFFFFFFFFFFFFF000 { kfd_die("kfd: VA reservation mmap failed", va) }
+    return va
+}
+
+fn dev_alloc_vram(uint64 nbytes) -> uint64 {
+    if _kfd_initialized == 0 { kfd_init() }
+    uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
+    uint64 va_pref = _kfd_reserve_va(nbytes)
+    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
+    if r != 0 { kfd_die("dev_alloc_vram: ALLOC_MEMORY_OF_GPU failed", r) }
+    uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
+    uint64 va = 0;     unsafe { *(va_slot as uint64) -> va }
+    r = raw_kfd_map_memory_to_gpu(_kfd_fd, handle, _kfd_gpu_id)
+    if r != 0 { kfd_die("dev_alloc_vram: MAP_MEMORY_TO_GPU failed", r) }
+    _kfd_alloc_track(va, handle, nbytes, 0)
+    return va
+}
+
+fn dev_alloc_host_visible(uint64 nbytes) -> uint64 {
+    if _kfd_initialized == 0 { kfd_init() }
+    uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
+    uint64 va_pref = _kfd_reserve_va(nbytes)
+    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
+    if r != 0 { kfd_die("dev_alloc_host_visible: ALLOC_MEMORY_OF_GPU failed", r) }
+    uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
+    uint64 va = 0;     unsafe { *(va_slot as uint64) -> va }
+    uint64 mm = 0;     unsafe { *(mm_slot as uint64) -> mm }
+    r = raw_kfd_map_memory_to_gpu(_kfd_fd, handle, _kfd_gpu_id)
+    if r != 0 { kfd_die("dev_alloc_host_visible: MAP failed", r) }
+    // mmap_offset is for the DRM render node, not /dev/kfd.
+    uint64 host = mmap(0, nbytes, KFD_MMAP_PROT, KFD_MMAP_FLAGS, _kfd_drm_fd, mm)
+    if host > 0xFFFFFFFFFFFFF000 { kfd_die("dev_alloc_host_visible: mmap failed", host) }
+    _kfd_alloc_track(va, handle, nbytes, host)
+    return va
+}
+
+fn dev_host_ptr(uint64 dev_ptr) -> uint64 {
+    uint64 h_slot = alloc(8); uint64 host_slot = alloc(8)
+    uint32 r = _kfd_alloc_lookup(dev_ptr, h_slot, host_slot)
+    if r != 0 { kfd_die("dev_host_ptr: dev ptr not tracked", dev_ptr) }
+    uint64 host = 0; unsafe { *(host_slot as uint64) -> host }
+    if host == 0 { kfd_die("dev_host_ptr: not host-visible", dev_ptr) }
+    return host
+}
+
+fn dev_free(uint64 dev_ptr) {
+    uint64 h_slot = alloc(8); uint64 host_slot = alloc(8)
+    uint32 r = _kfd_alloc_lookup(dev_ptr, h_slot, host_slot)
+    if r != 0 { return }
+    uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
+    raw_kfd_unmap_memory_from_gpu(_kfd_fd, handle, _kfd_gpu_id)
+    raw_kfd_free_memory_of_gpu(_kfd_fd, handle)
+}
+
+fn dev_copy_h2d(uint64 host, uint64 dev, uint64 nbytes) {
+    uint64 dev_host = dev_host_ptr(dev)
+    memcpy(dev_host, host, nbytes)
+}
+
+fn dev_copy_d2h(uint64 dev, uint64 host, uint64 nbytes) {
+    uint64 dev_host = dev_host_ptr(dev)
+    memcpy(host, dev_host, nbytes)
+}
