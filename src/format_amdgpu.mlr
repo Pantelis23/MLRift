@@ -5507,6 +5507,151 @@ fn asm_v_add_co_ci_u32_null_vv_vcc(uint64 vdst, uint64 v_src0, uint64 v_src1) {
     asm_u32(word2)
 }
 
+// ── Tier 1 primitives (verified via llvm-mc gfx1100) ─────────────────
+//
+// v_mul_hi_u32 vdst, v_src0, v_src1   (VOP3 op 0x12D)
+//   word1 = 0xD72D0000 | vdst
+//   word2 = ((0x100|v_src1) << 9) | (0x100|v_src0)
+//   Verified: v_mul_hi_u32 v3, v0, v1 → 0xD72D0003 0x00020300.
+fn asm_v_mul_hi_u32_vv(uint64 vdst, uint64 v_src0, uint64 v_src1) {
+    uint64 word1 = 0xD72D0000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_mul_hi_u32 vdst, v_src0, s_src1
+//   Verified: v_mul_hi_u32 v3, v0, s4 → 0xD72D0003 0x00000900.
+fn asm_v_mul_hi_u32_vs(uint64 vdst, uint64 v_src0, uint64 s_src1) {
+    uint64 word1 = 0xD72D0000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = s_src1 & 0x1FF
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_lshrrev_b64 v[dst:dst+1], <imm shift 0..63>, v[src:src+1]   (VOP3 op 0x13D)
+//   word1 = 0xD73D0000 | (dst & 0xFF)
+//   word2 = ((0x100|src_pair) << 9) | (0x80 + shift)
+//   Verified: v_lshrrev_b64 v[2:3], 30, v[0:1] → 0xD73D0002 0x0002009E.
+//             v_lshrrev_b64 v[2:3], 27, v[0:1] → 0xD73D0002 0x0002009B.
+//             v_lshrrev_b64 v[2:3], 31, v[0:1] → 0xD73D0002 0x0002009F.
+fn asm_v_lshrrev_b64_imm_vv(uint64 vdst_pair, uint64 shift_amount, uint64 v_src_pair) {
+    uint64 word1 = 0xD73D0000 | (vdst_pair & 0xFF)
+    uint64 src0_enc = 0x80 + (shift_amount & 0x3F)
+    uint64 src1_enc = 0x100 | (v_src_pair & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_xor_b32_e64 vdst, v_src0, v_src1   (VOP3 op 0x11D)
+//   word1 = 0xD51D0000 | vdst
+//   Verified: v_xor_b32_e64 v0, v2, v3 → 0xD51D0000 0x00020702.
+fn asm_v_xor_b32_e64_vv(uint64 vdst, uint64 v_src0, uint64 v_src1) {
+    uint64 word1 = 0xD51D0000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_sub_co_u32 vdst, vcc_lo, v_src0, v_src1   (VOP3B op 0x101)
+//   Mirrors v_add_co_u32 (op 0x100) byte-for-byte.
+//   Verified: v_sub_co_u32 v0, vcc_lo, v2, v4 → 0xD7016A00 0x00020902.
+fn asm_v_sub_co_u32_vcc_vv(uint64 vdst, uint64 v_src0, uint64 v_src1) {
+    uint64 word1 = 0xD7016A00 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_sub_co_ci_u32_e64 vdst, null, v_src0, v_src1, vcc_lo   (VOP3B op 0x121)
+//   Reads vcc_lo (borrow-in), discards borrow-out into null.
+//   Verified: v_sub_co_ci_u32_e64 v0, null, v2, v4, vcc_lo → 0xD5217C00 0x01AA0902.
+fn asm_v_sub_co_ci_u32_null_vv_vcc(uint64 vdst, uint64 v_src0, uint64 v_src1) {
+    uint64 word1 = 0xD5217C00 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 src2_enc = 0x6A                                 // vcc_lo
+    uint64 word2 = ((src2_enc & 0x1FF) << 18)
+                   | ((src1_enc & 0x1FF) << 9)
+                   | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_cmp_ge_u64_e64 vcc_lo, v[a:a+1], v[b:b+1]   (VOPC op 0xDE)
+//   Sets vcc_lo = (a >= b) per lane.
+//   Verified: v_cmp_ge_u64_e64 vcc_lo, v[0:1], v[2:3] → 0xD45E006A 0x00020500.
+fn asm_v_cmp_ge_u64_vv(uint64 v_src0_pair, uint64 v_src1_pair) {
+    uint64 word1 = 0xD45E006A
+    uint64 src0_enc = 0x100 | (v_src0_pair & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1_pair & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_lshlrev_b32_e64 vdst, <imm 0..31>, v_src   (VOP3 op 0x118)
+//   Verified: v_lshlrev_b32_e64 v0, 1, v1 → 0xD5180000 0x00020281.
+fn asm_v_lshlrev_b32_imm_e64(uint64 vdst, uint64 shift_amount, uint64 v_src) {
+    uint64 word1 = 0xD5180000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x80 + (shift_amount & 0x1F)
+    uint64 src1_enc = 0x100 | (v_src & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_lshrrev_b32_e64 vdst, <imm 0..31>, v_src   (VOP3 op 0x119)
+//   Verified: v_lshrrev_b32_e64 v0, 1, v1 → 0xD5190000 0x00020281.
+fn asm_v_lshrrev_b32_imm_e64(uint64 vdst, uint64 shift_amount, uint64 v_src) {
+    uint64 word1 = 0xD5190000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x80 + (shift_amount & 0x1F)
+    uint64 src1_enc = 0x100 | (v_src & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_or_b32_e64 vdst, v_src0, v_src1   (VOP3 op 0x11C)
+//   Verified: v_or_b32_e64 v0, v2, v3 → 0xD51C0000 0x00020702.
+fn asm_v_or_b32_e64_vv(uint64 vdst, uint64 v_src0, uint64 v_src1) {
+    uint64 word1 = 0xD51C0000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = 0x100 | (v_src1 & 0xFF)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_and_b32_e64 vdst, v_src0, <inline imm 0..63>   (VOP3 op 0x11B)
+//   Verified: v_and_b32_e64 v0, v2, 1 → 0xD51B0000 0x00010302.
+fn asm_v_and_b32_imm_e64(uint64 vdst, uint64 v_src0, uint64 imm) {
+    uint64 word1 = 0xD51B0000 | (vdst & 0xFF)
+    uint64 src0_enc = 0x100 | (v_src0 & 0xFF)
+    uint64 src1_enc = 0x80 + (imm & 0x3F)
+    uint64 word2 = ((src1_enc & 0x1FF) << 9) | (src0_enc & 0x1FF)
+    asm_u32(word1)
+    asm_u32(word2)
+}
+
+// v_mov_b32_e32 vdst, <32-bit literal>   (VOP1 op 0x01, lit32 follows)
+//   Verified: v_mov_b32_e32 v3, 0xBF58476D
+//             → word = 0x7E0602FF, lit = 0xBF58476D.
+fn asm_v_mov_b32_lit32(uint64 vdst, uint64 lit32) {
+    uint64 word = 0x7E0002FF | ((vdst & 0xFF) << 17)
+    asm_u32(word)
+    asm_u32(lit32 & 0xFFFFFFFF)
+}
+
 // v_cndmask_b32_e64 vdst, v_src0, v_src1, vcc_lo  — VOP3 op 0x101.
 //   gfx11 rejects an SGPR-pair pair as src0/src1 (verified in session 2).
 //   This helper is for the post-mov VGPR-only operand form.
