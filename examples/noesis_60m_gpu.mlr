@@ -230,6 +230,32 @@ fn delivery_step(
     }
 }
 
+// Reduce 60M-element spike[] (u64) to (sum, active_count) on-device.
+// Skips the 480 MB D2H and the host-side tally loop in the launcher.
+// Strategy: per-lane contribution, atomic-add into a 16-byte global
+// result. atomic_add_u64 on a single counter is contended but the
+// kernel is only one extra dispatch so the contention cost is far
+// less than the 130-150ms it replaces (480MB D2H + 60M-iter tally).
+@kernel
+fn spike_reduce(
+    uint64 spike_ptr,
+    uint64 result_ptr,           // [0]=total_spikes, [8]=active_neurons
+    uint64 n
+) {
+    uint64 i = tid_x()
+    if i < n {
+        uint64 sp = spike_ptr + i * 8
+        uint64 c = 0
+        unsafe { *(sp as uint64) -> c }
+        if c > 0 {
+            atomic_add_u64(result_ptr, c)
+            uint64 ap = result_ptr + 8
+            uint64 one = 1
+            atomic_add_u64(ap, one)
+        }
+    }
+}
+
 // RI is host-initialised (per-neuron variance) and H2D-copied once
 // before the sim loop — no init kernel needed here.
 

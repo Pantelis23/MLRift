@@ -52,7 +52,11 @@ import "thread.mlr"
 // drain signal we ensure they've also retired before sync.
 
 static uint64 _HIPKFD_KARG_SLOTS    = 1024
-static uint64 _HIPKFD_KARG_SLOT_SZ  = 256
+static uint64 _HIPKFD_KARG_SLOT_SZ  = 512        // up from 256: clang-compiled
+                                                  // COv5 kernels declare
+                                                  // kernarg_size that includes
+                                                  // ~256 B of hidden args
+                                                  // (csr_build = 336, lif = 384)
 static uint64 _HIPKFD_KARG_SLOT_MASK = 1023      // power-of-two — bitmask wrap
 
 static uint64 _hipkfd_q              = 0
@@ -437,6 +441,23 @@ fn hipModuleLaunchKernel(
     uint64 karg_va  = _hipkfd_kernarg_ring + slot_off
     uint64 karg_h   = _hipkfd_kernarg_ring_h + slot_off
     _hipkfd_karg_slot = (slot_idx + 1) & _HIPKFD_KARG_SLOT_MASK
+
+    // Pre-zero the whole slot before unmarshal. clang-compiled COv5
+    // kernels declare a kernarg_size that includes ~256 bytes of
+    // hidden args (printf/hostcall/heap-base pointers etc.); the
+    // launcher only fills the explicit prefix and the unmarshal loop
+    // breaks at the first NULL slot, so without zeroing first the
+    // hidden region carries stale data from a prior launch and the
+    // kernel reads bogus dispatch geometry. Native-emitted kernels
+    // (no hidden args) pay 16-32 8-byte writes per launch — far less
+    // than the COv5 hidden-arg-corruption tax.
+    uint64 zi = 0
+    while zi < ks {
+        uint64 zp = karg_h + zi
+        uint64 zero = 0
+        unsafe { *(zp as uint64) = zero }
+        zi = zi + 8
+    }
 
     // Unmarshal HIP ptr_table → contiguous KFD kernarg blob. nargs is
     // pre-computed in fn_handle so we avoid the ks/8 div per launch.

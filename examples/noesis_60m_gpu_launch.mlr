@@ -200,6 +200,15 @@ fn main() {
     if err != 0 { die("getFn delivery_step", err) }
     unsafe { *(slot as uint64) -> fh_delivery }
 
+    // Optional: GPU-side spike_reduce kernel. When present, post-sim
+    // D2H's 16 bytes (sum + count) instead of 480 MB and skips the
+    // host tally. Absence = opt-out, fall back to parallel CPU tally.
+    uint64 fh_reduce = 0
+    slot = alloc(8)
+    err = hipModuleGetFunction(slot, mod, "spike_reduce")
+    if err == 500 && fb_loaded != 0 { err = hipModuleGetFunction(slot, fb_mod, "spike_reduce") }
+    if err == 0 { unsafe { *(slot as uint64) -> fh_reduce } }
+
     uint64 t_start = time_ns()
 
     // ── Allocate device arrays ────────────────────────────────────────
@@ -427,43 +436,76 @@ fn main() {
         print_label_val("delivery_total_us", 17, dlv_us)
     }
 
-    // ── D2H spike_count → tally ──────────────────────────────────────
-    uint64 h_spike = alloc(bytes_n)
-    err = hipMemcpy(h_spike, d_spike, bytes_n, 2); if err != 0 { die("D2H spike", err) }
-
-    // Parallel tally — 60M-iter loop over u64 spike counts split across
-    // 4 workers via thread_pool. Each worker writes (sum, active) into
-    // its own 16-byte slot; main combines after the barrier. Saves
-    // ~80ms on the post-sim phase. Note: thread_pool may already have
-    // been initialised by the KFD shim's parallel-H2D path; init is
-    // idempotent (returns immediately if pool already up).
-    uint64 t_workers = 4
-    thread_pool_init(t_workers)
-    uint64 t_results = alloc(t_workers * 16)
-    uint64 t_fn      = fn_addr("tally_worker")
-    uint64 t_chunk   = N / t_workers
-    uint64 ti = 0
-    while ti < t_workers {
-        uint64 t_start_i = ti * t_chunk
-        uint64 t_end_i   = t_start_i + t_chunk
-        if ti == (t_workers - 1) { t_end_i = N }
-        uint64 range = t_start_i | (t_end_i << 32)
-        uint64 out_p = t_results + ti * 16
-        thread_pool_submit(ti, t_fn, h_spike, range, out_p)
-        ti = ti + 1
-    }
-    thread_pool_wait()
-
+    // ── Post-sim tally ────────────────────────────────────────────────
     uint64 total_spikes = 0
     uint64 active       = 0
-    ti = 0
-    while ti < t_workers {
-        uint64 op = t_results + ti * 16
-        uint64 v  = 0; unsafe { *(op as uint64) -> v }
-        uint64 a  = 0; unsafe { *((op + 8) as uint64) -> a }
-        total_spikes = total_spikes + v
-        active       = active + a
-        ti = ti + 1
+
+    if fh_reduce != 0 {
+        // Fast path: GPU-side spike_reduce kernel. 60M lanes scan
+        // d_spike, atomic-add into a 16-byte device buffer, then we
+        // D2H just those 16 bytes. Replaces the 480 MB D2H + 60M-iter
+        // CPU tally with one extra dispatch and a tiny copy.
+        uint64 d_reduce = 0
+        slot = alloc(8); err = hipMalloc(slot, 16)
+        if err != 0 { die("m reduce", err) }
+        unsafe { *(slot as uint64) -> d_reduce }
+
+        // Zero the 16-byte result via H2D from a stack scratch.
+        uint64 h_zero16 = alloc(16)
+        unsafe { *(h_zero16 as uint64) = 0 }
+        unsafe { *((h_zero16 + 8) as uint64) = 0 }
+        err = hipMemcpy(d_reduce, h_zero16, 16, 1)
+        if err != 0 { die("H2D reduce zero", err) }
+
+        // Args: (spike_ptr, result_ptr, n)
+        uint64 r_sp = alloc(8); unsafe { *(r_sp as uint64) = d_spike }
+        uint64 r_rp = alloc(8); unsafe { *(r_rp as uint64) = d_reduce }
+        uint64 r_n  = alloc(8); unsafe { *(r_n  as uint64) = N }
+        uint64 kp_red = alloc(3 * 8)
+        unsafe { *(kp_red       as uint64) = r_sp }
+        unsafe { *((kp_red + 8) as uint64) = r_rp }
+        unsafe { *((kp_red +16) as uint64) = r_n }
+
+        uint64 grid = (N + 255) / 256
+        err = hipModuleLaunchKernel(fh_reduce, grid, 1, 1, 256, 1, 1, 0, 0, kp_red, 0)
+        if err != 0 { die("launch reduce", err) }
+        err = hipDeviceSynchronize(); if err != 0 { die("sync reduce", err) }
+
+        uint64 h_red = alloc(16)
+        err = hipMemcpy(h_red, d_reduce, 16, 2)
+        if err != 0 { die("D2H reduce", err) }
+        unsafe { *(h_red as uint64) -> total_spikes }
+        unsafe { *((h_red + 8) as uint64) -> active }
+        hipFree(d_reduce)
+    } else {
+        // Fallback: 480 MB D2H + parallel-thread CPU tally.
+        uint64 h_spike = alloc(bytes_n)
+        err = hipMemcpy(h_spike, d_spike, bytes_n, 2); if err != 0 { die("D2H spike", err) }
+        uint64 t_workers = 4
+        thread_pool_init(t_workers)
+        uint64 t_results = alloc(t_workers * 16)
+        uint64 t_fn      = fn_addr("tally_worker")
+        uint64 t_chunk   = N / t_workers
+        uint64 ti = 0
+        while ti < t_workers {
+            uint64 t_start_i = ti * t_chunk
+            uint64 t_end_i   = t_start_i + t_chunk
+            if ti == (t_workers - 1) { t_end_i = N }
+            uint64 range = t_start_i | (t_end_i << 32)
+            uint64 out_p = t_results + ti * 16
+            thread_pool_submit(ti, t_fn, h_spike, range, out_p)
+            ti = ti + 1
+        }
+        thread_pool_wait()
+        ti = 0
+        while ti < t_workers {
+            uint64 op = t_results + ti * 16
+            uint64 v  = 0; unsafe { *(op as uint64) -> v }
+            uint64 a  = 0; unsafe { *((op + 8) as uint64) -> a }
+            total_spikes = total_spikes + v
+            active       = active + a
+            ti = ti + 1
+        }
     }
     uint64 t_end = time_ns()
 

@@ -683,8 +683,10 @@ fn _kfd_unwrap_offload_bundle(uint64 blob, uint64 sz,
                                uint64 out_blob_slot, uint64 out_size_slot) {
     unsafe { *(out_blob_slot as uint64) = blob }
     unsafe { *(out_size_slot as uint64) = sz }
-    if sz < 32 { return }
-    // Match "__CLANG_OFFLOAD_BUNDLE__" (24 bytes).
+    // Magic check first — works regardless of whether the caller knows
+    // the blob size (hipModuleLoadData passes sz=0). If the magic
+    // matches, the bundle's own header tells us how big each inner
+    // entry is, so we don't need the outer size for bounds checks.
     uint64 magic = "__CLANG_OFFLOAD_BUNDLE__"
     uint64 mi = 0
     while mi < 24 {
@@ -697,12 +699,12 @@ fn _kfd_unwrap_offload_bundle(uint64 blob, uint64 sz,
     uint64 cursor = 32
     uint64 idx = 0
     while idx < num {
-        if cursor + 24 > sz { return }
+        // No outer-size bound: trust the bundle header. Mismatched
+        // bundles will fail at the inner ELF's PT_LOAD parsing instead.
         uint64 e_off = 0; unsafe { *((blob + cursor + 0) as uint64) -> e_off }
         uint64 e_sz  = 0; unsafe { *((blob + cursor + 8) as uint64) -> e_sz }
         uint64 e_ids = 0; unsafe { *((blob + cursor + 16) as uint64) -> e_ids }
         uint64 id_ptr = blob + cursor + 24
-        if cursor + 24 + e_ids > sz { return }
         // Look for "amdgcn" anywhere in the id; that excludes the
         // "host-x86_64" entry and matches every gfx target tag.
         uint64 j = 0
