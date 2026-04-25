@@ -81,6 +81,28 @@ fn main() {
 
     dev_free(d)
 
+    // Queue create + destroy.
+    uint64 q = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint32 qid_v = 0; unsafe { *((q + 0x00) as uint32) -> qid_v }
+    uint64 ring_v = 0; unsafe { *((q + 0x08) as uint64) -> ring_v }
+    uint64 db_off_v = 0; unsafe { *((q + 0x20) as uint64) -> db_off_v }
+    uint64 db_host_v = 0; unsafe { *((q + 0x28) as uint64) -> db_host_v }
+    uint64 wp_va_v = 0; unsafe { *((q + 0x30) as uint64) -> wp_va_v }
+    uint64 ring_va_v = ring_v
+    print_label_val("queue_id",     8, qid_v)
+    print_label_val("ring_va",      7, ring_va_v)
+    print_label_val("db_off",       6, db_off_v)
+    print_label_val("db_host",      7, db_host_v)
+    print_label_val("wp_va",        5, wp_va_v)
+    // Whether wp_va lands inside the ring's host-visible range:
+    if wp_va_v >= ring_va_v {
+        if wp_va_v < ring_va_v + 4096 {
+            puts("wp_va: inside ring (good)")
+        }
+    }
+    kfd_destroy_queue(q)
+    puts("queue create+destroy OK")
+
     puts("b5a_kfd_init_smoke: OK")
     exit(0)
 }

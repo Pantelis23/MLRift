@@ -193,6 +193,30 @@ fn dev_alloc_host_visible(uint64 nbytes) -> uint64 {
     return va
 }
 
+// AQL-queue ring allocation: GTT + AQL_QUEUE_MEM flag. With this flag,
+// KFD reserves an extra page after the ring for the wp/rp slots. Both
+// the ring and the trailing slot page live in the same DRM mmap range.
+fn dev_alloc_aql_ring(uint64 nbytes) -> uint64 {
+    if _kfd_initialized == 0 { kfd_init() }
+    uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC | KFD_IOC_ALLOC_MEM_FLAGS_AQL_QUEUE_MEM
+    // Reserve nbytes + 8KiB host VA so KFD's trailing metadata page
+    // (wp/rp slots) lands inside the reservation.
+    uint64 reserve = nbytes + 8192
+    uint64 va_pref = _kfd_reserve_va(reserve)
+    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
+    if r != 0 { kfd_die("dev_alloc_aql_ring: ALLOC_MEMORY_OF_GPU failed", r) }
+    uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
+    uint64 va = 0;     unsafe { *(va_slot as uint64) -> va }
+    uint64 mm = 0;     unsafe { *(mm_slot as uint64) -> mm }
+    r = raw_kfd_map_memory_to_gpu(_kfd_fd, handle, _kfd_gpu_id)
+    if r != 0 { kfd_die("dev_alloc_aql_ring: MAP failed", r) }
+    uint64 host = mmap(0, nbytes, KFD_MMAP_PROT, KFD_MMAP_FLAGS, _kfd_drm_fd, mm)
+    if host > 0xFFFFFFFFFFFFF000 { kfd_die("dev_alloc_aql_ring: mmap failed", host) }
+    _kfd_alloc_track(va, handle, nbytes, host)
+    return va
+}
+
 fn dev_host_ptr(uint64 dev_ptr) -> uint64 {
     uint64 h_slot = alloc(8); uint64 host_slot = alloc(8)
     uint32 r = _kfd_alloc_lookup(dev_ptr, h_slot, host_slot)
@@ -219,4 +243,138 @@ fn dev_copy_h2d(uint64 host, uint64 dev, uint64 nbytes) {
 fn dev_copy_d2h(uint64 dev, uint64 host, uint64 nbytes) {
     uint64 dev_host = dev_host_ptr(dev)
     memcpy(host, dev_host, nbytes)
+}
+
+// Queue handle layout (~112 bytes):
+//   [0x00] queue_id        (u32)
+//   [0x04] gpu_id          (u32)
+//   [0x08] ring_va         (u64)    AQL ring (host-visible alloc)
+//   [0x10] ring_capacity   (u64)    AQL packet count = ring_bytes / 64
+//   [0x18] ring_host_ptr   (u64)    host-mapped ring base
+//   [0x20] doorbell_offset (u64)    from CREATE_QUEUE
+//   [0x28] doorbell_host   (u64)    mmap'd doorbell page base
+//   [0x30] write_ptr_va    (u64)    GPU VA of write index
+//   [0x38] read_ptr_va     (u64)    GPU VA of read index
+//   [0x40] write_ptr_host  (u64)    host pointer to write index
+//   [0x48] eop_va          (u64)
+//   [0x50] ctx_save_va     (u64)
+//   [0x58] wait_mode       (u32)
+//   [0x5C] _pad            (u32)
+//   [0x60] signal_va       (u64)    completion signal (alloc'd later)
+
+static uint64 KFD_QUEUE_RING_BYTES = 4096    // 64 packets x 64 bytes
+// EOP / ctl_stack / cwsr sizes are validated against the topology node's
+// computed values (kfd_queue_ctx_save_restore_size in kfd_queue.c). Wrong
+// values -> EINVAL at CREATE_QUEUE. The values below are for gfx_target_
+// _version 110001 (gfx1100, RDNA3 wave32):
+//   ctl_stack_size = ALIGN(40 + (cu_num*32 * 12 + 8), 4096) = 0x6000
+//   wg_data_size   = ALIGN(cu_num * (vgpr_size + sgpr + lds + hwreg), 4k)
+//                  = 60 * (0x60000+0x4000+0x10000+0x1000) = 0x1B6C000
+//   cwsr_size      = ctl_stack_size + wg_data_size       = 0x1B72000
+//   eop_buffer_size = 4096 (constant for gfx >= 80000)
+static uint64 KFD_EOP_BYTES        = 4096
+static uint64 KFD_CTL_STACK_BYTES  = 24576           // 0x6000
+static uint64 KFD_CTX_SAVE_BYTES   = 28778496        // 0x1B72000 (~27.4 MiB)
+static uint64 KFD_DOORBELL_PAGE    = 8192            // 8 KiB doorbell mmap
+
+static uint32 KFD_DOORBELL_PROT    = 0x3     // RW
+static uint32 KFD_DOORBELL_FLAGS   = 0x1     // MAP_SHARED
+
+static uint32 KFD_WAIT_BUSY_POLL   = 0
+static uint32 KFD_WAIT_EVENTS      = 1
+
+fn kfd_create_queue(uint32 wait_mode) -> uint64 {
+    if _kfd_initialized == 0 { kfd_init() }
+
+    uint64 q = alloc(112)
+    uint64 i = 0
+    while i < 112 { uint64 p = q + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
+
+    // AQL ring: host-visible with AQL_QUEUE_MEM flag so KFD allocates
+    // the wp/rp metadata page right after the ring.
+    uint64 ring_va = dev_alloc_aql_ring(KFD_QUEUE_RING_BYTES)
+    uint64 ring_host = dev_host_ptr(ring_va)
+    // Zero the ring so packet headers start as INVALID (= 0x01 reserved type).
+    uint64 z = 0
+    while z < KFD_QUEUE_RING_BYTES {
+        uint64 p = ring_host + z; unsafe { *(p as uint64) = 0 }
+        z = z + 8
+    }
+
+    // EOP + ctx-save in VRAM (no host access needed). The eop and cwsr
+    // BOs must be EXACT-size KFD-mapped buffers — kfd_queue_buffer_get()
+    // calls amdgpu_vm_bo_lookup_mapping() and rejects with EINVAL unless
+    // the user_addr == mapping->start AND size matches mapping->last+1.
+    uint64 eop_va = dev_alloc_vram(KFD_EOP_BYTES)
+    // total_cwsr in kernel = ALIGN((cwsr_size + debug_memory_size) * num_xcc, PAGE_SIZE)
+    // For gfx1100: debug_memory_size = ALIGN(wave_num*32, 64) = 1920*32 = 61440
+    //              num_xcc = 1
+    //              total = ALIGN(28778496 + 61440, 4096) = 28839936
+    uint64 cwsr_total = 28839936
+    uint64 ctx_va = dev_alloc_vram(cwsr_total)
+
+    // wp/rp pointers: undocumented gotcha — despite the header comment
+    // saying "from KFD", the kernel actually validates these as user
+    // pointers AND requires them to be the start of a KFD-mapped BO of
+    // exactly PAGE_SIZE (kfd_queue_acquire_buffers in kfd_queue.c). A
+    // plain anonymous mmap is not enough; we must allocate via KFD's
+    // ALLOC_MEMORY_OF_GPU and map to the GPU. Use a host-visible BO so
+    // we can read the indices from userspace without copy.
+    uint64 wp_va = dev_alloc_host_visible(4096)
+    uint64 rp_va = dev_alloc_host_visible(4096)
+    uint64 wp_host = dev_host_ptr(wp_va)
+    uint64 rp_host = dev_host_ptr(rp_va)
+    // Zero them.
+    unsafe { *(wp_host as uint64) = 0 }
+    unsafe { *(rp_host as uint64) = 0 }
+
+    uint64 qid_slot = alloc(4); uint64 db_slot = alloc(8)
+    uint64 wp_out_slot = alloc(8); uint64 rp_out_slot = alloc(8)
+
+    uint32 r = raw_kfd_create_queue(_kfd_fd,
+                                     ring_va, KFD_QUEUE_RING_BYTES,
+                                     _kfd_gpu_id, KFD_IOC_QUEUE_TYPE_COMPUTE_AQL, 7,
+                                     eop_va, KFD_EOP_BYTES,
+                                     ctx_va, KFD_CTX_SAVE_BYTES, KFD_CTL_STACK_BYTES,
+                                     wp_va, rp_va,
+                                     qid_slot, db_slot, wp_out_slot, rp_out_slot)
+    if r != 0 { kfd_die("kfd_create_queue: CREATE_QUEUE failed", r) }
+
+    uint32 qid = 0; unsafe { *(qid_slot as uint32) -> qid }
+    uint64 db_off = 0; unsafe { *(db_slot as uint64) -> db_off }
+
+    // mmap the doorbell page. Like other host-visible mmaps, this uses
+    // the DRM render node fd (per Task 5's discovery).
+    uint64 db_host = mmap(0, KFD_DOORBELL_PAGE, KFD_DOORBELL_PROT, KFD_DOORBELL_FLAGS,
+                           _kfd_drm_fd, db_off)
+    if db_host > 0xFFFFFFFFFFFFF000 {
+        // If DRM-fd mmap fails, fall back to KFD-fd mmap.
+        db_host = mmap(0, KFD_DOORBELL_PAGE, KFD_DOORBELL_PROT, KFD_DOORBELL_FLAGS,
+                        _kfd_fd, db_off)
+        if db_host > 0xFFFFFFFFFFFFF000 {
+            kfd_die("kfd_create_queue: doorbell mmap failed (both fds)", db_host)
+        }
+    }
+
+    unsafe { *((q + 0x00) as uint32) = qid }
+    unsafe { *((q + 0x04) as uint32) = _kfd_gpu_id }
+    unsafe { *((q + 0x08) as uint64) = ring_va }
+    unsafe { *((q + 0x10) as uint64) = KFD_QUEUE_RING_BYTES / 64 }
+    unsafe { *((q + 0x18) as uint64) = ring_host }
+    unsafe { *((q + 0x20) as uint64) = db_off }
+    unsafe { *((q + 0x28) as uint64) = db_host }
+    unsafe { *((q + 0x30) as uint64) = wp_va }
+    unsafe { *((q + 0x38) as uint64) = rp_va }
+    unsafe { *((q + 0x40) as uint64) = wp_host }
+    unsafe { *((q + 0x48) as uint64) = eop_va }
+    unsafe { *((q + 0x50) as uint64) = ctx_va }
+    unsafe { *((q + 0x58) as uint32) = wait_mode }
+
+    return q
+}
+
+fn kfd_destroy_queue(uint64 q) {
+    uint32 qid = 0; unsafe { *((q + 0x00) as uint32) -> qid }
+    raw_kfd_destroy_queue(_kfd_fd, qid)
+    // Don't unmap doorbell or free ring/eop/ctx - process exit reclaims.
 }
