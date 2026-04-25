@@ -90,6 +90,23 @@ fn csr_build(
     }
 }
 
+// Device-side memcpy for 8-byte-aligned buffers. Used by the launcher
+// to copy d_spike from host-mapped VRAM into a GTT staging area
+// before the host-side hipMemcpy D2H. CPU reads from PCIe BAR1 are
+// ~1.3 GB/s; reading on-device at HBM (~960 GB/s) and writing GTT
+// (~32 GB/s) drops a 480 MB copy from ~370 s to ~30 ms.
+@kernel
+fn _kfd_copy_u64(uint64 dst, uint64 src, uint64 n_u64) {
+    uint64 i = tid_x()
+    if i < n_u64 {
+        uint64 sp = src + i * 8
+        uint64 dp = dst + i * 8
+        uint64 v = 0
+        unsafe { *(sp as uint64) -> v }
+        unsafe { *(dp as uint64) = v }
+    }
+}
+
 // Decay: buf[i] -= buf[i] * factor
 @kernel
 fn decay_step(uint64 buf, uint64 n, f64 factor) {

@@ -61,6 +61,14 @@ static uint64 _hipkfd_kernarg_ring   = 0
 static uint64 _hipkfd_kernarg_ring_h = 0
 static uint64 _hipkfd_karg_slot      = 0     // round-robin index
 
+// Optional device-side u64-copy kernel handle. Auto-detected the
+// first time hipModuleLoadData sees a module containing the
+// "_kfd_copy_u64" symbol. Used by hipMemcpy(D2H) to speed up
+// reads from host-mapped VRAM, where CPU-side PCIe BAR1 reads run
+// at ~1.3 GB/s. Falls back to plain memcpy when not registered.
+static uint64 _hipkfd_copy_kernel_kd = 0
+static uint64 _hipkfd_copy_kernel_ks = 0
+
 fn _hipkfd_lazy_init() {
     if _hipkfd_q != 0 { return }
     kfd_init()
@@ -129,11 +137,76 @@ fn hipFree(uint64 dev_ptr) -> uint32 {
     return 0
 }
 
+// Run the registered _kfd_copy_u64 kernel: device-side u64 memcpy
+// from `src_va` (typically host-mapped VRAM) into `dst_va` (typically
+// GTT staging). nbytes must be 8-byte aligned. Returns 1 if the
+// kernel ran, 0 if no copy kernel is registered.
+fn _hipkfd_dev_copy(uint64 dst_va, uint64 src_va, uint64 nbytes) -> uint64 {
+    if _hipkfd_copy_kernel_kd == 0 { return 0 }
+    if (nbytes - (nbytes / 8) * 8) != 0 { return 0 }   // not 8-aligned
+    _hipkfd_lazy_init()
+
+    uint64 n_u64 = nbytes / 8
+
+    // Pack a 24-byte kernarg blob (dst, src, n).
+    uint64 slot_idx = _hipkfd_karg_slot
+    uint64 slot_off = slot_idx * _HIPKFD_KARG_SLOT_SZ
+    uint64 karg_va  = _hipkfd_kernarg_ring + slot_off
+    uint64 karg_h   = _hipkfd_kernarg_ring_h + slot_off
+    _hipkfd_karg_slot = slot_idx + 1
+    if _hipkfd_karg_slot >= _HIPKFD_KARG_SLOTS { _hipkfd_karg_slot = 0 }
+    unsafe { *((karg_h + 0x00) as uint64) = dst_va }
+    unsafe { *((karg_h + 0x08) as uint64) = src_va }
+    unsafe { *((karg_h + 0x10) as uint64) = n_u64 }
+
+    // Block 256, grid = ceil(n_u64 / 256).
+    uint64 block = 256
+    uint64 grid = (n_u64 + 255) / 256
+
+    // Same async-batch dispatch path used by hipModuleLaunchKernel.
+    uint64 one = 1
+    _hipkfd_pending = _hipkfd_pending - one
+    _kfd_dispatch_core(_hipkfd_q, _hipkfd_copy_kernel_kd,
+                        grid, 1, 1, block, 1, 1,
+                        karg_va, _hipkfd_copy_kernel_ks,
+                        _hipkfd_signal)
+    return 1
+}
+
 // hipMemcpy kinds: 0 = H2H, 1 = H2D, 2 = D2H, 3 = D2D, 4 = Default.
 fn hipMemcpy(uint64 dst, uint64 src, uint64 size, uint32 kind) -> uint32 {
     if kind == 1 {
         dev_copy_h2d(src, dst, size)
     } else if kind == 2 {
+        // D2H. If the source is host-mapped VRAM, the CPU-side memcpy
+        // would read at PCIe BAR1 speed (~1.3 GB/s on gfx1100); for
+        // anything bigger than a few MB that dominates total runtime.
+        // Path through the registered _kfd_copy_u64 kernel into a
+        // GTT staging buffer, then memcpy GTT->host.
+        if _hipkfd_copy_kernel_kd != 0 {
+            uint64 size_aligned = (size / 8) * 8
+            if size_aligned == size {
+                // Fast path: any non-GTT source. dev_alloc_kind == 1
+                // (host-vis VRAM) is the case that benefits most;
+                // kind 0 (VRAM-only without host pointer) would also
+                // fall through here but dev_copy_d2h's dev_host_ptr
+                // would have failed anyway.
+                uint64 srckind = dev_alloc_kind(src)
+                if srckind == 1 {
+                    uint64 stage_va = dev_try_alloc_host_visible(size)
+                    if stage_va != 0 {
+                        if _hipkfd_dev_copy(stage_va, src, size) == 1 {
+                            hipDeviceSynchronize()
+                            uint64 stage_h = dev_host_ptr(stage_va)
+                            memcpy(dst, stage_h, size)
+                            dev_free(stage_va)
+                            return 0
+                        }
+                        dev_free(stage_va)
+                    }
+                }
+            }
+        }
         dev_copy_d2h(src, dst, size)
     } else if kind == 3 {
         // D2D: both sides are device VAs; copy via host views.
@@ -180,6 +253,20 @@ fn hipModuleLoadData(uint64 mod_out, uint64 blob_ptr) -> uint32 {
     _hipkfd_lazy_init()
     uint64 mod = kernel_load_from_blob(blob_ptr, 0)
     unsafe { *(mod_out as uint64) = mod }
+
+    // If this module ships a `_kfd_copy_u64` symbol, register it as
+    // the HIP-shim's device-side copy kernel. The hipMemcpy(D2H)
+    // fast path uses it when the source is host-mapped VRAM, where
+    // CPU-side reads from PCIe BAR1 are ~20x slower than HBM reads.
+    // Only the first module that defines the symbol wins; subsequent
+    // loads keep using the original.
+    if _hipkfd_copy_kernel_kd == 0 {
+        uint64 ck = kernel_get_function(mod, "_kfd_copy_u64")
+        if ck != 0 {
+            _hipkfd_copy_kernel_kd = ck
+            _hipkfd_copy_kernel_ks = kernel_kernarg_size(mod, ck)
+        }
+    }
     return 0
 }
 

@@ -123,20 +123,46 @@ static uint32 KFD_VA_PROT     = 0x0      // PROT_NONE
 static uint32 KFD_VA_FLAGS    = 0x4022   // MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE
 
 // --- Allocation tracking (small static table; max 256 outstanding allocs) ---
+// Kind values for _kfd_alloc_kind (so the HIP shim's hipMemcpy(D2H)
+// fast-path can tell what backing won):
+//   0 = VRAM-only (no host pointer)
+//   1 = host-visible VRAM (PUBLIC flag, mmap'd via DRM render fd)
+//   2 = GTT  (host-visible system RAM mapped to GPU)
 static uint64 _kfd_alloc_tab_n = 0
 static uint64[256] _kfd_alloc_va
 static uint64[256] _kfd_alloc_handle
 static uint64[256] _kfd_alloc_size
 static uint64[256] _kfd_alloc_host
+static uint64[256] _kfd_alloc_kind
 
 fn _kfd_alloc_track(uint64 va, uint64 handle, uint64 size, uint64 host_ptr) {
+    _kfd_alloc_track_kind(va, handle, size, host_ptr, 0)
+}
+
+fn _kfd_alloc_track_kind(uint64 va, uint64 handle, uint64 size, uint64 host_ptr, uint64 kind) {
     if _kfd_alloc_tab_n >= 256 { kfd_die("kfd: alloc table full (max 256)", _kfd_alloc_tab_n) }
     uint64 i = _kfd_alloc_tab_n
     uint64 p_va  = _kfd_alloc_va     + i * 8; unsafe { *(p_va as uint64) = va }
     uint64 p_h   = _kfd_alloc_handle + i * 8; unsafe { *(p_h as uint64) = handle }
     uint64 p_s   = _kfd_alloc_size   + i * 8; unsafe { *(p_s as uint64) = size }
     uint64 p_hp  = _kfd_alloc_host   + i * 8; unsafe { *(p_hp as uint64) = host_ptr }
+    uint64 p_k   = _kfd_alloc_kind   + i * 8; unsafe { *(p_k as uint64) = kind }
     _kfd_alloc_tab_n = i + 1
+}
+
+// Return the recorded kind (0 / 1 / 2) for a tracked dev VA. -1
+// (= 0xFFFFFFFFFFFFFFFF) if not found.
+fn dev_alloc_kind(uint64 dev_va) -> uint64 {
+    uint64 i = 0
+    while i < _kfd_alloc_tab_n {
+        uint64 v = 0; unsafe { *((_kfd_alloc_va + i * 8) as uint64) -> v }
+        if v == dev_va {
+            uint64 k = 0; unsafe { *((_kfd_alloc_kind + i * 8) as uint64) -> k }
+            return k
+        }
+        i = i + 1
+    }
+    return 0xFFFFFFFFFFFFFFFF
 }
 
 fn _kfd_alloc_lookup(uint64 va, uint64 out_handle_slot, uint64 out_host_slot) -> uint32 {
@@ -188,7 +214,7 @@ fn dev_try_alloc_vram(uint64 nbytes) -> uint64 {
         raw_kfd_free_memory_of_gpu(_kfd_fd, handle)
         return 0
     }
-    _kfd_alloc_track(va, handle, nbytes, 0)
+    _kfd_alloc_track_kind(va, handle, nbytes, 0, 0)        // kind=0: VRAM-only
     return va
 }
 
@@ -221,7 +247,7 @@ fn dev_try_alloc_host_visible(uint64 nbytes) -> uint64 {
         raw_kfd_free_memory_of_gpu(_kfd_fd, handle)
         return 0
     }
-    _kfd_alloc_track(va, handle, nbytes, host)
+    _kfd_alloc_track_kind(va, handle, nbytes, host, 2)     // kind=2: GTT
     return va
 }
 
@@ -265,7 +291,7 @@ fn dev_try_alloc_vram_hostvis(uint64 nbytes) -> uint64 {
         raw_kfd_free_memory_of_gpu(_kfd_fd, handle)
         return 0
     }
-    _kfd_alloc_track(va, handle, nbytes, host)
+    _kfd_alloc_track_kind(va, handle, nbytes, host, 1)     // kind=1: VRAM-host-vis
     return va
 }
 

@@ -5918,6 +5918,16 @@ fn asm_global_load_b64_offvaddr(uint64 vdst_pair, uint64 vaddr_pair) {
     asm_u32(word2)
 }
 
+// global_store_b64 v[addr:+1], v[data:+1], off  — off-saddr form.
+//   Verified: global_store_b64 v[2:3], v[4:5], off → 0xDC6E0000 0x007C0402.
+fn asm_global_store_b64_offvaddr(uint64 vaddr_pair, uint64 vdata_pair) {
+    asm_u32(0xDC6E0000)
+    uint64 word2 = (0x7C << 16)                              // saddr = OFF
+                   | ((vdata_pair & 0xFF) << 8)
+                   | (vaddr_pair & 0xFF)
+    asm_u32(word2)
+}
+
 // global_atomic_cmpswap_b64 v[vdst:vdst+1], v[vaddr:+1], v[vdata_quad:+3], off glc
 //   Off-saddr form (vs the asm_global_atomic_cmpswap_b64_glc above
 //   which takes saddr_pair). v_addr is a full 64-bit pair.
@@ -6280,6 +6290,100 @@ fn amdgpu_lower_noesis_decay(uint64 kname_ptr, uint64 nl) -> uint64 {
     kt_push(kname_ptr, nl, k_text_buf, k_text_size,
             args_desc, 3, 24,
             18, 6,                                  // sgpr=18 (s0..s15+exec save), vgpr=6
+            rsrc1, rsrc2, rsrc3, props)
+    return 0
+}
+
+// _kfd_copy_u64: device-side memcpy for 8-byte-aligned buffers. The
+// canonical use is hipMemcpy(D2H) from a host-mapped VRAM buffer into
+// a GTT staging area, where CPU-side reads from VRAM are PCIe-BAR1-
+// limited (~1.3 GB/s) and a kernel copy through HBM (~960 GB/s) →
+// GTT (~32 GB/s) drops the cost from minutes to milliseconds at
+// 60M-thread scale.
+//
+// Kernarg layout (3 args × 8 = 24 bytes):
+//   [0x00] dst_ptr  (u64*)  — destination, typically GTT staging
+//   [0x08] src_ptr  (u64*)  — source, typically host-vis VRAM
+//   [0x10] n_u64    (u64 by-value, low 32 used) — number of u64s to copy
+//
+// Block size = 256, grid = ceil(n_u64 / 256). Each lane copies one
+// 8-byte word.
+fn amdgpu_lower_kfd_copy_u64(uint64 kname_ptr, uint64 nl) -> uint64 {
+    asm_init()
+    asm_noesis_compute_gid_v1()                          // v1 = gid
+
+    asm_s_load_b64(1, 0)                                 // s[2:3] dst_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                       // s[4:5] src_ptr
+    asm_s_load_b32(3, 0, 0x10)                           // s6     n_u64 (lo32)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Bounds check: gid < n_u64.
+    asm_v_cmp_gt_u32_sgpr_vgpr(6, 1)
+    asm_s_and_saveexec_b32_vcc_lo(8)                     // s8 = old EXEC
+    uint64 skip_off = asm_text_len / 4
+    asm_s_cbranch_execz(0)                               // patched to s_endpgm
+
+    // gid_byte_offset = gid * 8 → v[2:3] (zero-extended u64).
+    asm_v_lshlrev_b32_imm(2, 3, 1)
+    asm_v_mov_b32_inline_u(3, 0)
+
+    // src_addr = s[4:5] + v[2:3] → v[6:7].
+    asm_v_mov_b32(6, 0x100 | 2)
+    asm_v_mov_b32(7, 0x100 | 3)
+    asm_v_add_co_u32_vcc_sv(6, 4, 6)
+    asm_v_add_co_ci_u32_null_sv_vcc(7, 5, 7)
+
+    // Load src[gid] into v[4:5].
+    asm_global_load_b64_offvaddr(4, 6)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // dst_addr = s[2:3] + v[2:3] → v[6:7].
+    asm_v_mov_b32(6, 0x100 | 2)
+    asm_v_mov_b32(7, 0x100 | 3)
+    asm_v_add_co_u32_vcc_sv(6, 2, 6)
+    asm_v_add_co_ci_u32_null_sv_vcc(7, 3, 7)
+
+    // Store v[4:5] into dst[gid].
+    asm_global_store_b64_offvaddr(6, 4)
+    asm_s_waitcnt_vscnt_zero()
+
+    // Back-patch s_cbranch_execz to land here.
+    uint64 end_off = asm_text_len / 4
+    uint64 skip_dwords = end_off - (skip_off + 1)
+    uint64 skip_byte = asm_text_buf + skip_off * 4
+    uint32 skip_word = 0xBFA50000 | (skip_dwords & 0xFFFF)
+    unsafe { *(skip_byte as uint32) = skip_word }
+
+    asm_s_endpgm()
+
+    // 3 args: 2 GLOBAL_BUFFER + 1 BY_VALUE.
+    uint64 args_desc = alloc(3 * 16)
+    uint64 a0s = args_desc + 0;   unsafe { *(a0s as uint64) = 8 }
+    uint64 a0k = args_desc + 8;   unsafe { *(a0k as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a1s = args_desc + 16;  unsafe { *(a1s as uint64) = 8 }
+    uint64 a1k = args_desc + 24;  unsafe { *(a1k as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2s = args_desc + 32;  unsafe { *(a2s as uint64) = 8 }
+    uint64 a2k = args_desc + 40;  unsafe { *(a2k as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    uint64 k_text_size = asm_text_len
+    uint64 k_text_buf  = alloc(k_text_size)
+    uint64 ci = 0
+    while ci < k_text_size {
+        uint64 sp = asm_text_buf + ci
+        uint64 b = 0; unsafe { *(sp as uint8) -> b }
+        uint64 dp = k_text_buf + ci
+        uint8 b8 = b; unsafe { *(dp as uint8) = b8 }
+        ci = ci + 1
+    }
+
+    uint64 rsrc1 = 0xE0AF0000           // VGPR granule 0 → 8 VGPRs (v0..v7)
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    kt_push(kname_ptr, nl, k_text_buf, k_text_size,
+            args_desc, 3, 24,
+            10, 8,
             rsrc1, rsrc2, rsrc3, props)
     return 0
 }
@@ -7266,6 +7370,9 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
     if tok_matches(name_tok, "csr_build", 9) != 0 {
         return amdgpu_lower_noesis_csr_build(kname_ptr, nl)
+    }
+    if tok_matches(name_tok, "_kfd_copy_u64", 13) != 0 {
+        return amdgpu_lower_kfd_copy_u64(kname_ptr, nl)
     }
 
     // Param list — 1 or 2 params. If there are 2, the 2nd is taken
