@@ -13,6 +13,30 @@ tests pass, self-host fixed point holds. The MLRift-specific syntax
 and IR extensions are not started yet — those follow the roadmap in
 `~/Desktop/Projects/Work/ideas/MLRift.md`.
 
+## What works today
+
+Real LLM inference is already running end-to-end through the existing
+KernRift compiler + a small ML stdlib (`std/qwen3.mlr`,
+`std/matmul.mlr`, `std/tokenizer.mlr`, `std/gguf.mlr`) — no external
+runtime, no Python.
+
+| Model | Quant | tok/s | vs PyTorch BF16 | Peak RSS |
+|---|---|---:|---:|---:|
+| Qwen3-0.6B | bf16 (HF safetensors) | 32.03 | **1.24×** | 1.67 GB |
+| Qwen3-0.6B | bf16 (GGUF) | 32.27 | **1.25×** | 1.67 GB |
+| **Qwen3-14B** | **Q8_0 (GGUF)** | **0.479** | **3.63×** | **14.81 GB** |
+
+7900X / 16 threads / greedy decode / use_cache. First 10 generated
+tokens are bit-identical to HuggingFace `transformers.generate`
+across both sizes (token-id check, not a fuzzy text match). Methodology
++ commit-by-commit perf history:
+
+- `docs/BENCH_QWEN3.md` — Qwen3-0.6B (78× from scalar baseline, 3.27×
+  vs PyTorch F32, full per-op breakdown).
+- `docs/BENCH_QWEN3_14B.md` — Qwen3-14B Q8_0 vs PyTorch BF16 (3.63×
+  decode, 1.37× less peak RSS, 5-token prompt → 20-token greedy
+  continuation).
+
 ## Build
 
 ```
