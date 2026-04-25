@@ -1,0 +1,58 @@
+// Stage 2 raw AMDKFD ioctl wrappers.
+//
+// One fn per ioctl. Returns errno via uint32 (0 = success). No
+// die() at this layer — the high-level std/kfd.mlr layer translates
+// errors into kfd_die(...) aborts at its call sites.
+//
+// All ioctl numbers verified against /usr/include/linux/kfd_ioctl.h
+// v1.14 (Linux 6.17) via examples/_kfd_verify.c. See plan task 1
+// for the verification protocol.
+//
+// Struct field offsets cite kfd_ioctl.h line numbers. Do not change
+// without re-running the C verifier.
+
+@dynamic extern fn ioctl(uint32 fd, uint64 cmd, uint64 arg) -> uint32
+@dynamic extern fn open(uint64 path, uint32 flags, uint32 mode) -> uint32
+@dynamic extern fn close(uint32 fd) -> uint32
+
+// O_RDWR | O_CLOEXEC
+static uint32 KFD_OPEN_FLAGS = 0x80002
+
+// --- Ioctl numbers (verified by examples/_kfd_verify.c) ---
+static uint64 AMDKFD_IOC_GET_VERSION                = 0x80084B01
+static uint64 AMDKFD_IOC_CREATE_QUEUE               = 0xC0584B02
+static uint64 AMDKFD_IOC_DESTROY_QUEUE              = 0xC0084B03
+static uint64 AMDKFD_IOC_CREATE_EVENT               = 0xC0204B08
+static uint64 AMDKFD_IOC_WAIT_EVENTS                = 0xC0184B0C
+static uint64 AMDKFD_IOC_GET_PROCESS_APERTURES_NEW  = 0xC0104B14
+static uint64 AMDKFD_IOC_ACQUIRE_VM                 = 0x40084B15
+static uint64 AMDKFD_IOC_ALLOC_MEMORY_OF_GPU        = 0xC0284B16
+static uint64 AMDKFD_IOC_FREE_MEMORY_OF_GPU         = 0x40084B17
+static uint64 AMDKFD_IOC_MAP_MEMORY_TO_GPU          = 0xC0184B18
+static uint64 AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU      = 0xC0184B19
+static uint64 AMDKFD_IOC_RUNTIME_ENABLE             = 0xC0104B25
+
+// --- Allocation flags (kfd_ioctl.h:397-410) ---
+static uint64 KFD_IOC_ALLOC_MEM_FLAGS_VRAM          = 0x00000001
+static uint64 KFD_IOC_ALLOC_MEM_FLAGS_GTT           = 0x00000002
+static uint64 KFD_IOC_ALLOC_MEM_FLAGS_USERPTR       = 0x00000004
+static uint64 KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL      = 0x00000008
+static uint64 KFD_IOC_ALLOC_MEM_FLAGS_MMIO_REMAP    = 0x00000010
+static uint64 KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE      = 0x80000000
+static uint64 KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE    = 0x40000000
+static uint64 KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC        = 0x20000000
+static uint64 KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE = 0x10000000
+static uint64 KFD_IOC_ALLOC_MEM_FLAGS_AQL_QUEUE_MEM = 0x08000000
+static uint64 KFD_IOC_ALLOC_MEM_FLAGS_COHERENT      = 0x04000000
+
+// --- Queue types (kfd_ioctl.h:53-56) ---
+static uint64 KFD_IOC_QUEUE_TYPE_COMPUTE            = 0x0
+static uint64 KFD_IOC_QUEUE_TYPE_COMPUTE_AQL        = 0x2
+
+// --- Private ioctl helper ---
+fn _kfd_ioctl(uint32 fd, uint64 cmd, uint64 args_ptr) -> uint32 {
+    uint32 r = ioctl(fd, cmd, args_ptr)
+    return r
+}
+
+// fn raw_kfd_get_version, raw_kfd_acquire_vm, etc. — added in subsequent tasks.
