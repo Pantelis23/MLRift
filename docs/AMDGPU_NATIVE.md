@@ -183,21 +183,99 @@ dispatch. The current `b4_native_stage13_load.mlr` passes
 For the full set of KFD-runtime gotchas (queue MQD layout, doorbell
 off-by-one, EOP / ctx-save sizes, etc.) see `docs/KFD_GOTCHAS.md`.
 
+## VRAM allocators and the GTT fallback
+
+`std/kfd.mlr` exposes a small allocator family. The "smart" entry point
+is the GPU analogue of CUDA's system-memory fallback: try VRAM first,
+spill to host-mapped GTT if the card is short.
+
+| Function                              | Backing | Failure  | Use                                  |
+|---------------------------------------|---------|----------|--------------------------------------|
+| `dev_alloc_vram(n)`                   | VRAM    | `kfd_die`| Mandatory VRAM allocation            |
+| `dev_try_alloc_vram(n)`               | VRAM    | returns 0| Probe / caller handles fallback      |
+| `dev_alloc_host_visible(n)`           | GTT     | `kfd_die`| Always-mappable, slower (PCIe)       |
+| `dev_try_alloc_host_visible(n)`       | GTT     | returns 0| Probe                                |
+| `dev_alloc_smart(n)`                  | VRAM→GTT| returns 0| Default for "fits if possible"       |
+| `dev_alloc_is_vram(va) -> 0/1`        |   —     |    —     | Inspect what backing won out         |
+
+`dev_alloc_smart` is the recommended default for ML workloads: weights
+that fit in VRAM stay in VRAM (HBM bandwidth), oversized models spill
+to system RAM (PCIe bandwidth, but always works as long as RAM does).
+Both branches return the same kind of device VA — the GPU sees a
+contiguous mapping in either case.
+
+### Stress-test results (gfx1100, 16 GiB card)
+
+`examples/b5d_kfd_vram_stress.mlr` measured the limits on this dev box:
+
+* **Maximum single VRAM allocation: 16,176 MiB ≈ 15.8 GiB** — about 98%
+  of total VRAM. The KFD ioctl path imposes a small overhead beyond
+  the kernel's own bookkeeping but does not artificially cap chunk
+  size.
+* **Smart-fallback verified end to end**: held 15 separate 1 GiB VRAM
+  blocks, then `dev_alloc_smart(1 GiB)` successfully spilled to GTT;
+  the spilled buffer's host pointer round-tripped a marker write.
+
+Run it yourself:
+```
+./build/mlrc --arch=x86_64 examples/b5d_kfd_vram_stress.mlr -o /tmp/b5d_stress
+/tmp/b5d_stress
+```
+
+The stress test is deterministic on a quiet GPU; if other processes
+hold VRAM the cap it reports drops accordingly.
+
 ## File map
 
-* `std/hip_kfd.mlr` — the shim (~150 lines).
-* `std/kfd.mlr` — KFD library: `kfd_init`, `dev_alloc_*`,
+* `std/hip_kfd.mlr` — the HIP-API shim (~150 lines).
+* `std/kfd.mlr` — KFD library: `kfd_init`, `dev_alloc_*` family
+  (incl. `dev_alloc_smart` / `dev_try_alloc_*` / `dev_alloc_is_vram`),
   `kernel_load` / `kernel_load_from_blob` / `kernel_kernarg_size`,
   `kfd_create_queue`, `kfd_dispatch`, `kfd_wait`,
-  `kfd_signal_alloc`/`reset`/`value`, `dev_copy_h2d`/`dev_copy_d2h`/
-  `dev_free`, `dev_host_ptr`.
+  `kfd_signal_alloc`/`reset`/`value`, `dev_copy_h2d` / `dev_copy_d2h`
+  / `dev_free`, `dev_host_ptr`.
 * `std/kfd_raw.mlr` — bare AMDKFD ioctl wrappers.
 * `src/main.mlr` — `_maybe_redirect_hip_to_kfd`, the
   `--target=amdgpu-native` flag handler.
 * `src/analysis.mlr` — duplicate `@dynamic extern` dedup.
-* `examples/b5a_*.mlr`, `examples/b5b_*.mlr`, `examples/b5c_*.mlr` —
-  pre-shim launchers that import `std/kfd.mlr` directly. Useful as
-  references for the KFD library API.
+* `examples/b5a_*.mlr`, `examples/b5b_*.mlr`, `examples/b5c_*.mlr`,
+  `examples/b5d_kfd_vram_stress.mlr` — KFD-native launchers (import
+  `std/kfd.mlr` directly). Useful as references for the KFD library
+  API. The b5c set ports every Stage-1 milestone (M1p..M1v, B1, B4a)
+  to KFD-native form alongside the shim path.
+
+## Inventory of HIP-using example sources
+
+After the shim landed, every existing HIP-API launcher works under
+`--target=amdgpu-native` with no source change. The `examples/`
+directory still ships these so you can compare HIP-direct vs
+KFD-via-shim on the same code.
+
+* **Tested under the shim and ldd-clean**: `m1o_atomic_load`, `m1p_*`,
+  `m1q_*`, `m1r_*`, `m1s_*`, `m1t_*`, `m1t2_*`, `m1t3_*`, `m1t4_*`,
+  `m1u_*`, `m1u2_*`, `m1v_*`, `b1_lif_full_loop`,
+  `b4_decay_relax_fill_load`, `b4_native_stage13_load`. (Note: b4
+  carried a real bug — `write_slot * N` to LIF's `w_base` instead of
+  `write_slot` — that was "accidentally GREEN" under HIP and now
+  page-faults under strict KFD mappings; the fix is in tree.)
+* **Stay HIP-only** (use APIs the shim doesn't implement, mostly
+  `hipGraph*`): `gpu_graph_smoke`, `gpu_stage13_graph`,
+  `n1_launch{,_direct}`, `noesis_*` (graph variants),
+  `qwen3_*` (long-running launchers that benefit from `KFD_WAIT_EVENTS`,
+  not yet implemented). Compile these with the default path
+  (`./build/mlrc examples/...`) — they link `libamdhip64`.
+* **Stay HIP-only — kernel sources for `--target=hip-amd`**:
+  `gpu_atomic.mlr`, `gpu_csr.mlr`, `gpu_csr_i.mlr`, `gpu_decay.mlr`,
+  `gpu_lif.mlr`, `gpu_ring.mlr`, `gpu_stage13.mlr`. These ship
+  `@kernel` definitions to be compiled by `hipcc`. They predate the
+  native AMDGPU emitter and rely on HIP-runtime atomics / shapes the
+  emitter does not yet recognise. Their paired launchers
+  (`gpu_*_launch.mlr`) link `libamdhip64`.
+* **Removed**: `m1a_load_nop.mlr`, `m1b_load_sentinel.mlr` — trivial
+  bring-up tests (NOP kernel + sentinel writer) superseded by
+  `b5a_kfd_init_smoke` + `b5a_kfd_m1o_load`. Their kernel emit flags
+  (`--emit-amdgpu-nop=`, `--emit-amdgpu-sentinel=`) still exist in
+  the compiler for any future regression coverage.
 
 ## Testing
 

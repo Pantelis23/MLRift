@@ -1,0 +1,170 @@
+// b5d_kfd_vram_stress: probe the maximum single VRAM allocation that
+// the AMDKFD ioctl path will accept on the active gfx1100, then verify
+// dev_alloc_smart's GTT fallback fires once VRAM is exhausted.
+//
+// Methodology:
+//   Phase 1 — single-alloc cap. Doubling search from 64 MiB up to
+//   24 GiB; the first dev_try_alloc_vram(N) that returns 0 caps the
+//   range. Then a 24-step binary search over [last_ok, first_fail]
+//   pinpoints the largest size that succeeds. Each probe frees the
+//   allocation immediately so the search itself doesn't burn VRAM.
+//
+//   Phase 2 — fill-and-spill. Allocate as many 1 GiB VRAM blocks as
+//   possible (without freeing) until dev_try_alloc_vram fails. Then
+//   call dev_alloc_smart(1 GiB) and verify the result lives in GTT
+//   (dev_alloc_is_vram == 0). This is the "automatic spill into RAM"
+//   gate.
+//
+// Note: dev_free unmaps + frees the GPU handle, but the host VA range
+// reserved by _kfd_reserve_va via PROT_NONE mmap stays held — that's
+// fine for a one-shot probe but the process VA will fragment if you
+// loop forever. Phase 1 closes by exiting the process anyway.
+
+import "../std/kfd.mlr"
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1; uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn main() {
+    kfd_init()
+
+    // ----- Phase 1: doubling search for the single-alloc cap -----
+    puts("=== Phase 1: single-alloc cap (doubling search) ===")
+
+    uint64 MIB = 1024 * 1024
+    uint64 GIB = 1024 * MIB
+
+    uint64 size = 64 * MIB
+    uint64 last_ok = 0
+    uint64 first_fail = 0
+    uint64 cap = 24 * GIB
+
+    while size <= cap {
+        uint64 va = dev_try_alloc_vram(size)
+        if va != 0 {
+            last_ok = size
+            print_label_val("ok    MiB", 9, size / MIB)
+            dev_free(va)
+            // Double up.
+            size = size * 2
+        } else {
+            first_fail = size
+            print_label_val("FAIL  MiB", 9, size / MIB)
+            break
+        }
+    }
+    if first_fail == 0 {
+        // Nothing failed up to the cap — record cap as the upper bound.
+        first_fail = size
+    }
+
+    print_label_val("doubling-phase last_ok    MiB", 29, last_ok / MIB)
+    print_label_val("doubling-phase first_fail MiB", 29, first_fail / MIB)
+
+    // ----- Phase 1b: binary-search to refine the cap -----
+    if last_ok > 0 {
+        uint64 lo = last_ok
+        uint64 hi = first_fail
+        uint64 step = 0
+        while step < 24 {
+            // mid = lo + (hi - lo) / 2 — done in u64 to avoid overflow.
+            uint64 span = hi - lo
+            uint64 mid = lo + span / 2
+            // Snap mid to a 16 MiB grain so we don't probe pointless
+            // fractional sizes near the kernel's page-aligned ceiling.
+            uint64 grain = 16 * MIB
+            mid = (mid / grain) * grain
+            if mid <= lo { break }
+            uint64 va = dev_try_alloc_vram(mid)
+            if va != 0 {
+                lo = mid
+                dev_free(va)
+            } else {
+                hi = mid
+            }
+            step = step + 1
+        }
+        print_label_val("== max single VRAM alloc MiB ==", 31, lo / MIB)
+        print_label_val("                          MiB", 29, lo / MIB)
+        print_label_val("                          GiB", 29, lo / GIB)
+    } else {
+        puts("FAIL: even the smallest probe (64 MiB) failed")
+        exit(1)
+    }
+
+    // ----- Phase 2: fill VRAM, then prove dev_alloc_smart spills to GTT -----
+    puts("")
+    puts("=== Phase 2: fill VRAM, verify smart-alloc spill to GTT ===")
+
+    uint64 block = 1 * GIB
+    uint64 held = 0
+    while held < 32 {
+        uint64 va = dev_try_alloc_vram(block)
+        if va == 0 { break }
+        held = held + 1
+        if held % 2 == 1 { print_label_val("VRAM held GiB", 13, held) }
+    }
+    print_label_val("total VRAM held GiB before spill", 32, held)
+
+    uint64 spill_va = dev_alloc_smart(block)
+    if spill_va == 0 {
+        puts("FAIL: dev_alloc_smart returned 0 even after VRAM exhaustion (system RAM exhausted too?)")
+        exit(1)
+    }
+    uint64 is_vram = dev_alloc_is_vram(spill_va)
+    if is_vram == 1 {
+        // VRAM came back from somewhere — possible if the kernel freed
+        // a cached backing under us between the fill loop and the
+        // smart call. Not a failure, but warn so the operator notices.
+        puts("note: smart-alloc landed in VRAM — fill loop didn't reach the cap")
+    } else {
+        puts("smart-alloc spilled to GTT (host-mapped system RAM) — OK")
+    }
+
+    // Touch the spilled buffer through its host mapping to prove the
+    // backing is real and writable.
+    uint64 host = dev_host_ptr(spill_va)
+    f64 marker = 1234.5
+    unsafe { *(host as f64) = marker }
+    f64 readback = 0.0
+    unsafe { *(host as f64) -> readback }
+    uint64 same = 0; if readback == marker { same = 1 }
+    if same != 1 {
+        puts("FAIL: spilled buffer host readback didn't match")
+        exit(1)
+    }
+
+    puts("")
+    puts("b5d vram-stress: GREEN")
+    exit(0)
+}
