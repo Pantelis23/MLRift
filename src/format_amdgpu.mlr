@@ -5383,6 +5383,118 @@ fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> u
     return 0
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// noesis_60m_gpu kernel lowerers
+// ─────────────────────────────────────────────────────────────────────
+//
+// Each of these emits gfx1100 ISA matching one of the four @kernel
+// bodies in examples/noesis_60m_gpu.mlr, with kernarg layout matching
+// the launcher in examples/noesis_60m_gpu_launch.mlr. The launcher uses
+// grid_x = (N+255)/256, block_x = 256, so each kernel computes a global
+// thread index gid = wg_id_x * 256 + tid_in_wg before the bounds guard.
+//
+// The "block_dim = 256" assumption is hardcoded (rather than read from a
+// hidden kernarg / dispatch packet) because the launcher always uses
+// 256 and reading the dispatch packet here would require extra rsrc2
+// bits we don't currently emit. See "Caveats" in /tmp/native_lowering_report.md.
+//
+// rsrc2 = 0x9E enables 15 user SGPRs; this puts wg_id_x at s15.
+
+// gid = wg_id_x * 256 + tid_in_wg, written into v1.
+//   v_mov_b32 v1, s15            ; v1 = wg_id_x
+//   v_lshlrev_b32 v1, 8, v1      ; v1 = wg_id_x << 8
+//   v_add_nc_u32 v1, v1, v0      ; v1 = gid (tid_in_wg < 256 always)
+fn asm_noesis_compute_gid_v1() {
+    asm_v_mov_b32(1, 15)                            // v1 = s15
+    asm_v_lshlrev_b32_imm(1, 8, 1)                  // v1 <<= 8
+    asm_v_add_nc_u32_vv(1, 1, 0)                    // v1 += v0
+    asm_s_delay_alu(0x01)
+}
+
+// noesis decay_step lowering.
+//
+//   @kernel fn decay_step(uint64 buf, uint64 n, f64 factor) {
+//       uint64 i = tid_x()
+//       if i < n {
+//           uint64 p = buf + i * 8
+//           f64 v; *(p as f64) -> v
+//           v = v - v * factor
+//           *(p as f64) = v
+//       }
+//   }
+//
+// Kernarg layout (matches launcher kp_decay):
+//   [0x00] buf    (u64*) — GLOBAL_BUFFER size 8
+//   [0x08] n      (u64 by-value, low 32 bits used) — size 4 + 4 pad
+//   [0x10] factor (f64 by-value)                   — size 8
+//   total = 24 bytes
+fn amdgpu_lower_noesis_decay(uint64 kname_ptr, uint64 nl) -> uint64 {
+    asm_init()
+    asm_noesis_compute_gid_v1()                     // v1 = gid
+
+    // Load n (low 32 bits) into s2 — sdata_pair=1 → s2.
+    asm_s_load_b32(1, 0, 0x8)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // gid < n: vcc_lo = (s2 > v1).
+    asm_v_cmp_gt_u32_sgpr_vgpr(2, 1)
+    asm_s_and_saveexec_b32_vcc_lo(2)
+    asm_s_cbranch_execz(13)                         // skip 13 dwords to s_endpgm
+
+    // Load buf into s[2:3], factor into s[4:5].
+    asm_s_load_b64(1, 0)                            // s[2:3] = buf
+    asm_s_load_b64_off(2, 0, 0x10)                  // s[4:5] = factor
+    asm_v_lshlrev_b32_imm(2, 3, 1)                  // v2 = gid * 8
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Load buf[gid] into v[4:5] (saddr = raw SGPR index of pair low half = 2).
+    asm_global_load_b64(4, 2, 2)                    // v[4:5] = buf[gid]
+    asm_s_waitcnt_vmcnt_zero()
+
+    // v[4:5] = v - v*factor = -factor*v + v
+    //   asm_v_fma_f64_neg_s_v_v(vdst=4, neg_sgpr_pair=4, vsrc1=4, vsrc2=4)
+    //   → v_fma_f64 v[4:5], -s[4:5], v[4:5], v[4:5]
+    asm_v_fma_f64_neg_s_v_v(4, 4, 4, 4)
+    asm_global_store_b64(2, 4, 2)                   // buf[gid] = v[4:5]
+    asm_s_endpgm()
+
+    // 3 args; matches launcher's 24-byte buffer with HIP runtime
+    // size-driven packing (4-byte n + 4-byte pad + 8-byte factor).
+    uint64 args_desc = alloc(3 * 16)
+    uint64 a0s = args_desc + 0;   unsafe { *(a0s as uint64) = 8 }
+    uint64 a0k = args_desc + 8;   unsafe { *(a0k as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a1s = args_desc + 16;  unsafe { *(a1s as uint64) = 4 }
+    uint64 a1k = args_desc + 24;  unsafe { *(a1k as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a2s = args_desc + 32;  unsafe { *(a2s as uint64) = 8 }
+    uint64 a2k = args_desc + 40;  unsafe { *(a2k as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    // Snapshot the asm text into its own buffer (next kernel's asm_init
+    // will clobber asm_text_buf otherwise — same pattern as the
+    // existing structural lowerer).
+    uint64 k_text_size = asm_text_len
+    uint64 k_text_buf  = alloc(k_text_size)
+    uint64 ci = 0
+    while ci < k_text_size {
+        uint64 sp = asm_text_buf + ci
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        uint64 dp = k_text_buf + ci
+        uint8 b8 = b
+        unsafe { *(dp as uint8) = b8 }
+        ci = ci + 1
+    }
+
+    uint64 rsrc1 = 0xE0AF0000        // VGPR granule 0 → 8 VGPRs (we use v0..v5)
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+    kt_push(kname_ptr, nl, k_text_buf, k_text_size,
+            args_desc, 3, 24,
+            18, 6,                                  // sgpr=18 (s0..s15+exec save), vgpr=6
+            rsrc1, rsrc2, rsrc3, props)
+    return 0
+}
+
 // Lower one @kernel fn_node into the kernel table. Returns 0 on
 // success, 1 on unsupported shape. Recognises the same two shapes
 // the M1d/M1e lowerer already handled:
@@ -5402,6 +5514,53 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     uint64 ns = tok_text_start(name_tok)
     uint64 nl = tok_text_len(name_tok)
     uint64 kname_ptr = source + ns
+
+    // ── noesis_60m_gpu @kernel routing ────────────────────────────────
+    // The four kernels in examples/noesis_60m_gpu.mlr have rich bodies
+    // (atomics, branches, multi-arg layouts) that the structural
+    // recognisers below don't cover. Detect them by name and route to
+    // dedicated emitters that produce ISA matching the noesis launcher's
+    // kernarg packing (see examples/noesis_60m_gpu_launch.mlr).
+    //
+    // SCOPE NOTE: this branch implements decay_step natively. lif_step,
+    // delivery_step, and csr_build still flow through hipcc — they need
+    // primitives our gfx1100 encoder doesn't yet have (f64 division
+    // via Newton + div_fixup; v_mul_lo_u64 + 64-bit unsigned modulo;
+    // global_store_b8; v_add_co_u32 + carry chain for 64-bit address
+    // arithmetic; CAS-retry loop with backwards-branch patching). Each
+    // is in-scope for a follow-up but not deliverable in one session
+    // without high silent-corruption risk. See /tmp/native_lowering_report.md
+    // for the design plans of the missing three.
+    if tok_matches(name_tok, "decay_step", 10) != 0 {
+        return amdgpu_lower_noesis_decay(kname_ptr, nl)
+    }
+    if tok_matches(name_tok, "lif_step", 8) != 0 {
+        write(2, "mlrc: amdgpu-native: lif_step not yet supported (TODO).\n", 56)
+        write(2, "  needs f64 division (Newton+fixup), v_add_co_u32 carry,\n", 57)
+        write(2, "  global_store_b8. Build .co with --target=hip-amd.\n", 52)
+        return 1
+    }
+    if tok_matches(name_tok, "delivery_step", 13) != 0 {
+        write(2, "mlrc: amdgpu-native: delivery_step not yet supported (TODO).\n", 61)
+        write(2, "  needs v_mul_lo_u32, v_lshlrev_b64, v_add_co_u32 carry,\n", 57)
+        write(2, "  v_cndmask_b32, CAS-retry with backwards-branch patching,\n", 59)
+        write(2, "  global_load_u8. Build .co with --target=hip-amd.\n", 51)
+        return 1
+    }
+    if tok_matches(name_tok, "csr_build", 9) != 0 {
+        // csr_build needs splitmix64 (4× 64-bit multiply) and a 64-bit
+        // unsigned modulo. Neither has a primitive in our gfx1100
+        // encoder yet; implementing them is multi-day work and only
+        // amortises across one launch (csr_build runs once at sim
+        // start). csr_build is a one-shot startup kernel, so this does
+        // not block hot-path benchmarking once the other three lower
+        // natively.
+        write(2, "mlrc: amdgpu-native: csr_build not yet supported (TODO).\n", 57)
+        write(2, "  needs v_mul_lo_u64 + 64-bit unsigned modulo helpers.\n", 55)
+        write(2, "  Build the .co with --target=hip-amd. csr_build is\n", 52)
+        write(2, "  a one-shot startup kernel — not on the hot path.\n", 51)
+        return 1
+    }
 
     // Param list — 1 or 2 params. If there are 2, the 2nd is taken
     // as a u32 by-value scalar and its PARAM name is remembered so
