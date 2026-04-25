@@ -584,8 +584,95 @@ fn kfd_destroy_queue(uint64 q) {
 //   [0x20] image_base_host    (u64) — host pointer to the same image
 //                                     (added so the HIP-via-KFD shim can
 //                                      read kernel descriptors back)
-fn kernel_load_from_blob(uint64 elf, uint64 sz) -> uint64 {
+// Tier 2b: detect a Clang offload-bundle wrapper around the gfx1100
+// ELF and return a pointer / size for the inner image. Bundle layout:
+//
+//   char[24]  magic = "__CLANG_OFFLOAD_BUNDLE__"
+//   u64       num_bundles
+//   per entry (one per target):
+//     u64 entry_offset
+//     u64 entry_size
+//     u64 entry_id_size
+//     char[entry_id_size] entry_id   (e.g. "hip-amdgcn-amd-amdhsa--gfx1100")
+//
+// The first ELF magic byte is 0x7F; the bundle starts with 0x5F ('_').
+// If we don't see the bundle magic, the input is already a plain ELF
+// — return it unchanged. If we see the magic, walk the entries and
+// pick the one whose target id contains "amdgcn" (everything else is
+// the host bundle or an unused arch).
+//
+// Returns the inner ELF host pointer in `out_blob_slot` and its size
+// in `out_size_slot`. Both slots receive (elf, sz) unchanged when the
+// input wasn't a bundle.
+fn _kfd_unwrap_offload_bundle(uint64 blob, uint64 sz,
+                               uint64 out_blob_slot, uint64 out_size_slot) {
+    unsafe { *(out_blob_slot as uint64) = blob }
+    unsafe { *(out_size_slot as uint64) = sz }
+    if sz < 32 { return }
+    // Match "__CLANG_OFFLOAD_BUNDLE__" (24 bytes).
+    uint64 magic = "__CLANG_OFFLOAD_BUNDLE__"
+    uint64 mi = 0
+    while mi < 24 {
+        uint64 a = 0; unsafe { *((blob + mi) as uint8) -> a }
+        uint64 b = 0; unsafe { *((magic + mi) as uint8) -> b }
+        if a != b { return }
+        mi = mi + 1
+    }
+    uint64 num = 0; unsafe { *((blob + 24) as uint64) -> num }
+    uint64 cursor = 32
+    uint64 idx = 0
+    while idx < num {
+        if cursor + 24 > sz { return }
+        uint64 e_off = 0; unsafe { *((blob + cursor + 0) as uint64) -> e_off }
+        uint64 e_sz  = 0; unsafe { *((blob + cursor + 8) as uint64) -> e_sz }
+        uint64 e_ids = 0; unsafe { *((blob + cursor + 16) as uint64) -> e_ids }
+        uint64 id_ptr = blob + cursor + 24
+        if cursor + 24 + e_ids > sz { return }
+        // Look for "amdgcn" anywhere in the id; that excludes the
+        // "host-x86_64" entry and matches every gfx target tag.
+        uint64 j = 0
+        uint64 want = "amdgcn"
+        uint64 found = 0
+        while j + 6 <= e_ids {
+            uint64 m = 0
+            uint64 a0 = 0; uint64 b0 = 0
+            unsafe { *((id_ptr + j + 0) as uint8) -> a0 }; unsafe { *((want + 0) as uint8) -> b0 }
+            uint64 a1 = 0; uint64 b1 = 0
+            unsafe { *((id_ptr + j + 1) as uint8) -> a1 }; unsafe { *((want + 1) as uint8) -> b1 }
+            uint64 a2 = 0; uint64 b2 = 0
+            unsafe { *((id_ptr + j + 2) as uint8) -> a2 }; unsafe { *((want + 2) as uint8) -> b2 }
+            uint64 a3 = 0; uint64 b3 = 0
+            unsafe { *((id_ptr + j + 3) as uint8) -> a3 }; unsafe { *((want + 3) as uint8) -> b3 }
+            uint64 a4 = 0; uint64 b4 = 0
+            unsafe { *((id_ptr + j + 4) as uint8) -> a4 }; unsafe { *((want + 4) as uint8) -> b4 }
+            uint64 a5 = 0; uint64 b5 = 0
+            unsafe { *((id_ptr + j + 5) as uint8) -> a5 }; unsafe { *((want + 5) as uint8) -> b5 }
+            if a0 == b0 { if a1 == b1 { if a2 == b2 { if a3 == b3 { if a4 == b4 { if a5 == b5 {
+                found = 1
+            } } } } } }
+            if found == 1 { break }
+            j = j + 1
+        }
+        if found == 1 {
+            unsafe { *(out_blob_slot as uint64) = blob + e_off }
+            unsafe { *(out_size_slot as uint64) = e_sz }
+            return
+        }
+        cursor = cursor + 24 + e_ids
+        idx = idx + 1
+    }
+    // No amdgcn entry — leave original (caller will likely fail at
+    // PT_LOAD parsing, which is the right behaviour).
+}
+
+fn kernel_load_from_blob(uint64 raw_blob, uint64 raw_sz) -> uint64 {
     if _kfd_initialized == 0 { kfd_init() }
+
+    // Tier 2b: peel any Clang offload-bundle wrapper.
+    uint64 elf_slot = alloc(8); uint64 sz_slot = alloc(8)
+    _kfd_unwrap_offload_bundle(raw_blob, raw_sz, elf_slot, sz_slot)
+    uint64 elf = 0; unsafe { *(elf_slot as uint64) -> elf }
+    uint64 sz = 0; unsafe { *(sz_slot as uint64) -> sz }
 
     // ELF64 program-header table:
     //   e_phoff at [32]    (u64)
@@ -765,7 +852,10 @@ fn kernel_get_function(uint64 mod, uint64 fn_name) -> uint64 {
         }
         k = k + 1
     }
-    kfd_die("kernel_get_function: symbol not found (try '<name>.kd')", 0)
+    // Soft miss: return 0 so callers (like hip_kfd's hipModuleGetFunction)
+    // can decide whether to retry against a fallback module or die. Hard
+    // exit on miss makes the launcher's primary-then-fallback pattern
+    // impossible — the dual-`.co` flow needs miss-as-error semantics.
     return 0
 }
 

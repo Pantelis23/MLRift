@@ -133,6 +133,12 @@ fn hipModuleLoadData(uint64 mod_out, uint64 blob_ptr) -> uint32 {
 //   [0x08] kernarg_size  (u64)  — read from the kernel descriptor
 fn hipModuleGetFunction(uint64 fn_out, uint64 mod, uint64 name_cstr) -> uint32 {
     uint64 kd_va = kernel_get_function(mod, name_cstr)
+    if kd_va == 0 {
+        // Symbol not in this module. Return hipErrorNotFound (500) so
+        // launchers using the primary-then-fallback pattern can retry
+        // against a different module rather than dying.
+        return 500
+    }
     uint64 ks    = kernel_kernarg_size(mod, kd_va)
     uint64 wrap  = alloc(16)
     unsafe { *((wrap + 0x00) as uint64) = kd_va }
@@ -164,6 +170,25 @@ fn hipModuleLaunchKernel(
         kfd_die("hipModuleLaunchKernel: kernarg_size > 4096 (shim limit)", ks)
     }
 
+    // Pre-zero the kernarg buffer (Tier 2a defensive baseline). COv5
+    // kernels reserve trailing slots for hidden kernargs the runtime
+    // is supposed to populate (block_count, group_size, remainder,
+    // grid_dims, printf_buffer, hostcall_buffer, etc.). We don't parse
+    // msgpack metadata to discover which slots are which — when a
+    // launcher hits a kernel that *uses* hidden args, it will read
+    // back zero, which is the safe default for everything except
+    // block_count_* and group_size_*. None of the current MLRift
+    // launchers (Stage 1 + Stage 2) use those, so zero-fill works.
+    // Full hidden-kernarg-from-msgpack lookup is staged in the
+    // tier-1-2-3 roadmap for when a kernel actually needs it.
+    uint64 zi = 0
+    while zi < ks {
+        uint64 zp = _hipkfd_kernarg_h + zi
+        uint64 zero = 0
+        unsafe { *(zp as uint64) = zero }
+        zi = zi + 8
+    }
+
     // Unmarshal HIP ptr_table (array of u64*) into a contiguous KFD
     // kernarg blob. nargs = kernarg_size / 8: every MLRift @kernel
     // emitter declares size=8 for every arg (see args_desc init in
@@ -174,6 +199,11 @@ fn hipModuleLaunchKernel(
     while i < nargs {
         uint64 slot_ptr = 0
         unsafe { *((kernel_params + i * 8) as uint64) -> slot_ptr }
+        // Stop when ptr_table exhausted (caller's null sentinel) — a
+        // safety net that lets us coexist with COv5 trailing hidden
+        // args before the proper msgpack-driven fill lands. Without
+        // this, we'd dereference garbage past the launcher's ptr_table.
+        if slot_ptr == 0 { break }
         uint64 v = 0
         unsafe { *(slot_ptr as uint64) -> v }
         unsafe { *((_hipkfd_kernarg_h + i * 8) as uint64) = v }
