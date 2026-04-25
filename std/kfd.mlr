@@ -193,16 +193,58 @@ fn dev_alloc_host_visible(uint64 nbytes) -> uint64 {
     return va
 }
 
-// AQL-queue ring allocation: GTT + AQL_QUEUE_MEM flag. With this flag,
-// KFD reserves an extra page after the ring for the wp/rp slots. Both
-// the ring and the trailing slot page live in the same DRM mmap range.
+// VRAM with EXECUTABLE flag (small allocations like EOP buffer).
+fn dev_alloc_vram_exec(uint64 nbytes) -> uint64 {
+    if _kfd_initialized == 0 { kfd_init() }
+    uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE
+    uint64 va_pref = _kfd_reserve_va(nbytes)
+    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
+    if r != 0 { kfd_die("dev_alloc_vram_exec: ALLOC_MEMORY_OF_GPU failed", r) }
+    uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
+    uint64 va = 0;     unsafe { *(va_slot as uint64) -> va }
+    r = raw_kfd_map_memory_to_gpu(_kfd_fd, handle, _kfd_gpu_id)
+    if r != 0 { kfd_die("dev_alloc_vram_exec: MAP_MEMORY_TO_GPU failed", r) }
+    _kfd_alloc_track(va, handle, nbytes, 0)
+    return va
+}
+
+// Kernel-image allocation: GTT host-visible WITH EXECUTABLE flag set.
+// SQC fetches instructions from this BO, so the GPU page-table mapping
+// must allow execute. Same flag rationale as dev_alloc_aql_ring.
+fn dev_alloc_kernel_image(uint64 nbytes) -> uint64 {
+    if _kfd_initialized == 0 { kfd_init() }
+    uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE
+    uint64 va_pref = _kfd_reserve_va(nbytes)
+    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
+    if r != 0 { kfd_die("dev_alloc_kernel_image: ALLOC_MEMORY_OF_GPU failed", r) }
+    uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
+    uint64 va = 0;     unsafe { *(va_slot as uint64) -> va }
+    uint64 mm = 0;     unsafe { *(mm_slot as uint64) -> mm }
+    r = raw_kfd_map_memory_to_gpu(_kfd_fd, handle, _kfd_gpu_id)
+    if r != 0 { kfd_die("dev_alloc_kernel_image: MAP failed", r) }
+    uint64 host = mmap(0, nbytes, KFD_MMAP_PROT, KFD_MMAP_FLAGS, _kfd_drm_fd, mm)
+    if host > 0xFFFFFFFFFFFFF000 { kfd_die("dev_alloc_kernel_image: mmap failed", host) }
+    _kfd_alloc_track(va, handle, nbytes, host)
+    return va
+}
+
+// AQL-queue ring allocation: GTT + EXECUTABLE + COHERENT. The CP
+// (Command Processor Fetcher) needs EXECUTE permission to fetch
+// AQL packets from the ring — without it the GPU page-faults with
+// PERMISSION_FAULTS=0x8 (CPF client). Verified against HSA runtime
+// LD_PRELOAD trace: HSA registers the ring as USERPTR with
+// flags=0xd6000004 = USERPTR|WRITABLE|EXECUTABLE|NO_SUBSTITUTE|COHERENT|UNCACHED.
+// We use GTT instead of USERPTR (simpler — KFD allocates the page).
+//
+// NOTE: AQL_QUEUE_MEM flag is a GFX7/GFX8 wraparound workaround that
+// double-maps the ring; on gfx11 it is NOT used by HSA and harms us
+// (kernel_size = req/2, virtual size = req via aliasing).
 fn dev_alloc_aql_ring(uint64 nbytes) -> uint64 {
     if _kfd_initialized == 0 { kfd_init() }
-    uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC | KFD_IOC_ALLOC_MEM_FLAGS_AQL_QUEUE_MEM
-    // Reserve nbytes + 8KiB host VA so KFD's trailing metadata page
-    // (wp/rp slots) lands inside the reservation.
-    uint64 reserve = nbytes + 8192
-    uint64 va_pref = _kfd_reserve_va(reserve)
+    uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE | KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED
+    uint64 va_pref = _kfd_reserve_va(nbytes)
     uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
     uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
     if r != 0 { kfd_die("dev_alloc_aql_ring: ALLOC_MEMORY_OF_GPU failed", r) }
@@ -305,7 +347,13 @@ fn kfd_create_queue(uint32 wait_mode) -> uint64 {
     // BOs must be EXACT-size KFD-mapped buffers — kfd_queue_buffer_get()
     // calls amdgpu_vm_bo_lookup_mapping() and rejects with EINVAL unless
     // the user_addr == mapping->start AND size matches mapping->last+1.
-    uint64 eop_va = dev_alloc_vram(KFD_EOP_BYTES)
+    //
+    // EOP needs EXECUTABLE permission: CPF reads it as part of CP firmware
+    // execution and the GPU's L2 enforces an execute-bit check on the page
+    // table entry (PERMISSION_FAULTS=0x8 from CPF without it). HSA's trace
+    // shows VRAM EOP allocated with flags=0xd0000001 (WRITABLE|EXECUTABLE
+    // |NO_SUBSTITUTE|VRAM); we match that.
+    uint64 eop_va = dev_alloc_vram_exec(KFD_EOP_BYTES)
     // total_cwsr in kernel = ALIGN((cwsr_size + debug_memory_size) * num_xcc, PAGE_SIZE)
     // For gfx1100: debug_memory_size = ALIGN(wave_num*32, 64) = 1920*32 = 61440
     //              num_xcc = 1
@@ -433,8 +481,11 @@ fn kernel_load(uint64 co_path) -> uint64 {
     if vaddr_max == 0 { kfd_die("kernel_load: no PT_LOAD segments", 0) }
     uint64 image_size = vaddr_max - vaddr_min
 
-    // Allocate one host-visible buffer covering the full image.
-    uint64 image_va = dev_alloc_host_visible(image_size)
+    // Allocate one host-visible EXECUTABLE buffer covering the full image.
+    // The SQC (Shader instruction Cache) needs execute permission to fetch
+    // kernel instructions; without it the GPU page-faults with
+    // PERMISSION_FAULTS=0x8 from client SQC (inst).
+    uint64 image_va = dev_alloc_kernel_image(image_size)
     uint64 image_host = dev_host_ptr(image_va)
 
     // Zero the image (gap regions between segments).
@@ -614,10 +665,16 @@ fn kfd_signal_value(uint64 signal_va) -> uint64 {
 //   [0x38] completion_signal    (u64)  -- pointer to amd_signal_t
 //
 // MLRift may not have a direct atomic-release primitive. We use a
-// __sync_synchronize() fence sandwich to enforce ordering: regular
+// _kfd_fence() fence sandwich to enforce ordering: regular
 // stores -> fence -> header store -> fence. On x86 this is a noop in
 // hardware but the compiler treats it as a sequence point.
-@dynamic extern fn __sync_synchronize()
+// x86 has strong enough store ordering that we don't need an explicit
+// fence between body stores and the header store — single-core stores
+// retire in-order. If we ever port to ARM or another weakly-ordered
+// architecture, replace this no-op with a real mfence via inline asm.
+// (Originally tried `@dynamic extern fn _kfd_fence()` but that
+// is a GCC compiler builtin, not a libc symbol — link error at runtime.)
+fn _kfd_fence() { return }
 
 fn kfd_dispatch(uint64 q, uint64 kernel,
                  uint64 grid_x, uint64 grid_y, uint64 grid_z,
@@ -660,7 +717,7 @@ fn kfd_dispatch(uint64 q, uint64 kernel,
     uint64 r2 = 0;       unsafe { *((packet + 0x30) as uint64) = r2 }
     unsafe { *((packet + 0x38) as uint64) = signal_va }
 
-    __sync_synchronize()
+    _kfd_fence()
 
     // Header bits:
     //   bits[7:0]   type = HSA_PACKET_TYPE_KERNEL_DISPATCH = 2
@@ -673,7 +730,7 @@ fn kfd_dispatch(uint64 q, uint64 kernel,
     uint32 header_setup = (setup << 16) | 0x1502
     unsafe { *((packet + 0x00) as uint32) = header_setup }
 
-    __sync_synchronize()
+    _kfd_fence()
 
     // Increment wp, write doorbell.
     uint64 new_wp = wp + 1
