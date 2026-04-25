@@ -342,8 +342,25 @@ fn main() {
     unsafe { *((kp_deliv + 48) as uint64) = k4_n }
     unsafe { *((kp_deliv + 56) as uint64) = k4_sp }
 
+    // Optional per-kernel timing: set env MLRIFT_TIMED=1 to sync after
+    // each kernel and accumulate per-phase microseconds. Default path
+    // (no timing) keeps async dispatch — that's the real benchmark.
+    uint64 timed_env = getenv("MLRIFT_TIMED")
+    uint64 timed = 0
+    if timed_env != 0 {
+        uint8 c0 = 0
+        unsafe { *(timed_env as uint8) -> c0 }
+        if c0 != 48 { timed = 1 }   // != '0' means on
+    }
+
+    uint64 dec_us = 0
+    uint64 lif_us = 0
+    uint64 dlv_us = 0
+
     uint64 step = 0
     while step < N_STEPS {
+        uint64 t_a = 0
+        if timed > 0 { t_a = time_ns() }
         // Decay s_exc
         unsafe { *(k2_buf as uint64) = d_se }
         unsafe { *(k2_f   as f64)    = f_e }
@@ -354,18 +371,40 @@ fn main() {
         unsafe { *(k2_f   as f64)    = f_i }
         err = hipModuleLaunchKernel(fh_decay, grid, 1, 1, block, 1, 1, 0, 0, kp_decay, 0)
         if err != 0 { die("launch decay s_inh", err) }
+        if timed > 0 {
+            err = hipDeviceSynchronize(); if err != 0 { die("sync decay", err) }
+            uint64 t_b = time_ns()
+            dec_us = dec_us + (t_b - t_a) / 1000
+            t_a = t_b
+        }
         // LIF integrate
         err = hipModuleLaunchKernel(fh_lif, grid, 1, 1, block, 1, 1, 0, 0, kp_lif, 0)
         if err != 0 { die("launch lif", err) }
+        if timed > 0 {
+            err = hipDeviceSynchronize(); if err != 0 { die("sync lif", err) }
+            uint64 t_b = time_ns()
+            lif_us = lif_us + (t_b - t_a) / 1000
+            t_a = t_b
+        }
         // Delivery (one thread per source; skips non-firers)
         err = hipModuleLaunchKernel(fh_delivery, grid, 1, 1, block, 1, 1, 0, 0, kp_deliv, 0)
         if err != 0 { die("launch delivery", err) }
+        if timed > 0 {
+            err = hipDeviceSynchronize(); if err != 0 { die("sync delivery", err) }
+            uint64 t_b = time_ns()
+            dlv_us = dlv_us + (t_b - t_a) / 1000
+        }
         step = step + 1
     }
     err = hipDeviceSynchronize(); if err != 0 { die("sync sim end", err) }
 
     uint64 t_sim = time_ns()
     print_label_val("sim_us", 6, (t_sim - t_csr) / 1000)
+    if timed > 0 {
+        print_label_val("decay_total_us",    14, dec_us)
+        print_label_val("lif_total_us",      12, lif_us)
+        print_label_val("delivery_total_us", 17, dlv_us)
+    }
 
     // ── D2H spike_count → tally ──────────────────────────────────────
     uint64 h_spike = alloc(bytes_n)

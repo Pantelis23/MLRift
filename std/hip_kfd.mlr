@@ -325,17 +325,12 @@ fn hipModuleLaunchKernel(
     _hipkfd_karg_slot = slot_idx + 1
     if _hipkfd_karg_slot >= _HIPKFD_KARG_SLOTS { _hipkfd_karg_slot = 0 }
 
-    // Pre-zero up to ks bytes (defensive baseline for COv5 hidden
-    // args; current launchers don't use them).
-    uint64 zi = 0
-    while zi < ks {
-        uint64 zp = karg_h + zi
-        uint64 zero = 0
-        unsafe { *(zp as uint64) = zero }
-        zi = zi + 8
-    }
-
-    // Unmarshal HIP ptr_table → contiguous KFD kernarg blob.
+    // Unmarshal HIP ptr_table → contiguous KFD kernarg blob. We used
+    // to pre-zero the slot first (defensive against COv5 hidden args
+    // and short kernel_params arrays), but for the noesis hot loop
+    // every launch fully fills nargs entries — pre-zero shaved nothing
+    // and added 16 PCIe-mapped writes per launch. If a launcher needs
+    // zero-padding, it must fill those slots itself.
     uint64 nargs = ks / 8
     uint64 i = 0
     while i < nargs {
