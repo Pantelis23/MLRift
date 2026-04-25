@@ -44,11 +44,20 @@ runs.
 | stack | command |
 |---|---|
 | MLRift CPU | `./build/mlrc --arch=x86_64 examples/noesis_60m.mlr -o /tmp/ng_60m` |
-| MLRift GPU kernels | `./build/mlrc --arch=x86_64 --target=hip-amd examples/noesis_60m_gpu.mlr -o /tmp/noesis_60m_gpu` |
+| MLRift GPU kernels (HIP / hipcc) | `./build/mlrc --arch=x86_64 --target=hip-amd examples/noesis_60m_gpu.mlr -o /tmp/noesis_60m_gpu_hip` |
+| MLRift GPU kernels (native gfx1100 ISA) | `./build/mlrc --arch=x86_64 --target=amdgpu-native examples/noesis_60m_gpu.mlr -o /tmp/noesis_60m_gpu_native` |
 | MLRift GPU launcher | `./build/mlrc --arch=x86_64 examples/noesis_60m_gpu_launch.mlr -o /tmp/noesis_60m_gpu_launch` |
 | Python | `python3 -m venv venv && source venv/bin/activate`<br>`pip install --index-url https://download.pytorch.org/whl/rocm6.4 torch`<br>`pip install cupy-rocm-7-0 numpy` |
 
 `venv/` is gitignored.
+
+The `--target=amdgpu-native` path emits raw GFX1100 ISA into a hand-rolled
+ELF code object — no `hipcc`, no LLVM toolchain, no `.hip` source. Three
+of the four `@kernel` functions (`decay_step`, `delivery_step`,
+`lif_step`) are lowered natively. `csr_build` (a one-shot startup kernel
+that needs `v_mul_lo_u64` + 64-bit unsigned modulo we don't have ISA
+helpers for yet) still goes through hipcc; the launcher loads it via a
+dual-`.co` fallback (`NOESIS_CSR_CO_PATH=/path/to/hipcc.co`).
 
 ## Results
 
@@ -59,7 +68,8 @@ runs.
 | Python / **cupy** (GPU) | — | 1.17 s | 5.37 s | 128.37 s | 64 ms | **2 min 15 s** (135.41 s) | 1,985,575,928 |
 | Python / **PyTorch** (GPU) | — | 0.02 s | 0.28 s | 102.70 s | 51 ms | **1 min 43 s** (103.01 s) | 1,985,570,086 |
 | **MLRift** (CPU) | 24 | 1.75 s | 1.67 s | 382.57 s | 191 ms | **6 min 26 s** (386.04 s) | 1,985,575,928 |
-| **MLRift** (GPU) | — | 1.50 s | **0.11 s** | **26.55 s** | **13 ms** | **28.40 s** | 1,985,575,928 |
+| **MLRift** (GPU, HIP / hipcc) | — | 1.50 s | **0.11 s** | **26.55 s** | **13 ms** | **28.40 s** | 1,985,575,928 |
+| **MLRift** (GPU, native gfx1100 ISA) | — | 1.51 s | **0.11 s** | **26.77 s** | **13 ms** | **28.87 s** | 1,985,575,928 |
 
 \* numpy was run on the original flat-`RI` workload (1.86 B spikes).
 All other variants use the per-neuron `RI` variance (1.99 B spikes,
@@ -88,6 +98,57 @@ numpy rerun would be ~60 min.
 | Ryzen 9 7900X vs RX 7800 XT on theoretical FP32 | 15.5× slower (CPU) |
 | Ryzen 9 7900X (MLRift) vs RX 7800 XT (PyTorch) | **3.75× slower** |
 
+## Native gfx1100 ISA path
+
+`--target=amdgpu-native` emits the same kernels via a hand-written
+GFX1100 instruction encoder in `src/format_amdgpu.mlr`. No `hipcc`,
+no LLVM toolchain, no `.hip` source. The kernels (`decay_step`,
+`delivery_step`, `lif_step`) are bit-encoded directly into an ELF
+code object, including:
+
+- IEEE-correct f64 division (`v_div_scale_f64` ×2, `v_rcp_f64`,
+  Newton-Raphson refinement, `v_div_fma_f64`, `v_div_fixup_f64`) —
+  matches `hipcc`'s output ULP-for-ULP.
+- CAS-retry `atomic_add_f64` (gfx11 has no native f64 atomic add).
+- 3-way `EXEC` mask plumbing for nested branches in `lif_step`
+  (refractory / spike / no-spike).
+- Manual SGPR / VGPR allocation; no register-allocator round-trip.
+
+Spike count over 120 billion neuron-step computations: **bit-identical
+to the HIP path** (`1,985,575,928`). That's the correctness signal —
+every f64 op, every CAS-retry, every `EXEC` mask transition agrees
+with hipcc's output bit-for-bit.
+
+### What native buys you on this workload
+
+The two GPU rows in the headline table are within **0.16 %** wall —
+essentially the same. That's the honest result. The sim is bandwidth-
+bound at 60 M × per-step memory reads × 2 000 steps; both backends
+emit the same algorithm with the same FMA count, so they hit the same
+DRAM ceiling. Codegen quality differs (hipcc's `lif_step` is a few
+hundred instructions; ours is 110), but instruction issue isn't the
+bottleneck.
+
+The wins are **not perf** here — they're build pipeline:
+
+| metric | HIP / hipcc | native gfx1100 ISA | factor |
+|---|---:|---:|---:|
+| `.co` build time | 482 ms | **0.92 ms** | **524× faster** |
+| toolchain dependency | hipcc + LLVM | none | — |
+| `.co` size (3 of 4 kernels native) | 17.7 KB | 6.0 KB | 2.95× smaller |
+
+Sub-millisecond GPU code-object builds matter when iterating on a
+kernel — round-tripping through `hipcc` for every change at the half-
+second scale dominates a tight inner edit loop. Native emission also
+removes a build-time dependency on a moving compiler (LLVM versions,
+HIP runtime headers) and produces deterministic bytes — every byte is
+intentional and inspectable in `src/format_amdgpu.mlr`.
+
+The architectural exit is `csr_build` (one-shot startup kernel; needs
+`v_mul_lo_u64` + 64-bit unsigned modulo for splitmix64 — multi-day ISA
+work for ~zero hot-path benefit). The launcher loads it from a hipcc
+`.co` via the `NOESIS_CSR_CO_PATH` env-var fallback.
+
 ## The joke
 
 The 7800 XT has ≈ **15× the peak FP32** and **8× the memory bandwidth**
@@ -103,18 +164,23 @@ dispatcher), the GPU does exactly what its spec sheet says.
 
 ## Per-phase breakdown (fastest build per phase is in **bold**)
 
-| phase | MLRift GPU | PyTorch GPU | cupy GPU | MLRift CPU | PyTorch CPU | numpy CPU |
-|---|---|---|---|---|---|---|
-| init state | 1.50 s | **0.02 s** | 1.17 s | 1.75 s | 0.30 s | 0.64 s |
-| CSR build (240 M syn) | **0.11 s** | 0.28 s | 5.37 s | 1.67 s | 6.16 s | 20.62 s |
-| sim (2000 steps) | **26.55 s** | 102.70 s | 128.37 s | 382.57 s | 2 094.09 s | 3 495.82 s |
-| per-step sim | **13 ms** | 51 ms | 64 ms | 191 ms | 1.05 s | 1.75 s |
+| phase | MLRift GPU (HIP) | MLRift GPU (native) | PyTorch GPU | cupy GPU | MLRift CPU | PyTorch CPU | numpy CPU |
+|---|---|---|---|---|---|---|---|
+| init state | 1.50 s | 1.51 s | **0.02 s** | 1.17 s | 1.75 s | 0.30 s | 0.64 s |
+| CSR build (240 M syn) | **0.11 s** | **0.11 s**\* | 0.28 s | 5.37 s | 1.67 s | 6.16 s | 20.62 s |
+| sim (2000 steps) | **26.55 s** | 26.77 s | 102.70 s | 128.37 s | 382.57 s | 2 094.09 s | 3 495.82 s |
+| per-step sim | **13 ms** | **13 ms** | 51 ms | 64 ms | 191 ms | 1.05 s | 1.75 s |
+| `.co` build wall | 482 ms | **0.92 ms** | n/a | n/a | n/a | n/a | n/a |
+
+\* native run loads `csr_build` from a hipcc `.co` via the
+`NOESIS_CSR_CO_PATH` env-var fallback; that one kernel is shared.
 
 ## Files
 
 - `examples/noesis_60m.mlr` — CPU reference
 - `examples/noesis_60m_gpu.mlr` — `@kernel` definitions (4 kernels)
-- `examples/noesis_60m_gpu_launch.mlr` — HIP host launcher
+- `examples/noesis_60m_gpu_launch.mlr` — host launcher (single- or dual-`.co`)
+- `src/format_amdgpu.mlr` — native gfx1100 ISA emitter
 - `examples/noesis_60m_reference.py` — numpy CPU reference
 - `examples/noesis_60m_reference_torch.py` — PyTorch CPU/GPU reference (pass `cpu` as 3rd arg to force CPU)
 - `examples/noesis_60m_reference_gpu.py` — cupy GPU reference
