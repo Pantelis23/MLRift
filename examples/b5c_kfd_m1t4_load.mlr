@@ -1,0 +1,138 @@
+// Stage 2c port of M1t-4 (lif_full, single-thread) to raw KFD.
+// 22 kernargs. Two cases: E-cell (ct=0, expect ring write at
+// buf_delay[3]) and I-cell (ct=1, expect ring untouched).
+//
+// Emit: ./build/mlrc --emit-amdgpu-lif-full=/tmp/m1t4.co
+// Compile: ./build/mlrc --arch=x86_64 examples/b5c_kfd_m1t4_load.mlr -o /tmp/b5c_m1t4
+
+import "../std/kfd.mlr"
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn run_case(uint64 q, uint64 signal, uint64 kernel,
+            uint64 cell_type_val, uint64 expected_ring_bits) -> uint64 {
+    uint64 d_V     = dev_alloc_host_visible(8); uint64 d_V_h     = dev_host_ptr(d_V)
+    uint64 d_ref   = dev_alloc_host_visible(8); uint64 d_ref_h   = dev_host_ptr(d_ref)
+    uint64 d_RI    = dev_alloc_host_visible(8); uint64 d_RI_h    = dev_host_ptr(d_RI)
+    uint64 d_se    = dev_alloc_host_visible(8); uint64 d_se_h    = dev_host_ptr(d_se)
+    uint64 d_si    = dev_alloc_host_visible(8); uint64 d_si_h    = dev_host_ptr(d_si)
+    uint64 d_spike = dev_alloc_host_visible(8); uint64 d_spike_h = dev_host_ptr(d_spike)
+    uint64 d_xpre  = dev_alloc_host_visible(8); uint64 d_xpre_h  = dev_host_ptr(d_xpre)
+    uint64 d_xpost = dev_alloc_host_visible(8); uint64 d_xpost_h = dev_host_ptr(d_xpost)
+    uint64 d_ustp  = dev_alloc_host_visible(8); uint64 d_ustp_h  = dev_host_ptr(d_ustp)
+    uint64 d_xstp  = dev_alloc_host_visible(8); uint64 d_xstp_h  = dev_host_ptr(d_xstp)
+    uint64 d_rel   = dev_alloc_host_visible(8); uint64 d_rel_h   = dev_host_ptr(d_rel)
+    uint64 d_ct    = dev_alloc_host_visible(8); uint64 d_ct_h    = dev_host_ptr(d_ct)
+    uint64 d_buf   = dev_alloc_host_visible(64); uint64 d_buf_h  = dev_host_ptr(d_buf)
+
+    f64 V0 = 2.8;     unsafe { *(d_V_h     as f64)    = V0 }
+    uint64 z = 0;     unsafe { *(d_ref_h   as uint64) = z }
+    f64 RI = 0.5;     unsafe { *(d_RI_h    as f64)    = RI }
+    f64 se = 10.0;    unsafe { *(d_se_h    as f64)    = se }
+    f64 si = 1.0;     unsafe { *(d_si_h    as f64)    = si }
+    unsafe { *(d_spike_h as uint64) = z }
+    f64 zf = 0.0;     unsafe { *(d_xpre_h  as f64) = zf }
+    unsafe { *(d_xpost_h as f64) = zf }
+    f64 u0 = 0.4;     unsafe { *(d_ustp_h  as f64) = u0 }
+    f64 x0 = 0.8;     unsafe { *(d_xstp_h  as f64) = x0 }
+    unsafe { *(d_rel_h   as f64) = zf }
+    unsafe { *(d_ct_h    as uint64) = cell_type_val }
+    uint64 bi = 0
+    while bi < 8 {
+        uint64 bp = d_buf_h + bi * 8
+        unsafe { *(bp as f64) = zf }
+        bi = bi + 1
+    }
+
+    uint64 kernarg = dev_alloc_host_visible(176)
+    uint64 kh = dev_host_ptr(kernarg)
+    unsafe { *((kh + 0x00) as uint64) = d_V }
+    unsafe { *((kh + 0x08) as uint64) = d_ref }
+    unsafe { *((kh + 0x10) as uint64) = d_RI }
+    unsafe { *((kh + 0x18) as uint64) = d_se }
+    unsafe { *((kh + 0x20) as uint64) = d_si }
+    unsafe { *((kh + 0x28) as uint64) = d_spike }
+    unsafe { *((kh + 0x30) as uint64) = d_xpre }
+    unsafe { *((kh + 0x38) as uint64) = d_xpost }
+    unsafe { *((kh + 0x40) as uint64) = d_ustp }
+    unsafe { *((kh + 0x48) as uint64) = d_xstp }
+    unsafe { *((kh + 0x50) as uint64) = d_rel }
+    f64 dtot = 0.5;   unsafe { *((kh + 0x58) as f64) = dtot }
+    f64 Vrst = 0.0;   unsafe { *((kh + 0x60) as f64) = Vrst }
+    f64 JE   = 0.5;   unsafe { *((kh + 0x68) as f64) = JE }
+    f64 JI   = 0.25;  unsafe { *((kh + 0x70) as f64) = JI }
+    f64 Vres = -99.0; unsafe { *((kh + 0x78) as f64) = Vres }
+    f64 Vth  = 3.0;   unsafe { *((kh + 0x80) as f64) = Vth }
+    uint64 ref_steps = 7; unsafe { *((kh + 0x88) as uint64) = ref_steps }
+    f64 Ubase = 0.5;  unsafe { *((kh + 0x90) as f64) = Ubase }
+    unsafe { *((kh + 0x98) as uint64) = d_ct }
+    unsafe { *((kh + 0xA0) as uint64) = d_buf }
+    uint64 wbase = 3; unsafe { *((kh + 0xA8) as uint64) = wbase }
+
+    kfd_dispatch(q, kernel, 1, 1, 1, 1, 1, 1, kernarg, 176, signal)
+    kfd_wait(q, signal)
+
+    uint64 got_ring = 0; unsafe { *((d_buf_h + 24) as uint64) -> got_ring }
+    print_label_val("buf_delay[3]  ", 14, got_ring)
+
+    if got_ring != expected_ring_bits { return 0 }
+    return 1
+}
+
+fn main() {
+    kfd_init()
+    uint64 q = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 signal = kfd_signal_alloc()
+
+    uint64 mod = kernel_load("/tmp/m1t4.co")
+    uint64 kernel = kernel_get_function(mod, "lif_full")
+
+    uint64 exp_slot = alloc(8)
+    f64 u_init = 0.4; f64 x_init = 0.8; f64 rel_v = u_init * x_init
+    unsafe { *(exp_slot as f64) = rel_v }
+    uint64 exp_rel_bits = 0; unsafe { *(exp_slot as uint64) -> exp_rel_bits }
+
+    puts("--- E-cell (ct=0): expect ring write ---")
+    uint64 okE = run_case(q, signal, kernel, 0, exp_rel_bits)
+
+    puts("--- I-cell (ct=1): expect ring untouched ---")
+    uint64 okI = run_case(q, signal, kernel, 1, 0)
+
+    if okE == 1 { if okI == 1 { puts("M1t-4 gate (KFD): GREEN"); exit(0) } }
+    puts("FAIL: lif_full output did not match expected")
+    exit(1)
+}

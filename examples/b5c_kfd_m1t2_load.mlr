@@ -1,0 +1,124 @@
+// Stage 2c port of M1t-2 (lif_spike) to raw KFD. 13 kernargs; three
+// cases — integrate-no-spike, integrate-spike, refractory.
+//
+// Emit: ./build/mlrc --emit-amdgpu-lif-spike=/tmp/m1t2.co
+// Compile: ./build/mlrc --arch=x86_64 examples/b5c_kfd_m1t2_load.mlr -o /tmp/b5c_m1t2
+
+import "../std/kfd.mlr"
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn run_case(uint64 q, uint64 signal, uint64 kernel,
+            f64 V_init, uint64 ref_init, f64 RI_init,
+            f64 se_init, f64 si_init, uint64 spike_init,
+            uint64 expected_V_bits, uint64 expected_ref, uint64 expected_spike) -> uint64 {
+    uint64 d_V     = dev_alloc_host_visible(8); uint64 d_V_h     = dev_host_ptr(d_V)
+    uint64 d_ref   = dev_alloc_host_visible(8); uint64 d_ref_h   = dev_host_ptr(d_ref)
+    uint64 d_RI    = dev_alloc_host_visible(8); uint64 d_RI_h    = dev_host_ptr(d_RI)
+    uint64 d_se    = dev_alloc_host_visible(8); uint64 d_se_h    = dev_host_ptr(d_se)
+    uint64 d_si    = dev_alloc_host_visible(8); uint64 d_si_h    = dev_host_ptr(d_si)
+    uint64 d_spike = dev_alloc_host_visible(8); uint64 d_spike_h = dev_host_ptr(d_spike)
+
+    unsafe { *(d_V_h     as f64)    = V_init }
+    unsafe { *(d_ref_h   as uint64) = ref_init }
+    unsafe { *(d_RI_h    as f64)    = RI_init }
+    unsafe { *(d_se_h    as f64)    = se_init }
+    unsafe { *(d_si_h    as f64)    = si_init }
+    unsafe { *(d_spike_h as uint64) = spike_init }
+
+    uint64 kernarg = dev_alloc_host_visible(104)
+    uint64 kh = dev_host_ptr(kernarg)
+    unsafe { *((kh + 0x00) as uint64) = d_V }
+    unsafe { *((kh + 0x08) as uint64) = d_ref }
+    unsafe { *((kh + 0x10) as uint64) = d_RI }
+    unsafe { *((kh + 0x18) as uint64) = d_se }
+    unsafe { *((kh + 0x20) as uint64) = d_si }
+    unsafe { *((kh + 0x28) as uint64) = d_spike }
+    f64 dtot = 0.5;   unsafe { *((kh + 0x30) as f64) = dtot }
+    f64 Vr   = 0.0;   unsafe { *((kh + 0x38) as f64) = Vr }
+    f64 JE   = 0.5;   unsafe { *((kh + 0x40) as f64) = JE }
+    f64 JI   = 0.25;  unsafe { *((kh + 0x48) as f64) = JI }
+    f64 Vres = -99.0; unsafe { *((kh + 0x50) as f64) = Vres }
+    f64 Vth  = 3.0;   unsafe { *((kh + 0x58) as f64) = Vth }
+    uint64 ref_steps = 7; unsafe { *((kh + 0x60) as uint64) = ref_steps }
+
+    kfd_dispatch(q, kernel, 1, 1, 1, 1, 1, 1, kernarg, 104, signal)
+    kfd_wait(q, signal)
+
+    uint64 got_v = 0;     unsafe { *(d_V_h     as uint64) -> got_v }
+    uint64 got_ref = 0;   unsafe { *(d_ref_h   as uint64) -> got_ref }
+    uint64 got_spike = 0; unsafe { *(d_spike_h as uint64) -> got_spike }
+
+    print_label_val("V    (bits)", 11, got_v)
+    print_label_val("ref        ", 11, got_ref)
+    print_label_val("spike      ", 11, got_spike)
+
+    if got_v != expected_V_bits { return 0 }
+    if got_ref != expected_ref { return 0 }
+    if got_spike != expected_spike { return 0 }
+    return 1
+}
+
+fn main() {
+    kfd_init()
+    uint64 q = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 signal = kfd_signal_alloc()
+
+    uint64 mod = kernel_load("/tmp/m1t2.co")
+    uint64 kernel = kernel_get_function(mod, "lif_spike")
+
+    uint64 exp_slot = alloc(8)
+
+    puts("--- Case A: integrate, no spike ---")
+    f64 eA_v = 2.125; unsafe { *(exp_slot as f64) = eA_v }
+    uint64 eA_v_bits = 0; unsafe { *(exp_slot as uint64) -> eA_v_bits }
+    uint64 okA = run_case(q, signal, kernel, 2.0, 0, 0.5, 4.0, 1.0, 10, eA_v_bits, 0, 10)
+
+    puts("--- Case B: integrate, spike fires ---")
+    f64 eB_v = -99.0; unsafe { *(exp_slot as f64) = eB_v }
+    uint64 eB_v_bits = 0; unsafe { *(exp_slot as uint64) -> eB_v_bits }
+    uint64 okB = run_case(q, signal, kernel, 2.8, 0, 0.5, 10.0, 1.0, 10, eB_v_bits, 7, 11)
+
+    puts("--- Case C: refractory ---")
+    f64 eC_v = -99.0; unsafe { *(exp_slot as f64) = eC_v }
+    uint64 eC_v_bits = 0; unsafe { *(exp_slot as uint64) -> eC_v_bits }
+    uint64 okC = run_case(q, signal, kernel, 2.0, 5, 0.5, 4.0, 1.0, 10, eC_v_bits, 4, 10)
+
+    if okA == 1 { if okB == 1 { if okC == 1 { puts("M1t-2 gate (KFD): GREEN"); exit(0) } } }
+    puts("FAIL: lif_spike output did not match expected")
+    exit(1)
+}
