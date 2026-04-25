@@ -1,0 +1,204 @@
+// Stage 2c port of M1u-2 (mt_lif_full) to raw KFD. Multi-thread N=16
+// gate. 22 kernargs. W_BASE=3 (slot index). Two cases:
+//   E-cells (ct=0): expect ring write at buf_delay[W_BASE * N + i] = rel
+//   I-cells (ct=1): expect ring untouched
+//
+// Emit: ./build/mlrc --emit-amdgpu-mt-lif-full=/tmp/m1u2.co
+// Compile: ./build/mlrc --arch=x86_64 examples/b5c_kfd_m1u2_load.mlr -o /tmp/b5c_m1u2
+
+import "../std/kfd.mlr"
+
+static uint64 N = 16
+static uint64 DELAY_SLOTS = 8
+static uint64 W_BASE = 3
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 zero = 48; unsafe { *(buf as uint8) = zero }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 sp = 32; unsafe { *(sp2 as uint8) = sp }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn run_case(uint64 q, uint64 signal, uint64 kernel,
+            uint64 cell_type_val, uint64 expect_ring) -> uint64 {
+    uint64 nb         = N * 8
+    uint64 ring_bytes = DELAY_SLOTS * N * 8
+
+    uint64 d_V     = dev_alloc_host_visible(nb); uint64 d_V_h     = dev_host_ptr(d_V)
+    uint64 d_ref   = dev_alloc_host_visible(nb); uint64 d_ref_h   = dev_host_ptr(d_ref)
+    uint64 d_RI    = dev_alloc_host_visible(nb); uint64 d_RI_h    = dev_host_ptr(d_RI)
+    uint64 d_se    = dev_alloc_host_visible(nb); uint64 d_se_h    = dev_host_ptr(d_se)
+    uint64 d_si    = dev_alloc_host_visible(nb); uint64 d_si_h    = dev_host_ptr(d_si)
+    uint64 d_spike = dev_alloc_host_visible(nb); uint64 d_spike_h = dev_host_ptr(d_spike)
+    uint64 d_xpre  = dev_alloc_host_visible(nb); uint64 d_xpre_h  = dev_host_ptr(d_xpre)
+    uint64 d_xpost = dev_alloc_host_visible(nb); uint64 d_xpost_h = dev_host_ptr(d_xpost)
+    uint64 d_ustp  = dev_alloc_host_visible(nb); uint64 d_ustp_h  = dev_host_ptr(d_ustp)
+    uint64 d_xstp  = dev_alloc_host_visible(nb); uint64 d_xstp_h  = dev_host_ptr(d_xstp)
+    uint64 d_rel   = dev_alloc_host_visible(nb); uint64 d_rel_h   = dev_host_ptr(d_rel)
+    uint64 d_ct    = dev_alloc_host_visible(nb); uint64 d_ct_h    = dev_host_ptr(d_ct)
+    uint64 d_buf   = dev_alloc_host_visible(ring_bytes); uint64 d_buf_h = dev_host_ptr(d_buf)
+
+    uint64 i = 0
+    while i < N {
+        f64 V0 = 2.8;   unsafe { *((d_V_h     + i * 8) as f64)    = V0 }
+        uint64 r0 = 0;  unsafe { *((d_ref_h   + i * 8) as uint64) = r0 }
+        f64 RI = 0.5;   unsafe { *((d_RI_h    + i * 8) as f64)    = RI }
+        f64 se = 10.0;  unsafe { *((d_se_h    + i * 8) as f64)    = se }
+        f64 si = 1.0;   unsafe { *((d_si_h    + i * 8) as f64)    = si }
+        uint64 s0 = 0;  unsafe { *((d_spike_h + i * 8) as uint64) = s0 }
+        f64 zf = 0.0;   unsafe { *((d_xpre_h  + i * 8) as f64)    = zf }
+        unsafe { *((d_xpost_h + i * 8) as f64) = zf }
+        f64 u0 = 0.4;   unsafe { *((d_ustp_h  + i * 8) as f64)    = u0 }
+        f64 x0 = 0.8;   unsafe { *((d_xstp_h  + i * 8) as f64)    = x0 }
+        unsafe { *((d_rel_h + i * 8) as f64) = zf }
+        unsafe { *((d_ct_h  + i * 8) as uint64) = cell_type_val }
+        i = i + 1
+    }
+    uint64 bi = 0
+    while bi < DELAY_SLOTS * N {
+        uint64 bp = d_buf_h + bi * 8
+        f64 bz = 0.0; unsafe { *(bp as f64) = bz }
+        bi = bi + 1
+    }
+
+    uint64 kernarg = dev_alloc_host_visible(176)
+    uint64 kh = dev_host_ptr(kernarg)
+    unsafe { *((kh + 0x00) as uint64) = d_V }
+    unsafe { *((kh + 0x08) as uint64) = d_ref }
+    unsafe { *((kh + 0x10) as uint64) = d_RI }
+    unsafe { *((kh + 0x18) as uint64) = d_se }
+    unsafe { *((kh + 0x20) as uint64) = d_si }
+    unsafe { *((kh + 0x28) as uint64) = d_spike }
+    unsafe { *((kh + 0x30) as uint64) = d_xpre }
+    unsafe { *((kh + 0x38) as uint64) = d_xpost }
+    unsafe { *((kh + 0x40) as uint64) = d_ustp }
+    unsafe { *((kh + 0x48) as uint64) = d_xstp }
+    unsafe { *((kh + 0x50) as uint64) = d_rel }
+    f64 dtot = 0.5;   unsafe { *((kh + 0x58) as f64) = dtot }
+    f64 Vrst = 0.0;   unsafe { *((kh + 0x60) as f64) = Vrst }
+    f64 JE   = 0.5;   unsafe { *((kh + 0x68) as f64) = JE }
+    f64 JI   = 0.25;  unsafe { *((kh + 0x70) as f64) = JI }
+    f64 Vres = -99.0; unsafe { *((kh + 0x78) as f64) = Vres }
+    f64 Vth  = 3.0;   unsafe { *((kh + 0x80) as f64) = Vth }
+    uint64 ref_steps = 7; unsafe { *((kh + 0x88) as uint64) = ref_steps }
+    f64 Ubase = 0.5;  unsafe { *((kh + 0x90) as f64) = Ubase }
+    unsafe { *((kh + 0x98) as uint64) = d_ct }
+    unsafe { *((kh + 0xA0) as uint64) = d_buf }
+    unsafe { *((kh + 0xA8) as uint64) = W_BASE }
+
+    kfd_dispatch(q, kernel, 1, 1, 1, N, 1, 1, kernarg, 176, signal)
+    kfd_wait(q, signal)
+
+    uint64 exp_slot = alloc(8)
+
+    f64 exp_V = -99.0; unsafe { *(exp_slot as f64) = exp_V }
+    uint64 exp_V_bits = 0; unsafe { *(exp_slot as uint64) -> exp_V_bits }
+
+    f64 one = 1.0; unsafe { *(exp_slot as f64) = one }
+    uint64 exp_one_bits = 0; unsafe { *(exp_slot as uint64) -> exp_one_bits }
+
+    f64 U_base_v = 0.5; f64 u_init = 0.4
+    f64 exp_u = u_init + U_base_v * (1.0 - u_init)
+    unsafe { *(exp_slot as f64) = exp_u }
+    uint64 exp_u_bits = 0; unsafe { *(exp_slot as uint64) -> exp_u_bits }
+
+    f64 x_init = 0.8
+    f64 exp_x = x_init - u_init * x_init
+    unsafe { *(exp_slot as f64) = exp_x }
+    uint64 exp_x_bits = 0; unsafe { *(exp_slot as uint64) -> exp_x_bits }
+
+    f64 exp_rel = u_init * x_init
+    unsafe { *(exp_slot as f64) = exp_rel }
+    uint64 exp_rel_bits = 0; unsafe { *(exp_slot as uint64) -> exp_rel_bits }
+
+    f64 zero = 0.0; unsafe { *(exp_slot as f64) = zero }
+    uint64 exp_zero_bits = 0; unsafe { *(exp_slot as uint64) -> exp_zero_bits }
+
+    uint64 fails = 0
+    i = 0
+    while i < N {
+        uint64 got_V = 0; unsafe { *((d_V_h + i * 8) as uint64) -> got_V }
+        if got_V != exp_V_bits { fails = fails + 1 }
+
+        uint64 got_ref = 0; unsafe { *((d_ref_h + i * 8) as uint64) -> got_ref }
+        if got_ref != 7 { fails = fails + 1 }
+
+        uint64 got_sp = 0; unsafe { *((d_spike_h + i * 8) as uint64) -> got_sp }
+        if got_sp != 1 { fails = fails + 1 }
+
+        uint64 got_xp = 0; unsafe { *((d_xpre_h + i * 8) as uint64) -> got_xp }
+        if got_xp != exp_one_bits { fails = fails + 1 }
+
+        uint64 got_xq = 0; unsafe { *((d_xpost_h + i * 8) as uint64) -> got_xq }
+        if got_xq != exp_one_bits { fails = fails + 1 }
+
+        uint64 got_u = 0; unsafe { *((d_ustp_h + i * 8) as uint64) -> got_u }
+        if got_u != exp_u_bits { fails = fails + 1 }
+
+        uint64 got_x = 0; unsafe { *((d_xstp_h + i * 8) as uint64) -> got_x }
+        if got_x != exp_x_bits { fails = fails + 1 }
+
+        uint64 got_r = 0; unsafe { *((d_rel_h + i * 8) as uint64) -> got_r }
+        if got_r != exp_rel_bits { fails = fails + 1 }
+
+        uint64 ring_idx = W_BASE * N + i
+        uint64 got_buf = 0; unsafe { *((d_buf_h + ring_idx * 8) as uint64) -> got_buf }
+        uint64 want_buf = exp_zero_bits
+        if expect_ring == 1 { want_buf = exp_rel_bits }
+        if got_buf != want_buf { fails = fails + 1 }
+
+        i = i + 1
+    }
+
+    print_label_val("fails in case", 13, fails)
+    if fails == 0 { return 1 }
+    return 0
+}
+
+fn main() {
+    kfd_init()
+    uint64 q = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 signal = kfd_signal_alloc()
+
+    uint64 mod = kernel_load("/tmp/m1u2.co")
+    uint64 kernel = kernel_get_function(mod, "mt_lif_full")
+
+    puts("--- E-cells (ct=0): expect ring write per lane ---")
+    uint64 okE = run_case(q, signal, kernel, 0, 1)
+
+    puts("--- I-cells (ct=1): expect ring untouched ---")
+    uint64 okI = run_case(q, signal, kernel, 1, 0)
+
+    if okE == 1 { if okI == 1 { puts("M1u-2 gate (KFD): GREEN"); exit(0) } }
+    puts("FAIL: mt_lif_full output did not match expected")
+    exit(1)
+}
