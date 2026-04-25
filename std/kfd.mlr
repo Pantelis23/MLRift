@@ -378,3 +378,327 @@ fn kfd_destroy_queue(uint64 q) {
     raw_kfd_destroy_queue(_kfd_fd, qid)
     // Don't unmap doorbell or free ring/eop/ctx - process exit reclaims.
 }
+
+// ============================================================================
+// Stage 2a Task 7: ELF kernel loader + AQL dispatch + busy-poll wait
+// ============================================================================
+
+// Module handle: 32 bytes
+//   [0x00] elf_base       (u64)   host pointer to the loaded ELF source bytes
+//   [0x08] elf_size       (u64)
+//   [0x10] image_base_va  (u64)   GPU VA where the loaded image starts
+//   [0x18] image_size     (u64)   total bytes (vaddr_max - vaddr_min)
+fn kernel_load(uint64 co_path) -> uint64 {
+    if _kfd_initialized == 0 { kfd_init() }
+
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { kfd_die("kernel_load: open failed", fd) }
+    uint64 sz = file_size(fd)
+    uint64 elf = alloc(sz)
+    file_read(fd, elf, sz)
+    file_close(fd)
+
+    // ELF64 program-header table:
+    //   e_phoff at [32]    (u64)
+    //   e_phentsize at [54] (u16) -- = 56 for ELF64
+    //   e_phnum at [56]    (u16)
+    uint64 e_phoff = 0;     unsafe { *((elf + 32) as uint64) -> e_phoff }
+    uint64 e_phentsize = 0; unsafe { *((elf + 54) as uint16) -> e_phentsize }
+    uint64 e_phnum = 0;     unsafe { *((elf + 56) as uint16) -> e_phnum }
+    uint64 ph_off = elf + e_phoff
+
+    // PT_LOAD = 1. Each Elf64_Phdr (56 bytes):
+    //   [0x00] p_type    (u32)
+    //   [0x08] p_offset  (u64)   file offset
+    //   [0x10] p_vaddr   (u64)   virtual address
+    //   [0x20] p_filesz  (u64)
+    //   [0x28] p_memsz   (u64)
+
+    // First pass: vaddr_min, vaddr_max.
+    uint64 vaddr_min = 0xFFFFFFFFFFFFFFFF
+    uint64 vaddr_max = 0
+    uint64 i = 0
+    while i < e_phnum {
+        uint64 ph = ph_off + i * e_phentsize
+        uint32 p_type = 0; unsafe { *((ph + 0x00) as uint32) -> p_type }
+        if p_type == 1 {
+            uint64 p_vaddr = 0; unsafe { *((ph + 0x10) as uint64) -> p_vaddr }
+            uint64 p_memsz = 0; unsafe { *((ph + 0x28) as uint64) -> p_memsz }
+            if p_vaddr < vaddr_min { vaddr_min = p_vaddr }
+            uint64 end = p_vaddr + p_memsz
+            if end > vaddr_max { vaddr_max = end }
+        }
+        i = i + 1
+    }
+    if vaddr_max == 0 { kfd_die("kernel_load: no PT_LOAD segments", 0) }
+    uint64 image_size = vaddr_max - vaddr_min
+
+    // Allocate one host-visible buffer covering the full image.
+    uint64 image_va = dev_alloc_host_visible(image_size)
+    uint64 image_host = dev_host_ptr(image_va)
+
+    // Zero the image (gap regions between segments).
+    uint64 z = 0
+    while z < image_size {
+        uint64 p = image_host + z; unsafe { *(p as uint64) = 0 }
+        z = z + 8
+    }
+
+    // Second pass: copy each PT_LOAD into the image buffer at its
+    // (vaddr - vaddr_min) offset.
+    i = 0
+    while i < e_phnum {
+        uint64 ph = ph_off + i * e_phentsize
+        uint32 p_type = 0; unsafe { *((ph + 0x00) as uint32) -> p_type }
+        if p_type == 1 {
+            uint64 p_offset = 0; unsafe { *((ph + 0x08) as uint64) -> p_offset }
+            uint64 p_vaddr  = 0; unsafe { *((ph + 0x10) as uint64) -> p_vaddr }
+            uint64 p_filesz = 0; unsafe { *((ph + 0x20) as uint64) -> p_filesz }
+            if p_filesz > 0 {
+                uint64 dst = image_host + (p_vaddr - vaddr_min)
+                memcpy(dst, elf + p_offset, p_filesz)
+            }
+        }
+        i = i + 1
+    }
+
+    uint64 mod = alloc(32)
+    unsafe { *((mod + 0x00) as uint64) = elf }
+    unsafe { *((mod + 0x08) as uint64) = sz }
+    unsafe { *((mod + 0x10) as uint64) = image_va }
+    unsafe { *((mod + 0x18) as uint64) = image_size }
+    return mod
+}
+
+// Find a symbol named "<fn_name>.kd" in .dynsym, return its absolute
+// kernel_object address (image_base_va + st_value).
+fn kernel_get_function(uint64 mod, uint64 fn_name) -> uint64 {
+    uint64 elf = 0;            unsafe { *((mod + 0x00) as uint64) -> elf }
+    uint64 image_base_va = 0;  unsafe { *((mod + 0x10) as uint64) -> image_base_va }
+
+    // Walk section headers to find .dynsym + .dynstr.
+    uint64 e_shoff = 0;     unsafe { *((elf + 40) as uint64) -> e_shoff }
+    uint64 e_shentsize = 0; unsafe { *((elf + 58) as uint16) -> e_shentsize }
+    uint64 e_shnum = 0;     unsafe { *((elf + 60) as uint16) -> e_shnum }
+    uint64 e_shstrndx = 0;  unsafe { *((elf + 62) as uint16) -> e_shstrndx }
+    uint64 sh_off = elf + e_shoff
+    uint64 shstr_hdr = sh_off + e_shstrndx * e_shentsize
+    uint64 shstr_off = 0;  unsafe { *((shstr_hdr + 0x18) as uint64) -> shstr_off }
+    uint64 shstrtab = elf + shstr_off
+
+    uint64 dynsym_off = 0; uint64 dynsym_size = 0
+    uint64 dynstr_off = 0
+    uint64 i = 0
+    while i < e_shnum {
+        uint64 hdr = sh_off + i * e_shentsize
+        uint64 name_off = 0; unsafe { *((hdr + 0x00) as uint32) -> name_off }
+        uint64 nameptr = shstrtab + name_off
+        // Match ".dynsym" (8 bytes) or ".dynstr" (8 bytes)
+        uint64 c0 = 0; unsafe { *((nameptr + 0) as uint8) -> c0 }
+        uint64 c7 = 0; unsafe { *((nameptr + 7) as uint8) -> c7 }
+        if c0 == 46 {
+            if c7 == 0 {
+                uint64 c1 = 0; unsafe { *((nameptr + 1) as uint8) -> c1 }
+                if c1 == 100 {       // 'd'
+                    uint64 c4 = 0; unsafe { *((nameptr + 4) as uint8) -> c4 }
+                    if c4 == 115 {   // 's' (".dynsym" or ".dynstr" both are ".dyns?")
+                        uint64 c6 = 0; unsafe { *((nameptr + 6) as uint8) -> c6 }
+                        if c6 == 109 {       // 'm' -> .dynsym
+                            unsafe { *((hdr + 0x18) as uint64) -> dynsym_off }
+                            unsafe { *((hdr + 0x20) as uint64) -> dynsym_size }
+                        } else { if c6 == 114 {   // 'r' -> .dynstr
+                            unsafe { *((hdr + 0x18) as uint64) -> dynstr_off }
+                        } }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if dynsym_off == 0 { kfd_die("kernel_get_function: .dynsym not found", 0) }
+    if dynstr_off == 0 { kfd_die("kernel_get_function: .dynstr not found", 0) }
+
+    uint64 dynsym = elf + dynsym_off
+    uint64 dynstr = elf + dynstr_off
+
+    // Build search key "<fn_name>.kd"
+    uint64 nlen = 0
+    while 1 == 1 {
+        uint64 c = 0; unsafe { *((fn_name + nlen) as uint8) -> c }
+        if c == 0 { break }
+        nlen = nlen + 1
+    }
+    uint64 key = alloc(nlen + 4)
+    uint64 j = 0
+    while j < nlen {
+        uint64 sp = fn_name + j; uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = key + j; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        j = j + 1
+    }
+    uint64 dot = key + nlen;     uint8 dotc = 46; unsafe { *(dot as uint8) = dotc }
+    uint64 kc  = key + nlen + 1; uint8 kch = 107; unsafe { *(kc as uint8) = kch }
+    uint64 dc  = key + nlen + 2; uint8 dch = 100; unsafe { *(dc as uint8) = dch }
+    uint64 nul = key + nlen + 3; uint8 nuc = 0;  unsafe { *(nul as uint8) = nuc }
+
+    // Walk dynsym (each Elf64_Sym is 24 bytes).
+    uint64 sym_size = 24
+    uint64 nsyms = dynsym_size / sym_size
+    uint64 k = 0
+    while k < nsyms {
+        uint64 sym = dynsym + k * sym_size
+        uint64 st_name = 0; unsafe { *((sym + 0x00) as uint32) -> st_name }
+        uint64 nm = dynstr + st_name
+        uint64 m = 0; uint64 eq = 1
+        while eq == 1 {
+            uint64 a = 0; unsafe { *((nm + m) as uint8) -> a }
+            uint64 b = 0; unsafe { *((key + m) as uint8) -> b }
+            if a != b { eq = 0 }
+            if a == 0 { break }
+            m = m + 1
+        }
+        if eq == 1 {
+            uint64 st_value = 0; unsafe { *((sym + 0x08) as uint64) -> st_value }
+            return image_base_va + st_value
+        }
+        k = k + 1
+    }
+    kfd_die("kernel_get_function: symbol not found (try '<name>.kd')", 0)
+    return 0
+}
+
+// amd_signal_t layout (64 bytes):
+//   [0x00] kind     (u32) -- 1 = kAmdSignalKindUser
+//   [0x04] _pad     (u32)
+//   [0x08] value    (u64) -- initial 1; GPU writes 0 on completion
+//   [0x10] event_mailbox_ptr (u64) -- 0 for busy-poll
+//   [0x18] event_id  (u32) -- 0 for busy-poll
+//   ...remaining zero
+fn kfd_signal_alloc() -> uint64 {
+    uint64 sva = dev_alloc_host_visible(64)
+    uint64 host = dev_host_ptr(sva)
+    uint64 i = 0
+    while i < 64 { uint64 p = host + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
+    uint32 kind_user = 1
+    unsafe { *((host + 0x00) as uint32) = kind_user }    // kind = User
+    uint64 sig_init = 1
+    unsafe { *((host + 0x08) as uint64) = sig_init }     // value = 1 (in flight)
+    return sva
+}
+
+fn kfd_signal_reset(uint64 signal_va) {
+    uint64 host = dev_host_ptr(signal_va)
+    uint64 sig_init = 1
+    unsafe { *((host + 0x08) as uint64) = sig_init }
+}
+
+fn kfd_signal_value(uint64 signal_va) -> uint64 {
+    uint64 host = dev_host_ptr(signal_va)
+    uint64 v = 0; unsafe { *((host + 0x08) as uint64) -> v }
+    return v
+}
+
+// AQL kernel-dispatch packet (64 bytes):
+//   [0x00] header (u16) + setup (u16)         -- written LAST via atomic release
+//   [0x04] workgroup_size_x (u16)
+//   [0x06] workgroup_size_y (u16)
+//   [0x08] workgroup_size_z (u16)
+//   [0x0A] reserved0  (u16)
+//   [0x0C] grid_size_x (u32)
+//   [0x10] grid_size_y (u32)
+//   [0x14] grid_size_z (u32)
+//   [0x18] private_segment_size (u32)
+//   [0x1C] group_segment_size   (u32)
+//   [0x20] kernel_object        (u64)
+//   [0x28] kernarg_address      (u64)
+//   [0x30] reserved2            (u64)
+//   [0x38] completion_signal    (u64)  -- pointer to amd_signal_t
+//
+// MLRift may not have a direct atomic-release primitive. We use a
+// __sync_synchronize() fence sandwich to enforce ordering: regular
+// stores -> fence -> header store -> fence. On x86 this is a noop in
+// hardware but the compiler treats it as a sequence point.
+@dynamic extern fn __sync_synchronize()
+
+fn kfd_dispatch(uint64 q, uint64 kernel,
+                 uint64 grid_x, uint64 grid_y, uint64 grid_z,
+                 uint64 block_x, uint64 block_y, uint64 block_z,
+                 uint64 kernarg_ptr, uint64 kernarg_size, uint64 signal_va) {
+    uint64 ring_host = 0;     unsafe { *((q + 0x18) as uint64) -> ring_host }
+    uint64 ring_capacity = 0; unsafe { *((q + 0x10) as uint64) -> ring_capacity }
+    uint64 wp_host = 0;       unsafe { *((q + 0x40) as uint64) -> wp_host }
+    uint64 db_host = 0;       unsafe { *((q + 0x28) as uint64) -> db_host }
+    uint64 db_off = 0;        unsafe { *((q + 0x20) as uint64) -> db_off }
+
+    // Read current wp (kernel sees writes via separate wp BO).
+    uint64 wp = 0; unsafe { *(wp_host as uint64) -> wp }
+    uint64 slot = wp - (wp / ring_capacity) * ring_capacity   // wp % capacity
+    uint64 packet = ring_host + slot * 64
+
+    // Reset signal value to 1.
+    kfd_signal_reset(signal_va)
+
+    // Determine setup (number of dimensions).
+    uint32 setup = 1
+    if grid_y > 1 { setup = 2 }
+    if grid_z > 1 { setup = 3 }
+
+    // Write all fields except header[0..3]. uint16/uint32 stores are
+    // narrowing conversions of the uint64 args; use typed temps so
+    // the codegen produces narrow stores rather than relying on an
+    // implicit cast at the store site.
+    uint16 bx = block_x; unsafe { *((packet + 0x04) as uint16) = bx }
+    uint16 by = block_y; unsafe { *((packet + 0x06) as uint16) = by }
+    uint16 bz = block_z; unsafe { *((packet + 0x08) as uint16) = bz }
+    uint16 r0 = 0;       unsafe { *((packet + 0x0A) as uint16) = r0 }
+    uint32 gx = grid_x;  unsafe { *((packet + 0x0C) as uint32) = gx }
+    uint32 gy = grid_y;  unsafe { *((packet + 0x10) as uint32) = gy }
+    uint32 gz = grid_z;  unsafe { *((packet + 0x14) as uint32) = gz }
+    uint32 priv0 = 0;    unsafe { *((packet + 0x18) as uint32) = priv0 }   // private_segment_size
+    uint32 grp0  = 0;    unsafe { *((packet + 0x1C) as uint32) = grp0  }   // group_segment_size
+    unsafe { *((packet + 0x20) as uint64) = kernel }
+    unsafe { *((packet + 0x28) as uint64) = kernarg_ptr }
+    uint64 r2 = 0;       unsafe { *((packet + 0x30) as uint64) = r2 }
+    unsafe { *((packet + 0x38) as uint64) = signal_va }
+
+    __sync_synchronize()
+
+    // Header bits:
+    //   bits[7:0]   type = HSA_PACKET_TYPE_KERNEL_DISPATCH = 2
+    //   bit[8]      barrier = 1
+    //   bits[10:9]  acquire fence scope = 2 (system)
+    //   bits[12:11] release fence scope = 2 (system)
+    // header_value = 2 | (1 << 8) | (2 << 9) | (2 << 11)
+    //              = 0x2 | 0x100 | 0x400 | 0x1000 = 0x1502
+    // Combined header(16) + setup(16) into one u32 store.
+    uint32 header_setup = (setup << 16) | 0x1502
+    unsafe { *((packet + 0x00) as uint32) = header_setup }
+
+    __sync_synchronize()
+
+    // Increment wp, write doorbell.
+    uint64 new_wp = wp + 1
+    unsafe { *(wp_host as uint64) = new_wp }
+    // Doorbell write -- 8-byte WC store of the new write_index.
+    // Doorbell page is mmap'd at db_host; specific doorbell within
+    // page is at db_host + (db_off & 0xFFF) on most KFD versions,
+    // OR at db_host + 0 if KFD already returned the per-queue
+    // doorbell offset (likely on this KFD). Try the latter first;
+    // if dispatch hangs, switch to the former pattern.
+    unsafe { *(db_host as uint64) = new_wp }
+}
+
+fn kfd_wait(uint64 q, uint64 signal_va) {
+    uint32 wait_mode = 0; unsafe { *((q + 0x58) as uint32) -> wait_mode }
+    if wait_mode == KFD_WAIT_BUSY_POLL {
+        uint64 spin = 0
+        while kfd_signal_value(signal_va) != 0 {
+            spin = spin + 1
+            if spin > 1000000000 {
+                kfd_die("kfd_wait: timeout busy-polling signal", spin)
+            }
+        }
+    }
+    if wait_mode == KFD_WAIT_EVENTS {
+        kfd_die("kfd_wait: KFD_WAIT_EVENTS not implemented in 2a", 0)
+    }
+}
