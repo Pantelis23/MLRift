@@ -104,7 +104,8 @@ fn hip_emit_header() {
     hip_emit_cstr("typedef int32_t  int32;\n")
     hip_emit_cstr("typedef int64_t  int64;\n")
     hip_emit_cstr("typedef float    f32;\n")
-    hip_emit_cstr("typedef double   f64;\n\n")
+    hip_emit_cstr("typedef double   f64;\n")
+    hip_emit_cstr("typedef _Float16 f16;\n\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +164,7 @@ fn hip_emit_type_for_size(uint64 size) {
 fn hip_emit_ptr_elem_type(uint64 size, uint32 float_kind) {
     if float_kind == 1 { hip_emit_cstr("f64") }
     else if float_kind == 2 { hip_emit_cstr("f32") }
+    else if float_kind == 3 { hip_emit_cstr("f16") }
     else { hip_emit_type_for_size(size) }
 }
 

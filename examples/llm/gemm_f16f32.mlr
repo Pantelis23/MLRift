@@ -1,0 +1,169 @@
+// MLRift LLM Phase A milestone 4: f16-storage GEMM with f32 accumulator.
+//
+//   C = A · B    where A is [M × K] f16, B is [K × N] f16, C is
+//                [M × N] f32. Mixed-precision: storage halved, compute
+//                still in f32 (no WMMA yet — that's milestone 5).
+//
+// Why this shape: real LLM weights live as f16/bf16 to halve VRAM
+// footprint. Activations and accumulators are kept in f32 to bound
+// rounding error across the long K-dimension reduction. This is the
+// canonical "weight @ activations" matmul layout for transformer
+// prefill / decode.
+//
+// Tile layout: same 16×16 workgroup as milestone 3's LDS GEMM. Each
+// lane loads its assigned A and B element from f16 globals, converts
+// to f32 via implicit cast, and stages into the f32 LDS pool. The
+// inner FMA chain runs unchanged from milestone 3 — this kernel
+// validates the f16 plumbing end-to-end (mlrc emit, kernarg, host
+// fill, verifier diff) without touching the matmul math.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=hip-amd \
+//       examples/llm/gemm_f16f32.mlr -o /tmp/gemm_f16f32
+
+fn tid_local_x() -> uint64 { return 0 }
+fn tid_local_y() -> uint64 { return 0 }
+fn block_idx_x() -> uint64 { return 0 }
+fn block_idx_y() -> uint64 { return 0 }
+fn sync_block() -> uint64  { return 0 }
+fn lds_load_f32(uint64 idx) -> f32 { return 0.0 }
+fn lds_store_f32(uint64 idx, f32 v) -> uint64 { return 0 }
+
+@kernel
+fn gemm_f16f32(
+    uint64 a_ptr,    // [M × K] f16
+    uint64 b_ptr,    // [K × N] f16
+    uint64 c_ptr,    // [M × N] f32
+    uint64 m,
+    uint64 n,
+    uint64 k_dim
+) {
+    uint64 tx = tid_local_x()
+    uint64 ty = tid_local_y()
+    uint64 bx = block_idx_x()
+    uint64 by = block_idx_y()
+
+    uint64 row = by * 16 + ty
+    uint64 col = bx * 16 + tx
+
+    uint64 A_OFF_0 = 0
+    uint64 A_OFF_1 = 256
+    uint64 B_OFF_0 = 512
+    uint64 B_OFF_1 = 768
+
+    uint64 num_kt = k_dim / 16
+    uint64 tail   = k_dim - num_kt * 16
+    uint64 lds_idx = ty * 16 + tx
+
+    f32 sum = 0.0
+
+    // Prelude: load tile 0 from f16 globals into f32 LDS ping buffer.
+    if num_kt > 0 {
+        uint64 a_r = by * 16 + ty
+        uint64 a_c = 0 + tx
+        uint64 b_r = 0 + ty
+        uint64 b_c = bx * 16 + tx
+
+        f32 a_v = 0.0
+        f32 b_v = 0.0
+        if a_r < m {
+            if a_c < k_dim {
+                // f16 element is 2 bytes — pointer arithmetic needs
+                // *2 (size-of-f16) instead of *4.
+                uint64 ap = a_ptr + (a_r * k_dim + a_c) * 2
+                unsafe { *(ap as f16) -> a_v }   // C++ implicit f16→f32
+            }
+        }
+        if b_r < k_dim {
+            if b_c < n {
+                uint64 bp = b_ptr + (b_r * n + b_c) * 2
+                unsafe { *(bp as f16) -> b_v }
+            }
+        }
+        lds_store_f32(A_OFF_0 + lds_idx, a_v)
+        lds_store_f32(B_OFF_0 + lds_idx, b_v)
+    }
+    sync_block()
+
+    // Main K-tile loop, ping/pong prefetch identical to milestone 3.
+    uint64 kt = 0
+    while kt < num_kt {
+        uint64 cur_off_a = A_OFF_0
+        uint64 cur_off_b = B_OFF_0
+        if (kt - (kt / 2) * 2) == 1 {
+            cur_off_a = A_OFF_1
+            cur_off_b = B_OFF_1
+        }
+
+        uint64 kt_next = kt + 1
+        if kt_next < num_kt {
+            uint64 nxt_off_a = A_OFF_0
+            uint64 nxt_off_b = B_OFF_0
+            if (kt_next - (kt_next / 2) * 2) == 1 {
+                nxt_off_a = A_OFF_1
+                nxt_off_b = B_OFF_1
+            }
+            uint64 a_r = by * 16 + ty
+            uint64 a_c = kt_next * 16 + tx
+            uint64 b_r = kt_next * 16 + ty
+            uint64 b_c = bx * 16 + tx
+            f32 a_v = 0.0
+            f32 b_v = 0.0
+            if a_r < m {
+                if a_c < k_dim {
+                    uint64 ap = a_ptr + (a_r * k_dim + a_c) * 2
+                    unsafe { *(ap as f16) -> a_v }
+                }
+            }
+            if b_r < k_dim {
+                if b_c < n {
+                    uint64 bp = b_ptr + (b_r * n + b_c) * 2
+                    unsafe { *(bp as f16) -> b_v }
+                }
+            }
+            lds_store_f32(nxt_off_a + lds_idx, a_v)
+            lds_store_f32(nxt_off_b + lds_idx, b_v)
+        }
+
+        uint64 kk = 0
+        while kk < 16 {
+            f32 a = lds_load_f32(cur_off_a + ty * 16 + kk)
+            f32 b = lds_load_f32(cur_off_b + kk * 16 + tx)
+            sum = sum + a * b
+            kk = kk + 1
+        }
+
+        sync_block()
+        kt = kt + 1
+    }
+
+    // Tail (k_dim not a multiple of 16). Plain global f16 loads.
+    if tail > 0 {
+        uint64 t = num_kt * 16
+        while t < k_dim {
+            f32 a = 0.0
+            f32 b = 0.0
+            if row < m {
+                uint64 ap = a_ptr + (row * k_dim + t) * 2
+                unsafe { *(ap as f16) -> a }
+            }
+            if col < n {
+                uint64 bp = b_ptr + (t * n + col) * 2
+                unsafe { *(bp as f16) -> b }
+            }
+            sum = sum + a * b
+            t = t + 1
+        }
+    }
+
+    if row < m {
+        if col < n {
+            uint64 cp = c_ptr + (row * n + col) * 4
+            unsafe { *(cp as f32) = sum }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}
