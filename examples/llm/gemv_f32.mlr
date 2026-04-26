@@ -1,0 +1,53 @@
+// MLRift LLM Phase A: FP32 matrix–vector multiply kernel.
+//
+//   c[m] = sum over k of A[m, k] * b[k]    where A is [M, K] row-major.
+//
+// This is the simplest matmul shape and the dominant op during LLM
+// decoding (one query @ KV cache, hidden @ output projection, etc.).
+// The kernel is intentionally trivial — one lane per output row, no
+// LDS, no tiling — so that the launcher / verifier / native-emitter
+// scaffolding can be validated end-to-end before any WMMA work.
+//
+// Build (HIP-bundle path):
+//   ./build/mlrc --arch=x86_64 --target=hip-amd \
+//       examples/llm/gemv_f32.mlr -o /tmp/gemv_f32
+// The .co lands at /tmp/gemv_f32.co; the launcher loads it via
+// hipModuleLoadData under either KFD-shim or HIP-runtime path.
+
+fn tid_x() -> uint64 {
+    return 0
+}
+
+@kernel
+fn gemv_f32(
+    uint64 a_ptr,    // [M*K] row-major
+    uint64 b_ptr,    // [K]
+    uint64 c_ptr,    // [M]
+    uint64 m,
+    uint64 k_dim
+) {
+    uint64 row = tid_x()
+    if row < m {
+        f32 sum = 0.0
+        uint64 row_base = a_ptr + row * k_dim * 4
+        uint64 j = 0
+        while j < k_dim {
+            uint64 ap = row_base + j * 4
+            uint64 bp = b_ptr   + j * 4
+            f32 a = 0.0
+            f32 b = 0.0
+            unsafe { *(ap as f32) -> a }
+            unsafe { *(bp as f32) -> b }
+            sum = sum + a * b
+            j = j + 1
+        }
+        uint64 cp = c_ptr + row * 4
+        unsafe { *(cp as f32) = sum }
+    }
+}
+
+// Stub so mlrc --target=hip-amd is satisfied; not called by the
+// launcher (the kernel is loaded from the emitted .co instead).
+fn main() {
+    exit(0)
+}

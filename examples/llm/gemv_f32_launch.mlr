@@ -1,0 +1,326 @@
+// MLRift LLM Phase A: GEMV f32 launcher + CPU verifier.
+//
+// Loads /tmp/gemv_f32.co (built from examples/llm/gemv_f32.mlr) and
+// runs c = A·b for [M×K] matrix A and length-K vector b. Does the
+// same computation on the CPU and reports max absolute error and
+// max relative error. Also prints wall time and effective FLOPS.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=hip-amd      examples/llm/gemv_f32.mlr        -o /tmp/gemv_f32
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/gemv_f32_launch.mlr -o /tmp/gemv_f32_launch_kfd
+//   # or HIP runtime:
+//   ./build/mlrc --arch=x86_64                       examples/llm/gemv_f32_launch.mlr -o /tmp/gemv_f32_launch
+// Run with custom shape:
+//   GEMV_M=4096 GEMV_K=4096 /tmp/gemv_f32_launch_kfd
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+static uint64 M_DEF = 1024
+static uint64 K_DEF = 1024
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 {
+        uint8 zero = 48
+        unsafe { *(buf as uint8) = zero }
+        return 1
+    }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 {
+        n = n + 1
+        tmp = tmp / 10
+    }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+fn parse_env_count(uint64 name) -> uint64 {
+    uint64 s = getenv(name)
+    if s == 0 { return 0 }
+    uint64 v = 0
+    uint64 i = 0
+    uint64 mult = 1
+    while 1 == 1 {
+        uint64 cp = s + i
+        uint64 c = 0
+        unsafe { *(cp as uint8) -> c }
+        if c == 0 { break }
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48); i = i + 1; continue }
+        if c == 75 || c == 107 { mult = 1024;       break }
+        if c == 77 || c == 109 { mult = 1024 * 1024; break }
+        break
+    }
+    return v * mult
+}
+
+// Deterministic, fast-to-compute test data so any CPU/GPU divergence
+// is the math, not the inputs. Each cell uses a tiny mixing function
+// over integer indices, scaled to [0, 1). All scalars stay in f64
+// land until the final f32 narrowing — `f32 = f32 * f64_literal`
+// silently widens to f64 and the unsafe-store-as-f32 writes the wrong
+// 4 bytes (low half of the f64), which produced spurious 1e15-scale
+// outputs in the first version.
+fn fill_a(uint64 a_host, uint64 m, uint64 k_dim) {
+    uint64 row = 0
+    while row < m {
+        uint64 col = 0
+        while col < k_dim {
+            uint64 mix = (row * 31 + col * 17 + 7) - ((row * 31 + col * 17 + 7) / 100) * 100
+            f64 vd = int_to_f64(mix) * 0.01
+            f32 v  = f64_to_f32(vd)
+            uint64 p = a_host + (row * k_dim + col) * 4
+            unsafe { *(p as f32) = v }
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+fn fill_b(uint64 b_host, uint64 k_dim) {
+    uint64 col = 0
+    while col < k_dim {
+        uint64 mix = (col * 13 + 3) - ((col * 13 + 3) / 50) * 50
+        f64 vd = int_to_f64(mix) * 0.02
+        f32 v  = f64_to_f32(vd)
+        uint64 p = b_host + col * 4
+        unsafe { *(p as f32) = v }
+        col = col + 1
+    }
+}
+
+// CPU reference: identical math to the kernel, single-thread.
+fn cpu_gemv(uint64 a_host, uint64 b_host, uint64 c_host, uint64 m, uint64 k_dim) {
+    uint64 row = 0
+    while row < m {
+        f32 sum = 0.0
+        uint64 j = 0
+        uint64 base = a_host + row * k_dim * 4
+        while j < k_dim {
+            uint64 ap = base + j * 4
+            uint64 bp = b_host + j * 4
+            f32 a = 0.0; unsafe { *(ap as f32) -> a }
+            f32 b = 0.0; unsafe { *(bp as f32) -> b }
+            sum = sum + a * b
+            j = j + 1
+        }
+        uint64 cp = c_host + row * 4
+        unsafe { *(cp as f32) = sum }
+        row = row + 1
+    }
+}
+
+// f32 abs + max-error walk over [0, m). Returns (max_abs, max_rel)
+// packed as two u64 bits-of-f32. Avoids needing complex print of f32
+// values — we cast to bits and print as hex/decimal-of-bits if needed.
+fn diff_f32(uint64 ref_buf, uint64 got_buf, uint64 m,
+            uint64 max_abs_slot, uint64 max_rel_slot,
+            uint64 first_bad_idx_slot) {
+    f32 max_abs = 0.0
+    f32 max_rel = 0.0
+    uint64 first_bad = 0xFFFFFFFFFFFFFFFF
+    uint64 i = 0
+    while i < m {
+        uint64 rp = ref_buf + i * 4
+        uint64 gp = got_buf + i * 4
+        f32 r = 0.0; unsafe { *(rp as f32) -> r }
+        f32 g = 0.0; unsafe { *(gp as f32) -> g }
+        f32 d = g - r
+        if d < 0.0 { d = 0.0 - d }
+        f32 ar = r
+        if ar < 0.0 { ar = 0.0 - ar }
+        f32 rel = 0.0
+        if ar > 0.000001 { rel = d / ar }
+        if d > max_abs {
+            max_abs = d
+            if first_bad == 0xFFFFFFFFFFFFFFFF { first_bad = i }
+        }
+        if rel > max_rel { max_rel = rel }
+        i = i + 1
+    }
+    // Cast f32 to u32 bits via memory.
+    uint64 ma_p = max_abs_slot
+    unsafe { *(ma_p as f32) = max_abs }
+    uint64 mr_p = max_rel_slot
+    unsafe { *(mr_p as f32) = max_rel }
+    unsafe { *(first_bad_idx_slot as uint64) = first_bad }
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    // Shape from env (defaults: 1024×1024).
+    uint64 M = M_DEF
+    uint64 K = K_DEF
+    uint64 me = parse_env_count("GEMV_M"); if me != 0 { M = me }
+    uint64 ke = parse_env_count("GEMV_K"); if ke != 0 { K = ke }
+
+    // ── Load module ───────────────────────────────────────────────────
+    uint64 co_path = "/tmp/gemv_f32.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/gemv_f32.co — build first:")
+        puts("  mlrc --arch=x86_64 --target=hip-amd examples/llm/gemv_f32.mlr -o /tmp/gemv_f32")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "gemv_f32")
+    if err != 0 { die("getFn gemv_f32", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    uint64 t_start = time_ns()
+
+    // ── Allocate ──────────────────────────────────────────────────────
+    uint64 bytes_a = M * K * 4
+    uint64 bytes_b = K * 4
+    uint64 bytes_c = M * 4
+
+    uint64 d_A = 0
+    uint64 d_b = 0
+    uint64 d_c = 0
+    uint64 slot = alloc(8)
+    err = hipMalloc(slot, bytes_a); if err != 0 { die("m A", err) }; unsafe { *(slot as uint64) -> d_A }
+    slot = alloc(8); err = hipMalloc(slot, bytes_b); if err != 0 { die("m b", err) }; unsafe { *(slot as uint64) -> d_b }
+    slot = alloc(8); err = hipMalloc(slot, bytes_c); if err != 0 { die("m c", err) }; unsafe { *(slot as uint64) -> d_c }
+
+    uint64 t_alloc = time_ns()
+
+    // ── Host fill + H2D ───────────────────────────────────────────────
+    uint64 h_A = alloc(bytes_a); fill_a(h_A, M, K)
+    uint64 h_b = alloc(bytes_b); fill_b(h_b, K)
+    err = hipMemcpy(d_A, h_A, bytes_a, 1); if err != 0 { die("H2D A", err) }
+    err = hipMemcpy(d_b, h_b, bytes_b, 1); if err != 0 { die("H2D b", err) }
+
+    uint64 t_h2d = time_ns()
+
+    // ── CPU reference (compute while GPU runs would be nicer; serial
+    // is fine for a smoke test) ───────────────────────────────────────
+    uint64 h_c_ref = alloc(bytes_c)
+    cpu_gemv(h_A, h_b, h_c_ref, M, K)
+
+    uint64 t_cpu = time_ns()
+
+    // ── Launch ────────────────────────────────────────────────────────
+    uint64 k_a = alloc(8); unsafe { *(k_a  as uint64) = d_A }
+    uint64 k_b = alloc(8); unsafe { *(k_b  as uint64) = d_b }
+    uint64 k_c = alloc(8); unsafe { *(k_c  as uint64) = d_c }
+    uint64 k_m = alloc(8); uint64 mv = M; unsafe { *(k_m as uint64) = mv }
+    uint64 k_k = alloc(8); uint64 kv = K; unsafe { *(k_k as uint64) = kv }
+    uint64 kp = alloc(5 * 8)
+    unsafe { *(kp        as uint64) = k_a }
+    unsafe { *((kp +  8) as uint64) = k_b }
+    unsafe { *((kp + 16) as uint64) = k_c }
+    unsafe { *((kp + 24) as uint64) = k_m }
+    unsafe { *((kp + 32) as uint64) = k_k }
+
+    uint32 block = 256
+    uint64 grid_u = (M + 255) / 256
+    uint32 grid = grid_u
+
+    err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch gemv", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 t_gpu = time_ns()
+
+    // ── D2H + diff ────────────────────────────────────────────────────
+    uint64 h_c = alloc(bytes_c)
+    err = hipMemcpy(h_c, d_c, bytes_c, 2); if err != 0 { die("D2H c", err) }
+
+    uint64 ma_slot = alloc(4)
+    uint64 mr_slot = alloc(4)
+    uint64 fb_slot = alloc(8)
+    diff_f32(h_c_ref, h_c, M, ma_slot, mr_slot, fb_slot)
+
+    uint32 ma_bits = 0; unsafe { *(ma_slot as uint32) -> ma_bits }
+    uint32 mr_bits = 0; unsafe { *(mr_slot as uint32) -> mr_bits }
+    uint64 fb_idx  = 0; unsafe { *(fb_slot as uint64) -> fb_idx }
+
+    uint64 t_end = time_ns()
+
+    print_label_val("M",           1, M)
+    print_label_val("K",           1, K)
+    print_label_val("alloc_us",    8, (t_alloc - t_start) / 1000)
+    print_label_val("h2d_us",      6, (t_h2d - t_alloc) / 1000)
+    print_label_val("cpu_ref_us",  10, (t_cpu - t_h2d) / 1000)
+    print_label_val("gpu_us",      6, (t_gpu - t_cpu) / 1000)
+    print_label_val("d2h_diff_us", 11, (t_end - t_gpu) / 1000)
+    print_label_val("max_abs_bits", 12, ma_bits)
+    print_label_val("max_rel_bits", 12, mr_bits)
+    print_label_val("first_bad",    9, fb_idx)
+
+    // Diag: print first few CPU vs GPU outputs as f32 bits.
+    uint64 di = 0
+    while di < 4 {
+        uint64 rp = h_c_ref + di * 4
+        uint64 gp = h_c     + di * 4
+        uint32 r_bits = 0; unsafe { *(rp as uint32) -> r_bits }
+        uint32 g_bits = 0; unsafe { *(gp as uint32) -> g_bits }
+        print_label_val("c_ref_bits", 10, r_bits)
+        print_label_val("c_gpu_bits", 10, g_bits)
+        di = di + 1
+    }
+
+    // GFLOPS = 2 * M * K / gpu_time_us / 1000 (Mflops -> GFLOPS).
+    uint64 ops = 2 * M * K
+    uint64 us = (t_gpu - t_cpu) / 1000
+    if us == 0 { us = 1 }
+    uint64 gflops_x100 = ops / us / 10                  // ops/us / 1000 * 100 = ops/us/10
+    print_label_val("gflops_x100", 11, gflops_x100)
+
+    hipFree(d_A); hipFree(d_b); hipFree(d_c)
+    exit(0)
+}
