@@ -93,6 +93,30 @@ fn kfd_init() -> uint32 {
     r = raw_kfd_acquire_vm(fd, drm, gid)
     if r != 0 { kfd_die("kfd_init: ACQUIRE_VM failed", r) }
 
+    // SET_MEMORY_POLICY: HIP runtime calls this twice at startup with
+    // the lds and scratch apertures as `alternate_*`. Without it the
+    // firmware uses some KFD default policy that may force a slower
+    // L2 invalidate path on every dispatch. F1 in
+    // docs/SYNC_LAUNCH_GAP.md.
+    //
+    // default_policy   = 0 (KFD_IOC_CACHE_POLICY_COHERENT)
+    // alternate_policy = 1 (KFD_IOC_CACHE_POLICY_NONCOHERENT) for the
+    //                    scratch aperture — matches HIP's apparent
+    //                    setup. Failure here is non-fatal: the GPU
+    //                    runs without it, and we fall through to the
+    //                    pre-existing default behavior.
+    raw_kfd_set_memory_policy(fd, gid, 0, 1, _kfd_scratch_base,
+                               _kfd_scratch_limit - _kfd_scratch_base)
+    raw_kfd_set_memory_policy(fd, gid, 0, 1, _kfd_lds_base,
+                               _kfd_lds_limit - _kfd_lds_base)
+
+    // SET_XNACK_MODE=0 (disable recoverable page faults). With XNACK
+    // ON (gfx9+ default) waves can stall on speculative loads and
+    // retry; for HIP's compute path (no managed memory, no on-demand
+    // paging) it's pure overhead. F2 in docs/SYNC_LAUNCH_GAP.md.
+    int32 xnack_off = 0
+    raw_kfd_set_xnack_mode(fd, xnack_off)
+
     // RUNTIME_ENABLE (mode 1 = enable)
     r = raw_kfd_runtime_enable(fd, 1)
     if r != 0 { kfd_die("kfd_init: RUNTIME_ENABLE failed", r) }

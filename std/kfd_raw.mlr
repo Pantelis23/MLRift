@@ -31,6 +31,13 @@ static uint64 AMDKFD_IOC_FREE_MEMORY_OF_GPU         = 0x40084B17
 static uint64 AMDKFD_IOC_MAP_MEMORY_TO_GPU          = 0xC0184B18
 static uint64 AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU      = 0xC0184B19
 static uint64 AMDKFD_IOC_RUNTIME_ENABLE             = 0xC0104B25
+// SET_MEMORY_POLICY: IOW (write-only), nr=0x04, args size=0x20 (32 bytes).
+//   = (1<<30) | (32<<16) | (0x4B<<8) | 0x04 = 0x40204B04
+static uint64 AMDKFD_IOC_SET_MEMORY_POLICY          = 0x40204B04
+// SET_XNACK_MODE: IOWR (read+write — kernel may report current state
+// when input is -1), nr=0x21, args size=4 bytes.
+//   = (3<<30) | (4<<16) | (0x4B<<8) | 0x21 = 0xC0044B21
+static uint64 AMDKFD_IOC_SET_XNACK_MODE             = 0xC0044B21
 
 // --- Allocation flags (kfd_ioctl.h:397-410) ---
 static uint64 KFD_IOC_ALLOC_MEM_FLAGS_VRAM          = 0x00000001
@@ -167,6 +174,43 @@ fn raw_kfd_runtime_enable(uint32 fd, uint32 mode_mask) -> uint32 {
     uint64 pC = buf + 12; unsafe { *(pC as uint32) = 0 }       // capabilities
     uint32 r = _kfd_ioctl(fd, AMDKFD_IOC_RUNTIME_ENABLE, buf)
     return r
+}
+
+// kfd_ioctl_set_memory_policy_args (kfd_ioctl.h, 32 bytes):
+//   [0x00] alternate_aperture_base   (u64, in)
+//   [0x08] alternate_aperture_size   (u64, in)
+//   [0x10] gpu_id                    (u32, in)
+//   [0x14] default_policy            (u32, in: 0=COHERENT, 1=NONCOHERENT)
+//   [0x18] alternate_policy          (u32, in)
+//   [0x1C] pad                       (u32)
+//
+// HIP runtime calls this twice per process at startup with the
+// scratch and lds apertures as alternate_*; the call order in our
+// strace was (apertures→ACQUIRE_VM→SET_MEMORY_POLICY×2). Setting it
+// at all may flip a firmware fastpath for kernel-side L2 invalidate
+// on dispatch. Cheap to try.
+fn raw_kfd_set_memory_policy(uint32 fd, uint32 gpu_id,
+                              uint32 default_policy, uint32 alternate_policy,
+                              uint64 alt_base, uint64 alt_size) -> uint32 {
+    uint64 args = alloc(32)
+    uint64 i = 0
+    while i < 32 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
+    unsafe { *((args + 0x00) as uint64) = alt_base }
+    unsafe { *((args + 0x08) as uint64) = alt_size }
+    unsafe { *((args + 0x10) as uint32) = gpu_id }
+    unsafe { *((args + 0x14) as uint32) = default_policy }
+    unsafe { *((args + 0x18) as uint32) = alternate_policy }
+    return _kfd_ioctl(fd, AMDKFD_IOC_SET_MEMORY_POLICY, args)
+}
+
+// kfd_ioctl_set_xnack_mode_args: a single in/out s32.
+//   xnack_enabled = 0 → disable retries
+//   xnack_enabled = 1 → enable retries
+//   xnack_enabled = -1 → leave unchanged, return current state
+fn raw_kfd_set_xnack_mode(uint32 fd, int32 xnack_enabled) -> uint32 {
+    uint64 args = alloc(4)
+    unsafe { *(args as int32) = xnack_enabled }
+    return _kfd_ioctl(fd, AMDKFD_IOC_SET_XNACK_MODE, args)
 }
 
 // kfd_ioctl_get_process_apertures_new_args (kfd_ioctl.h:200-211):
