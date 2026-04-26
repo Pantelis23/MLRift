@@ -283,8 +283,14 @@ fn main() {
     }
 
     // Time 8 sequential single-launch+sync cycles after the warmup.
-    // Tells us whether DPM clock state persists across sync gaps or
-    // drops back immediately on idle.
+    // With MLRIFT_DUMP_QUEUE=1, dump shim state between each iter to
+    // catch where the boost-enabled queue corrupts.
+    uint64 dump_env = getenv("MLRIFT_DUMP_QUEUE")
+    uint64 do_dump = 0
+    if dump_env != 0 {
+        uint8 dc = 0; unsafe { *(dump_env as uint8) -> dc }
+        if dc != 48 { do_dump = 1 }
+    }
     uint64 ti = 0
     while ti < 8 {
         uint64 ts0 = time_ns()
@@ -293,6 +299,21 @@ fn main() {
         err = hipDeviceSynchronize(); if err != 0 { die("sync seq", err) }
         uint64 ts1 = time_ns()
         print_label_val("seq_us", 6, (ts1 - ts0) / 1000)
+        if do_dump > 0 {
+            uint64 tag_buf = alloc(32)
+            uint64 tag_pre = "after_seq_"
+            uint64 ki = 0
+            while ki < 10 {
+                uint64 sp = tag_pre + ki; uint64 c = 0
+                unsafe { *(sp as uint8) -> c }
+                uint64 dp = tag_buf + ki; uint8 cb = c
+                unsafe { *(dp as uint8) = cb }
+                ki = ki + 1
+            }
+            uint8 dc = ti + 48; unsafe { *((tag_buf + 10) as uint8) = dc }
+            uint8 nul = 0;       unsafe { *((tag_buf + 11) as uint8) = nul }
+            hipkfd_dump_queue(tag_buf)
+        }
         ti = ti + 1
     }
 

@@ -232,6 +232,181 @@ fn _hipkfd_drm_pin_clocks() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Debug introspection (task #56).
+//
+// hipkfd_dump_queue(tag) prints a snapshot of AQL queue + signal +
+// recent dispatch history to stderr. Called between hipModuleLaunch
+// invocations to bisect "queue corrupts after N dispatches" symptoms.
+//
+// History ring records the last 8 dispatches (kd_va, kernarg_va,
+// header_setup, slot index, wp at write time). Both user and boost
+// dispatches feed into it.
+
+static uint64 _HIPKFD_HIST_N      = 8
+static uint64 _hipkfd_hist_ring   = 0       // alloc'd lazily, 5*8 bytes per entry
+static uint64 _hipkfd_hist_idx    = 0       // next write slot (mod N)
+static uint64 _hipkfd_hist_count  = 0       // total dispatches recorded
+
+fn _hipkfd_hist_record(uint64 kd_va, uint64 karg_va, uint64 header_setup,
+                       uint64 slot, uint64 wp_at_write, uint64 kind) {
+    if _hipkfd_hist_ring == 0 {
+        _hipkfd_hist_ring = alloc(_HIPKFD_HIST_N * 48)
+    }
+    uint64 i = _hipkfd_hist_idx
+    uint64 base = _hipkfd_hist_ring + i * 48
+    unsafe { *((base +  0) as uint64) = kd_va }
+    unsafe { *((base +  8) as uint64) = karg_va }
+    unsafe { *((base + 16) as uint64) = header_setup }
+    unsafe { *((base + 24) as uint64) = slot }
+    unsafe { *((base + 32) as uint64) = wp_at_write }
+    unsafe { *((base + 40) as uint64) = kind }       // 0=user, 1=boost, 2=copy_d2h
+    _hipkfd_hist_idx = (i + 1) - ((i + 1) / _HIPKFD_HIST_N) * _HIPKFD_HIST_N
+    _hipkfd_hist_count = _hipkfd_hist_count + 1
+}
+
+// Format a u64 as decimal into buf, return length. Tiny self-contained
+// formatter — std/fmt.mlr might not be linked in every binary.
+fn _hipkfd_dec(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 t = val
+    while t > 0 { n = n + 1; t = t / 10 }
+    uint64 i = n; t = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = t - (t / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48; unsafe { *(p as uint8) = c }
+        t = t / 10
+    }
+    return n
+}
+
+// Format u64 as hex (no 0x prefix), return length, fixed `digits` width.
+fn _hipkfd_hex(uint64 val, uint64 buf, uint64 digits) -> uint64 {
+    uint64 i = digits
+    while i > 0 {
+        i = i - 1
+        uint64 d = val - (val / 16) * 16
+        uint8 c
+        if d < 10 { c = d + 48 } else { c = d + 87 }            // 'a'+(d-10)
+        uint64 p = buf + i
+        unsafe { *(p as uint8) = c }
+        val = val / 16
+    }
+    return digits
+}
+
+fn _hipkfd_dbg_emit(uint64 buf, uint64 label, uint64 lab_len,
+                    uint64 val, uint64 hex_digits) {
+    uint64 j = 0
+    while j < lab_len {
+        uint64 sp = label + j; uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + j; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        j = j + 1
+    }
+    uint64 sep = buf + lab_len
+    uint8 eq = 61; unsafe { *(sep as uint8) = eq }
+    uint64 vbase = buf + lab_len + 1
+    uint64 vlen
+    if hex_digits > 0 {
+        uint8 z = 48; unsafe { *(vbase as uint8) = z }
+        uint8 x = 120; unsafe { *((vbase + 1) as uint8) = x }
+        vlen = _hipkfd_hex(val, vbase + 2, hex_digits) + 2
+    } else {
+        vlen = _hipkfd_dec(val, vbase)
+    }
+    uint64 nl = vbase + vlen
+    uint8 nlc = 10; unsafe { *(nl as uint8) = nlc }
+    write(2, buf, lab_len + 1 + vlen + 1)
+}
+
+// Public: dump shim/queue state with a caller-supplied tag prefix.
+// Tag isn't bounds-checked — pass a NUL-terminated string.
+fn hipkfd_dump_queue(uint64 tag) {
+    if _hipkfd_q == 0 {
+        write(2, "[hipkfd] dump_queue: shim not initialised\n", 42)
+        return
+    }
+    uint64 buf = alloc(256)
+    write(2, "==== hipkfd_dump_queue [", 24)
+    uint64 tlen = 0
+    while 1 == 1 {
+        uint64 cp = tag + tlen; uint64 c = 0
+        unsafe { *(cp as uint8) -> c }
+        if c == 0 { break }
+        tlen = tlen + 1
+    }
+    write(2, tag, tlen)
+    write(2, "] ====\n", 7)
+
+    uint64 wp = 0; unsafe { *(_hipkfd_q_wp_host as uint64) -> wp }
+    uint64 rp = 0; unsafe { *(_hipkfd_q_rp_host as uint64) -> rp }
+    _hipkfd_dbg_emit(buf, "  queue.wp        ", 18, wp, 16)
+    _hipkfd_dbg_emit(buf, "  queue.rp        ", 18, rp, 16)
+    _hipkfd_dbg_emit(buf, "  queue.in_flight ", 18, wp - rp, 0)
+    _hipkfd_dbg_emit(buf, "  queue.cap       ", 18, _hipkfd_q_ring_cap, 0)
+
+    // Signal value vs expected pending.
+    uint64 sig_addr = _hipkfd_signal_h + 0x08
+    uint64 sv = 0; unsafe { *(sig_addr as uint64) -> sv }
+    _hipkfd_dbg_emit(buf, "  signal.value    ", 18, sv, 16)
+    _hipkfd_dbg_emit(buf, "  signal.pending  ", 18, _hipkfd_pending, 16)
+    uint64 drained = 1
+    if sv != _hipkfd_pending { drained = 0 }
+    _hipkfd_dbg_emit(buf, "  signal.drained  ", 18, drained, 0)
+
+    _hipkfd_dbg_emit(buf, "  hist.total      ", 18, _hipkfd_hist_count, 0)
+
+    // Walk the most recent N dispatches (oldest -> newest).
+    if _hipkfd_hist_ring != 0 {
+        uint64 n = _hipkfd_hist_count
+        if n > _HIPKFD_HIST_N { n = _HIPKFD_HIST_N }
+        uint64 start = (_hipkfd_hist_idx + _HIPKFD_HIST_N - n) - (((_hipkfd_hist_idx + _HIPKFD_HIST_N - n)) / _HIPKFD_HIST_N) * _HIPKFD_HIST_N
+        uint64 k = 0
+        while k < n {
+            uint64 idx = (start + k) - ((start + k) / _HIPKFD_HIST_N) * _HIPKFD_HIST_N
+            uint64 base = _hipkfd_hist_ring + idx * 48
+            uint64 kd  = 0; unsafe { *((base +  0) as uint64) -> kd }
+            uint64 ka  = 0; unsafe { *((base +  8) as uint64) -> ka }
+            uint64 hdr = 0; unsafe { *((base + 16) as uint64) -> hdr }
+            uint64 sl  = 0; unsafe { *((base + 24) as uint64) -> sl }
+            uint64 wpa = 0; unsafe { *((base + 32) as uint64) -> wpa }
+            uint64 kind = 0; unsafe { *((base + 40) as uint64) -> kind }
+            // Read back the header word actually in the ring at that
+            // slot — this catches "we wrote it but did the CP see it?"
+            uint64 ring_pkt = _hipkfd_q_ring_host + sl * 64
+            uint32 hdr_now = 0
+            unsafe { *(ring_pkt as uint32) -> hdr_now }
+
+            write(2, "  --- dispatch[", 15)
+            uint64 nl = _hipkfd_dec(k, buf); write(2, buf, nl)
+            write(2, "]\n", 2)
+            _hipkfd_dbg_emit(buf, "    .kind        ", 17, kind, 0)
+            _hipkfd_dbg_emit(buf, "    .kd_va       ", 17, kd, 16)
+            _hipkfd_dbg_emit(buf, "    .karg_va     ", 17, ka, 16)
+            _hipkfd_dbg_emit(buf, "    .slot        ", 17, sl, 0)
+            _hipkfd_dbg_emit(buf, "    .wp_at_write ", 17, wpa, 0)
+            _hipkfd_dbg_emit(buf, "    .header_set  ", 17, hdr, 8)
+            _hipkfd_dbg_emit(buf, "    .header_now  ", 17, hdr_now, 8)
+            // Decode header: low byte is type, bit 8 is barrier,
+            // bits[10:9] acquire, bits[12:11] release.
+            uint64 htype = hdr & 0xFF
+            uint64 hbarrier = (hdr >> 8) & 0x1
+            uint64 hacquire = (hdr >> 9) & 0x3
+            uint64 hrelease = (hdr >> 11) & 0x3
+            uint64 hsetup   = (hdr >> 16) & 0x3
+            _hipkfd_dbg_emit(buf, "    .h.type      ", 17, htype, 0)
+            _hipkfd_dbg_emit(buf, "    .h.barrier   ", 17, hbarrier, 0)
+            _hipkfd_dbg_emit(buf, "    .h.acquire   ", 17, hacquire, 0)
+            _hipkfd_dbg_emit(buf, "    .h.release   ", 17, hrelease, 0)
+            _hipkfd_dbg_emit(buf, "    .h.setup     ", 17, hsetup, 0)
+            k = k + 1
+        }
+    }
+    write(2, "==== end dump ====\n", 19)
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // GPU-clock keepalive (task #55).
 //
 // Mechanism: at lazy_init, allocate executable VRAM, write a 28-byte
@@ -350,8 +525,7 @@ fn _hipkfd_boost_dispatch() {
     _kfd_fence()
     uint64 db_value = new_wp - 1
     unsafe { *(_hipkfd_q_db_host as uint64) = db_value }
-    // No _hipkfd_pending update — boost has signal_va=0, GPU never
-    // touches our shared signal. User's pending count stays accurate.
+    _hipkfd_hist_record(_hipkfd_boost_kd_va, 0, header_setup, slot, wp, 1)
 }
 
 fn _hipkfd_lazy_init() {
@@ -788,16 +962,11 @@ fn hipModuleLaunchKernel(
     _kfd_fence()
     uint64 db_value = new_wp - 1
     unsafe { *(db_host as uint64) = db_value }
+    _hipkfd_hist_record(kd_va, karg_va, header_setup, slot, wp, 0)
 
-    // GPU-clock keepalive: queue a boost kernel behind the user's
-    // dispatch. WORKS on the first launch — GPU sclk ramps from 591
-    // MHz idle to ~2.6 GHz and the user kernel finishes in <1 ms vs
-    // 63 ms cold — but corrupts queue state after a few iterations
-    // (cause not yet bisected; suspect kernel-descriptor field in
-    // rsrc1/2/3 that gfx11 CP rejects on second-or-later dispatch).
-    // OFF by default until that's nailed down. Opt-in by setting
-    // MLRIFT_BOOST=1; at that point the run is fast but limited to a
-    // few launches before timeout. Use for benchmark probes only.
+    // GPU-clock keepalive (task #55, opt-in via MLRIFT_BOOST=1).
+    // See _hipkfd_boost_dispatch comments for the gfx11-CP corruption
+    // we're chasing — debug via hipkfd_dump_queue() between launches.
     uint64 boost_env = getenv("MLRIFT_BOOST")
     if boost_env != 0 {
         uint8 bc = 0; unsafe { *(boost_env as uint8) -> bc }
