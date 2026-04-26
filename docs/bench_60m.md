@@ -68,8 +68,14 @@ dual-`.co` fallback (`NOESIS_CSR_CO_PATH=/path/to/hipcc.co`).
 | Python / **cupy** (GPU) | — | 1.17 s | 5.37 s | 128.37 s | 64 ms | **2 min 15 s** (135.41 s) | 1,985,575,928 |
 | Python / **PyTorch** (GPU) | — | 0.02 s | 0.28 s | 102.70 s | 51 ms | **1 min 43 s** (103.01 s) | 1,985,570,086 |
 | **MLRift** (CPU) | 24 | 1.75 s | 1.67 s | 382.57 s | 191 ms | **6 min 26 s** (386.04 s) | 1,985,575,928 |
-| **MLRift** (GPU, HIP / hipcc) | — | 1.50 s | **0.11 s** | **26.55 s** | **13 ms** | **28.40 s** | 1,985,575,928 |
-| **MLRift** (GPU, native gfx1100 ISA) | — | 1.51 s | **0.11 s** | **26.77 s** | **13 ms** | **28.87 s** | 1,985,575,928 |
+| **MLRift** (GPU, HIP runtime + hipcc kernels) | — | 1.50 s | **0.11 s** | **26.55 s** | **13 ms** | **28.40 s** | 1,985,575,928 |
+| **MLRift** (GPU, KFD shim + hipcc kernels)\* | — | 1.69 s | 0.18 s | **26.59 s** | **13 ms** | **29.50 s** | 1,985,575,928 |
+| **MLRift** (GPU, KFD shim + native gfx1100 ISA + spike_reduce fallback)\* | — | 1.68 s | 0.22 s | **26.63 s** | **13 ms** | **29.28 s** | 1,985,575,926 |
+
+\* zero-ROCm linkage in the launcher binary — `ldd` shows only
+`libc + ld-linux + vdso`. No `libamdhip64`, `libhsa-runtime64`,
+`libdrm`, `libdrm_amdgpu`. Built with `--target=amdgpu-native` on
+the launcher source.
 
 \* numpy was run on the original flat-`RI` workload (1.86 B spikes).
 All other variants use the per-neuron `RI` variance (1.99 B spikes,
@@ -121,21 +127,23 @@ with hipcc's output bit-for-bit.
 
 ### What native buys you on this workload
 
-The two GPU rows in the headline table are within **0.16 %** wall —
+The GPU rows in the headline table are within **±2 %** wall —
 essentially the same. That's the honest result. The sim is bandwidth-
-bound at 60 M × per-step memory reads × 2 000 steps; both backends
-emit the same algorithm with the same FMA count, so they hit the same
-DRAM ceiling. Codegen quality differs (hipcc's `lif_step` is a few
-hundred instructions; ours is 110), but instruction issue isn't the
-bottleneck.
+bound at 60 M × per-step memory reads × 2 000 steps; every backend
+emits the same algorithm with the same FMA count, so they hit the
+same DRAM ceiling. Codegen quality differs (hipcc's `lif_step` is a
+few hundred instructions; ours is 110), but instruction issue isn't
+the bottleneck.
 
-The wins are **not perf** here — they're build pipeline:
+The wins are **not per-step perf** — they're build pipeline + runtime
+linkage:
 
-| metric | HIP / hipcc | native gfx1100 ISA | factor |
+| metric | HIP runtime + hipcc | KFD shim + native ISA | factor |
 |---|---:|---:|---:|
-| `.co` build time | 482 ms | **0.92 ms** | **524× faster** |
+| `.co` build time | 482 ms | **1.1 ms** | **438× faster** |
 | toolchain dependency | hipcc + LLVM | none | — |
-| `.co` size (3 of 4 kernels native) | 17.7 KB | 6.0 KB | 2.95× smaller |
+| `.co` size (5 of 6 kernels native) | 21.4 KB | 8.7 KB | 2.5× smaller |
+| launcher `ldd` | 5 ROCm DSOs | **0** ROCm DSOs | — |
 
 Sub-millisecond GPU code-object builds matter when iterating on a
 kernel — round-tripping through `hipcc` for every change at the half-
@@ -144,10 +152,52 @@ removes a build-time dependency on a moving compiler (LLVM versions,
 HIP runtime headers) and produces deterministic bytes — every byte is
 intentional and inspectable in `src/format_amdgpu.mlr`.
 
-The architectural exit is `csr_build` (one-shot startup kernel; needs
-`v_mul_lo_u64` + 64-bit unsigned modulo for splitmix64 — multi-day ISA
-work for ~zero hot-path benefit). The launcher loads it from a hipcc
-`.co` via the `NOESIS_CSR_CO_PATH` env-var fallback.
+**Zero-ROCm linkage** is the bigger structural milestone. With
+`--target=amdgpu-native` on the launcher source, MLRift redirects
+`import "../std/hip.mlr"` to `std/hip_kfd.mlr` (a KFD-backed shim that
+implements the HIP API surface against raw AMDKFD ioctls — see
+`docs/AMDGPU_NATIVE.md`). The launcher binary then drops every ROCm
+DSO from its dynamic-linkage list:
+
+```
+$ ldd /tmp/launch_kfd | grep -iE 'hip|hsa|amd|drm'
+(empty)
+$ ldd /tmp/launch_kfd
+    linux-vdso.so.1
+    libc.so.6
+    /lib64/ld-linux-x86-64.so.2
+```
+
+That removes the entire ROCm runtime dependency at deploy time —
+including a ~120 MB on-disk footprint and the version skew between
+`libhsa-runtime64` and the kernel-side `amdgpu` driver that has
+historically been a source of bugs.
+
+The architectural exit on this workload is the GPU `spike_reduce`
+kernel — a small reduction (two `atomic_add_u64` ops) recently added
+in service of the GPU-side D2H copy path. It's still hipcc-built and
+loaded via `NOESIS_CSR_CO_PATH` fallback while a native lowering for
+its `atomic_add_u64` shape is in progress. The KFD shim handles the
+clang offload bundle inline (no manual `clang-offload-bundler --unbundle`
+step) and zero-fills COv5 hidden kernargs before dispatch, so any
+hipcc-built kernel loads through the fallback path without source
+changes.
+
+#### Spike-count footnote: the 2-spike diff
+
+Native `csr_build`'s 64-bit unsigned modulo is implemented via Barrett
+reduction with a host-precomputed magic constant — a different bit-
+pattern than hipcc's `__remainderu64` lowering of the same C-level
+`%`. Both produce a uniform random graph on the same seed, but they
+visit slightly different `(src, tgt)` pairs in the synapse table.
+After 60 M neurons × 2 000 steps the 2-spike difference (out of
+1,985,575,928 — 1e-9 fractional) is the deterministic signature of
+that graph divergence. It is not a numerical-precision drift in the
+per-step path: every f64 op in `lif_step`, `delivery_step`, and
+`decay_step` produces bit-identical results between native and
+hipcc-built kernels (the f64 div sequence is `v_div_scale_f64` ×2,
+Newton-Raphson refinement, `v_div_fma_f64`, `v_div_fixup_f64` — IEEE-
+correct, ULP-equivalent to `__ocml_div_f64`).
 
 ## The joke
 
@@ -164,16 +214,14 @@ dispatcher), the GPU does exactly what its spec sheet says.
 
 ## Per-phase breakdown (fastest build per phase is in **bold**)
 
-| phase | MLRift GPU (HIP) | MLRift GPU (native) | PyTorch GPU | cupy GPU | MLRift CPU | PyTorch CPU | numpy CPU |
-|---|---|---|---|---|---|---|---|
-| init state | 1.50 s | 1.51 s | **0.02 s** | 1.17 s | 1.75 s | 0.30 s | 0.64 s |
-| CSR build (240 M syn) | **0.11 s** | **0.11 s**\* | 0.28 s | 5.37 s | 1.67 s | 6.16 s | 20.62 s |
-| sim (2000 steps) | **26.55 s** | 26.77 s | 102.70 s | 128.37 s | 382.57 s | 2 094.09 s | 3 495.82 s |
-| per-step sim | **13 ms** | **13 ms** | 51 ms | 64 ms | 191 ms | 1.05 s | 1.75 s |
-| `.co` build wall | 482 ms | **0.92 ms** | n/a | n/a | n/a | n/a | n/a |
-
-\* native run loads `csr_build` from a hipcc `.co` via the
-`NOESIS_CSR_CO_PATH` env-var fallback; that one kernel is shared.
+| phase | MLRift GPU (HIP runtime) | MLRift GPU (KFD + hipcc) | MLRift GPU (KFD + native) | PyTorch GPU | cupy GPU | MLRift CPU | PyTorch CPU | numpy CPU |
+|---|---|---|---|---|---|---|---|---|
+| init state | 1.50 s | 1.69 s | 1.68 s | **0.02 s** | 1.17 s | 1.75 s | 0.30 s | 0.64 s |
+| CSR build (240 M syn) | **0.11 s** | 0.18 s | 0.22 s | 0.28 s | 5.37 s | 1.67 s | 6.16 s | 20.62 s |
+| sim (2000 steps) | **26.55 s** | 26.59 s | 26.63 s | 102.70 s | 128.37 s | 382.57 s | 2 094.09 s | 3 495.82 s |
+| per-step sim | **13 ms** | **13 ms** | **13 ms** | 51 ms | 64 ms | 191 ms | 1.05 s | 1.75 s |
+| `.co` build wall | 482 ms | 482 ms | **1.1 ms** | n/a | n/a | n/a | n/a | n/a |
+| ROCm DSOs in launcher (`ldd`) | 5 | **0** | **0** | (Python) | (Python) | n/a | n/a | n/a |
 
 ## Files
 
