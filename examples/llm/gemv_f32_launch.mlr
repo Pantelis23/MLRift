@@ -270,11 +270,31 @@ fn main() {
     uint64 grid_u = (M + 255) / 256
     uint32 grid = grid_u
 
+    // Single launch + sync (real measurement) — this is the latency
+    // visible to a synchronous caller. For comparison: the LLM forward
+    // path uses async batching (queue many, sync once at end), which
+    // hides the sync-time GPU-clock dip. Run with GEMV_BATCH=N to see
+    // the async batched per-launch number.
     err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
     if err != 0 { die("launch gemv", err) }
     err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
-
     uint64 t_gpu = time_ns()
+
+    // Optional async-batch micro-benchmark.
+    uint64 nb = parse_env_count("GEMV_BATCH")
+    if nb > 0 {
+        uint64 t_b0 = time_ns()
+        uint64 bi = 0
+        while bi < nb {
+            err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+            if err != 0 { die("launch batch", err) }
+            bi = bi + 1
+        }
+        err = hipDeviceSynchronize(); if err != 0 { die("sync batch", err) }
+        uint64 t_b1 = time_ns()
+        print_label_val("batch_total_us", 14, (t_b1 - t_b0) / 1000)
+        print_label_val("batch_per_us",   12, ((t_b1 - t_b0) / 1000) / nb)
+    }
 
     // ── D2H + diff ────────────────────────────────────────────────────
     uint64 h_c = alloc(bytes_c)

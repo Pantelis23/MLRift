@@ -524,6 +524,9 @@ fn hipModuleLaunchKernel(
 
     // Unmarshal HIP ptr_table → contiguous KFD kernarg blob. nargs is
     // pre-computed in fn_handle so we avoid the ks/8 div per launch.
+    // The loop breaks at the first NULL slot — `i` after exit is the
+    // explicit-arg count, which is what we need to find the start of
+    // the COv5 hidden-arg region below.
     uint64 i = 0
     while i < nargs {
         uint64 slot_ptr = 0
@@ -534,6 +537,49 @@ fn hipModuleLaunchKernel(
         unsafe { *((karg_h + i * 8) as uint64) = v }
         i = i + 1
     }
+    uint64 explicit_args = i
+
+    // Fill clang's COv5 hidden-arg region. Layout (verified against
+    // amdhsa.kernels msgpack metadata for gfx1100, clang 19+):
+    //   explicit_size + 0   u32 hidden_block_count_x   = grid_x
+    //   explicit_size + 4   u32 hidden_block_count_y   = grid_y
+    //   explicit_size + 8   u32 hidden_block_count_z   = grid_z
+    //   explicit_size + 12  u16 hidden_group_size_x    = block_x
+    //   explicit_size + 14  u16 hidden_group_size_y    = block_y
+    //   explicit_size + 16  u16 hidden_group_size_z    = block_z
+    //   explicit_size + 18  u16 hidden_remainder_x     = 0 (clean div)
+    //   explicit_size + 20  u16 hidden_remainder_y     = 0
+    //   explicit_size + 22  u16 hidden_remainder_z     = 0
+    //   explicit_size + 40  u64 hidden_global_offset_x = 0
+    //   explicit_size + 48  u64 hidden_global_offset_y = 0
+    //   explicit_size + 56  u64 hidden_global_offset_z = 0
+    //   explicit_size + 64  u16 hidden_grid_dims       = ndim (1/2/3)
+    //
+    // Offsets 24..39 are msgpack-reserved (printf_buffer / hostcall /
+    // multigrid / heap_v1) — pre-zero leaves them as null pointers,
+    // which is correct behaviour as long as the kernel doesn't use
+    // printf or hostcall (none of our kernels do).
+    //
+    // Without this fill, group_size_x = 0 and `wg_id * group_size + tid`
+    // collapses to `tid`; every block computes the same lane range so
+    // outputs past block 0 are stale. That's both bugs we hit at once
+    // (M=4096 wrong outputs + ~60 ms fixed-cost stall — the stall was
+    // the GPU spinning on the "all-blocks-write-the-same-place" race).
+    uint64 hidden_base = karg_h + explicit_args * 8
+    uint32 gx32 = grid_x;  unsafe { *((hidden_base +  0) as uint32) = gx32 }
+    uint32 gy32 = grid_y;  unsafe { *((hidden_base +  4) as uint32) = gy32 }
+    uint32 gz32 = grid_z;  unsafe { *((hidden_base +  8) as uint32) = gz32 }
+    uint16 hbx = block_x;  unsafe { *((hidden_base + 12) as uint16) = hbx }
+    uint16 hby = block_y;  unsafe { *((hidden_base + 14) as uint16) = hby }
+    uint16 hbz = block_z;  unsafe { *((hidden_base + 16) as uint16) = hbz }
+    // hidden_grid_dims: 1 for x-only, 2 if y>1, 3 if z>1.
+    uint16 ndim = 1
+    if grid_y > 1 { ndim = 2 }
+    if grid_z > 1 { ndim = 3 }
+    if block_y > 1 { ndim = 2 }
+    if block_z > 1 { ndim = 3 }
+    unsafe { *((hidden_base + 64) as uint16) = ndim }
+    // remainder_*, global_offset_* already zero from the slot pre-zero.
 
     // Async dispatch with shared completion signal.
     uint64 one = 1
