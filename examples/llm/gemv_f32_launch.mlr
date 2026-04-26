@@ -296,9 +296,14 @@ fn main() {
         uint64 ts0 = time_ns()
         err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
         if err != 0 { die("launch seq", err) }
+        uint64 ts_launch = time_ns()
         err = hipDeviceSynchronize(); if err != 0 { die("sync seq", err) }
         uint64 ts1 = time_ns()
-        print_label_val("seq_us", 6, (ts1 - ts0) / 1000)
+        // launch_us: CPU-side path through hipModuleLaunchKernel
+        // sync_us:   wall time spinning on signal until GPU done
+        print_label_val("launch_us", 9, (ts_launch - ts0) / 1000)
+        print_label_val("sync_us",   7, (ts1 - ts_launch) / 1000)
+        print_label_val("seq_us",    6, (ts1 - ts0) / 1000)
         if do_dump > 0 {
             uint64 tag_buf = alloc(32)
             uint64 tag_pre = "after_seq_"

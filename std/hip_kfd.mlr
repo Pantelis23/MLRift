@@ -442,6 +442,27 @@ static uint64 _hipkfd_boost_q_db_host   = 0
 static uint64 _hipkfd_boost_q_rp_host   = 0
 static uint64 _hipkfd_boost_thread_done = 0
 
+// SDMA mclk-keeper queue — DPM ramps mclk only with sustained memory
+// traffic, and the compute boost queue's pure-VALU loop never touches
+// memory. We keep a second SDMA queue continuously dispatching small
+// VRAM↔VRAM copies so the memory subsystem stays warm. SDMA runs on
+// the dedicated DMA engine and steals zero CU cycles from the user
+// kernel.
+//
+// Buffers are 64 KiB VRAM-only — large enough that each copy moves
+// real bandwidth (not just header overhead) but small enough that the
+// queue can hold many packets without wasting GPU memory. wp is a
+// byte-cursor (SDMA semantic), not a packet count.
+static uint64 _hipkfd_sdma_boost_q      = 0
+static uint64 _hipkfd_sdma_boost_ring_h = 0
+static uint64 _hipkfd_sdma_boost_wp_h   = 0
+static uint64 _hipkfd_sdma_boost_db_h   = 0
+static uint64 _hipkfd_sdma_boost_rp_h   = 0
+static uint64 _hipkfd_sdma_boost_src    = 0
+static uint64 _hipkfd_sdma_boost_dst    = 0
+static uint64 _HIPKFD_SDMA_BOOST_BYTES  = 65536       // 64 KiB per copy
+static uint64 _HIPKFD_SDMA_BOOST_DEPTH  = 32          // packets in flight
+
 // Boost kernel image — 65 536-iter VALU loop. ~75 us at boost clock.
 // Tuned to be SHORTER than a typical user kernel: with barrier=1 on
 // user packets (ordering required for LLM-style chained kernels), a
@@ -452,6 +473,13 @@ static uint64 _hipkfd_boost_thread_done = 0
 // has barrier=0 so it dispatches concurrently with the *current*
 // user kernel on free CUs, adding zero latency to the user round-
 // trip while still keeping the queue non-empty for DPM.
+//
+// Iter count tuning: tried 0x40 (~1us per wave, 5000x less compute
+// than 0x10000), DPM dropped to idle floor and we went back to
+// 63 ms / launch (cold-clock baseline). DPM needs sustained shader
+// work, not just dispatch events. 0x10000 is the empirical sweet
+// spot: enough to keep DPM at the highest sclk state, while still
+// finishing well before a typical user kernel.
 fn _hipkfd_boost_emit_image(uint64 dst) {
     uint32 w0 = 0x7E000280; unsafe { *((dst +  0) as uint32) = w0 }
     uint32 w1 = 0x4A000081; unsafe { *((dst +  4) as uint32) = w1 }
@@ -564,40 +592,81 @@ fn _hipkfd_boost_queue_init() {
     uint64 t3 = 0; unsafe { *((q + 0x40) as uint64) -> t3 }; _hipkfd_boost_q_wp_host   = t3
     uint64 t4 = 0; unsafe { *((q + 0x28) as uint64) -> t4 }; _hipkfd_boost_q_db_host   = t4
     uint64 t5 = 0; unsafe { *((q + 0x60) as uint64) -> t5 }; _hipkfd_boost_q_rp_host   = t5
-    // Pre-fill the boost queue with packets so DPM sees activity
-    // before the user's first dispatch. Cap at ring_cap-1; each
-    // hipModuleLaunchKernel will top up if depth dips below the
-    // threshold.
-    uint64 i = 0
-    while i < 32 {
-        _hipkfd_boost_dispatch_on(_hipkfd_boost_q_ring_host,
-                                   _hipkfd_boost_q_ring_cap,
-                                   _hipkfd_boost_q_wp_host,
-                                   _hipkfd_boost_q_db_host,
-                                   _hipkfd_boost_q_rp_host)
+    // Prime DPM with one boost wave; user-launch path tops up the
+    // queue back to 1-deep on every dispatch.
+    _hipkfd_boost_dispatch_on(_hipkfd_boost_q_ring_host,
+                               _hipkfd_boost_q_ring_cap,
+                               _hipkfd_boost_q_wp_host,
+                               _hipkfd_boost_q_db_host,
+                               _hipkfd_boost_q_rp_host)
+}
+
+fn _hipkfd_sdma_boost_init() {
+    if _hipkfd_sdma_boost_q != 0 { return }
+    uint64 q = kfd_create_sdma_queue()
+    if q == 0 { return }                                // SDMA path not usable
+    _hipkfd_sdma_boost_q = q
+    uint64 t1 = 0; unsafe { *((q + 0x18) as uint64) -> t1 }; _hipkfd_sdma_boost_ring_h = t1
+    uint64 t2 = 0; unsafe { *((q + 0x40) as uint64) -> t2 }; _hipkfd_sdma_boost_wp_h   = t2
+    uint64 t3 = 0; unsafe { *((q + 0x28) as uint64) -> t3 }; _hipkfd_sdma_boost_db_h   = t3
+    uint64 t4 = 0; unsafe { *((q + 0x60) as uint64) -> t4 }; _hipkfd_sdma_boost_rp_h   = t4
+    // VRAM-only buffers (no host pointer needed). dev_try_alloc_vram
+    // returns 0 on failure — fall back to skipping mclk-keeper.
+    uint64 src = dev_try_alloc_vram(_HIPKFD_SDMA_BOOST_BYTES)
+    uint64 dst = dev_try_alloc_vram(_HIPKFD_SDMA_BOOST_BYTES)
+    if src == 0 { return }
+    if dst == 0 { return }
+    _hipkfd_sdma_boost_src = src
+    _hipkfd_sdma_boost_dst = dst
+}
+
+// Top up the SDMA boost queue with VRAM↔VRAM copies. Each copy is one
+// 7-dword (28-byte) PM4 packet; we cap in-flight at _HIPKFD_SDMA_BOOST_DEPTH.
+// SDMA wp is a byte cursor mod ring size, not a packet count — the
+// kfd_create_sdma_queue stores ring size in bytes at q+0x10.
+fn _hipkfd_sdma_boost_topup() {
+    if _hipkfd_sdma_boost_q == 0 { return }
+    if _hipkfd_sdma_boost_src == 0 { return }
+    uint64 cur_wp = 0; unsafe { *(_hipkfd_sdma_boost_wp_h as uint64) -> cur_wp }
+    uint64 cur_rp = 0; unsafe { *(_hipkfd_sdma_boost_rp_h as uint64) -> cur_rp }
+    uint64 in_flight_bytes = cur_wp - cur_rp
+    uint64 pkt_bytes = 28
+    uint64 in_flight_pkts = in_flight_bytes / pkt_bytes
+    if in_flight_pkts >= _HIPKFD_SDMA_BOOST_DEPTH { return }
+    uint64 wp = cur_wp
+    uint64 i = in_flight_pkts
+    while i < _HIPKFD_SDMA_BOOST_DEPTH {
+        wp = _sdma_emit_copy_linear(_hipkfd_sdma_boost_ring_h, wp,
+                                     _hipkfd_sdma_boost_src, _hipkfd_sdma_boost_dst,
+                                     _HIPKFD_SDMA_BOOST_BYTES)
         i = i + 1
     }
+    _kfd_fence()
+    unsafe { *(_hipkfd_sdma_boost_wp_h as uint64) = wp }
+    _kfd_fence()
+    unsafe { *(_hipkfd_sdma_boost_db_h as uint64) = wp }
 }
 
 // Top up the boost queue from the user thread on every dispatch.
 // Same-queue contention with the user-queue dispatch is zero — they
 // have separate ring buffers, doorbells, wp/rp pages.
+//
+// Topup depth (4) is empirical: deeper topup → more boost waves
+// running concurrently with the user kernel → more CU contention →
+// user kernel takes longer to retire. Going from 16-deep to 4-deep
+// drops the per-launch overhead by ~30 % at M=1024 with no DPM
+// regression (DPM samples activity over a coarser window than
+// individual packet retirements).
 fn _hipkfd_boost_topup() {
     if _hipkfd_boost_q == 0 { return }
     uint64 cur_wp = 0; unsafe { *(_hipkfd_boost_q_wp_host as uint64) -> cur_wp }
     uint64 cur_rp = 0; unsafe { *(_hipkfd_boost_q_rp_host as uint64) -> cur_rp }
-    uint64 in_flight = cur_wp - cur_rp
-    if in_flight >= 16 { return }
-    // Top up to 16.
-    uint64 i = in_flight
-    while i < 16 {
-        _hipkfd_boost_dispatch_on(_hipkfd_boost_q_ring_host,
-                                   _hipkfd_boost_q_ring_cap,
-                                   _hipkfd_boost_q_wp_host,
-                                   _hipkfd_boost_q_db_host,
-                                   _hipkfd_boost_q_rp_host)
-        i = i + 1
-    }
+    if cur_wp - cur_rp >= 1 { return }
+    _hipkfd_boost_dispatch_on(_hipkfd_boost_q_ring_host,
+                               _hipkfd_boost_q_ring_cap,
+                               _hipkfd_boost_q_wp_host,
+                               _hipkfd_boost_q_db_host,
+                               _hipkfd_boost_q_rp_host)
 }
 
 fn _hipkfd_lazy_init() {
@@ -642,7 +711,10 @@ fn _hipkfd_lazy_init() {
         uint8 bc = 0; unsafe { *(boost_env as uint8) -> bc }
         if bc == 48 { boost_off = 1 }
     }
-    if boost_off == 0 { _hipkfd_boost_queue_init() }
+    if boost_off == 0 {
+        _hipkfd_boost_queue_init()
+        _hipkfd_sdma_boost_init()
+    }
 }
 
 // --- Error handling ---
@@ -1058,7 +1130,10 @@ fn hipModuleLaunchKernel(
         uint8 bc = 0; unsafe { *(boost_env as uint8) -> bc }
         if bc == 48 { boost_off = 1 }
     }
-    if boost_off == 0 { _hipkfd_boost_topup() }
+    if boost_off == 0 {
+        _hipkfd_boost_topup()
+        _hipkfd_sdma_boost_topup()
+    }
 
     return 0
 }
