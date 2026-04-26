@@ -38,6 +38,9 @@ static uint64 AMDKFD_IOC_SET_MEMORY_POLICY          = 0x40204B04
 // when input is -1), nr=0x21, args size=4 bytes.
 //   = (3<<30) | (4<<16) | (0x4B<<8) | 0x21 = 0xC0044B21
 static uint64 AMDKFD_IOC_SET_XNACK_MODE             = 0xC0044B21
+// SET_SCRATCH_BACKING_VA: IOWR (3), nr=0x11, size=16.
+//   = (3<<30) | (16<<16) | (0x4B<<8) | 0x11 = 0xC0104B11
+static uint64 AMDKFD_IOC_SET_SCRATCH_BACKING_VA     = 0xC0104B11
 
 // --- Allocation flags (kfd_ioctl.h:397-410) ---
 static uint64 KFD_IOC_ALLOC_MEM_FLAGS_VRAM          = 0x00000001
@@ -211,6 +214,23 @@ fn raw_kfd_set_xnack_mode(uint32 fd, int32 xnack_enabled) -> uint32 {
     uint64 args = alloc(4)
     unsafe { *(args as int32) = xnack_enabled }
     return _kfd_ioctl(fd, AMDKFD_IOC_SET_XNACK_MODE, args)
+}
+
+// kfd_ioctl_set_scratch_backing_va_args: 16 bytes total.
+//   [0x00] va_addr  (u64, in) — scratch backing VA
+//   [0x08] gpu_id   (u32, in)
+//   [0x0C] pad      (u32)
+//
+// HIP runtime calls this so the firmware has a definite scratch
+// backing and skips a fallback path on every kernel that *might*
+// touch scratch (even ones that statically don't, since the firmware
+// doesn't know that at dispatch time).
+fn raw_kfd_set_scratch_backing_va(uint32 fd, uint32 gpu_id, uint64 va_addr) -> uint32 {
+    uint64 args = alloc(16)
+    unsafe { *((args + 0x00) as uint64) = va_addr }
+    unsafe { *((args + 0x08) as uint32) = gpu_id }
+    unsafe { *((args + 0x0C) as uint32) = 0 }
+    return _kfd_ioctl(fd, AMDKFD_IOC_SET_SCRATCH_BACKING_VA, args)
 }
 
 // kfd_ioctl_get_process_apertures_new_args (kfd_ioctl.h:200-211):
