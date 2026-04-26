@@ -290,3 +290,44 @@ make test                            # 439/439
 /tmp/m1o
 ldd /tmp/m1o | grep -iE 'hsa|hip|amd|drm'   # → (empty)
 ```
+
+## Tuning sync-launch latency (optional)
+
+Real workloads with sustained dispatch (noesis_60m, batched gemv, LLM
+decode) hit HIP-runtime parity out of the box — the in-process boost
+queues in `std/hip_kfd.mlr` (a compute boost on a dedicated AQL ring,
+plus an SDMA boost streaming VRAM↔VRAM copies) keep both sclk and the
+memory subsystem warm while the user queue stays non-empty.
+
+The one residual gap is the sync-launch micro-pattern: one
+`hipModuleLaunchKernel` followed by `hipDeviceSynchronize`, repeated.
+Between sync return and the next launch the firmware's DPM controller
+gets a window to drop clocks, and the next launch eats the ramp-up
+cost. Closing that window requires writing `high` (or `profile_peak`)
+to `/sys/class/drm/cardN/device/power_dpm_force_performance_level`
+— a root-only sysfs node, so we ship a small helper instead of
+escalating in-process:
+
+```
+sudo scripts/mlrift-gpu-perf-mode.sh high   # pin to top DPM state
+sudo scripts/mlrift-gpu-perf-mode.sh auto   # restore default
+```
+
+The script auto-detects the AMD card (override with `--card=N`), runs
+the echo, and prints the resulting `pp_dpm_sclk` / `pp_dpm_mclk` so
+you can confirm. Setting is non-persistent (resets on reboot); the
+file's footer carries a systemd unit if you want it permanent.
+
+Numbers on the gfx1100 reference (RX 7800 XT, gemv f32 M=K=1024):
+
+| pattern             | shim, default | HIP runtime |
+|---------------------|--------------:|------------:|
+| sync-launch         |       ~850 µs |    ~410 µs  |
+| batched (≥8 deep)   |       ~100 µs |     ~70 µs  |
+| noesis_60m, 2000 st |        29.0 s |     28.9 s  |
+
+With `high` set, the shim's sync-launch is expected to drop into
+HIP-runtime range (~150–400 µs) — with both clocks already pinned at
+the top, the only remaining cost is the per-dispatch CP fire latency,
+which is roughly the same on both paths.
+```
