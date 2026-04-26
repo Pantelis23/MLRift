@@ -41,6 +41,9 @@ static uint64 AMDKFD_IOC_SET_XNACK_MODE             = 0xC0044B21
 // SET_SCRATCH_BACKING_VA: IOWR (3), nr=0x11, size=16.
 //   = (3<<30) | (16<<16) | (0x4B<<8) | 0x11 = 0xC0104B11
 static uint64 AMDKFD_IOC_SET_SCRATCH_BACKING_VA     = 0xC0104B11
+// SET_CU_MASK: IOW (1), nr=0x1A, size=16.
+//   = (1<<30) | (16<<16) | (0x4B<<8) | 0x1A = 0x40104B1A
+static uint64 AMDKFD_IOC_SET_CU_MASK                = 0x40104B1A
 // Event-driven completion ioctls. CREATE_EVENT and WAIT_EVENTS are
 // already declared above; add DESTROY_EVENT for cleanup.
 //   DESTROY_EVENT: IOW (1), nr=0x09, size=8. = 0x40084B09
@@ -303,6 +306,24 @@ fn raw_kfd_wait_events(uint32 fd, uint64 events_ptr, uint32 num_events,
         unsafe { *(out_wait_result as uint32) = wr }
     }
     return r
+}
+
+// kfd_ioctl_set_cu_mask_args: 16 bytes total.
+//   [0x00] queue_id     (u32, in)
+//   [0x04] num_cu_mask  (u32, in) — number of bits in the mask
+//   [0x08] cu_mask_ptr  (u64, in) — pointer to bitmap
+//
+// Restricts which CUs the queue's waves can run on. Used here to
+// give the user compute queue and the boost compute queue disjoint
+// CU groups so CP firmware doesn't arbitrate per-dispatch — H in
+// docs/SYNC_LAUNCH_GAP.md.
+fn raw_kfd_set_cu_mask(uint32 fd, uint32 queue_id, uint32 num_bits,
+                        uint64 mask_ptr) -> uint32 {
+    uint64 args = alloc(16)
+    unsafe { *((args + 0x00) as uint32) = queue_id }
+    unsafe { *((args + 0x04) as uint32) = num_bits }
+    unsafe { *((args + 0x08) as uint64) = mask_ptr }
+    return _kfd_ioctl(fd, AMDKFD_IOC_SET_CU_MASK, args)
 }
 
 // kfd_ioctl_set_scratch_backing_va_args: 16 bytes total.
