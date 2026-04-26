@@ -67,6 +67,16 @@ static uint64 _hipkfd_kernarg_ring   = 0
 static uint64 _hipkfd_kernarg_ring_h = 0
 static uint64 _hipkfd_karg_slot      = 0     // round-robin index
 
+// KFD event-driven completion (B-full in docs/SYNC_LAUNCH_GAP.md).
+// Tested and rejected — see SYNC_LAUNCH_GAP.md "Events port: dead
+// end" for why. Wrappers stay in kfd_raw.mlr as infra for any future
+// work; this shim keeps the busy-poll signal path because:
+//   * mailbox-wired path hangs: GPU can't write to a CPU-mmap'd
+//     event page (no GPU VA mapping for it from CREATE_EVENT alone).
+//   * WAIT_EVENTS-as-sleep without mailbox: ~3 ms per sync — 3.5×
+//     SLOWER than busy-poll. Only useful for very long waits.
+// Statics intentionally absent.
+
 // Cached queue-descriptor fields (read once at lazy_init, never change).
 // Avoids 6 loads per launch from the queue struct.
 static uint64 _hipkfd_q_ring_host    = 0
@@ -886,6 +896,7 @@ fn hipDeviceSynchronize() -> uint32 {
     if _hipkfd_signal_h == 0 { return 0 }
     uint64 sig_addr = _hipkfd_signal_h + 0x08
     uint64 v = 0; unsafe { *(sig_addr as uint64) -> v }
+
     uint64 spin = 0
     while v != _hipkfd_pending {
         spin = spin + 1

@@ -41,6 +41,13 @@ static uint64 AMDKFD_IOC_SET_XNACK_MODE             = 0xC0044B21
 // SET_SCRATCH_BACKING_VA: IOWR (3), nr=0x11, size=16.
 //   = (3<<30) | (16<<16) | (0x4B<<8) | 0x11 = 0xC0104B11
 static uint64 AMDKFD_IOC_SET_SCRATCH_BACKING_VA     = 0xC0104B11
+// Event-driven completion ioctls. CREATE_EVENT and WAIT_EVENTS are
+// already declared above; add DESTROY_EVENT for cleanup.
+//   DESTROY_EVENT: IOW (1), nr=0x09, size=8. = 0x40084B09
+static uint64 AMDKFD_IOC_DESTROY_EVENT              = 0x40084B09
+
+// kfd_event_type values (from kfd_ioctl.h KFD_IOC_EVENT_*).
+static uint32 KFD_IOC_EVENT_SIGNAL                  = 0
 
 // --- Allocation flags (kfd_ioctl.h:397-410) ---
 static uint64 KFD_IOC_ALLOC_MEM_FLAGS_VRAM          = 0x00000001
@@ -214,6 +221,88 @@ fn raw_kfd_set_xnack_mode(uint32 fd, int32 xnack_enabled) -> uint32 {
     uint64 args = alloc(4)
     unsafe { *(args as int32) = xnack_enabled }
     return _kfd_ioctl(fd, AMDKFD_IOC_SET_XNACK_MODE, args)
+}
+
+// ── KFD event-driven completion ───────────────────────────────────
+//
+// HIP / libhsa-runtime use these instead of busy-polling the
+// completion signal. The GPU writes event_id to a small mailbox slot
+// after kernel completion and triggers an interrupt; the kernel
+// wakes any task in AMDKFD_IOC_WAIT_EVENTS.
+//
+// Layout (kfd_ioctl_create_event_args, 32 bytes):
+//   [0x00] event_page_offset   (u64, OUT) — mmap offset for mailbox
+//                                            page, OR 0 if signal
+//                                            page already mapped
+//   [0x08] event_trigger_data  (u32, OUT) — value GPU writes to
+//                                            mailbox slot (signal
+//                                            events only)
+//   [0x0C] event_type          (u32, IN)  — 0 = SIGNAL
+//   [0x10] auto_reset          (u32, IN)  — 1 = auto-reset on wake
+//   [0x14] node_id             (u32, IN)  — gpu node, 0 for shared
+//   [0x18] event_id            (u32, OUT)
+//   [0x1C] event_slot_index    (u32, OUT)
+fn raw_kfd_create_event(uint32 fd, uint32 event_type, uint32 auto_reset,
+                         uint32 node_id,
+                         uint64 out_page_offset, uint64 out_trigger_data,
+                         uint64 out_event_id, uint64 out_slot_index) -> uint32 {
+    uint64 args = alloc(32)
+    uint64 i = 0
+    while i < 32 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
+    unsafe { *((args + 0x0C) as uint32) = event_type }
+    unsafe { *((args + 0x10) as uint32) = auto_reset }
+    unsafe { *((args + 0x14) as uint32) = node_id }
+    uint32 r = _kfd_ioctl(fd, AMDKFD_IOC_CREATE_EVENT, args)
+    if r == 0 {
+        uint64 po = 0; unsafe { *((args + 0x00) as uint64) -> po }
+        uint32 td = 0; unsafe { *((args + 0x08) as uint32) -> td }
+        uint32 eid = 0; unsafe { *((args + 0x18) as uint32) -> eid }
+        uint32 sl = 0; unsafe { *((args + 0x1C) as uint32) -> sl }
+        unsafe { *(out_page_offset as uint64) = po }
+        unsafe { *(out_trigger_data as uint32) = td }
+        unsafe { *(out_event_id as uint32) = eid }
+        unsafe { *(out_slot_index as uint32) = sl }
+    }
+    return r
+}
+
+// kfd_ioctl_destroy_event_args: 8 bytes (event_id + pad).
+fn raw_kfd_destroy_event(uint32 fd, uint32 event_id) -> uint32 {
+    uint64 args = alloc(8)
+    unsafe { *((args + 0x00) as uint32) = event_id }
+    unsafe { *((args + 0x04) as uint32) = 0 }
+    return _kfd_ioctl(fd, AMDKFD_IOC_DESTROY_EVENT, args)
+}
+
+// kfd_ioctl_wait_events_args (24 bytes):
+//   [0x00] events_ptr      (u64, IN)  — array of kfd_event_data
+//   [0x08] num_events      (u32, IN)
+//   [0x0C] wait_for_all    (u32, IN)  — 1 = AND, 0 = OR
+//   [0x10] timeout         (u32, IN)  — ms; KFD_EVENT_TIMEOUT_INFINITE = 0xFFFFFFFF
+//   [0x14] wait_result     (u32, OUT) — 0 = success
+//
+// kfd_event_data (48 bytes per element):
+//   [0x00..0x20] union of memory/hw/signal exception data
+//                 (signal_event_data uses [0x00] u64 last_event_age)
+//   [0x20] kfd_event_data_ext  (u64)
+//   [0x28] event_id            (u32, IN)
+//   [0x2C] pad                 (u32)
+fn raw_kfd_wait_events(uint32 fd, uint64 events_ptr, uint32 num_events,
+                        uint32 wait_for_all, uint32 timeout_ms,
+                        uint64 out_wait_result) -> uint32 {
+    uint64 args = alloc(24)
+    uint64 i = 0
+    while i < 24 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
+    unsafe { *((args + 0x00) as uint64) = events_ptr }
+    unsafe { *((args + 0x08) as uint32) = num_events }
+    unsafe { *((args + 0x0C) as uint32) = wait_for_all }
+    unsafe { *((args + 0x10) as uint32) = timeout_ms }
+    uint32 r = _kfd_ioctl(fd, AMDKFD_IOC_WAIT_EVENTS, args)
+    if r == 0 {
+        uint32 wr = 0; unsafe { *((args + 0x14) as uint32) -> wr }
+        unsafe { *(out_wait_result as uint32) = wr }
+    }
+    return r
 }
 
 // kfd_ioctl_set_scratch_backing_va_args: 16 bytes total.
