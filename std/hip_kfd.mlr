@@ -727,6 +727,32 @@ fn _hipkfd_lazy_init() {
     }
 }
 
+// Profiling-timestamp surface for launchers that want to measure
+// per-launch GPU runtime independently of the host-side sync wall
+// time. The values are gpu_clock_counter ticks; pair with
+// hipkfd_clock_sample to convert to host-ns.
+fn hipkfd_signal_start_ts() -> uint64 {
+    if _hipkfd_signal == 0 { return 0 }
+    return kfd_signal_start_ts(_hipkfd_signal)
+}
+fn hipkfd_signal_end_ts() -> uint64 {
+    if _hipkfd_signal == 0 { return 0 }
+    return kfd_signal_end_ts(_hipkfd_signal)
+}
+
+// hipkfd_clock_sample: anchor (gpu_ticks, sys_ns) at the current
+// instant. Two calls seconds apart let the user back out gpu_freq
+// (gfx11 reports gpu ticks at a fixed rate, typically 100 MHz on
+// RDNA3 — verify by sampling).
+fn hipkfd_clock_sample(uint64 out_gpu_ticks, uint64 out_sys_ns) {
+    _hipkfd_lazy_init()
+    uint64 cpu_slot  = alloc(8)
+    uint64 freq_slot = alloc(8)
+    raw_kfd_get_clock_counters(kfd_fd(), kfd_gpu_id(),
+                                out_gpu_ticks, cpu_slot,
+                                out_sys_ns,    freq_slot)
+}
+
 // --- Error handling ---
 // HIP error strings are pointers into libamdhip64 .rodata. We don't
 // have one; return a fixed string so callers that print the message

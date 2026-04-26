@@ -1184,9 +1184,37 @@ fn kernel_get_function(uint64 mod, uint64 fn_name) -> uint64 {
 //   [0x10] event_mailbox_ptr (u64) -- 0 for busy-poll
 //   [0x18] event_id  (u32) -- 0 for busy-poll
 //   ...remaining zero
+// K (docs/SYNC_LAUNCH_GAP.md): allocate the signal page with
+// COHERENT|UNCACHED flags so the GPU's atomic-dec on signal.value
+// flushes through PCIe immediately and is observable to the busy-
+// poller without intermediate caching delay. Profiling timestamps
+// showed kernel_us ≈ 88 us but sync_us ≈ 850 us — the ~760 us gap
+// is the wait between GPU's end_ts and host observing the value
+// change. Same fix shape as dev_alloc_qdesc, which solved the
+// equivalent problem for the wp/rp shadows back in Stage 2b.
 fn kfd_signal_alloc() -> uint64 {
-    uint64 sva = dev_alloc_host_visible(64)
-    uint64 host = dev_host_ptr(sva)
+    if _kfd_initialized == 0 { kfd_init() }
+    uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT |
+                   KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE |
+                   KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+                   KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC |
+                   KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
+                   KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED
+    uint64 nbytes = 64
+    uint64 va_pref = _kfd_reserve_va(nbytes)
+    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref,
+                                            flags, h_slot, va_slot, mm_slot)
+    if r != 0 { kfd_die("kfd_signal_alloc: ALLOC_MEMORY_OF_GPU failed", r) }
+    uint64 handle = 0; unsafe { *(h_slot  as uint64) -> handle }
+    uint64 sva    = 0; unsafe { *(va_slot as uint64) -> sva }
+    uint64 mm     = 0; unsafe { *(mm_slot as uint64) -> mm }
+    r = raw_kfd_map_memory_to_gpu(_kfd_fd, handle, _kfd_gpu_id)
+    if r != 0 { kfd_die("kfd_signal_alloc: MAP failed", r) }
+    uint64 host = mmap(0, nbytes, KFD_MMAP_PROT, KFD_MMAP_FLAGS, _kfd_drm_fd, mm)
+    if host > 0xFFFFFFFFFFFFF000 { kfd_die("kfd_signal_alloc: mmap failed", host) }
+    _kfd_alloc_track(sva, handle, nbytes, host)
+
     uint64 i = 0
     while i < 64 { uint64 p = host + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
     uint32 kind_user = 1
@@ -1205,6 +1233,25 @@ fn kfd_signal_reset(uint64 signal_va) {
 fn kfd_signal_value(uint64 signal_va) -> uint64 {
     uint64 host = dev_host_ptr(signal_va)
     uint64 v = 0; unsafe { *((host + 0x08) as uint64) -> v }
+    return v
+}
+
+// amd_signal_t profiling timestamps (only valid when the queue was
+// created with AMD_QUEUE_PROPERTIES_ENABLE_PROFILING — qprops bit 3,
+// which kfd_create_queue already sets via 0x0A). The GPU writes:
+//   [0x20] start_ts: gpu-clock ticks when CP began dispatching the
+//                    packet
+//   [0x28] end_ts:   gpu-clock ticks when the kernel retired
+// Both values are in gpu_clock_counter units; pair with
+// AMDKFD_IOC_GET_CLOCK_COUNTERS to convert to wall time.
+fn kfd_signal_start_ts(uint64 signal_va) -> uint64 {
+    uint64 host = dev_host_ptr(signal_va)
+    uint64 v = 0; unsafe { *((host + 0x20) as uint64) -> v }
+    return v
+}
+fn kfd_signal_end_ts(uint64 signal_va) -> uint64 {
+    uint64 host = dev_host_ptr(signal_va)
+    uint64 v = 0; unsafe { *((host + 0x28) as uint64) -> v }
     return v
 }
 

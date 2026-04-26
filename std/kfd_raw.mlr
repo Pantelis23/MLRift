@@ -44,6 +44,9 @@ static uint64 AMDKFD_IOC_SET_SCRATCH_BACKING_VA     = 0xC0104B11
 // SET_CU_MASK: IOW (1), nr=0x1A, size=16.
 //   = (1<<30) | (16<<16) | (0x4B<<8) | 0x1A = 0x40104B1A
 static uint64 AMDKFD_IOC_SET_CU_MASK                = 0x40104B1A
+// GET_CLOCK_COUNTERS: IOWR, nr=0x05, size=40 bytes.
+//   = (3<<30) | (40<<16) | (0x4B<<8) | 0x05 = 0xC0284B05
+static uint64 AMDKFD_IOC_GET_CLOCK_COUNTERS         = 0xC0284B05
 // Event-driven completion ioctls. CREATE_EVENT and WAIT_EVENTS are
 // already declared above; add DESTROY_EVENT for cleanup.
 //   DESTROY_EVENT: IOW (1), nr=0x09, size=8. = 0x40084B09
@@ -304,6 +307,39 @@ fn raw_kfd_wait_events(uint32 fd, uint64 events_ptr, uint32 num_events,
     if r == 0 {
         uint32 wr = 0; unsafe { *((args + 0x14) as uint32) -> wr }
         unsafe { *(out_wait_result as uint32) = wr }
+    }
+    return r
+}
+
+// kfd_ioctl_get_clock_counters_args (40 bytes):
+//   [0x00] gpu_clock_counter     (u64, OUT) — gpu_clk_counter ticks now
+//   [0x08] cpu_clock_counter     (u64, OUT) — host TSC at the same instant
+//   [0x10] system_clock_counter  (u64, OUT) — CLOCK_MONOTONIC_RAW ns now
+//   [0x18] system_clock_freq     (u64, OUT) — typically 1e9 (ns)
+//   [0x20] gpu_id                (u32, IN)
+//   [0x24] pad
+//
+// Pair (gpu_clock_counter, system_clock_counter) anchors gpu-tick →
+// host-ns conversion; gpu_clock_freq for gfx11 must be derived by
+// taking two samples seconds apart and dividing the gpu-tick delta
+// by the system_clock_counter delta. (No public API reports it.)
+fn raw_kfd_get_clock_counters(uint32 fd, uint32 gpu_id,
+                               uint64 out_gpu_slot, uint64 out_cpu_slot,
+                               uint64 out_sys_slot,  uint64 out_freq_slot) -> uint32 {
+    uint64 args = alloc(40)
+    uint64 i = 0
+    while i < 40 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
+    unsafe { *((args + 0x20) as uint32) = gpu_id }
+    uint32 r = _kfd_ioctl(fd, AMDKFD_IOC_GET_CLOCK_COUNTERS, args)
+    if r == 0 {
+        uint64 g = 0; unsafe { *((args + 0x00) as uint64) -> g }
+        uint64 c = 0; unsafe { *((args + 0x08) as uint64) -> c }
+        uint64 s = 0; unsafe { *((args + 0x10) as uint64) -> s }
+        uint64 f = 0; unsafe { *((args + 0x18) as uint64) -> f }
+        unsafe { *(out_gpu_slot  as uint64) = g }
+        unsafe { *(out_cpu_slot  as uint64) = c }
+        unsafe { *(out_sys_slot  as uint64) = s }
+        unsafe { *(out_freq_slot as uint64) = f }
     }
     return r
 }

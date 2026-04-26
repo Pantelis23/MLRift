@@ -20,6 +20,12 @@ import "../../std/hip.mlr"
 @dynamic extern fn exit(uint64 code)
 @dynamic extern fn getenv(uint64 name) -> uint64
 
+// KFD-shim-only profiling hooks. Defined in std/hip_kfd.mlr; resolved
+// through the import-redirect under --target=amdgpu-native. Not
+// available under the HIP-runtime build of this launcher (which
+// would mlrc-warn about undefined function); only run with
+// --target=amdgpu-native for these to be live.
+
 static uint64 M_DEF = 1024
 static uint64 K_DEF = 1024
 
@@ -291,6 +297,40 @@ fn main() {
         uint8 dc = 0; unsafe { *(dump_env as uint8) -> dc }
         if dc != 48 { do_dump = 1 }
     }
+    // GPU clock-frequency calibration via two clock samples. The
+    // KFD GET_CLOCK_COUNTERS pair (gpu_ticks, system_ns) lets us
+    // back out the GPU tick rate; gfx11 reports at a fixed rate
+    // (usually 100 MHz). Skip if the shim hooks aren't available
+    // (HIP-runtime build).
+    uint64 gpu0 = 0
+    uint64 sys0 = 0
+    uint64 gpu1 = 0
+    uint64 sys1 = 0
+    uint64 gpu_freq_x1000 = 0
+    uint64 gpu_slot0 = alloc(8)
+    uint64 sys_slot0 = alloc(8)
+    uint64 gpu_slot1 = alloc(8)
+    uint64 sys_slot1 = alloc(8)
+    if 1 == 1 {
+        hipkfd_clock_sample(gpu_slot0, sys_slot0)
+        // ~5 ms wall to space the samples
+        uint64 spin_t0 = time_ns()
+        while time_ns() < spin_t0 + 5000000 { }
+        hipkfd_clock_sample(gpu_slot1, sys_slot1)
+        unsafe { *(gpu_slot0 as uint64) -> gpu0 }
+        unsafe { *(sys_slot0 as uint64) -> sys0 }
+        unsafe { *(gpu_slot1 as uint64) -> gpu1 }
+        unsafe { *(sys_slot1 as uint64) -> sys1 }
+        if sys1 > sys0 {
+            uint64 dg = gpu1 - gpu0
+            uint64 ds = sys1 - sys0
+            // ticks per ms = ticks / (ns/1e6) = ticks * 1e6 / ns
+            // Print *1000 to retain a digit of precision.
+            gpu_freq_x1000 = (dg * 1000000000) / ds
+        }
+    }
+    print_label_val("gpu_freq_hz", 11, gpu_freq_x1000)
+
     uint64 ti = 0
     while ti < 8 {
         uint64 ts0 = time_ns()
@@ -299,10 +339,23 @@ fn main() {
         uint64 ts_launch = time_ns()
         err = hipDeviceSynchronize(); if err != 0 { die("sync seq", err) }
         uint64 ts1 = time_ns()
+        // GPU profiling timestamps (start_ts, end_ts) are in gpu-tick
+        // ticks; (end - start) / gpu_freq_hz = actual kernel runtime
+        // independent of any host wait/setup overhead.
+        uint64 t_start = hipkfd_signal_start_ts()
+        uint64 t_end   = hipkfd_signal_end_ts()
+        uint64 gpu_ticks = 0
+        if t_end > t_start { gpu_ticks = t_end - t_start }
+        uint64 kernel_ns = 0
+        if gpu_freq_x1000 > 0 {
+            kernel_ns = (gpu_ticks * 1000000000) / gpu_freq_x1000
+        }
         // launch_us: CPU-side path through hipModuleLaunchKernel
         // sync_us:   wall time spinning on signal until GPU done
+        // kernel_us: pure GPU runtime from profiling timestamps
         print_label_val("launch_us", 9, (ts_launch - ts0) / 1000)
         print_label_val("sync_us",   7, (ts1 - ts_launch) / 1000)
+        print_label_val("kernel_us", 9, kernel_ns / 1000)
         print_label_val("seq_us",    6, (ts1 - ts0) / 1000)
         if do_dump > 0 {
             uint64 tag_buf = alloc(32)
