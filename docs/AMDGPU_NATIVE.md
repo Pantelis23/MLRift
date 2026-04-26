@@ -291,32 +291,13 @@ make test                            # 439/439
 ldd /tmp/m1o | grep -iE 'hsa|hip|amd|drm'   # → (empty)
 ```
 
-## Tuning sync-launch latency (optional)
+## Sync-launch latency vs HIP runtime
 
 Real workloads with sustained dispatch (noesis_60m, batched gemv, LLM
 decode) hit HIP-runtime parity out of the box — the in-process boost
 queues in `std/hip_kfd.mlr` (a compute boost on a dedicated AQL ring,
 plus an SDMA boost streaming VRAM↔VRAM copies) keep both sclk and the
 memory subsystem warm while the user queue stays non-empty.
-
-The one residual gap is the sync-launch micro-pattern: one
-`hipModuleLaunchKernel` followed by `hipDeviceSynchronize`, repeated.
-Between sync return and the next launch the firmware's DPM controller
-gets a window to drop clocks, and the next launch eats the ramp-up
-cost. Closing that window requires writing `high` (or `profile_peak`)
-to `/sys/class/drm/cardN/device/power_dpm_force_performance_level`
-— a root-only sysfs node, so we ship a small helper instead of
-escalating in-process:
-
-```
-sudo scripts/mlrift-gpu-perf-mode.sh high   # pin to top DPM state
-sudo scripts/mlrift-gpu-perf-mode.sh auto   # restore default
-```
-
-The script auto-detects the AMD card (override with `--card=N`), runs
-the echo, and prints the resulting `pp_dpm_sclk` / `pp_dpm_mclk` so
-you can confirm. Setting is non-persistent (resets on reboot); the
-file's footer carries a systemd unit if you want it permanent.
 
 Numbers on the gfx1100 reference (RX 7800 XT, gemv f32 M=K=1024):
 
@@ -326,8 +307,43 @@ Numbers on the gfx1100 reference (RX 7800 XT, gemv f32 M=K=1024):
 | batched (≥8 deep)   |       ~100 µs |     ~70 µs  |
 | noesis_60m, 2000 st |        29.0 s |     28.9 s  |
 
-With `high` set, the shim's sync-launch is expected to drop into
-HIP-runtime range (~150–400 µs) — with both clocks already pinned at
-the top, the only remaining cost is the per-dispatch CP fire latency,
-which is roughly the same on both paths.
+The shim's residual 2× on sync-launch is **not** closeable from
+userspace alone — see the next section for what we tried.
+
+### Why the sysfs DPM knob doesn't help (and the script is mostly diagnostic)
+
+`scripts/mlrift-gpu-perf-mode.sh` writes
+`/sys/class/drm/cardN/device/power_dpm_force_performance_level`. We
+expected `high` (or `profile_peak`) to pin both sclk and mclk at peak,
+removing the post-sync ramp-up cost. Measured outcome on RDNA3 / RX
+7800 XT:
+
+| mode                 | mclk pinned? | sclk pinned? | sync-launch |
+|----------------------|:------------:|:------------:|------------:|
+| `auto` (default)     |   no         |   no         |    ~850 µs  |
+| `high`               |  **yes**     |   no         |    ~940 µs  |
+| `profile_peak`       |  **yes**     |   no         |    ~830 µs  |
+
+Both `high` and `profile_peak` cap mclk at state 3 (1218 MHz) and
+fclk at state 7 (2301 MHz) as expected, but `pp_dpm_sclk` stays
+reading `1: 0Mhz *` — sclk DPM stays gated unless there's active
+shader work, regardless of the force level. HIP runtime achieves
+~157 µs under `profile_peak`, so it must pin sclk through a
+non-sysfs path (likely an internal libhsa-runtime ioctl or firmware
+hint we haven't yet identified).
+
+Worse: `profile_peak` + `MLRIFT_BOOST=0` (i.e. user disables our
+boost queues) **deadlocks** with `hipDeviceSynchronize: timeout
+draining queue`. Under pinned mclk, the user-queue dispatch never
+retires unless a second queue is also active — a firmware-side
+quirk we haven't root-caused.
+
+The script ships anyway as a diagnostic tool — useful for
+reproducing the table above, or as a starting point if you find the
+sclk-pin path HIP uses. **For normal use, leave the GPU in `auto`
+and rely on the in-process boost queues.**
+
+```
+sudo scripts/mlrift-gpu-perf-mode.sh profile_peak   # diagnostic
+sudo scripts/mlrift-gpu-perf-mode.sh auto           # restore default (do this!)
 ```

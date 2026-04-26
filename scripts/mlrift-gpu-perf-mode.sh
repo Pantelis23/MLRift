@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# Set the AMD GPU's DPM performance level for the KFD-shim path.
+# Set the AMD GPU's DPM performance level — diagnostic helper.
 #
-# Why: the KFD-shim's two-tier boost (compute + SDMA, see std/hip_kfd.mlr)
-# pins sclk and ramps mclk, but the firmware DPM controller still drops
-# clocks during the brief idle window between a hipDeviceSynchronize and
-# the next hipModuleLaunchKernel. For sync-launch micro-benchmarks (one
-# launch, then sync, then repeat) that ramp-up cost dominates wall time.
-# `power_dpm_force_performance_level=high` removes the ramp by pinning
-# the GPU at its highest DPM state continuously. The sysfs node is root-
-# only, so we ship this script instead of doing it in-process.
+# This is a thin wrapper around `echo MODE >
+# /sys/class/drm/cardN/device/power_dpm_force_performance_level`. The
+# sysfs node is root-only, so the script exists as a one-liner the
+# user can invoke with sudo rather than escalating in-process.
 #
-# Real workloads with sustained dispatch (noesis_60m, batched gemv, LLM
-# decode) already hit HIP-runtime parity without this — the firmware
-# never gets a chance to drop clocks while the queue stays non-empty.
-# Run this only if you care about sync-launch latency.
+# Honest status: on RDNA3 (gfx1100) neither `high` nor `profile_peak`
+# closes the KFD-shim's sync-launch latency gap to HIP runtime. Both
+# modes pin mclk + fclk to peak, but sclk DPM stays gated when the
+# user queue is idle, so sync-launch sits at ~830-940 us regardless.
+# HIP runtime hits ~157 us under profile_peak, so the path it uses
+# to pin sclk is something we haven't reproduced from this side of
+# the kernel boundary. See docs/AMDGPU_NATIVE.md for the full table.
+#
+# `profile_peak + MLRIFT_BOOST=0` deadlocks the user queue (timeout
+# in hipDeviceSynchronize) — see docs/KFD_GOTCHAS.md gotcha #11.
+#
+# Real workloads with sustained dispatch (noesis_60m, batched gemv,
+# LLM decode) already hit HIP-runtime parity without touching this
+# knob. Leave the GPU in `auto` for normal use.
 #
 # Usage:
 #   sudo scripts/mlrift-gpu-perf-mode.sh                 # → high

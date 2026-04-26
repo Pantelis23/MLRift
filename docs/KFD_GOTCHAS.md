@@ -375,3 +375,43 @@ correct units from the start.
 (`emit_amdgpu_mt_lif_full_blob` and `emit_amdgpu_mt_csr_e_delayed_blob`);
 launchers in `examples/b4_native_stage13_load.mlr` and
 `examples/b5b_kfd_stage13_load.mlr`.
+
+---
+
+## 11. `power_dpm_force_performance_level=profile_peak` deadlocks single-queue dispatch
+
+While probing whether the sysfs DPM knob could close the sync-launch
+latency gap to HIP runtime (it can't — see `docs/AMDGPU_NATIVE.md`),
+we found a specific firmware-side quirk: with the GPU pinned to
+`profile_peak` AND only one active KFD compute queue (i.e. the user
+queue, with our in-process boost queues disabled via `MLRIFT_BOOST=0`),
+`hipDeviceSynchronize` times out:
+
+```
+hipDeviceSynchronize: timeout draining queue errno=30000000001
+```
+
+The user-queue AQL packet is dispatched cleanly (we see wp advance,
+doorbell ring, packet header valid), but the GPU never retires it —
+the completion signal stays at its in-flight value forever.
+
+**Workaround:** keep at least one other compute or SDMA queue active
+in the same process. Our default `MLRIFT_BOOST=1` path satisfies this
+trivially (the dedicated boost AQL queue + SDMA boost queue stay
+non-empty), so the deadlock only surfaces if you explicitly disable
+the boost queues *and* pin DPM at `profile_peak`. Both `auto` and
+`high` modes work fine with a single queue — only `profile_peak`
+exposes this.
+
+**Probable cause:** `profile_peak` puts the firmware's CP scheduler
+into a mode where it expects multi-queue arbitration to drive
+dispatch progress. With only a single queue's wp updates, the
+scheduler appears to wait for a second queue's doorbell before
+advancing rp. We have not root-caused this in firmware sources.
+
+**Where:** `_hipkfd_lazy_init` in `std/hip_kfd.mlr` always brings up
+the boost queues, so the deadlock is unreachable from any default
+path. Documented here only because the script
+`scripts/mlrift-gpu-perf-mode.sh` makes it easy to set
+`profile_peak`, and someone bisecting the boost queues against the
+DPM knob would hit it.
