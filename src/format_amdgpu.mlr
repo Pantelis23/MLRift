@@ -5514,7 +5514,13 @@ fn emit_amdgpu_gemv_f32_blob(uint64 out_path) -> uint64 {
     uint64 a8 = args_desc + 64;  unsafe { *(a8 as uint64) = 8 }
     uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
 
-    uint64 rsrc1 = 0xE0AF0000
+    // rsrc1 with granulated_workitem_vgpr_count = 1 (gfx11 wave32 →
+    // 16 vgprs allocated). The kernel uses v0..v8 = 9 vgprs. Default
+    // 0xE0AF0000 only allocates 8; works most of the time because
+    // gemv's hot path doesn't exceed v7 in a way the firmware
+    // notices, but the latent under-allocation is the same shape of
+    // bug that hung N2's gemm at all sizes.
+    uint64 rsrc1 = 0xE0AF0001
     uint64 rsrc2 = 0x0000009E
     uint64 rsrc3 = 0x00000010
     uint64 props = 0x0408
@@ -5531,6 +5537,120 @@ fn emit_amdgpu_gemv_f32_blob(uint64 out_path) -> uint64 {
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
         write(2, "emit_amdgpu_gemv_f32_blob: cannot open output\n", 46)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// LLM Phase A milestone 2 — tile GEMM f32, native-emit. One workgroup
+// of 256 lanes computes one 16x16 output tile; one lane per output
+// cell. Reference: /tmp/gemm_f32_native.s (llvm-mc verified).
+// Kernarg layout (48 bytes): a, b, c, m, n, k_dim — all u64.
+// Dispatch: block=256 (1-D), grid=ceil(M/16)*ceil(N/16).
+@export
+fn emit_amdgpu_gemm_f32_blob(uint64 out_path) -> uint64 {
+    asm_init()
+    // Kernarg load.
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)
+    asm_u32(0xF4040300); asm_u32(0xF8000020)
+    asm_u32(0xF4040380); asm_u32(0xF8000028)
+    asm_u32(0xBF89FC07)
+    // i_in/j_in.
+    asm_u32(0x32020084)
+    asm_u32(0x3604008F)
+    // tiles_n.
+    asm_u32(0x80108F0C)
+    asm_u32(0x85108410)
+    // Scalar divide loop: tile_row=s18, tile_col=s17.
+    asm_u32(0xBE910002)
+    asm_u32(0xBE920080)
+    asm_u32(0xBF0A1011)
+    asm_u32(0xBFA20003)
+    asm_u32(0x80911011)
+    asm_u32(0x80128112)
+    asm_u32(0xBFA0FFFB)
+    // row, col.
+    asm_u32(0x84138412)
+    asm_u32(0x84148411)
+    asm_u32(0x4A060213)
+    asm_u32(0x4A080414)
+    // Bounds check (saveexec to s2).
+    asm_u32(0xBE82007E)
+    asm_u32(0x7C98060A)
+    asm_u32(0x8B7E6A7E)
+    asm_u32(0x7C98080C)
+    asm_u32(0x8B7E6A7E)
+    asm_u32(0xBFA50032)                         // s_cbranch_execz +50 → .Lend
+    // a_row_base = a_ptr + row*k_dim*4.
+    asm_u32(0xD72C0008); asm_u32(0x00001D03)
+    asm_u32(0x7E120280)
+    asm_u32(0xD73C0008); asm_u32(0x00021082)
+    asm_u32(0xD7006A08); asm_u32(0x00021004)
+    asm_u32(0xD5207C09); asm_u32(0x01AA1205)
+    // b_col_base = b_ptr + col*4.
+    asm_u32(0x30140882)
+    asm_u32(0x7E160280)
+    asm_u32(0xD7006A0A); asm_u32(0x00021406)
+    asm_u32(0xD5207C0B); asm_u32(0x01AA1607)
+    // b row stride bytes.
+    asm_u32(0x8411820C)
+    // sum=0, k=0; bypass loop if k_dim==0.
+    asm_u32(0x7E180280)
+    asm_u32(0xBE900080)
+    asm_u32(0xBF090E10)
+    asm_u32(0xBFA20011)
+    // .Lloop:
+    asm_u32(0xDC520000); asm_u32(0x0D7C0008)
+    asm_u32(0xDC520000); asm_u32(0x0E7C000A)
+    asm_u32(0xBF8903F7)
+    asm_u32(0x56181D0D)
+    asm_u32(0xD7006A08); asm_u32(0x00010908)
+    asm_u32(0xD5207C09); asm_u32(0x01AA1280)
+    asm_u32(0xD7006A0A); asm_u32(0x0000230A)
+    asm_u32(0xD5207C0B); asm_u32(0x01AA1680)
+    asm_u32(0x80108110)
+    asm_u32(0xBF0A0E10)
+    asm_u32(0xBFA2FFEF)
+    // .Lstore:
+    asm_u32(0xD72C0008); asm_u32(0x00001903)
+    asm_u32(0x4A100908)
+    asm_u32(0x7E120280)
+    asm_u32(0xD73C0008); asm_u32(0x00021082)
+    asm_u32(0xD7006A08); asm_u32(0x00021008)
+    asm_u32(0xD5207C09); asm_u32(0x01AA1209)
+    asm_u32(0xDC6A0000); asm_u32(0x007C0C08)
+    asm_u32(0xBC7C0000)
+    // .Lend:
+    asm_u32(0xBFB00000)
+
+    uint64[12] args_desc
+    uint64 a0  = args_desc + 0;   unsafe { *(a0  as uint64) = 8 }
+    uint64 a1  = args_desc + 8;   unsafe { *(a1  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2  = args_desc + 16;  unsafe { *(a2  as uint64) = 8 }
+    uint64 a3  = args_desc + 24;  unsafe { *(a3  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4  = args_desc + 32;  unsafe { *(a4  as uint64) = 8 }
+    uint64 a5  = args_desc + 40;  unsafe { *(a5  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6  = args_desc + 48;  unsafe { *(a6  as uint64) = 8 }
+    uint64 a7  = args_desc + 56;  unsafe { *(a7  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a8  = args_desc + 64;  unsafe { *(a8  as uint64) = 8 }
+    uint64 a9  = args_desc + 72;  unsafe { *(a9  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a10 = args_desc + 80;  unsafe { *(a10 as uint64) = 8 }
+    uint64 a11 = args_desc + 88;  unsafe { *(a11 as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    // rsrc1 with granulated_workitem_vgpr_count = 1 (gfx11 wave32 → 16
+    // vgprs allocated; default 0xE0AF0000 only allocates 8). Step 3c
+    // uses v0..v12 = 13 vgprs, so we need at least 16.
+    uint64 size = emit_amdgpu_code_object("gemm_f32", 8,
+                                           asm_text_buf, asm_text_len,
+                                           48, 8, 21, 13,
+                                           0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                           args_desc, 6)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_gemm_f32_blob: cannot open output\n", 46)
         return 1
     }
     file_write(fd, amd_buf, size)
