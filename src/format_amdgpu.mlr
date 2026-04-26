@@ -5393,6 +5393,152 @@ fn emit_amdgpu_loop_demo_blob(uint64 out_path) -> uint64 {
 }
 
 // ---------------------------------------------------------------------------
+// LLM Phase A milestone 1 — GEMV f32, native-emit replacement of the
+// clang-built /tmp/gemv_f32.co reference. Bytes hand-extracted from
+// llvm-mc -mcpu=gfx1100 disassembly of the hand-written reference at
+// the comment block below; the dwords appear in the same order.
+//
+// Each lane computes one row of c[M] = A[M×K] · b[K]. Dispatch is
+// (block=256, grid=ceil(M/256)). KD enables USER_SGPR_KERNARG_PTR=2
+// and WORKGROUP_ID_X=1 so the GPU pre-loads s[0:1] and s2 before the
+// kernel runs.
+//
+// Kernarg layout (40 bytes, 8-byte aligned):
+//   [0..7]   a_ptr (u64)
+//   [8..15]  b_ptr (u64)
+//   [16..23] c_ptr (u64)
+//   [24..31] m     (u64; only low 32 used by the kernel)
+//   [32..39] k_dim (u64; only low 32 used by the kernel)
+//
+// Reference assembly (gfx1100, 47 dwords / 188 bytes):
+//
+//   s_load_b256       s[4:11], s[0:1], 0x0           ; a/b/c/m
+//   s_load_b64        s[12:13], s[0:1], 0x20         ; k_dim
+//   s_waitcnt         lgkmcnt(0)
+//   s_mov_b32         s14, 0x100                     ; blockDim.x = 256
+//   v_mad_u64_u32     v[1:2], null, s2, s14, v[0:1]  ; row = wgid*256 + lane
+//   s_mov_b32         s2, exec_lo                    ; (saveexec for cmpx)
+//   v_cmpx_lt_u64     s[10:11], v[1:2]               ; exec &= row<m
+//   s_cbranch_execz   .Lend
+//   v_mul_lo_u32      v3, v1, s12                    ; row*k_dim (low 32)
+//   v_mov_b32         v4, 0
+//   v_lshlrev_b64     v[3:4], 2, v[3:4]              ; *4
+//   v_add_co_u32      v3, vcc_lo, s4, v3             ; +a_ptr.lo
+//   v_add_co_ci_u32   v4, null, s5, v4, vcc_lo       ; +a_ptr.hi
+//   v_mov_b32         v5, 0                          ; sum
+//   s_mov_b32         s14, 0                         ; k = 0
+//   s_cmp_ge_u32      s14, s12
+//   s_cbranch_scc1    .Lstore                        ; k_dim==0 fastpath
+//   v_mov_b32         v6, 0                          ; b byte offset
+// .Lloop:
+//   global_load_b32   v7, v[3:4], off                ; A[row,k]
+//   global_load_b32   v8, v6, s[6:7]                 ; b[k]
+//   s_waitcnt         vmcnt(0)
+//   v_fmac_f32_e32    v5, v7, v8
+//   v_add_co_u32      v3, vcc_lo, v3, 4
+//   v_add_co_ci_u32   v4, null, 0, v4, vcc_lo
+//   v_add_nc_u32_e64  v6, v6, 4
+//   s_add_u32         s14, s14, 1
+//   s_cmp_lt_u32      s14, s12
+//   s_cbranch_scc1    .Lloop
+// .Lstore:
+//   v_lshlrev_b32     v3, 2, v1                      ; row*4
+//   global_store_b32  v3, v5, s[8:9]
+//   s_waitcnt_vscnt   null, 0
+// .Lend:
+//   s_endpgm
+@export
+fn emit_amdgpu_gemv_f32_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "gemv_f32"
+    uint64 klen  = 8
+
+    asm_init()
+
+    // Kernarg load + workgroup-id scaling.
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)   // s_load_b256 s[4:11], s[0:1], 0x0
+    asm_u32(0xF4040300); asm_u32(0xF8000020)   // s_load_b64  s[12:13], s[0:1], 0x20
+    asm_u32(0xBF89FC07)                         // s_waitcnt   lgkmcnt(0)
+    asm_u32(0xBE8E00FF); asm_u32(0x00000100)   // s_mov_b32   s14, 0x100
+    asm_u32(0xD6FE7C01); asm_u32(0x04001C02)   // v_mad_u64_u32 v[1:2], null, s2, s14, v[0:1]
+
+    // Bounds check + skip-to-end if row >= m.
+    asm_u32(0xBE82007E)                         // s_mov_b32   s2, exec_lo
+    asm_u32(0xD4D9007E); asm_u32(0x0002020A)   // v_cmpx_lt_u64_e64 s[10:11], v[1:2]
+    asm_u32(0xBFA50021)                         // s_cbranch_execz .Lend (+33 dwords)
+
+    // a_row_base = a_ptr + row * k_dim * 4 (in v[3:4]).
+    asm_u32(0xD72C0003); asm_u32(0x00001901)   // v_mul_lo_u32 v3, v1, s12
+    asm_u32(0x7E080280)                         // v_mov_b32   v4, 0
+    asm_u32(0xD73C0003); asm_u32(0x00020682)   // v_lshlrev_b64 v[3:4], 2, v[3:4]
+    asm_u32(0xD7006A03); asm_u32(0x00020604)   // v_add_co_u32 v3, vcc_lo, s4, v3
+    asm_u32(0xD5207C04); asm_u32(0x01AA0805)   // v_add_co_ci_u32_e64 v4, null, s5, v4, vcc_lo
+
+    // Init sum + k counter; skip loop body if k_dim == 0.
+    asm_u32(0x7E0A0280)                         // v_mov_b32   v5, 0
+    asm_u32(0xBE8E0080)                         // s_mov_b32   s14, 0
+    asm_u32(0xBF090C0E)                         // s_cmp_ge_u32 s14, s12
+    asm_u32(0xBFA20010)                         // s_cbranch_scc1 .Lstore (+16 dwords)
+    asm_u32(0x7E0C0280)                         // v_mov_b32   v6, 0  (b byte offset)
+
+    // .Lloop:
+    asm_u32(0xDC520000); asm_u32(0x077C0003)   // global_load_b32 v7, v[3:4], off
+    asm_u32(0xDC520000); asm_u32(0x08060006)   // global_load_b32 v8, v6, s[6:7]
+    asm_u32(0xBF8903F7)                         // s_waitcnt   vmcnt(0)
+    asm_u32(0x560A1107)                         // v_fmac_f32_e32 v5, v7, v8
+    asm_u32(0xD7006A03); asm_u32(0x00010903)   // v_add_co_u32 v3, vcc_lo, v3, 4
+    asm_u32(0xD5207C04); asm_u32(0x01AA0880)   // v_add_co_ci_u32_e64 v4, null, 0, v4, vcc_lo
+    asm_u32(0xD5250006); asm_u32(0x00010906)   // v_add_nc_u32_e64 v6, v6, 4
+    asm_u32(0x800E810E)                         // s_add_u32   s14, s14, 1
+    asm_u32(0xBF0A0C0E)                         // s_cmp_lt_u32 s14, s12
+    asm_u32(0xBFA2FFF1)                         // s_cbranch_scc1 .Lloop (-15 dwords)
+
+    // .Lstore:
+    asm_u32(0x30060282)                         // v_lshlrev_b32 v3, 2, v1
+    asm_u32(0xDC6A0000); asm_u32(0x00080503)   // global_store_b32 v3, v5, s[8:9]
+    asm_u32(0xBC7C0000)                         // s_waitcnt_vscnt null, 0x0
+
+    // .Lend:
+    asm_u32(0xBFB00000)                         // s_endpgm
+
+    // 5 args: 3 GLOBAL_BUFFER (a, b, c) + 2 BY_VALUE (m, k_dim), all
+    // 8 bytes. args_desc layout is (size, kind) per arg.
+    uint64[10] args_desc
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a8 = args_desc + 64;  unsafe { *(a8 as uint64) = 8 }
+    uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    uint64 rsrc1 = 0xE0AF0000
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           40,         // kernarg_size
+                                           8,          // kernarg_align
+                                           15,         // sgpr_count s0..s14
+                                           9,          // vgpr_count v0..v8
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 5)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_gemv_f32_blob: cannot open output\n", 46)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
 // AST→AMDGPU lowerer (M1d, extended by M1e).
 //
 // Two supported kernel shapes. Both require the body to be a

@@ -4590,6 +4590,23 @@ fn main() {
                 write(1, ad_path, apl)
                 write(1, " (amdgpu atomic-demo code object)\n", 34)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-gemv-f32=", 23) != 0 {
+                // LLM Phase A milestone 1, native-emit version (task
+                // #68). Replaces the clang-built /tmp/gemv_f32.co
+                // with a hand-rolled gfx1100 kernel of identical
+                // kernarg layout + symbol name, so the existing
+                // gemv_f32_launch consumes it transparently.
+                uint64 gv_path = arg + 23
+                uint64 gv_rc = emit_amdgpu_gemv_f32_blob(gv_path)
+                if gv_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-gemv-f32 failed\n", 36)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 gvl = str_len(gv_path)
+                write(1, gv_path, gvl)
+                write(1, " (amdgpu gemv-f32 code object)\n", 31)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-f64-atomic-add=", 29) != 0 {
                 // Stage-1 M1p smoke: f64-atomic-add CAS loop. Composes
                 // the M1o cmpswap_b64 encoder with v_add_f64 + a
