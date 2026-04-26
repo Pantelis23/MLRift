@@ -524,13 +524,14 @@ fn _hipkfd_boost_dispatch() {
     uint64 sigz = 0; unsafe { *((packet + 0x38) as uint64) = sigz }
 
     _kfd_fence()
-    // Header: same as user's (type=2, barrier=1, acquire/release=2 = 0x1502).
-    // We tried barrier=0 to allow concurrent dispatch; the CP races between
-    // the doorbell rings of two consecutive packets, occasionally observes
-    // an unwritten boost header before the body store retires, and stalls.
-    // Serial-with-barrier is safe and still keeps the queue continuously
-    // non-empty, which is what DPM samples.
-    uint32 header_setup = (1 << 16) | 0x1502
+    // Header: type=2, barrier=0, acquire/release=2 → 0x1402.
+    // With the boost KD now correctly formed (post task #57 KD-field
+    // and branch-target fixes), gfx11 CP dispatches the boost wave on
+    // free CUs concurrently with the user kernel — sync returns when
+    // the user signal hits target, boost continues briefly in the
+    // background. Net effect: boost adds essentially zero latency to
+    // the user's hipDeviceSynchronize round-trip.
+    uint32 header_setup = (1 << 16) | 0x1402
     unsafe { *((packet + 0x00) as uint32) = header_setup }
     _kfd_fence()
     uint64 new_wp = wp + 1
