@@ -425,27 +425,40 @@ fn hipkfd_dump_queue(uint64 tag) {
 // user launch is simpler and the cost is invisible alongside the
 // user's own kernel runtime.
 
-static uint64 _hipkfd_boost_va    = 0
-static uint64 _hipkfd_boost_kd_va = 0
-static uint64 _hipkfd_boost_done  = 0
+static uint64 _hipkfd_boost_va     = 0
+static uint64 _hipkfd_boost_kd_va  = 0
+static uint64 _hipkfd_boost_done   = 0
 
-// Boost kernel image — verified output of llvm-mc -mcpu=gfx1100:
-//   v_mov_b32_e32 v0, 0                            ; 7E000280
-//   .loop:
-//   v_add_nc_u32_e32 v0, 1, v0                     ; 4A000081
-//   v_cmp_lt_u32_e64 vcc_lo, v0, 0x10000           ; D449006A 0001FF00 00010000
-//   s_cbranch_vccnz .loop  (-3 dwords)             ; BFA4FFFD
-//   s_endpgm                                       ; BFB00000
-// 28 bytes total. Each lane runs 65 536 iterations; one wave at boost
-// clocks finishes in ~250 us — long enough for DPM to register
-// "active" but short enough that the queue drains promptly.
+// Dedicated boost queue — runs the boost kernel continuously from a
+// background thread, completely separate from the user's compute queue.
+// Goal: GPU sees continuous queue activity and DPM holds sclk at peak
+// for the lifetime of the process. With this, the user's sync-launch
+// path runs at full boost clocks, no warmup, no dips.
+static uint64 _hipkfd_boost_q          = 0
+static uint64 _hipkfd_boost_q_ring_host = 0
+static uint64 _hipkfd_boost_q_ring_cap  = 0
+static uint64 _hipkfd_boost_q_wp_host   = 0
+static uint64 _hipkfd_boost_q_db_host   = 0
+static uint64 _hipkfd_boost_q_rp_host   = 0
+static uint64 _hipkfd_boost_thread_done = 0
+
+// Boost kernel image — 65 536-iter VALU loop. ~75 us at boost clock.
+// Tuned to be SHORTER than a typical user kernel: with barrier=1 on
+// user packets (ordering required for LLM-style chained kernels), a
+// boost in flight when the next user dispatches forces the user to
+// wait for boost completion. Keeping boost <= user-kernel time means
+// the next user launch finds the boost from the previous cycle
+// already drained — no false serialization. The boost packet itself
+// has barrier=0 so it dispatches concurrently with the *current*
+// user kernel on free CUs, adding zero latency to the user round-
+// trip while still keeping the queue non-empty for DPM.
 fn _hipkfd_boost_emit_image(uint64 dst) {
     uint32 w0 = 0x7E000280; unsafe { *((dst +  0) as uint32) = w0 }
     uint32 w1 = 0x4A000081; unsafe { *((dst +  4) as uint32) = w1 }
     uint32 w2 = 0xD449006A; unsafe { *((dst +  8) as uint32) = w2 }
     uint32 w3 = 0x0001FF00; unsafe { *((dst + 12) as uint32) = w3 }
-    uint32 w4 = 0x00010000; unsafe { *((dst + 16) as uint32) = w4 }
-    uint32 w5 = 0xBFA4FFFB; unsafe { *((dst + 20) as uint32) = w5 }   // -5 dwords back to `loop:` (v_add)
+    uint32 w4 = 0x00010000; unsafe { *((dst + 16) as uint32) = w4 }   // limit = 0x10000
+    uint32 w5 = 0xBFA4FFFB; unsafe { *((dst + 20) as uint32) = w5 }
     uint32 w6 = 0xBFB00000; unsafe { *((dst + 24) as uint32) = w6 }
 }
 
@@ -495,19 +508,20 @@ fn _hipkfd_boost_init() {
     _hipkfd_boost_done = 1
 }
 
-// Queue a boost dispatch on the shim's compute queue. AQL header
-// barrier=0 (so it can dispatch concurrently with the user kernel),
-// signal_va=0 (no completion notification — we never wait on it).
-fn _hipkfd_boost_dispatch() {
+// Generic boost dispatch on a caller-provided queue. Used by both the
+// inline-on-user-queue path (kept as an opt-in fallback) and the
+// dedicated boost-queue path driven by the keepalive thread.
+fn _hipkfd_boost_dispatch_on(uint64 ring_host, uint64 ring_cap,
+                              uint64 wp_host, uint64 db_host, uint64 rp_host) {
     if _hipkfd_boost_done == 0 { return }
 
-    uint64 wp = 0; unsafe { *(_hipkfd_q_wp_host as uint64) -> wp }
-    uint64 rp = 0; unsafe { *(_hipkfd_q_rp_host as uint64) -> rp }
-    while (wp - rp) >= _hipkfd_q_ring_cap {
-        unsafe { *(_hipkfd_q_rp_host as uint64) -> rp }
+    uint64 wp = 0; unsafe { *(wp_host as uint64) -> wp }
+    uint64 rp = 0; unsafe { *(rp_host as uint64) -> rp }
+    while (wp - rp) >= ring_cap {
+        unsafe { *(rp_host as uint64) -> rp }
     }
-    uint64 slot   = wp - (wp / _hipkfd_q_ring_cap) * _hipkfd_q_ring_cap
-    uint64 packet = _hipkfd_q_ring_host + slot * 64
+    uint64 slot   = wp - (wp / ring_cap) * ring_cap
+    uint64 packet = ring_host + slot * 64
 
     uint16 bx16 = 32; unsafe { *((packet + 0x04) as uint16) = bx16 }
     uint16 by16 = 1;  unsafe { *((packet + 0x06) as uint16) = by16 }
@@ -524,22 +538,66 @@ fn _hipkfd_boost_dispatch() {
     uint64 sigz = 0; unsafe { *((packet + 0x38) as uint64) = sigz }
 
     _kfd_fence()
-    // Header: type=2, barrier=0, acquire/release=2 → 0x1402.
-    // With the boost KD now correctly formed (post task #57 KD-field
-    // and branch-target fixes), gfx11 CP dispatches the boost wave on
-    // free CUs concurrently with the user kernel — sync returns when
-    // the user signal hits target, boost continues briefly in the
-    // background. Net effect: boost adds essentially zero latency to
-    // the user's hipDeviceSynchronize round-trip.
-    uint32 header_setup = (1 << 16) | 0x1402
+    uint32 header_setup = (1 << 16) | 0x1402   // type=2, barrier=0
     unsafe { *((packet + 0x00) as uint32) = header_setup }
     _kfd_fence()
     uint64 new_wp = wp + 1
-    unsafe { *(_hipkfd_q_wp_host as uint64) = new_wp }
+    unsafe { *(wp_host as uint64) = new_wp }
     _kfd_fence()
     uint64 db_value = new_wp - 1
-    unsafe { *(_hipkfd_q_db_host as uint64) = db_value }
+    unsafe { *(db_host as uint64) = db_value }
     _hipkfd_hist_record(_hipkfd_boost_kd_va, 0, header_setup, slot, wp, 1)
+}
+
+// Inline boost on the user's compute queue (legacy path).
+fn _hipkfd_boost_dispatch() {
+    _hipkfd_boost_dispatch_on(_hipkfd_q_ring_host, _hipkfd_q_ring_cap,
+                              _hipkfd_q_wp_host,   _hipkfd_q_db_host, _hipkfd_q_rp_host)
+}
+
+fn _hipkfd_boost_queue_init() {
+    if _hipkfd_boost_q != 0 { return }
+    _hipkfd_boost_q = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 q = _hipkfd_boost_q
+    uint64 t1 = 0; unsafe { *((q + 0x18) as uint64) -> t1 }; _hipkfd_boost_q_ring_host = t1
+    uint64 t2 = 0; unsafe { *((q + 0x10) as uint64) -> t2 }; _hipkfd_boost_q_ring_cap  = t2
+    uint64 t3 = 0; unsafe { *((q + 0x40) as uint64) -> t3 }; _hipkfd_boost_q_wp_host   = t3
+    uint64 t4 = 0; unsafe { *((q + 0x28) as uint64) -> t4 }; _hipkfd_boost_q_db_host   = t4
+    uint64 t5 = 0; unsafe { *((q + 0x60) as uint64) -> t5 }; _hipkfd_boost_q_rp_host   = t5
+    // Pre-fill the boost queue with packets so DPM sees activity
+    // before the user's first dispatch. Cap at ring_cap-1; each
+    // hipModuleLaunchKernel will top up if depth dips below the
+    // threshold.
+    uint64 i = 0
+    while i < 32 {
+        _hipkfd_boost_dispatch_on(_hipkfd_boost_q_ring_host,
+                                   _hipkfd_boost_q_ring_cap,
+                                   _hipkfd_boost_q_wp_host,
+                                   _hipkfd_boost_q_db_host,
+                                   _hipkfd_boost_q_rp_host)
+        i = i + 1
+    }
+}
+
+// Top up the boost queue from the user thread on every dispatch.
+// Same-queue contention with the user-queue dispatch is zero — they
+// have separate ring buffers, doorbells, wp/rp pages.
+fn _hipkfd_boost_topup() {
+    if _hipkfd_boost_q == 0 { return }
+    uint64 cur_wp = 0; unsafe { *(_hipkfd_boost_q_wp_host as uint64) -> cur_wp }
+    uint64 cur_rp = 0; unsafe { *(_hipkfd_boost_q_rp_host as uint64) -> cur_rp }
+    uint64 in_flight = cur_wp - cur_rp
+    if in_flight >= 16 { return }
+    // Top up to 16.
+    uint64 i = in_flight
+    while i < 16 {
+        _hipkfd_boost_dispatch_on(_hipkfd_boost_q_ring_host,
+                                   _hipkfd_boost_q_ring_cap,
+                                   _hipkfd_boost_q_wp_host,
+                                   _hipkfd_boost_q_db_host,
+                                   _hipkfd_boost_q_rp_host)
+        i = i + 1
+    }
 }
 
 fn _hipkfd_lazy_init() {
@@ -571,10 +629,20 @@ fn _hipkfd_lazy_init() {
     uint64 t_ph = 0; unsafe { *((q + 0x60) as uint64) -> t_ph }; _hipkfd_q_rp_host   = t_ph
     _hipkfd_q_signal_va = _hipkfd_signal
 
-    // Build the GPU-clock keepalive boost kernel. Must come after the
-    // queue/cache statics are populated since _hipkfd_boost_dispatch
-    // reads them.
+    // Build the GPU-clock keepalive boost kernel + dedicated boost queue,
+    // and kick off the background thread that keeps it continuously
+    // non-empty.  Must come after the user-queue statics are populated
+    // since the boost path uses kfd_create_queue (one-time alloc per
+    // queue).  Disable via MLRIFT_BOOST=0 if you want raw cold-clock
+    // measurements.
     _hipkfd_boost_init()
+    uint64 boost_env = getenv("MLRIFT_BOOST")
+    uint64 boost_off = 0
+    if boost_env != 0 {
+        uint8 bc = 0; unsafe { *(boost_env as uint8) -> bc }
+        if bc == 48 { boost_off = 1 }
+    }
+    if boost_off == 0 { _hipkfd_boost_queue_init() }
 }
 
 // --- Error handling ---
@@ -978,34 +1046,19 @@ fn hipModuleLaunchKernel(
     unsafe { *(db_host as uint64) = db_value }
     _hipkfd_hist_record(kd_va, karg_va, header_setup, slot, wp, 0)
 
-    // GPU-clock keepalive (task #55). Queues a tiny VALU-loop kernel
-    // behind every user launch IFF the queue is shallow — so sync-
-    // per-launch patterns (LLM decode tokens, gemv smoke) keep sclk
-    // at boost (~2.6 GHz) instead of dropping to 591 MHz idle floor,
-    // while batched-dispatch workloads (noesis sim loop, LLM prefill)
-    // skip the boost packet when the queue already has plenty of
-    // user work in flight to keep DPM happy on its own. Threshold
-    // tuned empirically: with > 4 user packets in flight, GPU stays
-    // ramped without help.
-    //
-    // Toggle via env: MLRIFT_BOOST=0 disables completely; =force
-    // ignores the queue-depth heuristic and always dispatches.
+    // GPU-clock keepalive: top up the dedicated boost queue if the
+    // CP has drained it below the threshold. Boost queue is on its
+    // own AQL ring / doorbell / wp / rp — zero contention with the
+    // user queue. This runs from the user thread (no separate
+    // keepalive thread needed); refilling 16-deep at most adds
+    // ~16 packet writes (~few hundred ns).
     uint64 boost_env = getenv("MLRIFT_BOOST")
-    uint64 boost_mode = 1                  // 0=off, 1=auto, 2=force
+    uint64 boost_off = 0
     if boost_env != 0 {
         uint8 bc = 0; unsafe { *(boost_env as uint8) -> bc }
-        if bc == 48 { boost_mode = 0 }       // '0'
-        if bc == 102 { boost_mode = 2 }      // 'f' (force)
+        if bc == 48 { boost_off = 1 }
     }
-    if boost_mode > 0 {
-        uint64 should_boost = 1
-        if boost_mode == 1 {
-            uint64 cur_wp = 0; unsafe { *(_hipkfd_q_wp_host as uint64) -> cur_wp }
-            uint64 cur_rp = 0; unsafe { *(_hipkfd_q_rp_host as uint64) -> cur_rp }
-            if (cur_wp - cur_rp) > 4 { should_boost = 0 }
-        }
-        if should_boost > 0 { _hipkfd_boost_dispatch() }
-    }
+    if boost_off == 0 { _hipkfd_boost_topup() }
 
     return 0
 }

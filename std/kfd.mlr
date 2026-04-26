@@ -632,18 +632,27 @@ fn kfd_create_queue(uint32 wait_mode) -> uint64 {
     uint32 qid = 0; unsafe { *(qid_slot as uint32) -> qid }
     uint64 db_off = 0; unsafe { *(db_slot as uint64) -> db_off }
 
-    // mmap the doorbell page. Like other host-visible mmaps, this uses
-    // the DRM render node fd (per Task 5's discovery).
+    // KFD packs every queue's 8-byte doorbell into a single shared
+    // page; the offset returned in db_off has the page-aligned base
+    // in its high bits and the in-page byte offset in the low 13.
+    // mmap requires page-aligned offsets, so peel off the low bits
+    // before mapping and add them back when computing the host
+    // address. (First queue happens to land at offset 0 = page
+    // boundary so this didn't bite on user-queue setup; second queue
+    // gets offset 8 or 16 and mmap rejects unaligned offsets.)
+    uint64 db_page  = db_off & 0xFFFFFFFFFFFFE000        // 8 KiB page mask
+    uint64 db_in_pg = db_off - db_page
+
     uint64 db_host = mmap(0, KFD_DOORBELL_PAGE, KFD_DOORBELL_PROT, KFD_DOORBELL_FLAGS,
-                           _kfd_drm_fd, db_off)
+                           _kfd_drm_fd, db_page)
     if db_host > 0xFFFFFFFFFFFFF000 {
-        // If DRM-fd mmap fails, fall back to KFD-fd mmap.
         db_host = mmap(0, KFD_DOORBELL_PAGE, KFD_DOORBELL_PROT, KFD_DOORBELL_FLAGS,
-                        _kfd_fd, db_off)
+                        _kfd_fd, db_page)
         if db_host > 0xFFFFFFFFFFFFF000 {
             kfd_die("kfd_create_queue: doorbell mmap failed (both fds)", db_host)
         }
     }
+    db_host = db_host + db_in_pg
 
     unsafe { *((q + 0x00) as uint32) = qid }
     unsafe { *((q + 0x04) as uint32) = _kfd_gpu_id }
