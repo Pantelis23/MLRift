@@ -445,7 +445,7 @@ fn _hipkfd_boost_emit_image(uint64 dst) {
     uint32 w2 = 0xD449006A; unsafe { *((dst +  8) as uint32) = w2 }
     uint32 w3 = 0x0001FF00; unsafe { *((dst + 12) as uint32) = w3 }
     uint32 w4 = 0x00010000; unsafe { *((dst + 16) as uint32) = w4 }
-    uint32 w5 = 0xBFA4FFFD; unsafe { *((dst + 20) as uint32) = w5 }
+    uint32 w5 = 0xBFA4FFFB; unsafe { *((dst + 20) as uint32) = w5 }   // -5 dwords back to `loop:` (v_add)
     uint32 w6 = 0xBFB00000; unsafe { *((dst + 24) as uint32) = w6 }
 }
 
@@ -455,28 +455,41 @@ fn _hipkfd_boost_emit_image(uint64 dst) {
 // the noesis kernels (1 wave, no kernargs needed beyond what KD/CP
 // auto-set). kernarg_size = 0 — the kernel doesn't dereference any.
 fn _hipkfd_boost_emit_kd(uint64 kd_h) {
+    // HSA kernel-descriptor layout (gfx11):
+    //   0x00 u32  group_segment_fixed_size
+    //   0x04 u32  private_segment_fixed_size
+    //   0x08 u32  kernarg_size
+    //   0x0C u32  reserved
+    //   0x10 i64  kernel_code_entry_byte_offset
+    //   0x18 u8[20] reserved
+    //   0x2C u32  compute_pgm_rsrc3              ← was at 0x38 (wrong!)
+    //   0x30 u32  compute_pgm_rsrc1
+    //   0x34 u32  compute_pgm_rsrc2
+    //   0x38 u16  kernel_code_properties         ← was at 0x3C (wrong!)
+    //   0x3A u16  kernarg_preload (length+offset)
+    //   0x3C u32  reserved
     uint64 i = 0
     while i < 64 { uint64 p = kd_h + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
     uint32 ks   = 0;          unsafe { *((kd_h + 0x08) as uint32) = ks }
-    uint64 kce  = 64;         unsafe { *((kd_h + 0x10) as uint64) = kce }
+    uint64 kce  = 256;        unsafe { *((kd_h + 0x10) as uint64) = kce }
+    uint32 r3   = 0x00000010; unsafe { *((kd_h + 0x2C) as uint32) = r3 }
     uint32 r1   = 0xE0AF0000; unsafe { *((kd_h + 0x30) as uint32) = r1 }
     uint32 r2   = 0x0000009E; unsafe { *((kd_h + 0x34) as uint32) = r2 }
-    uint32 r3   = 0x00000010; unsafe { *((kd_h + 0x38) as uint32) = r3 }
-    uint16 props = 0x0408;    unsafe { *((kd_h + 0x3C) as uint16) = props }
+    uint16 props = 0x0408;    unsafe { *((kd_h + 0x38) as uint16) = props }
 }
 
 fn _hipkfd_boost_init() {
     if _hipkfd_boost_done != 0 { return }
     // GTT + PUBLIC + EXECUTABLE so the CPU can write the kernel image
-    // and the CP can fetch instructions from it. Same flag set as
-    // dev_alloc_aql_ring uses for the AQL packet ring (which the CP
-    // also has to read with EXEC permission). Page-aligned 4096 covers
-    // the 96 byte KD + image footprint with room for slack.
+    // and the CP can fetch instructions from it. gfx11 requires the
+    // kernel-code entry to be 256-byte aligned (CP fetches in 256 B
+    // bursts and ignores low bits when computing the wave's PC base).
+    // KD is 64 B at offset 0; place the image at offset 256.
     uint64 va = dev_alloc_aql_ring(4096)
     _hipkfd_boost_kd_va = va
-    _hipkfd_boost_va    = va + 64
+    _hipkfd_boost_va    = va + 256
     uint64 kd_h  = dev_host_ptr(va)
-    uint64 img_h = kd_h + 64
+    uint64 img_h = kd_h + 256
     _hipkfd_boost_emit_image(img_h)
     _hipkfd_boost_emit_kd(kd_h)
     _hipkfd_boost_done = 1
@@ -964,13 +977,33 @@ fn hipModuleLaunchKernel(
     unsafe { *(db_host as uint64) = db_value }
     _hipkfd_hist_record(kd_va, karg_va, header_setup, slot, wp, 0)
 
-    // GPU-clock keepalive (task #55, opt-in via MLRIFT_BOOST=1).
-    // See _hipkfd_boost_dispatch comments for the gfx11-CP corruption
-    // we're chasing — debug via hipkfd_dump_queue() between launches.
+    // GPU-clock keepalive (task #55). Queues a tiny VALU-loop kernel
+    // behind every user launch IFF the queue is shallow — so sync-
+    // per-launch patterns (LLM decode tokens, gemv smoke) keep sclk
+    // at boost (~2.6 GHz) instead of dropping to 591 MHz idle floor,
+    // while batched-dispatch workloads (noesis sim loop, LLM prefill)
+    // skip the boost packet when the queue already has plenty of
+    // user work in flight to keep DPM happy on its own. Threshold
+    // tuned empirically: with > 4 user packets in flight, GPU stays
+    // ramped without help.
+    //
+    // Toggle via env: MLRIFT_BOOST=0 disables completely; =force
+    // ignores the queue-depth heuristic and always dispatches.
     uint64 boost_env = getenv("MLRIFT_BOOST")
+    uint64 boost_mode = 1                  // 0=off, 1=auto, 2=force
     if boost_env != 0 {
         uint8 bc = 0; unsafe { *(boost_env as uint8) -> bc }
-        if bc != 48 { _hipkfd_boost_dispatch() }
+        if bc == 48 { boost_mode = 0 }       // '0'
+        if bc == 102 { boost_mode = 2 }      // 'f' (force)
+    }
+    if boost_mode > 0 {
+        uint64 should_boost = 1
+        if boost_mode == 1 {
+            uint64 cur_wp = 0; unsafe { *(_hipkfd_q_wp_host as uint64) -> cur_wp }
+            uint64 cur_rp = 0; unsafe { *(_hipkfd_q_rp_host as uint64) -> cur_rp }
+            if (cur_wp - cur_rp) > 4 { should_boost = 0 }
+        }
+        if should_boost > 0 { _hipkfd_boost_dispatch() }
     }
 
     return 0
