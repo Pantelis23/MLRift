@@ -96,6 +96,32 @@ fn die(uint64 msg, uint64 code) {
     exit(1)
 }
 
+// Parse a decimal env value with optional 'K' / 'M' / 'G' suffix.
+// Returns 0 if the env var is unset; otherwise the parsed value.
+fn parse_env_count(uint64 name) -> uint64 {
+    uint64 s = getenv(name)
+    if s == 0 { return 0 }
+    uint64 v = 0
+    uint64 i = 0
+    uint64 mult = 1
+    while 1 == 1 {
+        uint64 cp = s + i
+        uint64 c = 0
+        unsafe { *(cp as uint8) -> c }
+        if c == 0 { break }
+        if c >= 48 && c <= 57 {           // '0'..'9'
+            v = v * 10 + (c - 48)
+            i = i + 1
+            continue
+        }
+        if c == 75 || c == 107 { mult = 1000;       break }       // K/k
+        if c == 77 || c == 109 { mult = 1000000;    break }       // M/m
+        if c == 71 || c == 103 { mult = 1000000000; break }       // G/g
+        break
+    }
+    return v * mult
+}
+
 // Parallel-tally worker: scans h_spike[start..end], writes (sum,
 // active_count) as two u64s into out_ptr. Called via thread_pool.
 fn tally_worker(uint64 h_spike_base, uint64 range_pack, uint64 out_ptr) {
@@ -121,6 +147,22 @@ fn tally_worker(uint64 h_spike_base, uint64 range_pack, uint64 out_ptr) {
 // graph needed here.
 
 fn main() {
+    // Optional env overrides for stress testing. NOESIS_N takes plain
+    // decimals or K/M/G suffixes; we keep N_E proportional (4:1
+    // exc:inh, matching the default 60 / 48 ratio) unless explicitly
+    // overridden, and NOESIS_N_STEPS lets the sweep driver drop the
+    // step count for shorter probe runs.
+    uint64 n_env = parse_env_count("NOESIS_N")
+    if n_env != 0 {
+        N = n_env
+        // 80% excitatory by default; overridden below if NOESIS_N_E set.
+        N_E = (n_env / 5) * 4
+    }
+    uint64 ne_env = parse_env_count("NOESIS_N_E")
+    if ne_env != 0 { N_E = ne_env }
+    uint64 ns_env = parse_env_count("NOESIS_N_STEPS")
+    if ns_env != 0 { N_STEPS = ns_env }
+
     uint32 err = hipSetDevice(0)
     if err != 0 { die("hipSetDevice failed", err) }
 
