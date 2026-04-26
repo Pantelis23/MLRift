@@ -48,7 +48,9 @@ static uint64 KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED      = 0x02000000
 
 // --- Queue types (kfd_ioctl.h:53-56) ---
 static uint64 KFD_IOC_QUEUE_TYPE_COMPUTE            = 0x0
+static uint64 KFD_IOC_QUEUE_TYPE_SDMA               = 0x1
 static uint64 KFD_IOC_QUEUE_TYPE_COMPUTE_AQL        = 0x2
+static uint64 KFD_IOC_QUEUE_TYPE_SDMA_XGMI          = 0x3
 
 // --- Private ioctl helper ---
 fn _kfd_ioctl(uint32 fd, uint64 cmd, uint64 args_ptr) -> uint32 {
@@ -157,6 +159,32 @@ fn raw_kfd_alloc_memory_of_gpu(uint32 fd, uint32 gpu_id, uint64 size, uint64 va_
         unsafe { *(out_handle_slot as uint64) = hh }
         unsafe { *(out_va_slot as uint64) = va }
         unsafe { *(out_mmap_offset_slot as uint64) = mm }
+    }
+    return r
+}
+
+// USERPTR variant: pin existing host pages and map them into the GPU
+// VM. user_addr (passed in mmap_offset) is the host VA returned by
+// malloc/mmap. va_addr is the preferred GPU VA. Used by hipMemcpy(H2D)
+// SDMA path to skip the GTT-staging-WC bottleneck — host RAM is
+// cacheable WB so memcpy/store from CPU runs at full DDR speed, and
+// the GPU SDMA engine reads it through PCIe DMA (~25 GB/s).
+fn raw_kfd_alloc_userptr(uint32 fd, uint32 gpu_id, uint64 size, uint64 user_addr,
+                          uint64 va_pref, uint32 flags,
+                          uint64 out_handle_slot, uint64 out_va_slot) -> uint32 {
+    uint64 args = alloc(40)
+    uint64 p0 = args + 0x00; unsafe { *(p0 as uint64) = va_pref }
+    uint64 p1 = args + 0x08; unsafe { *(p1 as uint64) = size }
+    uint64 p2 = args + 0x10; unsafe { *(p2 as uint64) = 0 }
+    uint64 p3 = args + 0x18; unsafe { *(p3 as uint64) = user_addr }   // user VA
+    uint64 p4 = args + 0x20; unsafe { *(p4 as uint32) = gpu_id }
+    uint64 p5 = args + 0x24; unsafe { *(p5 as uint32) = flags }
+    uint32 r = _kfd_ioctl(fd, AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, args)
+    if r == 0 {
+        uint64 hh = 0; unsafe { *(p2 as uint64) -> hh }
+        uint64 va = 0; unsafe { *(p0 as uint64) -> va }
+        unsafe { *(out_handle_slot as uint64) = hh }
+        unsafe { *(out_va_slot as uint64) = va }
     }
     return r
 }

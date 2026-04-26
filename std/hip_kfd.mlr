@@ -92,6 +92,18 @@ static uint64 _hipkfd_stage_va     = 0
 static uint64 _hipkfd_stage_h      = 0
 static uint64 _hipkfd_stage_bytes  = 0
 
+// Lazy SDMA queue used by hipMemcpy(H2D). For each H2D the source
+// host buffer is registered with the GPU as a USERPTR (kernel pins
+// the pages and adds a GPU VM mapping that aliases them) and the SDMA
+// engine reads from there directly into VRAM. Skips both the BAR1-WC
+// CPU-write path and the GTT-WC staging-memcpy path — the only PCIe
+// traffic is the SDMA's own DMA reads (~25 GB/s).
+//
+// Failure to create the queue (old kernels, no SDMA, perm issues)
+// falls back to the parallel-thread BAR1 path.
+static uint64 _hipkfd_sdma_q         = 0
+static uint64 _hipkfd_sdma_init_done = 0       // 0 = not tried, 1 = ok, 2 = failed
+
 // Parallel-memcpy thread pool for H2D writes through PCIe BAR1. WC
 // buffer flushes serialise per-core, so a single thread tops out at
 // ~2 GB/s on this RX 7800 XT setup. 4 cores split the buffer across
@@ -143,6 +155,42 @@ fn _hipkfd_h2d_parallel(uint64 dst, uint64 src, uint64 size) {
         i = i + 1
     }
     thread_pool_wait()
+}
+
+// Ensure the SDMA queue is ready. Returns 1 on success, 0 if the path
+// isn't usable.
+fn _hipkfd_sdma_ensure() -> uint64 {
+    if _hipkfd_sdma_init_done == 2 { return 0 }
+    if _hipkfd_sdma_init_done == 0 {
+        _hipkfd_lazy_init()
+        uint64 q = kfd_create_sdma_queue()
+        if q == 0 {
+            _hipkfd_sdma_init_done = 2
+            return 0
+        }
+        _hipkfd_sdma_q = q
+        _hipkfd_sdma_init_done = 1
+    }
+    return 1
+}
+
+// SDMA-backed H2D via USERPTR: pin the source host buffer in the GPU
+// VM, kick the SDMA engine to read straight from there into VRAM.
+// The userptr mapping stays alive until process exit (KFD reclaims
+// at fd-close). Returns 1 on success, 0 if any step declines.
+fn _hipkfd_h2d_sdma(uint64 dst_va, uint64 src, uint64 size) -> uint64 {
+    if _hipkfd_sdma_ensure() == 0 { return 0 }
+    // KFD's USERPTR alloc requires the source VA to be page-aligned
+    // and the size to be a multiple of a page. Round size up; the
+    // SDMA copy itself only transfers `size` bytes (the trailing
+    // bytes in the rounded-up region are pinned but never read).
+    uint64 page_mask = 4095
+    if (src & page_mask) != 0 { return 0 }
+    uint64 reg_size  = (size + page_mask) & 0xFFFFFFFFFFFFF000
+    uint64 src_va = dev_register_userptr(src, reg_size)
+    if src_va == 0 { return 0 }
+    kfd_sdma_copy(_hipkfd_sdma_q, src_va, dst_va, size)
+    return 1
 }
 
 fn _hipkfd_ensure_stage(uint64 nbytes) -> uint64 {
@@ -281,14 +329,29 @@ fn _hipkfd_dev_copy(uint64 dst_va, uint64 src_va, uint64 nbytes) -> uint64 {
 // hipMemcpy kinds: 0 = H2H, 1 = H2D, 2 = D2H, 3 = D2D, 4 = Default.
 fn hipMemcpy(uint64 dst, uint64 src, uint64 size, uint32 kind) -> uint32 {
     if kind == 1 {
-        // H2D. Direct memcpy(host -> mmap'd VRAM) writes through PCIe
-        // BAR1. KFD's PUBLIC mmap returns a write-combined mapping —
-        // CPU stores stream through the WC buffer at ~2 GB/s per core
-        // (limited by 64-byte WC line flushes hitting PCIe latency).
-        // We split across 4 worker threads, each driving its own core's
-        // WC buffer in parallel — empirically 3–4× the single-thread
-        // bandwidth on this RX 7800 XT.
+        // H2D. CPU stores to KFD's BAR1-mapped VRAM go through write-
+        // combined PCIe; per-core WC flushes are PCIe-latency bound at
+        // ~2 GB/s. We split each H2D across 4 worker threads to drive
+        // 4 separate WC queues to the PCIe controller in parallel —
+        // empirically a 3-4× throughput win.
+        //
+        // We also have an SDMA-engine path (_hipkfd_h2d_sdma) ready for
+        // future use: USERPTR-pin the source RAM, kick a PM4 SDMA
+        // COPY_LINEAR, drain. On this RX 7800 XT the PCIe controller's
+        // SDMA engine bench at ~the same rate as 4 cores' WC writes,
+        // and USERPTR pin-time + per-packet drain eats the DMA savings,
+        // so it lands ~150 ms slower on the noesis 7×480 MB H2D phase.
+        // Kept opt-in: enable by setting MLRIFT_USE_SDMA=1.
         if size >= 0x100000 {                              // ≥1 MB worth doing
+            uint64 sdma_env = getenv("MLRIFT_USE_SDMA")
+            uint64 use_sdma = 0
+            if sdma_env != 0 {
+                uint8 c = 0; unsafe { *(sdma_env as uint8) -> c }
+                if c != 48 { use_sdma = 1 }
+            }
+            if use_sdma > 0 {
+                if _hipkfd_h2d_sdma(dst, src, size) == 1 { return 0 }
+            }
             uint64 dst_h = dev_host_ptr(dst)
             _hipkfd_h2d_parallel(dst_h, src, size)
             return 0

@@ -402,6 +402,33 @@ fn dev_alloc_kernel_image(uint64 nbytes) -> uint64 {
     return va
 }
 
+// Register a user-allocated host buffer with the GPU's address space.
+// `host_ptr` is a regular malloc'd / page-aligned RAM pointer; KFD
+// pins it and adds a GPU VM mapping. Returns the GPU VA (which aliases
+// the host RAM physically). Used for the SDMA H2D path: CPU writes to
+// host_ptr at full DDR bandwidth (cacheable WB), then SDMA reads via
+// PCIe DMA at ~25 GB/s — neither side hits the BAR1 / GTT-WC choke.
+//
+// The buffer should be aligned to a page (4 KiB) and a multiple of a
+// page in size for the kernel's pinning logic.
+fn dev_register_userptr(uint64 host_ptr, uint64 nbytes) -> uint64 {
+    if _kfd_initialized == 0 { kfd_init() }
+    uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_USERPTR | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
+    uint64 va_pref = _kfd_reserve_va(nbytes)
+    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8)
+    uint32 r = raw_kfd_alloc_userptr(_kfd_fd, _kfd_gpu_id, nbytes, host_ptr, va_pref, flags, h_slot, va_slot)
+    if r != 0 { return 0 }
+    uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
+    uint64 va     = 0; unsafe { *(va_slot as uint64) -> va }
+    r = raw_kfd_map_memory_to_gpu(_kfd_fd, handle, _kfd_gpu_id)
+    if r != 0 {
+        raw_kfd_free_memory_of_gpu(_kfd_fd, handle)
+        return 0
+    }
+    _kfd_alloc_track_kind(va, handle, nbytes, host_ptr, 3)     // kind=3: USERPTR
+    return va
+}
+
 // AQL-queue ring allocation: GTT + EXECUTABLE + COHERENT. The CP
 // (Command Processor Fetcher) needs EXECUTE permission to fetch
 // AQL packets from the ring — without it the GPU page-faults with
@@ -640,6 +667,180 @@ fn kfd_destroy_queue(uint64 q) {
     uint32 qid = 0; unsafe { *((q + 0x00) as uint32) -> qid }
     raw_kfd_destroy_queue(_kfd_fd, qid)
     // Don't unmap doorbell or free ring/eop/ctx - process exit reclaims.
+}
+
+// ============================================================================
+// SDMA queue: a separate KFD queue type (1) driven by PM4 SDMA packets,
+// not AQL. The SDMA engine bypasses the CP/CU pipeline and runs DMA
+// directly through PCIe — used here to fast-path host->VRAM without
+// the BAR1 write-combined bottleneck that bites direct CPU memcpys.
+//
+// Queue handle layout reuses the compute-queue layout (so hipMemcpy
+// fast paths can store either type). Differences from compute queue:
+//   * queue_type = KFD_IOC_QUEUE_TYPE_SDMA (1)
+//   * No EOP buffer, no ctx_save/restore — kernel's set_queue_properties
+//     ignores those slots for SDMA queues.
+//   * Ring is plain memory; CPU writes raw PM4 SDMA packets (4-byte dwords)
+//     starting at byte offset wp_byte; wp/rp track BYTE positions, not packet
+//     indices (different from AQL).
+// ============================================================================
+
+static uint64 KFD_SDMA_RING_BYTES = 65536        // 64 KiB ring; pow2 required.
+static uint64 KFD_SDMA_RING_MASK  = 65535        // wp/rp wrap mask (rb_size-1).
+
+fn kfd_create_sdma_queue() -> uint64 {
+    if _kfd_initialized == 0 { kfd_init() }
+
+    uint64 q = alloc(112)
+    uint64 i = 0
+    while i < 112 { uint64 p = q + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
+
+    // SDMA ring lives in GTT (host-allocated, GPU-readable). Use the
+    // host-visible-GTT allocator we already have for kernarg rings.
+    uint64 ring_va   = dev_alloc_host_visible(KFD_SDMA_RING_BYTES)
+    uint64 ring_host = dev_host_ptr(ring_va)
+    // Zero the ring (SDMA decoder treats undefined opcodes as NOPs but
+    // we clean up for predictable behaviour).
+    uint64 z = 0
+    while z < KFD_SDMA_RING_BYTES {
+        uint64 p = ring_host + z; unsafe { *(p as uint64) = 0 }
+        z = z + 8
+    }
+
+    // wp/rp: small u64 pair in GTT. The kernel polls these via the GPU's
+    // HQD MQD; CPU is the writer (wp) and reader-of-progress (rp).
+    uint64 wprp_va   = dev_alloc_host_visible(64)
+    uint64 wprp_host = dev_host_ptr(wprp_va)
+    unsafe { *(wprp_host as uint64) = 0 }
+    unsafe { *((wprp_host + 8) as uint64) = 0 }
+    uint64 wp_va   = wprp_va
+    uint64 rp_va   = wprp_va + 8
+    uint64 wp_host = wprp_host
+    uint64 rp_host = wprp_host + 8
+
+    uint64 qid_slot = alloc(4); uint64 db_slot = alloc(8)
+    uint64 wp_out_slot = alloc(8); uint64 rp_out_slot = alloc(8)
+
+    // queue_type = 1 (SDMA); no EOP / no ctx_save (SDMA queues don't preempt
+    // through the same CWSR mechanism as compute). Priority same as compute (7).
+    uint32 r = raw_kfd_create_queue(_kfd_fd,
+                                     ring_va, KFD_SDMA_RING_BYTES,
+                                     _kfd_gpu_id, KFD_IOC_QUEUE_TYPE_SDMA, 7,
+                                     0, 0,                              // eop
+                                     0, 0, 0,                            // ctx
+                                     wp_va, rp_va,
+                                     qid_slot, db_slot, wp_out_slot, rp_out_slot)
+    if r != 0 { return 0 }
+
+    uint32 qid = 0; unsafe { *(qid_slot as uint32) -> qid }
+    uint64 db_off = 0; unsafe { *(db_slot as uint64) -> db_off }
+
+    // Doorbell page-aligned offset is db_off & ~(PAGE-1); the in-page
+    // byte offset of our slot is db_off & (PAGE-1). KFD returns the
+    // composed value, so we mmap the page-aligned base.
+    uint64 db_page  = db_off & 0xFFFFFFFFFFFFE000      // round to 8 KiB page
+    uint64 db_in_pg = db_off - db_page
+
+    uint64 db_host = mmap(0, KFD_DOORBELL_PAGE, KFD_DOORBELL_PROT, KFD_DOORBELL_FLAGS,
+                           _kfd_drm_fd, db_page)
+    if db_host > 0xFFFFFFFFFFFFF000 {
+        db_host = mmap(0, KFD_DOORBELL_PAGE, KFD_DOORBELL_PROT, KFD_DOORBELL_FLAGS,
+                        _kfd_fd, db_page)
+        if db_host > 0xFFFFFFFFFFFFF000 { return 0 }
+    }
+    db_host = db_host + db_in_pg
+
+    unsafe { *((q + 0x00) as uint32) = qid }
+    unsafe { *((q + 0x04) as uint32) = _kfd_gpu_id }
+    unsafe { *((q + 0x08) as uint64) = ring_va }
+    unsafe { *((q + 0x10) as uint64) = KFD_SDMA_RING_BYTES }    // store BYTES (not packet count) for SDMA
+    unsafe { *((q + 0x18) as uint64) = ring_host }
+    unsafe { *((q + 0x20) as uint64) = db_off }
+    unsafe { *((q + 0x28) as uint64) = db_host }
+    unsafe { *((q + 0x30) as uint64) = wp_va }
+    unsafe { *((q + 0x38) as uint64) = rp_va }
+    unsafe { *((q + 0x40) as uint64) = wp_host }
+    unsafe { *((q + 0x60) as uint64) = rp_host }
+    return q
+}
+
+// PM4 SDMA opcodes (gfx11 SDMA 5.0+):
+//   COPY (op=1)
+//     sub_op=0 LINEAR
+//     header  = sub_op<<8 | op
+//     count32 = byte_count - 1
+//     count64 = 0
+//     src_lo, src_hi, dst_lo, dst_hi
+//   FENCE (op=5, sub_op=0): writes value to addr after pipe drain.
+//     header  = 0x05
+//     addr_lo, addr_hi, data
+//
+// Byte-cursor based wp: the kernel reads `wp` as a byte index modulo
+// ring_size. After writing N bytes of packets, set wp += N and ring
+// the doorbell with the new wp value (full byte index, not slot).
+
+fn _sdma_emit_copy_linear(uint64 ring_host, uint64 wp_byte,
+                           uint64 src_va, uint64 dst_va, uint64 nbytes) -> uint64 {
+    // 7 dwords (28 bytes) per packet. nbytes-1 must fit in 30 bits
+    // (~1 GiB), which covers our 480 MiB H2D buffers in a single packet.
+    uint64 off = wp_byte
+    // Word 0: header — op=1 (COPY), sub_op=0 (LINEAR), encoding bits 0.
+    uint32 hdr = 0x00000001
+    uint64 p0 = ring_host + (off & KFD_SDMA_RING_MASK)
+    unsafe { *(p0 as uint32) = hdr }
+    // Word 1: count low 32 = byte_count - 1
+    uint32 cnt = (nbytes - 1) & 0xFFFFFFFF
+    uint64 p1 = ring_host + ((off + 4) & KFD_SDMA_RING_MASK)
+    unsafe { *(p1 as uint32) = cnt }
+    // Word 2: count high 32 = 0 (we never emit >4 GiB single packets here)
+    uint32 cnt_hi = 0
+    uint64 p2 = ring_host + ((off + 8) & KFD_SDMA_RING_MASK)
+    unsafe { *(p2 as uint32) = cnt_hi }
+    // Word 3-4: src VA (lo, hi)
+    uint32 sl = src_va & 0xFFFFFFFF
+    uint32 sh = (src_va >> 32) & 0xFFFFFFFF
+    uint64 p3 = ring_host + ((off + 12) & KFD_SDMA_RING_MASK)
+    unsafe { *(p3 as uint32) = sl }
+    uint64 p4 = ring_host + ((off + 16) & KFD_SDMA_RING_MASK)
+    unsafe { *(p4 as uint32) = sh }
+    // Word 5-6: dst VA (lo, hi)
+    uint32 dl = dst_va & 0xFFFFFFFF
+    uint32 dh = (dst_va >> 32) & 0xFFFFFFFF
+    uint64 p5 = ring_host + ((off + 20) & KFD_SDMA_RING_MASK)
+    unsafe { *(p5 as uint32) = dl }
+    uint64 p6 = ring_host + ((off + 24) & KFD_SDMA_RING_MASK)
+    unsafe { *(p6 as uint32) = dh }
+    return off + 28
+}
+
+// One-shot dispatch + wait. Caller passes pre-mapped GPU VAs. Spins on
+// rp == wp to drain. Suitable for the H2D init phase where we want
+// ordering w.r.t. the subsequent compute queue.
+fn kfd_sdma_copy(uint64 q, uint64 src_va, uint64 dst_va, uint64 nbytes) {
+    uint64 ring_host = 0; unsafe { *((q + 0x18) as uint64) -> ring_host }
+    uint64 wp_host   = 0; unsafe { *((q + 0x40) as uint64) -> wp_host }
+    uint64 db_host   = 0; unsafe { *((q + 0x28) as uint64) -> db_host }
+    uint64 rp_host   = 0; unsafe { *((q + 0x60) as uint64) -> rp_host }
+
+    uint64 wp = 0; unsafe { *(wp_host as uint64) -> wp }
+    uint64 new_wp = _sdma_emit_copy_linear(ring_host, wp, src_va, dst_va, nbytes)
+    _kfd_fence()
+    unsafe { *(wp_host as uint64) = new_wp }
+    _kfd_fence()
+    // SDMA doorbell value = new wp byte index (low 32 bits suffice for our 64 KiB ring).
+    uint64 db_value = new_wp
+    unsafe { *(db_host as uint64) = db_value }
+
+    // Spin until rp catches up. SDMA processes packets in order; rp == wp
+    // means our packet retired.
+    uint64 rp = 0
+    unsafe { *(rp_host as uint64) -> rp }
+    uint64 spin = 0
+    while rp != new_wp {
+        spin = spin + 1
+        if spin > 30000000000 { kfd_die("kfd_sdma_copy: timeout draining", spin) }
+        unsafe { *(rp_host as uint64) -> rp }
+    }
 }
 
 // ============================================================================
