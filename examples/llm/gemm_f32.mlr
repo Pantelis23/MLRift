@@ -1,0 +1,76 @@
+// MLRift LLM Phase A milestone 2: FP32 tile GEMM kernel.
+//
+//   C = A · B    where A is [M × K], B is [K × N], C is [M × N], all
+//                row-major and f32. (Matches the typical "weight @
+//                activations" shape used in transformer prefill: A =
+//                weight matrix, B = batch of activation columns.)
+//
+// Tile shape: each workgroup is 256 lanes (16×16 in tile coords) and
+// computes one 16×16 tile of C. Each lane owns one output cell of the
+// tile. No LDS yet — raw global loads. Milestone 3 layers double-
+// buffered LDS on top of this.
+//
+// Why 16×16: matches the canonical RDNA3 WMMA tile size, so milestone
+// 3's LDS layout drops in cleanly when we swap the inner FMA loop for
+// `v_wmma_*` in Phase B. Lets us validate correctness + scheduling
+// before encoding-detail work.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=hip-amd \
+//       examples/llm/gemm_f32.mlr -o /tmp/gemm_f32
+
+fn tid_x() -> uint64 {
+    return 0
+}
+
+@kernel
+fn gemm_f32(
+    uint64 a_ptr,    // [M × K]
+    uint64 b_ptr,    // [K × N]
+    uint64 c_ptr,    // [M × N]
+    uint64 m,
+    uint64 n,
+    uint64 k_dim
+) {
+    // 256-lane block laid out as 16×16. lane = blockIdx-style id we
+    // get from tid_x(); HIP lowers blockIdx*blockDim + threadIdx.
+    uint64 lane = tid_x()
+    // tile_row, tile_col within the 16×16 output tile this block owns:
+    // we synthesise them from a single linear lane id since hip lowers
+    // tid_x to (blockIdx.x*blockDim.x + threadIdx.x). Tile-id can be
+    // recovered as lane / 256, and within-tile (i, j) = (tid%16, ...).
+    uint64 tile_id   = lane / 256        // which 16×16 tile this lane owns part of
+    uint64 within    = lane - tile_id * 256
+    uint64 i_in_tile = within / 16
+    uint64 j_in_tile = within - i_in_tile * 16
+
+    uint64 tiles_per_row = (n + 15) / 16
+    uint64 tile_row = tile_id / tiles_per_row
+    uint64 tile_col = tile_id - tile_row * tiles_per_row
+
+    uint64 row = tile_row * 16 + i_in_tile
+    uint64 col = tile_col * 16 + j_in_tile
+
+    if row < m {
+        if col < n {
+            f32 sum = 0.0
+            uint64 a_row_base = a_ptr + row * k_dim * 4
+            uint64 b_col_base = b_ptr + col * 4
+            uint64 t = 0
+            while t < k_dim {
+                uint64 ap = a_row_base + t * 4
+                uint64 bp = b_col_base + t * n * 4
+                f32 a = 0.0; unsafe { *(ap as f32) -> a }
+                f32 b = 0.0; unsafe { *(bp as f32) -> b }
+                sum = sum + a * b
+                t = t + 1
+            }
+            uint64 cp = c_ptr + (row * n + col) * 4
+            unsafe { *(cp as f32) = sum }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}
