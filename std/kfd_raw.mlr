@@ -46,6 +46,73 @@ static uint64 KFD_IOC_ALLOC_MEM_FLAGS_AQL_QUEUE_MEM = 0x08000000
 static uint64 KFD_IOC_ALLOC_MEM_FLAGS_COHERENT      = 0x04000000
 static uint64 KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED      = 0x02000000
 
+// --- DRM amdgpu CTX ioctl (separate from KFD; goes to /dev/dri/renderD*) ---
+// HIP / HSA-runtime use this to pin sclk to the peak DPM state so
+// short kernels don't see the GPU's idle-clock floor (~591 MHz on
+// gfx1100 vs ~2700 MHz boost). Without it, our sync-launch path
+// runs each kernel ~17× slower than HIP runtime — see task #55.
+//
+// ioctl number: DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_CTX, union drm_amdgpu_ctx)
+//   DRM_COMMAND_BASE = 0x40, DRM_AMDGPU_CTX = 0x02 → nr = 0x42
+//   type = 'd' = 0x64, size = 16, dir = READ|WRITE = 3
+//   = (3<<30) | (16<<16) | (0x64<<8) | 0x42 = 0xC0106442
+static uint64 DRM_IOCTL_AMDGPU_CTX = 0xC0106442
+
+// drm_amdgpu_ctx_in / _out share a 16-byte union. Layout (in):
+//   [0x00] u32 op
+//   [0x04] u32 flags
+//   [0x08] u32 ctx_id   (input for SET_*; ignored for ALLOC_CTX)
+//   [0x0C] u32 priority OR stable_pstate_flags (depends on op)
+// Layout (out, after ALLOC_CTX):
+//   [0x00] u32 ctx_id   (allocated context id)
+//   [0x04] u32 _pad
+//   [0x08] u32 _pad
+//   [0x0C] u32 _pad
+
+static uint64 AMDGPU_CTX_OP_ALLOC_CTX        = 1
+static uint64 AMDGPU_CTX_OP_FREE_CTX         = 2
+static uint64 AMDGPU_CTX_OP_SET_STABLE_PSTATE = 6
+static uint64 AMDGPU_CTX_STABLE_PSTATE_NONE  = 0
+static uint64 AMDGPU_CTX_STABLE_PSTATE_PEAK  = 4
+
+// Allocate a DRM context. Required input fd is the DRM render-node
+// fd already opened in std/kfd.mlr's kfd_init.
+fn raw_drm_ctx_alloc(uint32 drm_fd, uint64 out_ctx_id_slot) -> uint32 {
+    uint64 args = alloc(16)
+    uint64 i = 0; while i < 16 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
+    uint32 op = AMDGPU_CTX_OP_ALLOC_CTX
+    unsafe { *((args + 0x00) as uint32) = op }
+    uint32 r = ioctl(drm_fd, DRM_IOCTL_AMDGPU_CTX, args)
+    if r == 0 {
+        uint32 ctx_id = 0
+        unsafe { *((args + 0x00) as uint32) -> ctx_id }   // out: ctx_id at offset 0
+        unsafe { *(out_ctx_id_slot as uint32) = ctx_id }
+    }
+    return r
+}
+
+// Free a DRM context.
+fn raw_drm_ctx_free(uint32 drm_fd, uint32 ctx_id) -> uint32 {
+    uint64 args = alloc(16)
+    uint64 i = 0; while i < 16 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
+    uint32 op = AMDGPU_CTX_OP_FREE_CTX
+    unsafe { *((args + 0x00) as uint32) = op }
+    unsafe { *((args + 0x08) as uint32) = ctx_id }
+    return ioctl(drm_fd, DRM_IOCTL_AMDGPU_CTX, args)
+}
+
+// Pin DPM to one of AMDGPU_CTX_STABLE_PSTATE_*. PEAK pins sclk/mclk
+// to the highest valid DPM levels for the lifetime of the context.
+fn raw_drm_ctx_set_stable_pstate(uint32 drm_fd, uint32 ctx_id, uint32 pstate_flags) -> uint32 {
+    uint64 args = alloc(16)
+    uint64 i = 0; while i < 16 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
+    uint32 op = AMDGPU_CTX_OP_SET_STABLE_PSTATE
+    unsafe { *((args + 0x00) as uint32) = op }
+    unsafe { *((args + 0x08) as uint32) = ctx_id }
+    unsafe { *((args + 0x0C) as uint32) = pstate_flags }
+    return ioctl(drm_fd, DRM_IOCTL_AMDGPU_CTX, args)
+}
+
 // --- Queue types (kfd_ioctl.h:53-56) ---
 static uint64 KFD_IOC_QUEUE_TYPE_COMPUTE            = 0x0
 static uint64 KFD_IOC_QUEUE_TYPE_SDMA               = 0x1

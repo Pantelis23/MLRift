@@ -270,11 +270,32 @@ fn main() {
     uint64 grid_u = (M + 255) / 256
     uint32 grid = grid_u
 
-    // Single launch + sync (real measurement) — this is the latency
-    // visible to a synchronous caller. For comparison: the LLM forward
-    // path uses async batching (queue many, sync once at end), which
-    // hides the sync-time GPU-clock dip. Run with GEMV_BATCH=N to see
-    // the async batched per-launch number.
+    // Optional warmup burst.
+    uint64 nw = parse_env_count("GEMV_WARMUP")
+    if nw > 0 {
+        uint64 wi = 0
+        while wi < nw {
+            err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+            if err != 0 { die("launch warmup", err) }
+            wi = wi + 1
+        }
+        err = hipDeviceSynchronize(); if err != 0 { die("sync warmup", err) }
+    }
+
+    // Time 8 sequential single-launch+sync cycles after the warmup.
+    // Tells us whether DPM clock state persists across sync gaps or
+    // drops back immediately on idle.
+    uint64 ti = 0
+    while ti < 8 {
+        uint64 ts0 = time_ns()
+        err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+        if err != 0 { die("launch seq", err) }
+        err = hipDeviceSynchronize(); if err != 0 { die("sync seq", err) }
+        uint64 ts1 = time_ns()
+        print_label_val("seq_us", 6, (ts1 - ts0) / 1000)
+        ti = ti + 1
+    }
+
     err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
     if err != 0 { die("launch gemv", err) }
     err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }

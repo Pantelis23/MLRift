@@ -209,9 +209,155 @@ fn _hipkfd_ensure_stage(uint64 nbytes) -> uint64 {
     return 1
 }
 
+// DRM AMDGPU context allocated as part of the no-ROCm GPU power-state
+// story (task #55). SET_STABLE_PSTATE/PEAK over DRM applies the hint
+// to that context's DRM command-submissions only — KFD doorbell-driven
+// compute queues are a separate scheduler tree. We allocate the ctx
+// anyway: cheap, exercises the path for future kernel versions, and
+// having an active AMDGPU context per-process nudges DPM heuristics
+// on at least gfx12+.
+static uint32 _hipkfd_drm_ctx_id   = 0
+static uint64 _hipkfd_drm_ctx_done = 0
+
+fn _hipkfd_drm_pin_clocks() {
+    if _hipkfd_drm_ctx_done != 0 { return }
+    uint64 ctx_slot = alloc(4)
+    uint32 r = raw_drm_ctx_alloc(kfd_drm_fd(), ctx_slot)
+    if r != 0 { _hipkfd_drm_ctx_done = 1; return }
+    uint32 ctx_id = 0; unsafe { *(ctx_slot as uint32) -> ctx_id }
+    _hipkfd_drm_ctx_id = ctx_id
+    uint32 peak = AMDGPU_CTX_STABLE_PSTATE_PEAK
+    raw_drm_ctx_set_stable_pstate(kfd_drm_fd(), ctx_id, peak)
+    _hipkfd_drm_ctx_done = 1
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// GPU-clock keepalive (task #55).
+//
+// Mechanism: at lazy_init, allocate executable VRAM, write a 28-byte
+// "boost" kernel (a 65k-iter VALU loop ending with s_endpgm) and a
+// 64-byte HSA kernel descriptor pointing at it. After every user
+// hipModuleLaunchKernel we dispatch the boost kernel WITH
+// barrier=0/signal_va=0 so it runs in parallel with the user's kernel,
+// keeping the AQL queue continuously non-empty. The CP-side activity
+// is what DPM samples — sustained 1+ ms of dispatch keeps sclk at
+// boost. Cost per user-launch: 12 extra packet stores + 1 fence,
+// ~few hundred nanoseconds.
+//
+// Why not a separate thread: contention on the AQL ring write pointer
+// would need a spinlock, and the existing single-threaded dispatch
+// fast path is fragile to mutate. Inlining the boost behind every
+// user launch is simpler and the cost is invisible alongside the
+// user's own kernel runtime.
+
+static uint64 _hipkfd_boost_va    = 0
+static uint64 _hipkfd_boost_kd_va = 0
+static uint64 _hipkfd_boost_done  = 0
+
+// Boost kernel image — verified output of llvm-mc -mcpu=gfx1100:
+//   v_mov_b32_e32 v0, 0                            ; 7E000280
+//   .loop:
+//   v_add_nc_u32_e32 v0, 1, v0                     ; 4A000081
+//   v_cmp_lt_u32_e64 vcc_lo, v0, 0x10000           ; D449006A 0001FF00 00010000
+//   s_cbranch_vccnz .loop  (-3 dwords)             ; BFA4FFFD
+//   s_endpgm                                       ; BFB00000
+// 28 bytes total. Each lane runs 65 536 iterations; one wave at boost
+// clocks finishes in ~250 us — long enough for DPM to register
+// "active" but short enough that the queue drains promptly.
+fn _hipkfd_boost_emit_image(uint64 dst) {
+    uint32 w0 = 0x7E000280; unsafe { *((dst +  0) as uint32) = w0 }
+    uint32 w1 = 0x4A000081; unsafe { *((dst +  4) as uint32) = w1 }
+    uint32 w2 = 0xD449006A; unsafe { *((dst +  8) as uint32) = w2 }
+    uint32 w3 = 0x0001FF00; unsafe { *((dst + 12) as uint32) = w3 }
+    uint32 w4 = 0x00010000; unsafe { *((dst + 16) as uint32) = w4 }
+    uint32 w5 = 0xBFA4FFFD; unsafe { *((dst + 20) as uint32) = w5 }
+    uint32 w6 = 0xBFB00000; unsafe { *((dst + 24) as uint32) = w6 }
+}
+
+// HSA kernel descriptor — same shape we use for native kernels. The
+// kernel image lives 64 bytes after the KD start, so the kd's
+// kernel_code_entry_byte_offset = 64. rsrc1/2/3 + properties match
+// the noesis kernels (1 wave, no kernargs needed beyond what KD/CP
+// auto-set). kernarg_size = 0 — the kernel doesn't dereference any.
+fn _hipkfd_boost_emit_kd(uint64 kd_h) {
+    uint64 i = 0
+    while i < 64 { uint64 p = kd_h + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
+    uint32 ks   = 0;          unsafe { *((kd_h + 0x08) as uint32) = ks }
+    uint64 kce  = 64;         unsafe { *((kd_h + 0x10) as uint64) = kce }
+    uint32 r1   = 0xE0AF0000; unsafe { *((kd_h + 0x30) as uint32) = r1 }
+    uint32 r2   = 0x0000009E; unsafe { *((kd_h + 0x34) as uint32) = r2 }
+    uint32 r3   = 0x00000010; unsafe { *((kd_h + 0x38) as uint32) = r3 }
+    uint16 props = 0x0408;    unsafe { *((kd_h + 0x3C) as uint16) = props }
+}
+
+fn _hipkfd_boost_init() {
+    if _hipkfd_boost_done != 0 { return }
+    // GTT + PUBLIC + EXECUTABLE so the CPU can write the kernel image
+    // and the CP can fetch instructions from it. Same flag set as
+    // dev_alloc_aql_ring uses for the AQL packet ring (which the CP
+    // also has to read with EXEC permission). Page-aligned 4096 covers
+    // the 96 byte KD + image footprint with room for slack.
+    uint64 va = dev_alloc_aql_ring(4096)
+    _hipkfd_boost_kd_va = va
+    _hipkfd_boost_va    = va + 64
+    uint64 kd_h  = dev_host_ptr(va)
+    uint64 img_h = kd_h + 64
+    _hipkfd_boost_emit_image(img_h)
+    _hipkfd_boost_emit_kd(kd_h)
+    _hipkfd_boost_done = 1
+}
+
+// Queue a boost dispatch on the shim's compute queue. AQL header
+// barrier=0 (so it can dispatch concurrently with the user kernel),
+// signal_va=0 (no completion notification — we never wait on it).
+fn _hipkfd_boost_dispatch() {
+    if _hipkfd_boost_done == 0 { return }
+
+    uint64 wp = 0; unsafe { *(_hipkfd_q_wp_host as uint64) -> wp }
+    uint64 rp = 0; unsafe { *(_hipkfd_q_rp_host as uint64) -> rp }
+    while (wp - rp) >= _hipkfd_q_ring_cap {
+        unsafe { *(_hipkfd_q_rp_host as uint64) -> rp }
+    }
+    uint64 slot   = wp - (wp / _hipkfd_q_ring_cap) * _hipkfd_q_ring_cap
+    uint64 packet = _hipkfd_q_ring_host + slot * 64
+
+    uint16 bx16 = 32; unsafe { *((packet + 0x04) as uint16) = bx16 }
+    uint16 by16 = 1;  unsafe { *((packet + 0x06) as uint16) = by16 }
+    uint16 bz16 = 1;  unsafe { *((packet + 0x08) as uint16) = bz16 }
+    uint16 r0   = 0;  unsafe { *((packet + 0x0A) as uint16) = r0 }
+    uint32 g_x  = 32; unsafe { *((packet + 0x0C) as uint32) = g_x }
+    uint32 g_y  = 1;  unsafe { *((packet + 0x10) as uint32) = g_y }
+    uint32 g_z  = 1;  unsafe { *((packet + 0x14) as uint32) = g_z }
+    uint32 priv0 = 0; unsafe { *((packet + 0x18) as uint32) = priv0 }
+    uint32 grp0  = 0; unsafe { *((packet + 0x1C) as uint32) = grp0 }
+    unsafe { *((packet + 0x20) as uint64) = _hipkfd_boost_kd_va }
+    uint64 zk = 0; unsafe { *((packet + 0x28) as uint64) = zk }
+    uint64 r2 = 0; unsafe { *((packet + 0x30) as uint64) = r2 }
+    uint64 sigz = 0; unsafe { *((packet + 0x38) as uint64) = sigz }
+
+    _kfd_fence()
+    // Header: same as user's (type=2, barrier=1, acquire/release=2 = 0x1502).
+    // We tried barrier=0 to allow concurrent dispatch; the CP races between
+    // the doorbell rings of two consecutive packets, occasionally observes
+    // an unwritten boost header before the body store retires, and stalls.
+    // Serial-with-barrier is safe and still keeps the queue continuously
+    // non-empty, which is what DPM samples.
+    uint32 header_setup = (1 << 16) | 0x1502
+    unsafe { *((packet + 0x00) as uint32) = header_setup }
+    _kfd_fence()
+    uint64 new_wp = wp + 1
+    unsafe { *(_hipkfd_q_wp_host as uint64) = new_wp }
+    _kfd_fence()
+    uint64 db_value = new_wp - 1
+    unsafe { *(_hipkfd_q_db_host as uint64) = db_value }
+    // No _hipkfd_pending update — boost has signal_va=0, GPU never
+    // touches our shared signal. User's pending count stays accurate.
+}
+
 fn _hipkfd_lazy_init() {
     if _hipkfd_q != 0 { return }
     kfd_init()
+    _hipkfd_drm_pin_clocks()
     _hipkfd_q              = kfd_create_queue(KFD_WAIT_BUSY_POLL)
     _hipkfd_signal         = kfd_signal_alloc()
     // kfd_signal_alloc inits value=1 (HSA "in flight" default).
@@ -236,6 +382,11 @@ fn _hipkfd_lazy_init() {
     uint64 t_dh = 0; unsafe { *((q + 0x28) as uint64) -> t_dh }; _hipkfd_q_db_host   = t_dh
     uint64 t_ph = 0; unsafe { *((q + 0x60) as uint64) -> t_ph }; _hipkfd_q_rp_host   = t_ph
     _hipkfd_q_signal_va = _hipkfd_signal
+
+    // Build the GPU-clock keepalive boost kernel. Must come after the
+    // queue/cache statics are populated since _hipkfd_boost_dispatch
+    // reads them.
+    _hipkfd_boost_init()
 }
 
 // --- Error handling ---
@@ -637,6 +788,21 @@ fn hipModuleLaunchKernel(
     _kfd_fence()
     uint64 db_value = new_wp - 1
     unsafe { *(db_host as uint64) = db_value }
+
+    // GPU-clock keepalive: queue a boost kernel behind the user's
+    // dispatch. WORKS on the first launch — GPU sclk ramps from 591
+    // MHz idle to ~2.6 GHz and the user kernel finishes in <1 ms vs
+    // 63 ms cold — but corrupts queue state after a few iterations
+    // (cause not yet bisected; suspect kernel-descriptor field in
+    // rsrc1/2/3 that gfx11 CP rejects on second-or-later dispatch).
+    // OFF by default until that's nailed down. Opt-in by setting
+    // MLRIFT_BOOST=1; at that point the run is fast but limited to a
+    // few launches before timeout. Use for benchmark probes only.
+    uint64 boost_env = getenv("MLRIFT_BOOST")
+    if boost_env != 0 {
+        uint8 bc = 0; unsafe { *(boost_env as uint8) -> bc }
+        if bc != 48 { _hipkfd_boost_dispatch() }
+    }
 
     return 0
 }
