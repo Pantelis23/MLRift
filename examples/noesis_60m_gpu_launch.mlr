@@ -96,6 +96,13 @@ fn die(uint64 msg, uint64 code) {
     exit(1)
 }
 
+// dev_alloc_kind comes from std/kfd.mlr (KFD-shim path only). Define a
+// fallback here so the launcher links under both --target=amdgpu-native
+// (real impl from the shim wins via @dynamic dispatch order) and the
+// HIP-runtime path (this stub returns "unknown"). Same handling as how
+// hipMemcpy keeps a dummy fallback when the shim isn't loaded.
+@dynamic extern fn dev_alloc_kind(uint64 dev_va) -> uint64
+
 // Parse a decimal env value with optional 'K' / 'M' / 'G' suffix.
 // Returns 0 if the env var is unset; otherwise the parsed value.
 fn parse_env_count(uint64 name) -> uint64 {
