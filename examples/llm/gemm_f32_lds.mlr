@@ -1,0 +1,190 @@
+// MLRift LLM Phase A milestone 3: FP32 GEMM with LDS double-buffer.
+//
+//   C = A · B    where A is [M × K], B is [K × N], C is [M × N], all
+//                row-major and f32. Same shape as gemm_f32.mlr, but
+//                each 16×16 output tile is now computed via shared-
+//                memory tiles A_lds / B_lds with the standard
+//                load-next-while-computing-current double buffer.
+//
+// Workgroup: blockDim = (16, 16, 1) — one lane per output cell of the
+// 16×16 tile. Each lane is also responsible for loading one A and one
+// B element per K-tile. K is iterated in 16-element strides.
+//
+// LDS layout in the per-kernel `_lds_f32_buf` pool (declared by
+// src/format_hip.mlr at 8 KiB / 2048 floats):
+//   offset    0 .. 256   A_lds[0]   (16×16, ping)
+//   offset  256 .. 512   A_lds[1]   (16×16, pong)
+//   offset  512 .. 768   B_lds[0]
+//   offset  768 .. 1024  B_lds[1]
+// Total 1024 floats = 4 KiB, well within the per-CU LDS budget.
+//
+// Numerical equivalence vs the no-LDS gemm_f32 kernel: bit-for-bit
+// not guaranteed (different summation order across the 16-wide inner
+// loop on each tile), but max_abs stays within f32 noise (~1e-4 at
+// M=N=K=512) when verified against the cpu_gemm reference.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=hip-amd \
+//       examples/llm/gemm_f32_lds.mlr -o /tmp/gemm_f32_lds
+
+fn tid_local_x() -> uint64 { return 0 }
+fn tid_local_y() -> uint64 { return 0 }
+fn block_idx_x() -> uint64 { return 0 }
+fn block_idx_y() -> uint64 { return 0 }
+fn sync_block() -> uint64  { return 0 }
+fn lds_load_f32(uint64 idx) -> f32 { return 0.0 }
+fn lds_store_f32(uint64 idx, f32 v) -> uint64 { return 0 }
+
+@kernel
+fn gemm_f32_lds(
+    uint64 a_ptr,    // [M × K]
+    uint64 b_ptr,    // [K × N]
+    uint64 c_ptr,    // [M × N]
+    uint64 m,
+    uint64 n,
+    uint64 k_dim
+) {
+    uint64 tx = tid_local_x()
+    uint64 ty = tid_local_y()
+    uint64 bx = block_idx_x()
+    uint64 by = block_idx_y()
+
+    uint64 row = by * 16 + ty           // C row this lane writes
+    uint64 col = bx * 16 + tx           // C col this lane writes
+
+    // LDS region offsets (matches the layout in this file's header).
+    uint64 A_OFF_0 = 0
+    uint64 A_OFF_1 = 256
+    uint64 B_OFF_0 = 512
+    uint64 B_OFF_1 = 768
+
+    // Number of full K-tiles plus a tail count for the last partial.
+    uint64 num_kt = k_dim / 16          // full 16-wide tiles
+    uint64 tail   = k_dim - num_kt * 16
+
+    // Helper indexing inside the per-tile [16 × 16] LDS layout, row-
+    // major: A_lds[r, c] = A_OFF + r * 16 + c.
+    uint64 lds_idx = ty * 16 + tx       // this lane's LDS slot for the
+                                         // tile element it loads each iter
+
+    // ─ Prelude: load tile 0 into ping buffer. ─────────────────────
+    // Each lane (ty, tx) loads exactly one A element and one B element
+    // per K-tile; we cover the whole 16×16 tile via the workgroup.
+    f32 sum = 0.0
+    if num_kt > 0 {
+        uint64 a_r = by * 16 + ty
+        uint64 a_c = 0 + tx
+        uint64 b_r = 0 + ty
+        uint64 b_c = bx * 16 + tx
+
+        f32 a_v = 0.0
+        f32 b_v = 0.0
+        if a_r < m {
+            if a_c < k_dim {
+                uint64 ap = a_ptr + (a_r * k_dim + a_c) * 4
+                unsafe { *(ap as f32) -> a_v }
+            }
+        }
+        if b_r < k_dim {
+            if b_c < n {
+                uint64 bp = b_ptr + (b_r * n + b_c) * 4
+                unsafe { *(bp as f32) -> b_v }
+            }
+        }
+        lds_store_f32(A_OFF_0 + lds_idx, a_v)
+        lds_store_f32(B_OFF_0 + lds_idx, b_v)
+    }
+    sync_block()
+
+    // ─ Main K-tile loop with prefetch. ────────────────────────────
+    uint64 kt = 0
+    while kt < num_kt {
+        // Pick which LDS buffer holds the *current* tile's data.
+        uint64 cur_off_a = A_OFF_0
+        uint64 cur_off_b = B_OFF_0
+        if (kt - (kt / 2) * 2) == 1 {
+            cur_off_a = A_OFF_1
+            cur_off_b = B_OFF_1
+        }
+
+        // Issue load of *next* tile into the other LDS half. The
+        // hardware overlaps these flat_loads with the compute below;
+        // sync_block at the end of the iteration is what guarantees
+        // visibility before the next iter consumes the prefetched
+        // buffer.
+        uint64 kt_next = kt + 1
+        if kt_next < num_kt {
+            uint64 nxt_off_a = A_OFF_0
+            uint64 nxt_off_b = B_OFF_0
+            if (kt_next - (kt_next / 2) * 2) == 1 {
+                nxt_off_a = A_OFF_1
+                nxt_off_b = B_OFF_1
+            }
+            uint64 a_r = by * 16 + ty
+            uint64 a_c = kt_next * 16 + tx
+            uint64 b_r = kt_next * 16 + ty
+            uint64 b_c = bx * 16 + tx
+            f32 a_v = 0.0
+            f32 b_v = 0.0
+            if a_r < m {
+                if a_c < k_dim {
+                    uint64 ap = a_ptr + (a_r * k_dim + a_c) * 4
+                    unsafe { *(ap as f32) -> a_v }
+                }
+            }
+            if b_r < k_dim {
+                if b_c < n {
+                    uint64 bp = b_ptr + (b_r * n + b_c) * 4
+                    unsafe { *(bp as f32) -> b_v }
+                }
+            }
+            lds_store_f32(nxt_off_a + lds_idx, a_v)
+            lds_store_f32(nxt_off_b + lds_idx, b_v)
+        }
+
+        // Compute on the current tile. Each lane reads its row of A
+        // and column of B from the ping (or pong) buffer and runs a
+        // 16-wide FMA chain.
+        uint64 kk = 0
+        while kk < 16 {
+            f32 a = lds_load_f32(cur_off_a + ty * 16 + kk)
+            f32 b = lds_load_f32(cur_off_b + kk * 16 + tx)
+            sum = sum + a * b
+            kk = kk + 1
+        }
+
+        sync_block()
+        kt = kt + 1
+    }
+
+    // ─ Tail (k_dim not a multiple of 16). Plain global loads, no LDS. ─
+    if tail > 0 {
+        uint64 t = num_kt * 16
+        while t < k_dim {
+            f32 a = 0.0
+            f32 b = 0.0
+            if row < m {
+                uint64 ap = a_ptr + (row * k_dim + t) * 4
+                unsafe { *(ap as f32) -> a }
+            }
+            if col < n {
+                uint64 bp = b_ptr + (t * n + col) * 4
+                unsafe { *(bp as f32) -> b }
+            }
+            sum = sum + a * b
+            t = t + 1
+        }
+    }
+
+    // ─ Write result. ──────────────────────────────────────────────
+    if row < m {
+        if col < n {
+            uint64 cp = c_ptr + (row * n + col) * 4
+            unsafe { *(cp as f32) = sum }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}

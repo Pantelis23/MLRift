@@ -250,6 +250,74 @@ fn hip_emit_expr(uint64 node) {
             hip_emit_cstr("gridDim.x")
             return
         }
+        // Workgroup-local thread / block IDs. tid_x()/y()/z() above
+        // collapse blockIdx*blockDim+threadIdx into one global id; for
+        // tile-shaped kernels (LDS GEMM, fused attention) we need the
+        // pieces separately.
+        if tok_matches(callee_tok, "tid_local_x", 11) != 0 {
+            hip_emit_cstr("threadIdx.x")
+            return
+        }
+        if tok_matches(callee_tok, "tid_local_y", 11) != 0 {
+            hip_emit_cstr("threadIdx.y")
+            return
+        }
+        if tok_matches(callee_tok, "tid_local_z", 11) != 0 {
+            hip_emit_cstr("threadIdx.z")
+            return
+        }
+        if tok_matches(callee_tok, "block_idx_x", 11) != 0 {
+            hip_emit_cstr("blockIdx.x")
+            return
+        }
+        if tok_matches(callee_tok, "block_idx_y", 11) != 0 {
+            hip_emit_cstr("blockIdx.y")
+            return
+        }
+        if tok_matches(callee_tok, "block_idx_z", 11) != 0 {
+            hip_emit_cstr("blockIdx.z")
+            return
+        }
+        if tok_matches(callee_tok, "block_dim_y", 11) != 0 {
+            hip_emit_cstr("blockDim.y")
+            return
+        }
+        if tok_matches(callee_tok, "block_dim_z", 11) != 0 {
+            hip_emit_cstr("blockDim.z")
+            return
+        }
+        // Workgroup barrier — every lane in the block must reach this
+        // call before any lane proceeds. Required between LDS writes
+        // and reads in tiled GEMM, attention, etc. Returns void; we
+        // emit it as a comma expression yielding 0 so it can be used
+        // as a statement (`sync_block()`) without grammar pain.
+        if tok_matches(callee_tok, "sync_block", 10) != 0 {
+            hip_emit_cstr("(__syncthreads(), 0)")
+            return
+        }
+        // Shared-memory (LDS) accessors. All static @lds buffers live
+        // in a single 8 KiB f32 array `_lds_f32_buf` declared by the
+        // kernel header emitter; the user picks an offset/index. This
+        // keeps us out of the language-level "named __shared__ var"
+        // problem — we just give every kernel one big buffer it can
+        // partition however it likes.
+        if tok_matches(callee_tok, "lds_load_f32", 12) != 0 {
+            uint32 lla = ast_child(node)
+            hip_emit_cstr("_lds_f32_buf[")
+            hip_emit_expr(lla)
+            hip_emit_byte(93)
+            return
+        }
+        if tok_matches(callee_tok, "lds_store_f32", 13) != 0 {
+            uint32 lsa = ast_child(node)
+            uint32 lsv = ast_next(lsa)
+            hip_emit_cstr("(_lds_f32_buf[")
+            hip_emit_expr(lsa)
+            hip_emit_cstr("] = ")
+            hip_emit_expr(lsv)
+            hip_emit_cstr(", 0)")
+            return
+        }
         // Atomic adds — map MLRift `atomic_add_<ty>(ptr, val)` onto
         // HIP's overloaded atomicAdd. Return value is the pre-update
         // memory contents (C11 atomic_fetch_add semantics); kernel
@@ -565,8 +633,21 @@ fn hip_emit_kernel(uint64 fn_node) {
         hip_emit_cstr("{\n}\n\n")
         return
     }
-    uint64 wb = body_node
-    hip_emit_block(wb, 0)
+    // Emit body open brace + LDS scratch buffer (every kernel gets a
+    // 8 KiB f32 LDS pool addressable via lds_load_f32 / lds_store_f32),
+    // then walk statements directly. Skipping the regular hip_emit_block
+    // wrapper because we need to inject the __shared__ decl right after
+    // the opening brace.
+    hip_emit_cstr("{\n")
+    hip_emit_cstr("    __shared__ float _lds_f32_buf[2048];\n")
+    uint32 ch = ast_child(body_node)
+    uint64 wch = ch
+    while wch != 0 {
+        hip_emit_stmt(wch, 1)
+        uint32 nch = ast_next(wch)
+        wch = nch
+    }
+    hip_emit_cstr("}\n")
     hip_emit_byte(10)  // trailing blank line between kernels
 }
 
