@@ -4619,6 +4619,20 @@ fn main() {
                 write(1, gm_path, gml)
                 write(1, " (amdgpu gemm-f32 code object)\n", 31)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-gemm-f32-lds=", 27) != 0 {
+                // LLM Phase A milestone 3 native-emit (task #70).
+                // 16x16 LDS-tiled GEMM, 2 KiB LDS per workgroup.
+                uint64 gl_path = arg + 27
+                uint64 gl_rc = emit_amdgpu_gemm_f32_lds_blob(gl_path)
+                if gl_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-gemm-f32-lds failed\n", 40)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 gll = str_len(gl_path)
+                write(1, gl_path, gll)
+                write(1, " (amdgpu gemm-f32-lds code object)\n", 35)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-f64-atomic-add=", 29) != 0 {
                 // Stage-1 M1p smoke: f64-atomic-add CAS loop. Composes
                 // the M1o cmpswap_b64 encoder with v_add_f64 + a

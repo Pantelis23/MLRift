@@ -75,7 +75,7 @@ static uint64 target_amdgpu_native = 0
 //   kt_text_off[i]   — .text   byte offset of kernel i's first instr
 //   kt_text_vaddr[i] — kd-to-entry delta lives in KD offset 0x10
 
-static uint64 KT_STRIDE = 104
+static uint64 KT_STRIDE = 112
 static uint64 KT_MAX    = 32
 static uint64 kt_buf    = 0
 static uint64 kt_count  = 0
@@ -101,6 +101,22 @@ fn kt_push(uint64 name_ptr, uint64 name_len,
            uint64 kernarg_size,
            uint64 sgpr_count, uint64 vgpr_count,
            uint64 rsrc1, uint64 rsrc2, uint64 rsrc3, uint64 props) {
+    // Thin wrapper: existing emitters call kt_push with 13 fields and
+    // expect group_segment_fixed_size = 0 (no LDS). LDS-using emitters
+    // call kt_push_lds instead.
+    kt_push_lds(name_ptr, name_len, bytes_ptr, bytes_len,
+                args_desc, n_args, kernarg_size,
+                sgpr_count, vgpr_count, rsrc1, rsrc2, rsrc3, props,
+                0)
+}
+
+fn kt_push_lds(uint64 name_ptr, uint64 name_len,
+               uint64 bytes_ptr, uint64 bytes_len,
+               uint64 args_desc, uint64 n_args,
+               uint64 kernarg_size,
+               uint64 sgpr_count, uint64 vgpr_count,
+               uint64 rsrc1, uint64 rsrc2, uint64 rsrc3, uint64 props,
+               uint64 group_segment_size) {
     if kt_count >= KT_MAX {
         write(2, "format_amdgpu: kernel table overflow\n", 37)
         exit(1)
@@ -119,6 +135,7 @@ fn kt_push(uint64 name_ptr, uint64 name_len,
     uint64 p10 = base +  80; unsafe { *(p10 as uint64) = rsrc2 }
     uint64 p11 = base +  88; unsafe { *(p11 as uint64) = rsrc3 }
     uint64 p12 = base +  96; unsafe { *(p12 as uint64) = props }
+    uint64 p13 = base + 104; unsafe { *(p13 as uint64) = group_segment_size }
     kt_count = kt_count + 1
 }
 
@@ -489,9 +506,9 @@ fn amd_emit_metadata_body() -> uint64 {
 
 fn amd_emit_kernel_descriptor(uint64 kernarg_size, uint64 entry_offset,
                               uint64 rsrc1, uint64 rsrc2, uint64 rsrc3,
-                              uint64 properties) {
+                              uint64 properties, uint64 group_segment_size) {
     // 0x00
-    amd_u32(0)                        // group_segment_fixed_size
+    amd_u32(group_segment_size)       // group_segment_fixed_size (LDS bytes)
     amd_u32(0)                        // private_segment_fixed_size
     amd_u32(kernarg_size)             // kernarg_size
     amd_u32(0)                        // reserved
@@ -1545,6 +1562,30 @@ fn asm_v_fma_f64_neg_s_v_v(uint64 vdst_pair, uint64 neg_sgpr_pair,
 // Top-level emitter
 // ---------------------------------------------------------------------------
 
+// LDS-aware variant: takes an extra group_segment_size parameter
+// (bytes of LDS the kernel needs) and threads it through to the
+// kernel descriptor's group_segment_fixed_size field. Required for
+// any kernel that uses ds_write_*/ds_read_* (LDS GEMM, attention,
+// etc.). The default emit_amdgpu_code_object below calls this with
+// group_segment_size = 0.
+@export
+fn emit_amdgpu_code_object_lds(uint64 kname_ptr, uint64 kname_len,
+                                uint64 kernel_bytes, uint64 kernel_size,
+                                uint64 kernarg_size, uint64 kernarg_align,
+                                uint64 sgpr_count, uint64 vgpr_count,
+                                uint64 rsrc1, uint64 rsrc2, uint64 rsrc3,
+                                uint64 properties,
+                                uint64 args_desc, uint64 n_args,
+                                uint64 group_segment_size) -> uint64 {
+    kt_reset()
+    kt_push_lds(kname_ptr, kname_len, kernel_bytes, kernel_size,
+                args_desc, n_args, kernarg_size,
+                sgpr_count, vgpr_count,
+                rsrc1, rsrc2, rsrc3, properties,
+                group_segment_size)
+    return emit_amdgpu_multi_code_object()
+}
+
 // Back-compat single-kernel emit: push one entry and emit. Used by
 // emit_amdgpu_nop_blob, emit_amdgpu_sentinel_blob, and any other
 // single-shot caller.
@@ -1711,7 +1752,8 @@ fn emit_amdgpu_multi_code_object() -> uint64 {
         uint64 k_rsrc2    = kt_get(rdi, 10)
         uint64 k_rsrc3    = kt_get(rdi, 11)
         uint64 k_props    = kt_get(rdi, 12)
-        amd_emit_kernel_descriptor(kernarg_sz, 0, k_rsrc1, k_rsrc2, k_rsrc3, k_props)
+        uint64 k_lds      = kt_get(rdi, 13)
+        amd_emit_kernel_descriptor(kernarg_sz, 0, k_rsrc1, k_rsrc2, k_rsrc3, k_props, k_lds)
         rdi = rdi + 1
     }
     amd_align(8)
@@ -5651,6 +5693,149 @@ fn emit_amdgpu_gemm_f32_blob(uint64 out_path) -> uint64 {
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
         write(2, "emit_amdgpu_gemm_f32_blob: cannot open output\n", 46)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// LLM Phase A milestone 3 — gemm f32 LDS-tiled, native-emit. 16x16
+// workgroup, 16x16 LDS A-tile + 16x16 LDS B-tile (single buffer; the
+// "double-buffer" name is from the milestone-3 launcher's ping/pong
+// scaffold which we may add later as a perf optimization). Reference
+// asm: /tmp/gemm_f32_lds_native.s, llvm-mc verified.
+// LDS layout: 2 KiB total (1 KiB A + 1 KiB B). KD's
+// group_segment_fixed_size = 2048 — wired through emit_amdgpu_code_object_lds.
+@export
+fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
+    asm_init()
+    // Kernarg load.
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)
+    asm_u32(0xF4040300); asm_u32(0xF8000020)
+    asm_u32(0xF4040380); asm_u32(0xF8000028)
+    asm_u32(0xBF89FC07)
+    // ty/tx, tiles_n.
+    asm_u32(0x32020084)
+    asm_u32(0x3604008F)
+    asm_u32(0x80108F0C)
+    asm_u32(0x85108410)
+    // Scalar divide.
+    asm_u32(0xBE910002)
+    asm_u32(0xBE920080)
+    asm_u32(0xBF0A1011)
+    asm_u32(0xBFA20003)
+    asm_u32(0x80911011)
+    asm_u32(0x80128112)
+    asm_u32(0xBFA0FFFB)
+    // row, col.
+    asm_u32(0x84138412)
+    asm_u32(0x84148411)
+    asm_u32(0x4A060213)
+    asm_u32(0x4A080414)
+    // Bounds.
+    asm_u32(0xBE82007E)
+    asm_u32(0x7C98060A)
+    asm_u32(0x8B7E6A7E)
+    asm_u32(0x7C98080C)
+    asm_u32(0x8B7E6A7E)
+    asm_u32(0xBFA5004E)
+    // num_kt, sum, kt counter, lane LDS-write idx.
+    asm_u32(0x8515840E)
+    asm_u32(0x7E0C0280)
+    asm_u32(0xBE960080)
+    asm_u32(0x300A0082)
+    // LDS read base addresses.
+    asm_u32(0x30220286)                         // v_lshlrev_b32 v17, 6, v1 (ty*64)
+    asm_u32(0x30240482)                         // v_lshlrev_b32 v18, 2, v2 (tx*4)
+    asm_u32(0xD5250012); asm_u32(0x0001FF12); asm_u32(0x00000400)  // v_add_nc_u32_e64 v18, v18, 0x400
+    // Skip if num_kt == 0.
+    asm_u32(0xBF068015)
+    asm_u32(0xBFA20036)
+    // .Lkt_loop:
+    asm_u32(0x84178416)                         // s_lshl_b32 s23, s22, 4
+    // a_global col, addr.
+    asm_u32(0x4A0E0417)
+    asm_u32(0xD72C0008); asm_u32(0x00001D03)
+    asm_u32(0x4A100F08)
+    asm_u32(0x7E120280)
+    asm_u32(0xD73C0008); asm_u32(0x00021082)
+    asm_u32(0xD7006A08); asm_u32(0x00021004)
+    asm_u32(0xD5207C09); asm_u32(0x01AA1205)
+    asm_u32(0xDC520000); asm_u32(0x0A7C0008)
+    // b_global row, addr.
+    asm_u32(0x4A160217)
+    asm_u32(0xD72C000C); asm_u32(0x0000190B)
+    asm_u32(0x4A18090C)
+    asm_u32(0x7E1A0280)
+    asm_u32(0xD73C000C); asm_u32(0x00021882)
+    asm_u32(0xD7006A0C); asm_u32(0x00021806)
+    asm_u32(0xD5207C0D); asm_u32(0x01AA1A07)
+    asm_u32(0xDC520000); asm_u32(0x0E7C000C)
+    // Wait + LDS stores + barrier.
+    asm_u32(0xBF8903F7)
+    asm_u32(0xD8340000); asm_u32(0x00000A05)
+    asm_u32(0xD8340400); asm_u32(0x00000E05)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    // Inner loop init.
+    asm_u32(0xBE970080)
+    asm_u32(0x7E1E0311)
+    asm_u32(0x7E200312)
+    // .Linner: 16 fmac per K-tile.
+    asm_u32(0xD8D80000); asm_u32(0x0900000F)
+    asm_u32(0xD8D80000); asm_u32(0x0A000010)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x560C1509)
+    asm_u32(0xD525000F); asm_u32(0x0001090F)
+    asm_u32(0xD5250010); asm_u32(0x00018110)
+    asm_u32(0x80178117)
+    asm_u32(0xBF0A9017)
+    asm_u32(0xBFA2FFF3)
+    // Barrier + outer increment.
+    asm_u32(0xBFBD0000)
+    asm_u32(0x80168116)
+    asm_u32(0xBF0A1516)
+    asm_u32(0xBFA2FFCA)
+    // .Lstore:
+    asm_u32(0xD72C0008); asm_u32(0x00001903)
+    asm_u32(0x4A100908)
+    asm_u32(0x7E120280)
+    asm_u32(0xD73C0008); asm_u32(0x00021082)
+    asm_u32(0xD7006A08); asm_u32(0x00021008)
+    asm_u32(0xD5207C09); asm_u32(0x01AA1209)
+    asm_u32(0xDC6A0000); asm_u32(0x007C0608)
+    asm_u32(0xBC7C0000)
+    // .Lend:
+    asm_u32(0xBFB00000)
+
+    // 6 args: 3 GLOBAL_BUFFER + 3 BY_VALUE.
+    uint64[12] args_desc
+    uint64 a0  = args_desc + 0;   unsafe { *(a0  as uint64) = 8 }
+    uint64 a1  = args_desc + 8;   unsafe { *(a1  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2  = args_desc + 16;  unsafe { *(a2  as uint64) = 8 }
+    uint64 a3  = args_desc + 24;  unsafe { *(a3  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4  = args_desc + 32;  unsafe { *(a4  as uint64) = 8 }
+    uint64 a5  = args_desc + 40;  unsafe { *(a5  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6  = args_desc + 48;  unsafe { *(a6  as uint64) = 8 }
+    uint64 a7  = args_desc + 56;  unsafe { *(a7  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a8  = args_desc + 64;  unsafe { *(a8  as uint64) = 8 }
+    uint64 a9  = args_desc + 72;  unsafe { *(a9  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a10 = args_desc + 80;  unsafe { *(a10 as uint64) = 8 }
+    uint64 a11 = args_desc + 88;  unsafe { *(a11 as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    // rsrc1 with granulated_workitem_vgpr_count = 2 (24 vgprs allocated;
+    // kernel uses v0..v18 = 19). LDS = 2048 bytes (2 KiB).
+    uint64 size = emit_amdgpu_code_object_lds("gemm_f32_lds", 12,
+                                               asm_text_buf, asm_text_len,
+                                               48, 8, 24, 19,
+                                               0xE0AF0002, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 6,
+                                               2048)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_gemm_f32_lds_blob: cannot open output\n", 50)
         return 1
     }
     file_write(fd, amd_buf, size)
