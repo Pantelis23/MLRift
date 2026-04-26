@@ -274,6 +274,33 @@ fn main() {
     uint64 t_alloc = time_ns()
     print_label_val("alloc_us", 8, (t_alloc - t_start) / 1000)
 
+    // Diagnostic: report where each device buffer landed (VRAM vs GTT)
+    // when MLRIFT_PLACEMENT=1. Useful for tracking the spillover
+    // boundary as N scales — the CSR-style buffers (d_tgt = csr_indices,
+    // d_w, d_inh) are the largest and are the first to go to GTT.
+    uint64 plac_env = getenv("MLRIFT_PLACEMENT")
+    uint64 plac = 0
+    if plac_env != 0 {
+        uint8 pc = 0; unsafe { *(plac_env as uint8) -> pc }
+        if pc != 48 { plac = 1 }
+    }
+    if plac > 0 {
+        // dev_alloc_kind: 0 = VRAM-only, 1 = host-vis VRAM, 2 = GTT.
+        // Re-import via the shim's hip.mlr (under amdgpu-native it's
+        // hip_kfd → kfd which already exposes dev_alloc_kind).
+        print_label_val("kind_d_V    ", 12, dev_alloc_kind(d_V))
+        print_label_val("kind_d_ref  ", 12, dev_alloc_kind(d_ref))
+        print_label_val("kind_d_RI   ", 12, dev_alloc_kind(d_RI))
+        print_label_val("kind_d_se   ", 12, dev_alloc_kind(d_se))
+        print_label_val("kind_d_si   ", 12, dev_alloc_kind(d_si))
+        print_label_val("kind_d_spike", 12, dev_alloc_kind(d_spike))
+        print_label_val("kind_d_ct   ", 12, dev_alloc_kind(d_ct))
+        print_label_val("kind_d_fired", 12, dev_alloc_kind(d_fired))
+        print_label_val("kind_d_tgt  ", 12, dev_alloc_kind(d_tgt))    // = csr_indices
+        print_label_val("kind_d_w    ", 12, dev_alloc_kind(d_w))
+        print_label_val("kind_d_inh  ", 12, dev_alloc_kind(d_inh))
+    }
+
     // ── Host-init V, ref, s_exc, s_inh, spike, cell_type, RI → H2D ──
     uint64 h_V     = alloc(bytes_n)
     uint64 h_ref   = alloc(bytes_n)
