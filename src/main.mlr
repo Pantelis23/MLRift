@@ -4729,6 +4729,36 @@ fn main() {
                 write(1, sx_path, sxl)
                 write(1, " (amdgpu softmax-f32 code object)\n", 34)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-softmax-f32-N=", 28) != 0 {
+                // Format: --emit-amdgpu-softmax-f32-N=<N>:<path>
+                // e.g.    --emit-amdgpu-softmax-f32-N=512:/tmp/softmax_n512.co
+                uint64 sxn_arg = arg + 28
+                // Parse N until first ':'
+                uint64 sxn_N = 0
+                uint64 sxn_i = 0
+                while 1 == 1 {
+                    uint64 sxn_p = sxn_arg + sxn_i
+                    uint64 sxn_c = 0
+                    unsafe { *(sxn_p as uint8) -> sxn_c }
+                    if sxn_c == 0 || sxn_c == 58 { break }
+                    if sxn_c < 48 || sxn_c > 57 {
+                        write(2, "mlrc: --emit-amdgpu-softmax-f32-N: expected <N>:<path>\n", 56)
+                        exit(1)
+                    }
+                    sxn_N = sxn_N * 10 + (sxn_c - 48)
+                    sxn_i = sxn_i + 1
+                }
+                uint64 sxn_path = sxn_arg + sxn_i + 1
+                uint64 sxn_rc = emit_amdgpu_softmax_f32_N_blob(sxn_path, sxn_N)
+                if sxn_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-softmax-f32-N failed\n", 41)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 sxnl = str_len(sxn_path)
+                write(1, sxn_path, sxnl)
+                write(1, " (amdgpu softmax-f32 code object, N-parametric)\n", 49)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-gemm-f16f32-wmma=", 31) != 0 {
                 // LLM Phase A milestone 5 native-emit (task #72).
                 // WMMA-tiled f16/f32 GEMM, 1 wave per 16x16 output tile.

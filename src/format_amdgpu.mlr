@@ -667,6 +667,93 @@ fn asm_u32(uint64 word) {
     asm_byte((word >> 24) & 0xFF)
 }
 
+// Patch a previously-emitted dword in place. Used to back-fill branch
+// offsets that depend on the rest of the kernel body (e.g.,
+// s_cbranch_scc1 to .Lend, where the offset is only knowable after
+// the full kernel has been emitted).
+fn asm_patch_u32(uint64 dword_idx, uint64 word) {
+    uint64 p = asm_text_buf + dword_idx * 4
+    uint8 b0 =  word        & 0xFF
+    uint8 b1 = (word >> 8)  & 0xFF
+    uint8 b2 = (word >> 16) & 0xFF
+    uint8 b3 = (word >> 24) & 0xFF
+    unsafe { *(p as uint8) = b0 }
+    uint64 p1 = p + 1; unsafe { *(p1 as uint8) = b1 }
+    uint64 p2 = p + 2; unsafe { *(p2 as uint8) = b2 }
+    uint64 p3 = p + 3; unsafe { *(p3 as uint8) = b3 }
+}
+
+// integer log2 for power-of-two inputs.  Asserts (returns 0xFF) if the
+// input isn't a power of two; emit-time helpers should validate before
+// calling.
+fn _ilog2_pow2(uint64 n) -> uint64 {
+    if n == 0 { return 0xFF }
+    if (n & (n - 1)) != 0 { return 0xFF }
+    uint64 k = 0
+    uint64 m = n
+    while m > 1 { m = m >> 1; k = k + 1 }
+    return k
+}
+
+// One step of the LDS pairwise reduction over a power-of-two block.
+// Each step:
+//   ds_load_b32 v7, v6 offset:(stride*4)   ; pull from neighbour
+//   v_<reduce>_f32 v5, v5, v7              ; reduce_op_dword picks max/add
+//   gate lanes < stride, gated ds_store back to LDS[lane*4]
+//   barrier
+// `saved_exec_sgpr` is the SGPR number used for the s_and_saveexec
+// (softmax uses s12; layernorm/rmsnorm use s14).
+fn _emit_reduce_step_pow2(uint64 stride, uint64 reduce_op_dword,
+                          uint64 saved_exec_sgpr) {
+    uint64 byte_off = stride * 4
+    // ds_load_b32 v7, v6 offset:byte_off
+    asm_u32(0xD8D80000 | (byte_off & 0xFFFF))
+    asm_u32(0x07000006)
+    // s_waitcnt lgkmcnt(0)
+    asm_u32(0xBF89FC07)
+    // v_<max|add>_f32_e32 v5, v5, v7
+    asm_u32(reduce_op_dword)
+    // v_cmp_gt_u32_e32 vcc_lo, stride, v0
+    if stride <= 64 {
+        // inline constant: low byte = 0x80 + stride (covers 0..64)
+        uint64 inline_byte = 0x80 + stride
+        asm_u32(0x7C980000 | inline_byte)
+    } else {
+        // literal-constant escape
+        asm_u32(0x7C9800FF)
+        asm_u32(stride)
+    }
+    // s_and_saveexec_b32 saved_exec, vcc_lo
+    uint64 sgpr_field = 0x80 | (saved_exec_sgpr & 0x7F)
+    asm_u32(0xBE00206A | (sgpr_field << 16))
+    // ds_store_b32 v6, v5
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    // s_mov_b32 exec_lo, saved_exec
+    asm_u32(0xBEFE0000 | (saved_exec_sgpr & 0xFF))
+    // s_waitcnt lgkmcnt(0)
+    asm_u32(0xBF89FC07)
+    // s_barrier
+    asm_u32(0xBFBD0000)
+}
+
+// Emit the full LDS pairwise reduction tree for a power-of-two N.
+// Caller is responsible for the initial ds_store + barrier that puts
+// every lane's value into LDS[lane*4] before this is called.
+//
+// reduce_op_dword:
+//   0x200A0F05  for v_max_f32_e32 v5, v5, v7  (used by softmax phase A)
+//   0x060A0F05  for v_add_f32_e32 v5, v5, v7  (used by softmax phase B,
+//                                              layernorm/rmsnorm sum-of-…)
+fn _emit_lds_reduce_pow2(uint64 N, uint64 reduce_op_dword,
+                         uint64 saved_exec_sgpr) {
+    uint64 stride = N / 2
+    while stride >= 1 {
+        _emit_reduce_step_pow2(stride, reduce_op_dword, saved_exec_sgpr)
+        stride = stride / 2
+    }
+}
+
 // ── SOPP format (single 32-bit word) ────────────────────────────────
 // [31:23] = 0x17F   (SOPP prefix on gfx11)
 // [22:16] = 7-bit opcode
@@ -6509,6 +6596,123 @@ fn emit_amdgpu_softmax_f32_blob(uint64 out_path) -> uint64 {
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
         write(2, "emit_amdgpu_softmax_f32_blob: cannot open output\n", 50)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// Shape-parametric softmax_f32. N must be a power of two in [32, 1024].
+// Same kernel structure as _emit_softmax_f32_body but with the LDS
+// reduction tree depth driven by log2(N) and the s_cbranch_scc1 to .Lend
+// patched in after the body length is known.  Block size = N (one lane
+// per element of the row).  LDS allocation = 4*N bytes.
+fn _emit_softmax_f32_body_N(uint64 args_desc, uint64 N) {
+    asm_init()
+
+    // ── Prologue (kernarg load + bounds check + per-lane setup) ─────
+    asm_u32(0xF40C0100)             // s_load_b256 s[4:11], s[0:1], 0x0
+    asm_u32(0xF8000000)
+    asm_u32(0xBF89FC07)             // s_waitcnt lgkmcnt(0)
+    asm_u32(0xBF09080F)             // s_cmp_ge_u32 s15, s8
+    uint64 cbranch_dword_idx = asm_text_len / 4
+    asm_u32(0xBFA20000)             // s_cbranch_scc1 → .Lend (patched)
+    asm_u32(0x960C0A0F)             // s_mul_i32 s12, s15, s10
+    asm_u32(0x4A02000C)             // v_add_nc_u32 v1, s12, v0
+    asm_u32(0x30080282)             // v_lshlrev_b32 v4, 2, v1
+    asm_u32(0x7E060280)             // v_mov_b32 v3, 0
+    asm_u32(0xD7006A02)             // v_add_co_u32 v2, vcc_lo, s4, v4
+    asm_u32(0x00020804)
+    asm_u32(0xD5207C03)             // v_add_co_ci_u32 v3, null, s5, v3, vcc_lo
+    asm_u32(0x01AA0605)
+    asm_u32(0x7E1A0280)             // v_mov_b32 v13, 0
+    asm_u32(0xD7006A0C)             // v_add_co_u32 v12, vcc_lo, s6, v4
+    asm_u32(0x00020806)
+    asm_u32(0xD5207C0D)             // v_add_co_ci_u32 v13, null, s7, v13, vcc_lo
+    asm_u32(0x01AA1A07)
+    asm_u32(0xDC520000)             // global_load_b32 v10, v[2:3], off
+    asm_u32(0x0A7C0002)
+    asm_u32(0xBF8903F7)             // s_waitcnt vmcnt(0)
+    asm_u32(0x7E0A030A)             // v_mov_b32 v5, v10  (stash x in v5)
+    asm_u32(0x300C0082)             // v_lshlrev_b32 v6, 2, v0  (LDS slot)
+    asm_u32(0x7E120280)             // v_mov_b32 v9, 0
+    asm_u32(0xD8340000)             // ds_store_b32 v6, v5  (initial store)
+    asm_u32(0x00000506)
+    asm_u32(0xBF89FC07)             // s_waitcnt lgkmcnt(0)
+    asm_u32(0xBFBD0000)             // s_barrier
+
+    // ── Phase A: max-reduce over N lanes via LDS pairwise tree ──────
+    // v_max_f32_e32 v5, v5, v7 = 0x200A0F05
+    _emit_lds_reduce_pow2(N, 0x200A0F05, 12)
+
+    // ── Mid: broadcast max, e = exp(x - max) via 2^((x-max)*log2e) ──
+    asm_u32(0xD8D80000)             // ds_load_b32 v8, v9  (LDS[0] = max)
+    asm_u32(0x08000009)
+    asm_u32(0xBF89FC07)             // s_waitcnt
+    asm_u32(0x0816110A)             // v_sub_f32 v11, v10, v8  (diff)
+    asm_u32(0xBE8C00FF)             // s_mov_b32 s12, lit
+    asm_u32(0x3FB8AA3B)             // log2(e)
+    asm_u32(0x1016160C)             // v_mul_f32 v11, s12, v11
+    asm_u32(0x7E164B0B)             // v_exp_f32 v11, v11  (= e)
+    asm_u32(0xBFBD0000)             // s_barrier
+    asm_u32(0x7E0A030B)             // v_mov_b32 v5, v11  (e for sum)
+    asm_u32(0xD8340000)             // ds_store_b32 v6, v5  (initial store)
+    asm_u32(0x00000506)
+    asm_u32(0xBF89FC07)             // s_waitcnt
+    asm_u32(0xBFBD0000)             // s_barrier
+
+    // ── Phase B: sum-reduce e over N lanes ──────────────────────────
+    // v_add_f32_e32 v5, v5, v7 = 0x060A0F05
+    _emit_lds_reduce_pow2(N, 0x060A0F05, 12)
+
+    // ── Finalize: out = e / sum ─────────────────────────────────────
+    asm_u32(0xD8D80000)             // ds_load_b32 v8, v9  (LDS[0] = sum)
+    asm_u32(0x08000009)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x7E105508)             // v_rcp_f32 v8, v8
+    asm_u32(0x100A110B)             // v_mul_f32 v5, v11, v8
+    asm_u32(0xDC6A0000)             // global_store_b32 v[12:13], v5, off
+    asm_u32(0x007C050C)
+    asm_u32(0xBC7C0000)             // s_waitcnt_vscnt null, 0
+    asm_u32(0xBFB00000)             // s_endpgm
+
+    // Patch s_cbranch_scc1 simm16 to .Lend.  s_endpgm sits at dword
+    // (total - 1); branch lands at (cbranch + 1) + simm16 = total - 1,
+    // so simm16 = total - cbranch - 2.
+    uint64 total_dwords = asm_text_len / 4
+    uint64 simm16 = total_dwords - cbranch_dword_idx - 2
+    asm_patch_u32(cbranch_dword_idx, 0xBFA20000 | (simm16 & 0xFFFF))
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+// Shape-parametric softmax_f32 .co emit. N ∈ {32, 64, 128, 256, 512, 1024}.
+@export
+fn emit_amdgpu_softmax_f32_N_blob(uint64 out_path, uint64 N) -> uint64 {
+    if _ilog2_pow2(N) == 0xFF || N < 32 || N > 1024 {
+        write(2, "emit_amdgpu_softmax_f32_N_blob: N must be power of two in [32, 1024]\n", 70)
+        return 1
+    }
+    uint64[8] args_desc
+    _emit_softmax_f32_body_N(args_desc, N)
+    uint64 lds_bytes = N * 4
+    uint64 size = emit_amdgpu_code_object_lds("softmax_f32", 11,
+                                               asm_text_buf, asm_text_len,
+                                               32, 8, 16, 14,
+                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 4,
+                                               lds_bytes)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_softmax_f32_N_blob: cannot open output\n", 52)
         return 1
     }
     file_write(fd, amd_buf, size)
