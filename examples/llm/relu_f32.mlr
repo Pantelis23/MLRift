@@ -1,0 +1,28 @@
+// Phase 3a unary: relu_f32 = max(0, v).
+//
+// Body matches the same canonical pointwise shape as scale_f32, but
+// the assign uses a Call to the recognised intrinsic `relu_f32`
+// instead of a BinOp. Compiled by amdgpu_lower_pointwise_3a.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/relu_f32.mlr -o /tmp/relu_f32
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+fn relu_f32(f32 x) -> f32 { return x }   // intrinsic stub, body ignored
+
+@kernel
+fn relu(uint64 buf, uint64 n) {
+    uint64 gid = block_idx_x() * 256 + tid_local_x()
+    if gid < n {
+        uint64 p = buf + gid * 4
+        f32 v = 0.0
+        unsafe { *(p as f32) -> v }
+        v = relu_f32(v)
+        unsafe { *(p as f32) = v }
+    }
+}
+
+fn main() {
+    exit(0)
+}
