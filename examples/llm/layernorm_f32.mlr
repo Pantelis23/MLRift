@@ -1,0 +1,24 @@
+// LLM Phase 2 — layernorm_f32 placeholder. --target=amdgpu-native
+// routes the @kernel name to the hand-tuned LDS-reduction kernel.
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+
+@kernel
+fn layernorm_f32(uint64 in_ptr, uint64 out_ptr, uint64 m, uint64 n) {
+    uint64 row = block_idx_x()
+    uint64 tid = tid_local_x()
+    if row < m {
+        if tid < n {
+            f32 x = 0.0
+            uint64 ip = in_ptr + (row * n + tid) * 4
+            unsafe { *(ip as f32) -> x }
+            uint64 op = out_ptr + (row * n + tid) * 4
+            unsafe { *(op as f32) = x }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}

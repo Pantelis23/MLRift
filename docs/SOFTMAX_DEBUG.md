@@ -47,11 +47,30 @@ likely the same code path occasionally not falling back.
   Phase 2 routing. Verified per-row sum = 1.0 ± 1 ULP across
   M ∈ {1, 4, 16, 64, 256, 1024}; 0/all rows fail.
 
-## Layernorm
+## Layernorm — shipped same session
 
-The same kernel shape (one WG per row, two LDS pairwise reductions,
-broadcast-read each result, normalize) covers layernorm: mean reduce
+Same kernel shape (one WG per row, two LDS pairwise reductions,
+broadcast-read each result, normalize). 234-dword kernel: mean reduce
 in place of max, variance reduce (∑(x-mean)²) in place of sum-of-exp,
-then `(x - mean) / sqrt(var + eps)` per element with optional gamma/
-beta scale-shift. Estimated ~1h on top of the softmax kernel — a copy
-with the math swapped and the second reduction operand changed.
+then `(x - mean) * rsqrt(var + eps)` per element. No gamma/beta yet
+(can add as 2 extra kernarg pointers + per-element FMA at the end).
+
+Verified per-row mean ≈ 0 and var ≈ 1.0 (within ULP) across
+M ∈ {1, 4, 16, 64, 256, 1024}; 0/all rows fail. Constants in the
+kernel: `0x3B800000` = 1/256, `0x3727C5AC` = eps = 1e-5.
+
+Phase 2 routes "softmax_f32" and "layernorm_f32" by name in
+`--target=amdgpu-native`; the .mlr placeholder source is just a
+device-side stub for the @kernel. Mlrc flags
+`--emit-amdgpu-softmax-f32=` and `--emit-amdgpu-layernorm-f32=`
+emit standalone .co files for direct shim launch.
+
+## Sharp edge: f32 launcher verification
+
+Both launchers initially reported 100% rows_failed even though the
+kernel output was correct. Cause: `f32 d = row_var - 1.0` and
+`if d < 0.0 { ... }` — the f64 literal in mixed-mode arithmetic
+breaks. Fix: bind `f32 zero = 0.0; f32 one = 1.0; f32 thresh = 0.01`
+first and use those instead. Always dump first_bad_*_bits as uint32
+before bisecting the kernel — if the bits decode to in-tolerance
+values, the bug is the launcher.

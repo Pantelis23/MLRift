@@ -4633,6 +4633,18 @@ fn main() {
                 write(1, gl_path, gll)
                 write(1, " (amdgpu gemm-f32-lds code object)\n", 35)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-layernorm-f32=", 28) != 0 {
+                uint64 ln_path = arg + 28
+                uint64 ln_rc = emit_amdgpu_layernorm_f32_blob(ln_path)
+                if ln_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-layernorm-f32 failed\n", 42)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 lnl = str_len(ln_path)
+                write(1, ln_path, lnl)
+                write(1, " (amdgpu layernorm-f32 code object)\n", 37)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-softmax-f32=", 26) != 0 {
                 uint64 sx_path = arg + 26
                 uint64 sx_rc = emit_amdgpu_softmax_f32_blob(sx_path)
