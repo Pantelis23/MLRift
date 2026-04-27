@@ -5751,7 +5751,7 @@ fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
     asm_u32(0xD5250012); asm_u32(0x0001FF12); asm_u32(0x00000400)  // v_add_nc_u32_e64 v18, v18, 0x400
     // Skip if num_kt == 0.
     asm_u32(0xBF068015)
-    asm_u32(0xBFA20036)
+    asm_u32(0xBFA2003A)                         // s_cbranch_scc1 +58 (was +54 pre-gl0_inv)
     // .Lkt_loop:
     asm_u32(0x84178416)                         // s_lshl_b32 s23, s22, 4
     // a_global col, addr.
@@ -5772,12 +5772,13 @@ fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
     asm_u32(0xD7006A0C); asm_u32(0x00021806)
     asm_u32(0xD5207C0D); asm_u32(0x01AA1A07)
     asm_u32(0xDC520000); asm_u32(0x0E7C000C)
-    // Wait + LDS stores + barrier.
+    // Wait + LDS stores + barrier + L0 invalidate.
     asm_u32(0xBF8903F7)
     asm_u32(0xD8340000); asm_u32(0x00000A05)
     asm_u32(0xD8340400); asm_u32(0x00000E05)
     asm_u32(0xBF89FC07)
     asm_u32(0xBFBD0000)
+    asm_u32(0xE0AC0000); asm_u32(0x00000000)   // buffer_gl0_inv
     // Inner loop init.
     asm_u32(0xBE970080)
     asm_u32(0x7E1E0311)
@@ -5792,11 +5793,12 @@ fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
     asm_u32(0x80178117)
     asm_u32(0xBF0A9017)
     asm_u32(0xBFA2FFF3)
-    // Barrier + outer increment.
+    // Barrier + L0 inv + outer increment.
     asm_u32(0xBFBD0000)
+    asm_u32(0xE0AC0000); asm_u32(0x00000000)   // buffer_gl0_inv
     asm_u32(0x80168116)
     asm_u32(0xBF0A1516)
-    asm_u32(0xBFA2FFCA)
+    asm_u32(0xBFA2FFC6)                         // s_cbranch_scc1 -58 (was -54 pre-gl0_inv)
     // .Lstore:
     asm_u32(0xD72C0008); asm_u32(0x00001903)
     asm_u32(0x4A100908)
@@ -5831,7 +5833,7 @@ fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
                                                48, 8, 24, 19,
                                                0xE0AF0002, 0x0000009E, 0x00000010, 0x0408,
                                                args_desc, 6,
-                                               2048)
+                                               4096)                          // 4 KiB LDS (kernel uses 2 KiB; pad to 4K granule)
 
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
