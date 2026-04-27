@@ -4693,6 +4693,34 @@ fn main() {
                 write(1, rp_path, rpl)
                 write(1, " (amdgpu rope-f32 code object)\n", 32)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-rope-f32-D=", 25) != 0 {
+                // Format: --emit-amdgpu-rope-f32-D=<D>:<path>
+                uint64 rpd_arg = arg + 25
+                uint64 rpd_D = 0
+                uint64 rpd_i = 0
+                while 1 == 1 {
+                    uint64 rpd_p = rpd_arg + rpd_i
+                    uint64 rpd_c = 0
+                    unsafe { *(rpd_p as uint8) -> rpd_c }
+                    if rpd_c == 0 || rpd_c == 58 { break }
+                    if rpd_c < 48 || rpd_c > 57 {
+                        write(2, "mlrc: --emit-amdgpu-rope-f32-D: expected <D>:<path>\n", 53)
+                        exit(1)
+                    }
+                    rpd_D = rpd_D * 10 + (rpd_c - 48)
+                    rpd_i = rpd_i + 1
+                }
+                uint64 rpd_path = rpd_arg + rpd_i + 1
+                uint64 rpd_rc = emit_amdgpu_rope_f32_D_blob(rpd_path, rpd_D)
+                if rpd_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-rope-f32-D failed\n", 39)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 rpdl = str_len(rpd_path)
+                write(1, rpd_path, rpdl)
+                write(1, " (amdgpu rope-f32 code object, D-parametric)\n", 46)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-residual-add-f32=", 31) != 0 {
                 uint64 ra_path = arg + 31
                 uint64 ra_rc = emit_amdgpu_residual_add_f32_blob(ra_path)

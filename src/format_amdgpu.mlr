@@ -8487,6 +8487,102 @@ fn _emit_rope_f32_body(uint64 args_desc) {
     uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
 }
 
+// Shape-parametric rope_f32. D = head_dim, must be power of two in
+// [4, 2048] (block size = D/2 ≤ 1024 = gfx11 max).  Same 17-VGPR
+// half-split rotation kernel as the hand-coded D=128 version, with
+// four D-dependent dwords substituted at emit time:
+//   - s_lshl_b32 s13, s15, log2(D)+2  — row * D * 4   (in/out stride)
+//   - s_lshl_b32 s13, s15, log2(D)+1  — row * D/2 * 4 (cos/sin stride)
+//   - global_load_b32 ... offset:D*2   — second-half x load
+//   - global_store_b32 ... offset:D*2  — second-half out store
+fn _emit_rope_f32_body_D(uint64 args_desc, uint64 D) {
+    asm_init()
+    uint64 logD = _ilog2_pow2(D)        // pow2-only
+    uint64 shift_full = logD + 2        // log2(D*4)
+    uint64 shift_half = logD + 1        // log2(D*2)
+    uint64 half_off   = D * 2           // D/2 * 4
+
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)
+    asm_u32(0xF4000300); asm_u32(0xF8000020)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBF090C0F)
+    asm_u32(0xBFA2002D)
+    // s_lshl_b32 s13, s15, shift_full   (was 0x840D890F for shift=9 / D=128)
+    //   byte 1 = (shift_full | 0x80)
+    asm_u32(0x840D000F | (((shift_full | 0x80) & 0xFF) << 8))
+    asm_u32(0x30020082)
+    asm_u32(0x4A02020D)
+    asm_u32(0x7E060280)
+    asm_u32(0xD7006A02); asm_u32(0x00020204)
+    asm_u32(0xD5207C03); asm_u32(0x01AA0605)
+    asm_u32(0x7E0A0280)
+    asm_u32(0xD7006A04); asm_u32(0x00020206)
+    asm_u32(0xD5207C05); asm_u32(0x01AA0A07)
+    // s_lshl_b32 s13, s15, shift_half   (was 0x840D880F for shift=8 / D=128)
+    asm_u32(0x840D000F | (((shift_half | 0x80) & 0xFF) << 8))
+    asm_u32(0x30200082)
+    asm_u32(0x4A20200D)
+    asm_u32(0x7E0E0280)
+    asm_u32(0xD7006A06); asm_u32(0x00022008)
+    asm_u32(0xD5207C07); asm_u32(0x01AA0E09)
+    asm_u32(0x7E120280)
+    asm_u32(0xD7006A08); asm_u32(0x0002200A)
+    asm_u32(0xD5207C09); asm_u32(0x01AA120B)
+    asm_u32(0xDC520000); asm_u32(0x0A7C0002)        // load a (first half)
+    // global_load_b32 v11, v[2:3], off offset:half_off   (was 0xDC520100 for D=128)
+    asm_u32(0xDC520000 | (half_off & 0xFFF))
+    asm_u32(0x0B7C0002)
+    asm_u32(0xDC520000); asm_u32(0x0C7C0006)        // cos
+    asm_u32(0xDC520000); asm_u32(0x0D7C0008)        // sin
+    asm_u32(0xBF8903F7)
+    asm_u32(0x101C1B0B)
+    asm_u32(0xD613000E)
+    asm_u32(0x843A190A)
+    asm_u32(0x101E1B0A)
+    asm_u32(0x561E190B)
+    asm_u32(0xDC6A0000); asm_u32(0x007C0E04)        // store first half
+    // global_store_b32 v[4:5], v15, off offset:half_off
+    asm_u32(0xDC6A0000 | (half_off & 0xFFF))
+    asm_u32(0x007C0F04)
+    asm_u32(0xBC7C0000)
+    asm_u32(0xBFB00000)
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a8 = args_desc + 64;  unsafe { *(a8 as uint64) = 8 }
+    uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+@export
+fn emit_amdgpu_rope_f32_D_blob(uint64 out_path, uint64 D) -> uint64 {
+    if _ilog2_pow2(D) == 0xFF || D < 4 || D > 2048 {
+        write(2, "emit_amdgpu_rope_f32_D_blob: D must be power of two in [4, 2048]\n", 65)
+        return 1
+    }
+    uint64[10] args_desc
+    _emit_rope_f32_body_D(args_desc, D)
+    uint64 size = emit_amdgpu_code_object_lds("rope_f32", 8,
+                                               asm_text_buf, asm_text_len,
+                                               40, 8, 16, 17,
+                                               0xE0AF0002, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 5,
+                                               0)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_rope_f32_D_blob: cannot open output\n", 49)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 @export
 fn emit_amdgpu_rope_f32_blob(uint64 out_path) -> uint64 {
     uint64[10] args_desc
