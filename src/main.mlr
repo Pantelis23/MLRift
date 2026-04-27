@@ -4633,6 +4633,19 @@ fn main() {
                 write(1, gl_path, gll)
                 write(1, " (amdgpu gemm-f32-lds code object)\n", 35)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-gemm-f32-lds-debug=", 33) != 0 {
+                // Debug variant: same KD, but kernel body just stores 1.0.
+                uint64 gd_path = arg + 33
+                uint64 gd_rc = emit_amdgpu_gemm_f32_lds_debug_blob(gd_path)
+                if gd_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-gemm-f32-lds-debug failed\n", 46)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 gdl = str_len(gd_path)
+                write(1, gd_path, gdl)
+                write(1, " (amdgpu gemm-f32-lds DEBUG code object)\n", 41)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-f64-atomic-add=", 29) != 0 {
                 // Stage-1 M1p smoke: f64-atomic-add CAS loop. Composes
                 // the M1o cmpswap_b64 encoder with v_add_f64 + a
