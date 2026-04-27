@@ -548,13 +548,26 @@ fn ir_emit_arm64_insn(uint64 ii) {
         return
     }
 
-    // ----- IR_SHR (11) -----
+    // ----- IR_SHR (11) — logical (zero-fill) -----
     if op == 11 {
         uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
         uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
         uint64 d = dst_r
         if d == 0xFFFFFFFF { d = 9 }
         emit_a64_lsr(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_SAR (134) — arithmetic (sign-fill) -----
+    if op == 134 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_asr(d, a_reg, b_reg)
         if dst_r == 0xFFFFFFFF {
             ir_a64_emit_store_spill(9, dest_v)
         }

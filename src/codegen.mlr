@@ -2181,6 +2181,57 @@ fn tok_kind_at_raw(uint64 tok_idx) -> uint64 {
     return wk
 }
 
+// Walk an AST node to determine if its value should be treated as a
+// signed int. Used by the legacy backend to pick setl/setle/setg/setge
+// over setb/setbe/seta/setae for ordered compares, idiv over div, and
+// SAR over SHR. The IR backend has its own per-vreg signed-flag
+// tracking; legacy has to introspect the AST each time.
+//
+// Recognises: bare Idents declared as int8/16/32/64, recursive BinOps
+// where either operand is signed, UnaryOp negate (always signed), and
+// the f64_to_int builtin call (cvttsd2si is signed).
+fn legacy_node_is_signed(uint64 node) -> uint64 {
+    if node == 0 { return 0 }
+    uint32 kind_u32 = ast_kind(node)
+    uint64 nk = kind_u32
+    if nk == 32 {
+        // Ident — check declared type
+        uint32 tok = ast_data1(node)
+        uint64 wtok = tok
+        uint64 tk = var_type_lookup(wtok)
+        if tk == 84 || tk == 85 || tk == 86 || tk == 87 { return 1 }
+        return 0
+    }
+    if nk == 33 {
+        // BinOp — signed if either operand is signed
+        uint32 lhs = ast_child(node)
+        uint32 rhs = ast_data2(node)
+        uint64 wlhs = lhs
+        uint64 wrhs = rhs
+        if legacy_node_is_signed(wlhs) != 0 { return 1 }
+        if legacy_node_is_signed(wrhs) != 0 { return 1 }
+        return 0
+    }
+    if nk == 34 {
+        // UnaryOp — `-x` produces a signed result
+        uint32 op_tok = ast_data1(node)
+        uint64 wop = op_tok
+        uint64 op_kind = tok_kind_at_raw(wop)
+        if op_kind == 31 { return 1 }   // negate
+        uint32 child = ast_child(node)
+        uint64 wc = child
+        return legacy_node_is_signed(wc)
+    }
+    if nk == 35 {
+        // Call — recognise f64_to_int (cvttsd2si is signed truncation)
+        uint32 callee_tok = ast_data1(node)
+        uint64 wct = callee_tok
+        if tok_matches(wct, "f64_to_int", 10) != 0 { return 1 }
+        return 0
+    }
+    return 0
+}
+
 // Parse an x86_64 register name token into a 4-bit register code.
 // Returns 0..15 for recognised names, 0xFFFF for unknown.
 // Recognised: rax..rdi (0..7), r8..r15 (8..15).
@@ -2594,19 +2645,37 @@ fn resolve_win_iat_fixups(uint64 text_start, uint64 iat_rva) {
     }
 }
 
-// emit: setCC al + movzx eax, al (flags already set by caller)
-fn emit_setcc(uint64 op_tok_kind) {
+// emit: setCC al + movzx eax, al (flags already set by caller).
+// `is_signed` selects setl/setle/setg/setge over the unsigned variants
+// for ordered compares; equality/inequality are bitwise so they stay
+// on sete/setne regardless.
+fn emit_setcc_typed(uint64 op_tok_kind, uint64 is_signed) {
     emit_byte(0x0F)
     if op_tok_kind == 35 { emit_byte(0x94) }
     else if op_tok_kind == 36 { emit_byte(0x95) }
-    else if op_tok_kind == 37 { emit_byte(0x92) }
-    else if op_tok_kind == 38 { emit_byte(0x96) }
-    else if op_tok_kind == 39 { emit_byte(0x97) }
-    else if op_tok_kind == 40 { emit_byte(0x93) }
+    else if op_tok_kind == 37 {
+        if is_signed != 0 { emit_byte(0x9C) } else { emit_byte(0x92) }   // setl / setb
+    }
+    else if op_tok_kind == 38 {
+        if is_signed != 0 { emit_byte(0x9E) } else { emit_byte(0x96) }   // setle / setbe
+    }
+    else if op_tok_kind == 39 {
+        if is_signed != 0 { emit_byte(0x9F) } else { emit_byte(0x97) }   // setg / seta
+    }
+    else if op_tok_kind == 40 {
+        if is_signed != 0 { emit_byte(0x9D) } else { emit_byte(0x93) }   // setge / setae
+    }
     else { emit_byte(0x94) }
     emit_byte(0xC0)
     emit_byte(0x0F); emit_byte(0xB6); emit_byte(0xC0) // movzx eax, al
 }
+
+// Legacy entry point — kept for callers that don't have AST context
+// to detect signedness (e.g., float compares synthesise a setcc on
+// already-set ucomi flags). Defaults to unsigned, which is correct
+// for those cases since float ucomi sets CF/ZF as unsigned-like
+// flags that map onto the existing setb/setae mapping.
+fn emit_setcc(uint64 op_tok_kind) { emit_setcc_typed(op_tok_kind, 0) }
 
 // emit: cmp rax, rcx + setCC al + movzx eax, al
 fn emit_compare(uint64 op_tok_kind) {
@@ -2617,6 +2686,15 @@ fn emit_compare(uint64 op_tok_kind) {
     emit_byte(0xC8)
 
     emit_setcc(op_tok_kind)
+}
+
+fn emit_compare_typed(uint64 op_tok_kind, uint64 is_signed) {
+    rax_invalidate()
+    // cmp rax, rcx
+    emit_byte(0x48)
+    emit_byte(0x39)
+    emit_byte(0xC8)
+    emit_setcc_typed(op_tok_kind, is_signed)
 }
 
 
@@ -3762,6 +3840,14 @@ fn gen_expr(uint64 node) {
         uint32 op_kind = 0
         unsafe { *(p as uint32) -> op_kind }
 
+        // Detect signed-int operands so / / % / >> select the right
+        // x86 instruction below. Int compares are routed separately
+        // (see Compare emission at line ~4440); arithmetic +-* don't
+        // care about signedness in two's complement.
+        uint64 binop_is_signed = 0
+        if legacy_node_is_signed(wlhs) != 0 { binop_is_signed = 1 }
+        if legacy_node_is_signed(wrhs) != 0 { binop_is_signed = 1 }
+
         if op_kind == 30 {
             emit_add_rax_rcx()
             if debug_mode != 0 {
@@ -3867,13 +3953,15 @@ fn gen_expr(uint64 node) {
                 uint64 dz_pp = out_buf + dz_jnz_patch
                 unsafe { *(dz_pp as uint8) = dz_skip8 }
             }
-            // xor rdx, rdx; div rcx → quotient in rax
-            emit_byte(0x48)
-            emit_byte(0x31)
-            emit_byte(0xD2)
-            emit_byte(0x48)
-            emit_byte(0xF7)
-            emit_byte(0xF1)
+            if binop_is_signed != 0 {
+                // cqo (sign-extend rax → rdx:rax); idiv rcx (REX.W F7 /7)
+                emit_byte(0x48); emit_byte(0x99)
+                emit_byte(0x48); emit_byte(0xF7); emit_byte(0xF9)
+            } else {
+                // xor rdx, rdx; div rcx → quotient in rax
+                emit_byte(0x48); emit_byte(0x31); emit_byte(0xD2)
+                emit_byte(0x48); emit_byte(0xF7); emit_byte(0xF1)
+            }
         }
         else if op_kind == 33 {
             // % modulo: rax % rcx
@@ -3903,16 +3991,17 @@ fn gen_expr(uint64 node) {
                 uint64 mz_pp = out_buf + mz_jnz_patch
                 unsafe { *(mz_pp as uint8) = mz_skip8 }
             }
-            // xor rdx, rdx; div rcx → remainder in rdx; mov rax, rdx
-            emit_byte(0x48)
-            emit_byte(0x31)
-            emit_byte(0xD2)
-            emit_byte(0x48)
-            emit_byte(0xF7)
-            emit_byte(0xF1)
-            emit_byte(0x48)
-            emit_byte(0x89)
-            emit_byte(0xD0)
+            if binop_is_signed != 0 {
+                // cqo; idiv rcx → remainder in rdx; mov rax, rdx
+                emit_byte(0x48); emit_byte(0x99)
+                emit_byte(0x48); emit_byte(0xF7); emit_byte(0xF9)
+                emit_byte(0x48); emit_byte(0x89); emit_byte(0xD0)
+            } else {
+                // xor rdx, rdx; div rcx → remainder in rdx; mov rax, rdx
+                emit_byte(0x48); emit_byte(0x31); emit_byte(0xD2)
+                emit_byte(0x48); emit_byte(0xF7); emit_byte(0xF1)
+                emit_byte(0x48); emit_byte(0x89); emit_byte(0xD0)
+            }
         }
         else if op_kind == 23 {
             // & bitwise AND: and rcx, rax
@@ -3939,10 +4028,11 @@ fn gen_expr(uint64 node) {
             emit_byte(0xE0)
         }
         else if op_kind == 44 {
-            // >> shift right: shr cl, rax
+            // >> shift right. SAR (arithmetic, sign-fill) for signed ints
+            // so `int64 x = -8; x >> 1` becomes -4 instead of (2^64-8)/2.
             emit_byte(0x48)
             emit_byte(0xD3)
-            emit_byte(0xE8)
+            if binop_is_signed != 0 { emit_byte(0xF8) } else { emit_byte(0xE8) }
         }
         // Compound assignment ops (desugared by parser: x += y → x = x + y)
         else if op_kind == 45 {
@@ -4359,12 +4449,20 @@ fn gen_expr(uint64 node) {
         uint32 op_kind = 0
         unsafe { *(p as uint32) -> op_kind }
 
+        // Pick signed setcc for ordered compares when either operand is
+        // signed-int (int8/16/32/64 declared, or signed-producing
+        // expression). Without this, `int64 k = -3; if k < 0` lowered
+        // through legacy used setb (unsigned <) and never fired.
+        uint64 is_signed_cmp = 0
+        if legacy_node_is_signed(wlhs) != 0 { is_signed_cmp = 1 }
+        if legacy_node_is_signed(wrhs) != 0 { is_signed_cmp = 1 }
+
         if used_direct_cmp != 0 {
             // cmp rbx, imm already set flags — just emit setcc
             rax_invalidate()
-            emit_setcc(op_kind)
+            emit_setcc_typed(op_kind, is_signed_cmp)
         } else {
-            emit_compare(op_kind)
+            emit_compare_typed(op_kind, is_signed_cmp)
         }
         return
     }

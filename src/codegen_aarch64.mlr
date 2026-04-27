@@ -293,9 +293,15 @@ fn emit_a64_lsl(uint64 rd, uint64 rn, uint64 rm) {
     emit_a64(insn)
 }
 
-// LSR Xd, Xn, Xm (alias for LSRV)
+// LSR Xd, Xn, Xm (alias for LSRV) — logical shift right (zero-fill).
 fn emit_a64_lsr(uint64 rd, uint64 rn, uint64 rm) {
     uint64 insn = 0x9AC02400 | (rm << 16) | (rn << 5) | rd
+    emit_a64(insn)
+}
+
+// ASR Xd, Xn, Xm (alias for ASRV) — arithmetic shift right (sign-fill).
+fn emit_a64_asr(uint64 rd, uint64 rn, uint64 rm) {
+    uint64 insn = 0x9AC02800 | (rm << 16) | (rn << 5) | rd
     emit_a64(insn)
 }
 

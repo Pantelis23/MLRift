@@ -133,6 +133,7 @@ static uint64 IR_SCMP_GE = 123      // dest = (src1 >= src2) signed
 // past the highest existing opcode to avoid colliding with format ops.
 static uint64 IR_SDIV = 132         // dest = src1 / src2 (signed: cqo+idiv)
 static uint64 IR_SMOD = 133         // dest = src1 % src2 (signed: cqo+idiv)
+static uint64 IR_SAR  = 134         // dest = src1 >> src2 (arithmetic / sign-fill)
 
 // Typed print formatters: dest=len_vreg, src1=buf_vreg, src2=val_vreg
 static uint64 IR_FMT_BOOL = 124     // format bool as "true"/"false" into buf
@@ -1204,7 +1205,9 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         if op_kind == 24 || op_kind == 51 { ir_op = IR_OR }      // | |=
         if op_kind == 25 || op_kind == 52 { ir_op = IR_XOR }     // ^ ^=
         if op_kind == 43 || op_kind == 53 { ir_op = IR_SHL }     // << <<=
-        if op_kind == 44 || op_kind == 54 { ir_op = IR_SHR }     // >> >>=
+        if op_kind == 44 || op_kind == 54 {
+            if use_signed != 0 { ir_op = IR_SAR } else { ir_op = IR_SHR }   // >> >>=
+        }
         ir_emit(ir_op, dest, lhs, rhs, 0, ir_current_bb)
         // Propagate signed-int flag: if either operand is signed, the
         // result of arithmetic stays signed for downstream comparisons.
@@ -3953,6 +3956,7 @@ fn ir_opcode_name(uint64 op) -> uint64 {
     if op == 123 { return "scmp_ge" }
     if op == 132 { return "sdiv" }
     if op == 133 { return "smod" }
+    if op == 134 { return "sar" }
     return "???"
 }
 
@@ -5559,6 +5563,41 @@ fn ir_emit_x86_insn(uint64 ii) {
             emit_byte(0x48)
             emit_byte(0xD3)
             emit_byte(0xE8)
+            ir_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    if op == 134 {
+        // IR_SAR: arithmetic shift right (sign-fill). Identical encoding
+        // to SHR except modrm /7 (0xF8 base) instead of /5 (0xE8 base).
+        // Without this, `int64 x = -8; x >> 1` would lower to logical
+        // SHR and produce (2^64-8)/2 instead of -4.
+        uint64 a_reg = ir_resolve_src(s1_v, 0)
+        uint64 b_reg = ir_resolve_src(s2_v, 1)
+        if b_reg != 1 { ir_emit_mov_r64_r64(1, b_reg) }
+        if dst_r != 0xFFFFFFFF {
+            if dst_r == 1 && a_reg != 1 {
+                ir_emit_mov_r64_r64(0, a_reg)
+                emit_byte(0x48)
+                emit_byte(0xD3)
+                emit_byte(0xF8)
+                ir_emit_mov_r64_r64(dst_r, 0)
+            } else {
+                ir_emit_mov_r64_r64(dst_r, a_reg)
+                uint8 sar_rex = 0x48
+                if dst_r >= 8 { sar_rex = sar_rex | 1 }
+                emit_byte(sar_rex)
+                emit_byte(0xD3)
+                uint64 sar_modrm = 0xF8 | (dst_r & 7)
+                uint8 sar_m = sar_modrm
+                emit_byte(sar_m)
+            }
+        } else {
+            ir_emit_mov_r64_r64(0, a_reg)
+            emit_byte(0x48)
+            emit_byte(0xD3)
+            emit_byte(0xF8)
             ir_emit_store_spill(0, dest_v)
         }
         return

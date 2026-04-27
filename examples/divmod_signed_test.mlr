@@ -40,5 +40,18 @@ fn main() {
     uint64 ru = c - (c / d) * d
     print_bits("100u %% 7u = ", 13, ru)
 
+    // Case 4: arithmetic right shift. -8 (0xFFF...FFF8) >> 1 = -4 (signed)
+    //                                    or  (2^64-8)/2 (unsigned).
+    int64 e = 0 - 8
+    int64 sh = 1
+    int64 sr = e >> sh
+    print_bits("(-8) >> 1 raw = ", 16, sr)
+
+    // Case 5: unsigned shift still logical.
+    uint64 ue = 0xFF00000000000000
+    uint64 ush = 1
+    uint64 usr = ue >> ush
+    print_bits("0xFF00...>>1u = ", 16, usr)
+
     exit(0)
 }
