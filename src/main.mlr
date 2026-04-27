@@ -4633,6 +4633,20 @@ fn main() {
                 write(1, gl_path, gll)
                 write(1, " (amdgpu gemm-f32-lds code object)\n", 35)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-gemm-f16f32-wmma=", 31) != 0 {
+                // LLM Phase A milestone 5 native-emit (task #72).
+                // WMMA-tiled f16/f32 GEMM, 1 wave per 16x16 output tile.
+                uint64 gw_path = arg + 31
+                uint64 gw_rc = emit_amdgpu_gemm_f16f32_wmma_blob(gw_path)
+                if gw_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-gemm-f16f32-wmma failed\n", 44)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 gwl = str_len(gw_path)
+                write(1, gw_path, gwl)
+                write(1, " (amdgpu gemm-f16f32 WMMA code object)\n", 39)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-gemm-f16f32=", 26) != 0 {
                 // LLM Phase A milestone 4 native-emit (task #71).
                 // f16-storage GEMM with f32 accumulator. Same 16x16
