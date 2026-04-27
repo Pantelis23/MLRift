@@ -66,20 +66,13 @@ fn parse_env_count(uint64 name) -> uint64 {
 // Inline exp_f64 — avoids needing libm linkage. Range-reduce
 //   exp(x) = 2^k * exp(r),  k = round(x / ln2),  r = x - k*ln2
 // then Taylor-7 on r ∈ [-ln2/2, ln2/2]. 2^k via repeated *2.
-//
-// Branch on f64 sign rather than int64, since MLRift treats int64
-// comparisons as unsigned (so int64 < 0 never fires, hanging negative
-// inputs). Same reason we recompute |k| from the f64 directly.
 fn host_exp_f64(f64 x) -> f64 {
     f64 LN2     = 0.6931471805599453
     f64 INV_LN2 = 1.4426950408889634
     f64 kf = x * INV_LN2
-    uint64 neg = 0
-    if kf < 0.0 { neg = 1; kf = 0.0 - kf }
-    kf = kf + 0.5    // round-toward-zero of the |kf|+0.5 gives nearest
-    uint64 ak = f64_to_int(kf)    // |k| as nonneg
-    f64 kd = int_to_f64(ak)
-    if neg != 0 { kd = 0.0 - kd }
+    if kf < 0.0 { kf = kf - 0.5 } else { kf = kf + 0.5 }
+    int64 k = f64_to_int(kf)
+    f64 kd = int_to_f64(k)
     f64 r = x - kd * LN2
     // Taylor: 1 + r + r²/2 + r³/6 + r⁴/24 + r⁵/120 + r⁶/720 + r⁷/5040
     f64 r2 = r * r
@@ -95,12 +88,16 @@ fn host_exp_f64(f64 x) -> f64 {
                   + r5 * 0.008333333333333333
                   + r6 * 0.001388888888888889
                   + r7 * 0.0001984126984126984
-    // 2^|k| via repeated mul, then invert if needed.
-    f64 two_ak = 1.0
-    uint64 i = 0
-    while i < ak { two_ak = two_ak * 2.0; i = i + 1 }
-    f64 two_k = two_ak
-    if neg != 0 { two_k = 1.0 / two_ak }
+    // 2^k via repeated mul (k ∈ [-12, 12] for x ∈ [-8, 8])
+    f64 two_k = 1.0
+    if k >= 0 {
+        int64 i = 0
+        while i < k { two_k = two_k * 2.0; i = i + 1 }
+    } else {
+        int64 i = 0
+        int64 nk = 0 - k
+        while i < nk { two_k = two_k * 0.5; i = i + 1 }
+    }
     return two_k * e_r
 }
 

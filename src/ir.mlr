@@ -177,6 +177,14 @@ static uint64 ir_vreg_next = 0      // next vreg number to allocate
 static uint64 ir_vreg_fkind_buf = 0  // array of uint8, indexed by vreg
 static uint64 ir_vreg_fkind_cap = 0
 
+// Signed-int flag per vreg (1 = signed int8/16/32/64). Only meaningful
+// when fkind == 0. Drives Compare lowering to pick IR_SCMP_LT/LE/GT/GE
+// (signed setl/setle/setg/setge on x86) over the unsigned IR_CMP_LT/etc.
+// Without this, `int64 k = -3; if k < 0` lowers to an unsigned compare
+// and never fires (the bit pattern 0xFFFFFFFFFFFFFFFD looks larger than 0).
+static uint64 ir_vreg_signed_buf = 0
+static uint64 ir_vreg_signed_cap = 0
+
 // Per-vreg use count (saturates at 255). Populated in ir_compute_use_count.
 // Used by the CMP+JCC fusion peephole to prove a cmp result is single-use
 // (so its materialization can be elided in favour of a direct jcc).
@@ -223,6 +231,12 @@ fn ir_init() {
     // so stale bytes from a prior function would mislabel a vreg as float.
     memset(ir_vreg_fkind_buf, 0, ir_vreg_fkind_cap)
 
+    if ir_vreg_signed_buf == 0 {
+        ir_vreg_signed_cap = 65536
+        ir_vreg_signed_buf = alloc(ir_vreg_signed_cap)
+    }
+    memset(ir_vreg_signed_buf, 0, ir_vreg_signed_cap)
+
     if ir_use_count_buf == 0 {
         ir_use_count_cap = 65536
         ir_use_count_buf = alloc(ir_use_count_cap)
@@ -253,6 +267,9 @@ fn ir_reset() {
     ir_loop_depth = 0
     if ir_vreg_fkind_buf != 0 {
         memset(ir_vreg_fkind_buf, 0, ir_vreg_fkind_cap)
+    }
+    if ir_vreg_signed_buf != 0 {
+        memset(ir_vreg_signed_buf, 0, ir_vreg_signed_cap)
     }
     if ir_use_count_buf != 0 {
         memset(ir_use_count_buf, 0, ir_use_count_cap)
@@ -289,6 +306,24 @@ fn ir_vreg_fkind_set(uint64 vreg, uint64 fk) {
 fn ir_vreg_fkind_get(uint64 vreg) -> uint64 {
     if vreg < ir_vreg_fkind_cap {
         uint64 p = ir_vreg_fkind_buf + vreg
+        uint64 b = 0
+        unsafe { *(p as uint8) -> b }
+        return b
+    }
+    return 0
+}
+
+fn ir_vreg_signed_set(uint64 vreg, uint64 s) {
+    if vreg < ir_vreg_signed_cap {
+        uint64 p = ir_vreg_signed_buf + vreg
+        uint8 b = s
+        unsafe { *(p as uint8) = b }
+    }
+}
+
+fn ir_vreg_signed_get(uint64 vreg) -> uint64 {
+    if vreg < ir_vreg_signed_cap {
+        uint64 p = ir_vreg_signed_buf + vreg
         uint64 b = 0
         unsafe { *(p as uint8) -> b }
         return b
@@ -1154,6 +1189,13 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         if op_kind == 43 || op_kind == 53 { ir_op = IR_SHL }     // << <<=
         if op_kind == 44 || op_kind == 54 { ir_op = IR_SHR }     // >> >>=
         ir_emit(ir_op, dest, lhs, rhs, 0, ir_current_bb)
+        // Propagate signed-int flag: if either operand is signed, the
+        // result of arithmetic stays signed for downstream comparisons.
+        // (ADD/SUB/MUL produce identical bits regardless of signedness;
+        // we only need the flag so a later `< 0` picks IR_SCMP_LT.)
+        if ir_vreg_signed_get(lhs) != 0 || ir_vreg_signed_get(rhs) != 0 {
+            ir_vreg_signed_set(dest, 1)
+        }
         return dest
     }
 
@@ -1238,13 +1280,31 @@ fn ir_lower_expr(uint64 node) -> uint64 {
             ir_emit(ir_op, dest, lhs, rhs, cmp_fk, ir_current_bb)
             return dest
         }
+        // For ordered ints, pick signed variants if either operand is
+        // explicitly signed (int8/16/32/64 declared, or f64_to_int / negate
+        // result). Equality/inequality are bitwise, so they stay on the
+        // unsigned ops regardless. Without this, `int64 k = -3; if k < 0`
+        // lowers to `setb` (unsigned setb) and never fires — the bit
+        // pattern 0xFFFFFFFFFFFFFFFD compares as huge-positive.
+        uint64 lhs_s = ir_vreg_signed_get(lhs)
+        uint64 rhs_s = ir_vreg_signed_get(rhs)
+        uint64 use_signed = 0
+        if lhs_s != 0 || rhs_s != 0 { use_signed = 1 }
         uint64 ir_op = IR_CMP_EQ
         if op_kind == 35 { ir_op = IR_CMP_EQ }  // ==
         if op_kind == 36 { ir_op = IR_CMP_NE }  // !=
-        if op_kind == 37 { ir_op = IR_CMP_LT }  // <
-        if op_kind == 38 { ir_op = IR_CMP_LE }  // <=
-        if op_kind == 39 { ir_op = IR_CMP_GT }  // >
-        if op_kind == 40 { ir_op = IR_CMP_GE }  // >=
+        if op_kind == 37 {
+            if use_signed != 0 { ir_op = IR_SCMP_LT } else { ir_op = IR_CMP_LT }
+        }
+        if op_kind == 38 {
+            if use_signed != 0 { ir_op = IR_SCMP_LE } else { ir_op = IR_CMP_LE }
+        }
+        if op_kind == 39 {
+            if use_signed != 0 { ir_op = IR_SCMP_GT } else { ir_op = IR_CMP_GT }
+        }
+        if op_kind == 40 {
+            if use_signed != 0 { ir_op = IR_SCMP_GE } else { ir_op = IR_CMP_GE }
+        }
         ir_emit(ir_op, dest, lhs, rhs, 0, ir_current_bb)
         return dest
     }
@@ -2222,13 +2282,16 @@ fn ir_lower_expr(uint64 node) -> uint64 {
             return dest
         }
 
-        // f64_to_int(x): convert f64 bit pattern to integer
+        // f64_to_int(x): convert f64 bit pattern to integer.
+        // Codegen uses cvttsd2si which is a *signed* truncation, so the
+        // result vreg is signed for downstream comparison purposes.
         if tok_matches(wct, "f64_to_int", 10) != 0 {
             uint32 first_arg = ast_child(node)
             uint64 src_v = ir_lower_expr(first_arg)
             uint64 dest = ir_new_vreg()
             ir_emit(IR_FTOI, dest, src_v, 0, 0, ir_current_bb)
             ir_vreg_fkind_set(dest, 0)
+            ir_vreg_signed_set(dest, 1)
             return dest
         }
 
@@ -2945,6 +3008,12 @@ fn ir_lower_stmt(uint64 node) {
         if vd_type_kind == 95 { vd_fk = 2 }
         if vd_type_kind == 98 { vd_fk = 3 }
         if vd_type_kind == 99 { vd_fk = 4 }
+        // Signed-int types: int8=84, int16=85, int32=86, int64=87 (token
+        // kinds from src/lexer.mlr KwInt8..KwInt64). Mark the vreg as
+        // signed so Compare lowering picks IR_SCMP_* over IR_CMP_*.
+        uint64 vd_signed = 0
+        if vd_type_kind == 84 || vd_type_kind == 85 ||
+           vd_type_kind == 86 || vd_type_kind == 87 { vd_signed = 1 }
         if winit != 0 {
             uint64 val = ir_lower_expr(winit)
             uint64 fk_from_val = ir_vreg_fkind_get(val)
@@ -2994,11 +3063,23 @@ fn ir_lower_stmt(uint64 node) {
             } else if fk_from_val != 0 {
                 ir_vreg_fkind_set(fresh_val, fk_from_val)
             }
+            // Signed-int flag: prefer the declared type, fall back to the
+            // RHS's flag (e.g., `auto-style int x = signed_var` doesn't
+            // apply here since MLRift requires an explicit type, but RHS
+            // sign info still helps when declared type is uint64 and RHS
+            // came from a signed source — leave declared type authoritative).
+            if vd_signed != 0 {
+                ir_vreg_signed_set(fresh_val, 1)
+            } else if vd_fk == 0 && ir_vreg_signed_get(val) != 0 {
+                // Untyped destination (shouldn't happen with explicit decls)
+                ir_vreg_signed_set(fresh_val, 1)
+            }
             ir_var_set(name_tok, fresh_val)
         } else {
             uint64 zero = ir_new_vreg()
             ir_emit(IR_CONST, zero, 0, 0, 0, ir_current_bb)
             if vd_fk != 0 { ir_vreg_fkind_set(zero, vd_fk) }
+            if vd_signed != 0 { ir_vreg_signed_set(zero, 1) }
             ir_var_set(name_tok, zero)
         }
         return
@@ -3046,6 +3127,14 @@ fn ir_lower_stmt(uint64 node) {
                 ir_emit(IR_F32TOF64, f64v, val, 0, 0, ir_current_bb)
                 ir_vreg_fkind_set(f64v, 1)
                 val = f64v
+            }
+            // Carry the LHS's signed-int flag onto the assigned vreg.
+            // ir_var_set rebinds the name to `val`, which is a fresh
+            // vreg from the RHS expression — without this, a `t = -k`
+            // assignment that lands a fresh non-signed vreg into `t`
+            // would lose the signed flag from the original declaration.
+            if ir_vreg_signed_get(local_vreg) != 0 {
+                ir_vreg_signed_set(val, 1)
             }
             ir_var_set(name_tok, val)
             return

@@ -1,0 +1,43 @@
+// Verify int64 signed compares fire correctly.
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+
+fn ok(uint64 lbl, uint64 ll) { write(1, lbl, ll); write(1, " OK\n", 4) }
+fn bad(uint64 lbl, uint64 ll) { write(1, lbl, ll); write(1, " FAIL\n", 6) }
+
+fn main() {
+    int64 a = 5
+    int64 b = 0 - 7   // -7
+
+    // signed lt
+    if b < a { ok("b < a", 5) } else { bad("b < a", 5) }
+    // signed lt 0
+    if b < 0 { ok("b < 0", 5) } else { bad("b < 0", 5) }
+    // signed gt 0
+    if a > 0 { ok("a > 0", 5) } else { bad("a > 0", 5) }
+    // signed le
+    if b <= a { ok("b <= a", 6) } else { bad("b <= a", 6) }
+    // signed ge 0 with positive
+    if a >= 0 { ok("a >= 0", 6) } else { bad("a >= 0", 6) }
+    // signed not >= 0 with negative
+    if b >= 0 {
+        bad("b >= 0 (should not fire)", 24)
+    } else {
+        ok("b >= 0 negated", 14)
+    }
+
+    // f64_to_int negative
+    f64 x = 0.0 - 3.7
+    int64 k = f64_to_int(x)
+    if k < 0 { ok("f64_to_int(-3.7) < 0", 20) } else { bad("f64_to_int(-3.7) < 0", 20) }
+
+    // Arithmetic preserves signed
+    int64 m = b + 2    // -5
+    if m < 0 { ok("(b+2) < 0", 9) } else { bad("(b+2) < 0", 9) }
+
+    // Unsigned should NOT use signed compare (regression: uint64 0xFFFFF... > 0)
+    uint64 u = 0xFFFFFFFFFFFF0000
+    if u > 0 { ok("uint64 large > 0", 16) } else { bad("uint64 large > 0", 16) }
+
+    exit(0)
+}
