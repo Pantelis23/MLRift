@@ -5700,13 +5700,12 @@ fn emit_amdgpu_gemm_f32_blob(uint64 out_path) -> uint64 {
     return 0
 }
 
-// LLM Phase A milestone 3 — gemm f32 LDS-tiled, native-emit. 16x16
-// workgroup, 16x16 LDS A-tile + 16x16 LDS B-tile (single buffer; the
-// "double-buffer" name is from the milestone-3 launcher's ping/pong
-// scaffold which we may add later as a perf optimization). Reference
-// asm: /tmp/gemm_f32_lds_native.s, llvm-mc verified.
-// LDS layout: 2 KiB total (1 KiB A + 1 KiB B). KD's
-// group_segment_fixed_size = 2048 — wired through emit_amdgpu_code_object_lds.
+// LLM Phase A milestone 3 — gemm f32 LDS-tiled, native-emit.
+// 2-D dispatch: grid=(tiles_n, tiles_m, 1), block=(16, 16, 1).
+// SGPR setup: USER_SGPR_KERNARG_PTR=2, WORKGROUP_ID_X=1, WORKGROUP_ID_Y=1.
+//   s[0:1]=kernarg, s2=blockIdx.x=tile_col, s3=blockIdx.y=tile_row.
+//   v0=threadIdx.x=tx, v1=threadIdx.y=ty (rsrc2 enables both).
+// LDS layout: 2 KiB (1 KiB A + 1 KiB B).
 @export
 fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
     asm_init()
@@ -5715,56 +5714,43 @@ fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
     asm_u32(0xF4040300); asm_u32(0xF8000020)
     asm_u32(0xF4040380); asm_u32(0xF8000028)
     asm_u32(0xBF89FC07)
-    // ty/tx, tiles_n.
-    asm_u32(0x32020084)
-    asm_u32(0x3604008F)
-    asm_u32(0x80108F0C)
-    asm_u32(0x85108410)
-    // Scalar divide.
-    asm_u32(0xBE910002)
-    asm_u32(0xBE920080)
-    asm_u32(0xBF0A1011)
-    asm_u32(0xBFA20003)
-    asm_u32(0x80911011)
-    asm_u32(0x80128112)
-    asm_u32(0xBFA0FFFB)
-    // row, col.
-    asm_u32(0x84138412)
-    asm_u32(0x84148411)
-    asm_u32(0x4A060213)
-    asm_u32(0x4A080414)
+    // row=tile_row*16+ty, col=tile_col*16+tx (no divide; 2-D dispatch).
+    asm_u32(0x84108403)                         // s_lshl_b32 s16, s3, 4
+    asm_u32(0x84118402)                         // s_lshl_b32 s17, s2, 4
+    asm_u32(0x4A060210)                         // v_add_nc_u32 v3, s16, v1
+    asm_u32(0x4A080011)                         // v_add_nc_u32 v4, s17, v0
     // Bounds.
     asm_u32(0xBE82007E)
     asm_u32(0x7C98060A)
     asm_u32(0x8B7E6A7E)
     asm_u32(0x7C98080C)
     asm_u32(0x8B7E6A7E)
-    asm_u32(0xBFA5004E)
-    // num_kt, sum, kt counter, lane LDS-write idx.
-    asm_u32(0x8515840E)
-    asm_u32(0x7E0C0280)
-    asm_u32(0xBE960080)
-    asm_u32(0x300A0082)
-    // LDS read base addresses.
-    asm_u32(0x30220286)                         // v_lshlrev_b32 v17, 6, v1 (ty*64)
-    asm_u32(0x30240482)                         // v_lshlrev_b32 v18, 2, v2 (tx*4)
+    asm_u32(0xBFA50054)                         // s_cbranch_execz +84 → .Lend
+    // num_kt, sum, kt counter.
+    asm_u32(0x8512840E)                         // s_lshr_b32 s18, s14, 4
+    asm_u32(0x7E0C0280)                         // v_mov_b32 v6, 0
+    asm_u32(0xBE930080)                         // s_mov_b32 s19, 0
+    // LDS write idx (BYTES) = (ty*16 + tx) * 4.
+    asm_u32(0x300A0284)                         // v_lshlrev_b32 v5, 4, v1
+    asm_u32(0x4A0A0105)                         // v_add_nc_u32 v5, v5, v0
+    asm_u32(0x300A0A82)                         // v_lshlrev_b32 v5, 2, v5
+    // LDS read base: A_lds_base = ty*64, B_lds_base = tx*4 + 1024.
+    asm_u32(0x30220286)                         // v_lshlrev_b32 v17, 6, v1
+    asm_u32(0x30240082)                         // v_lshlrev_b32 v18, 2, v0
     asm_u32(0xD5250012); asm_u32(0x0001FF12); asm_u32(0x00000400)  // v_add_nc_u32_e64 v18, v18, 0x400
-    // Skip if num_kt == 0.
-    asm_u32(0xBF068015)
-    asm_u32(0xBFA2003A)                         // s_cbranch_scc1 +58 (was +54 pre-gl0_inv)
+    asm_u32(0xBF068012)
+    asm_u32(0xBFA2003A)                         // s_cbranch_scc1 +58 → .Lstore
     // .Lkt_loop:
-    asm_u32(0x84178416)                         // s_lshl_b32 s23, s22, 4
-    // a_global col, addr.
-    asm_u32(0x4A0E0417)
-    asm_u32(0xD72C0008); asm_u32(0x00001D03)
+    asm_u32(0x84148413)                         // s_lshl_b32 s20, s19, 4
+    asm_u32(0x4A0E0014)                         // v_add_nc_u32 v7, s20, v0
+    asm_u32(0xD72C0008); asm_u32(0x00001D03)   // v_mul_lo_u32 v8, v3, s14
     asm_u32(0x4A100F08)
     asm_u32(0x7E120280)
     asm_u32(0xD73C0008); asm_u32(0x00021082)
     asm_u32(0xD7006A08); asm_u32(0x00021004)
     asm_u32(0xD5207C09); asm_u32(0x01AA1205)
     asm_u32(0xDC520000); asm_u32(0x0A7C0008)
-    // b_global row, addr.
-    asm_u32(0x4A160217)
+    asm_u32(0x4A160214)                         // v_add_nc_u32 v11, s20, v1
     asm_u32(0xD72C000C); asm_u32(0x0000190B)
     asm_u32(0x4A18090C)
     asm_u32(0x7E1A0280)
@@ -5772,33 +5758,31 @@ fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
     asm_u32(0xD7006A0C); asm_u32(0x00021806)
     asm_u32(0xD5207C0D); asm_u32(0x01AA1A07)
     asm_u32(0xDC520000); asm_u32(0x0E7C000C)
-    // Wait + LDS stores + barrier + L0 invalidate.
     asm_u32(0xBF8903F7)
     asm_u32(0xD8340000); asm_u32(0x00000A05)
     asm_u32(0xD8340400); asm_u32(0x00000E05)
     asm_u32(0xBF89FC07)
     asm_u32(0xBFBD0000)
-    asm_u32(0xE0AC0000); asm_u32(0x00000000)   // buffer_gl0_inv
-    // Inner loop init.
-    asm_u32(0xBE970080)
+    asm_u32(0xE0AC0000); asm_u32(0x00000000)
+    asm_u32(0xBE940080)                         // s_mov_b32 s20, 0
     asm_u32(0x7E1E0311)
     asm_u32(0x7E200312)
-    // .Linner: 16 fmac per K-tile.
+    // .Linner:
     asm_u32(0xD8D80000); asm_u32(0x0900000F)
     asm_u32(0xD8D80000); asm_u32(0x0A000010)
     asm_u32(0xBF89FC07)
     asm_u32(0x560C1509)
     asm_u32(0xD525000F); asm_u32(0x0001090F)
     asm_u32(0xD5250010); asm_u32(0x00018110)
-    asm_u32(0x80178117)
-    asm_u32(0xBF0A9017)
+    asm_u32(0x80148114)
+    asm_u32(0xBF0A9014)
     asm_u32(0xBFA2FFF3)
-    // Barrier + L0 inv + outer increment.
+    // Barrier + outer increment.
     asm_u32(0xBFBD0000)
-    asm_u32(0xE0AC0000); asm_u32(0x00000000)   // buffer_gl0_inv
-    asm_u32(0x80168116)
-    asm_u32(0xBF0A1516)
-    asm_u32(0xBFA2FFC6)                         // s_cbranch_scc1 -58 (was -54 pre-gl0_inv)
+    asm_u32(0xE0AC0000); asm_u32(0x00000000)
+    asm_u32(0x80138113)
+    asm_u32(0xBF0A1213)
+    asm_u32(0xBFA2FFC6)                         // s_cbranch_scc1 -58 → .Lkt_loop
     // .Lstore:
     asm_u32(0xD72C0008); asm_u32(0x00001903)
     asm_u32(0x4A100908)
@@ -5828,12 +5812,15 @@ fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
 
     // rsrc1 with granulated_workitem_vgpr_count = 2 (24 vgprs allocated;
     // kernel uses v0..v18 = 19). LDS = 2048 bytes (2 KiB).
+    // rsrc2 = 0x99E enables WORKGROUP_ID_Y (bit 8) and VGPR workitem
+    // X+Y (bits 11-12 = 1) — the 2-D dispatch needs s3=blockIdx.y
+    // and v1=threadIdx.y preloaded by HW.
     uint64 size = emit_amdgpu_code_object_lds("gemm_f32_lds", 12,
                                                asm_text_buf, asm_text_len,
                                                48, 8, 24, 19,
-                                               0xE0AF0002, 0x0000009E, 0x00000010, 0x0408,
+                                               0xE0AF0002, 0x0000099E, 0x00000010, 0x0408,
                                                args_desc, 6,
-                                               4096)                          // 4 KiB LDS (kernel uses 2 KiB; pad to 4K granule)
+                                               2048)
 
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
