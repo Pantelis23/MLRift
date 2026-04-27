@@ -1,0 +1,23 @@
+// LLM Phase 2 — residual_add_f32 placeholder. --target=amdgpu-native
+// routes the @kernel name to the pointwise add kernel.
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+
+@kernel
+fn residual_add_f32(uint64 a_ptr, uint64 b_ptr, uint64 out_ptr, uint64 n) {
+    uint64 gid = block_idx_x() * 256 + tid_local_x()
+    if gid < n {
+        f32 a = 0.0
+        uint64 ap = a_ptr + gid * 4
+        unsafe { *(ap as f32) -> a }
+        uint64 bp = b_ptr + gid * 4
+        unsafe { *(bp as f32) -> a }
+        uint64 op = out_ptr + gid * 4
+        unsafe { *(op as f32) = a }
+    }
+}
+
+fn main() {
+    exit(0)
+}

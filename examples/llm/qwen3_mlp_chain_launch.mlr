@@ -1,0 +1,260 @@
+// Qwen3 LLM native pipeline — first slice (#30): MLP-block kernel chain.
+//
+// Demonstrates that the Phase 2 kernels compose end-to-end through
+// device-resident buffers with NO host roundtrips, mirroring the
+// "post-norm sublayer + residual" pattern of a Qwen3 transformer block:
+//
+//   gate'      = silu_mul_f32(gate, up)             // SwiGLU activation
+//   y          = residual_add_f32(x, gate')         // add residual
+//
+// (The full block also has rmsnorm before the activation and a down-
+// proj GEMM after; both are reachable from the kernels we have, but
+// generalising the matmul shapes for Qwen3-0.6B (hidden=896) is a
+// follow-up. This launcher proves the integration plumbing works on
+// the elementwise leg, which is most of the launch-overhead surface.)
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/silu_mul_f32.mlr        -o /tmp/silu_mul_f32
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/residual_add_f32.mlr    -o /tmp/residual_add_f32
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/qwen3_mlp_chain_launch.mlr -o /tmp/qwen3_mlp_chain_kfd
+// Run:
+//   N=4096 /tmp/qwen3_mlp_chain_kfd
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i; uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128); uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i; uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1; uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+fn die(uint64 msg, uint64 code) { puts(msg); print_label_val("e", 1, code); exit(1) }
+fn parse_env_count(uint64 name) -> uint64 {
+    uint64 s = getenv(name)
+    if s == 0 { return 0 }
+    uint64 v = 0; uint64 i = 0
+    while 1 == 1 {
+        uint64 cp = s + i; uint64 c = 0
+        unsafe { *(cp as uint8) -> c }
+        if c == 0 { break }
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48); i = i + 1; continue }
+        break
+    }
+    return v
+}
+
+// Inline exp_f64 (Taylor-7 + range reduction).  Same as silu launcher.
+fn host_exp_f64(f64 x) -> f64 {
+    f64 LN2     = 0.6931471805599453
+    f64 INV_LN2 = 1.4426950408889634
+    f64 kf = x * INV_LN2
+    if kf < 0.0 { kf = kf - 0.5 } else { kf = kf + 0.5 }
+    int64 k = f64_to_int(kf)
+    f64 kd = int_to_f64(k)
+    f64 r = x - kd * LN2
+    f64 r2 = r * r; f64 r3 = r2 * r; f64 r4 = r2 * r2
+    f64 r5 = r4 * r; f64 r6 = r4 * r2; f64 r7 = r6 * r
+    f64 e_r = 1.0 + r
+                  + r2 * 0.5
+                  + r3 * 0.16666666666666666
+                  + r4 * 0.041666666666666664
+                  + r5 * 0.008333333333333333
+                  + r6 * 0.001388888888888889
+                  + r7 * 0.0001984126984126984
+    f64 two_k = 1.0
+    if k >= 0 {
+        int64 i = 0
+        while i < k { two_k = two_k * 2.0; i = i + 1 }
+    } else {
+        int64 i = 0
+        int64 nk = 0 - k
+        while i < nk { two_k = two_k * 0.5; i = i + 1 }
+    }
+    return two_k * e_r
+}
+
+// Reference: y = x + silu(gate) * up.
+fn ref_chain(f32 x, f32 g, f32 u) -> f32 {
+    f64 gd = f32_to_f64(g)
+    f64 ud = f32_to_f64(u)
+    f64 e  = host_exp_f64(0.0 - gd)
+    f64 silu_g = gd / (1.0 + e)
+    f64 prod   = silu_g * ud
+    f64 sum    = f32_to_f64(x) + prod
+    return f64_to_f32(sum)
+}
+
+fn load_kernel(uint64 co_path, uint64 fname, uint64 fname_len) -> uint64 {
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { puts("missing co"); puts(co_path); exit(1) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    uint32 err = hipModuleLoadData(mod_slot, blob)
+    if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fname)
+    if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+    return fh
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 N = 4096
+    uint64 ne = parse_env_count("N"); if ne != 0 { N = ne }
+
+    // Load both kernels into one process.  Each kernel comes from its own
+    // .co; both are loaded simultaneously (no module-unload between
+    // launches), proving we can host multi-kernel pipelines.
+    uint64 fh_silu_mul     = load_kernel("/tmp/silu_mul_f32.co",     "silu_mul_f32",     12)
+    uint64 fh_residual_add = load_kernel("/tmp/residual_add_f32.co", "residual_add_f32", 16)
+
+    uint64 bytes = N * 4
+    uint64 d_x = 0; uint64 d_gate = 0; uint64 d_up = 0
+    uint64 d_act = 0          // intermediate: silu_mul output
+    uint64 d_y = 0            // final: residual sum
+    uint64 slot
+    slot = alloc(8); err = hipMalloc(slot, bytes); if err != 0 { die("mX",   err) }; unsafe { *(slot as uint64) -> d_x }
+    slot = alloc(8); err = hipMalloc(slot, bytes); if err != 0 { die("mG",   err) }; unsafe { *(slot as uint64) -> d_gate }
+    slot = alloc(8); err = hipMalloc(slot, bytes); if err != 0 { die("mU",   err) }; unsafe { *(slot as uint64) -> d_up }
+    slot = alloc(8); err = hipMalloc(slot, bytes); if err != 0 { die("mAct", err) }; unsafe { *(slot as uint64) -> d_act }
+    slot = alloc(8); err = hipMalloc(slot, bytes); if err != 0 { die("mY",   err) }; unsafe { *(slot as uint64) -> d_y }
+
+    // Deterministic non-trivial inputs.
+    //   x[i]    = (i / (N-1)) * 0.4 - 0.2     ∈ [-0.2, 0.2]
+    //   gate[i] = (i / (N-1)) * 16  - 8       ∈ [-8, 8]   (sigmoid range)
+    //   up[i]   = 0.5 + (i / (N-1))           ∈ [0.5, 1.5]
+    uint64 h_x    = alloc(bytes)
+    uint64 h_gate = alloc(bytes)
+    uint64 h_up   = alloc(bytes)
+    uint64 i = 0
+    while i < N {
+        f64 frac = int_to_f64(i) / int_to_f64(N - 1)
+        f32 xv = f64_to_f32(frac * 0.4 - 0.2)
+        f32 gv = f64_to_f32(frac * 16.0 - 8.0)
+        f32 uv = f64_to_f32(0.5 + frac)
+        uint64 px = h_x    + i * 4; unsafe { *(px as f32) = xv }
+        uint64 pg = h_gate + i * 4; unsafe { *(pg as f32) = gv }
+        uint64 pu = h_up   + i * 4; unsafe { *(pu as f32) = uv }
+        i = i + 1
+    }
+    err = hipMemcpy(d_x,    h_x,    bytes, 1); if err != 0 { die("H2D x",    err) }
+    err = hipMemcpy(d_gate, h_gate, bytes, 1); if err != 0 { die("H2D gate", err) }
+    err = hipMemcpy(d_up,   h_up,   bytes, 1); if err != 0 { die("H2D up",   err) }
+
+    // ----- Stage 1: silu_mul(gate, up) -> d_act ---------------------
+    uint64 k_g    = alloc(8); unsafe { *(k_g    as uint64) = d_gate }
+    uint64 k_u    = alloc(8); unsafe { *(k_u    as uint64) = d_up }
+    uint64 k_a    = alloc(8); unsafe { *(k_a    as uint64) = d_act }
+    uint64 k_n_sm = alloc(8); unsafe { *(k_n_sm as uint64) = N }
+    uint64 kp1 = alloc(4 * 8)
+    unsafe { *(kp1        as uint64) = k_g }
+    unsafe { *((kp1 +  8) as uint64) = k_u }
+    unsafe { *((kp1 + 16) as uint64) = k_a }
+    unsafe { *((kp1 + 24) as uint64) = k_n_sm }
+
+    uint32 grid_x  = (N + 255) / 256
+    uint32 block_x = 256
+    err = hipModuleLaunchKernel(fh_silu_mul, grid_x, 1, 1, block_x, 1, 1, 0, 0, kp1, 0)
+    if err != 0 { die("launch silu_mul", err) }
+    // No sync between stages — the queue serialises them.
+
+    // ----- Stage 2: residual_add(x, d_act) -> d_y -------------------
+    // d_act was just written by stage 1; the queue ordering guarantees
+    // stage 2 sees it.  This is the load-bearing claim of the demo.
+    uint64 k_x    = alloc(8); unsafe { *(k_x    as uint64) = d_x }
+    uint64 k_a2   = alloc(8); unsafe { *(k_a2   as uint64) = d_act }
+    uint64 k_y    = alloc(8); unsafe { *(k_y    as uint64) = d_y }
+    uint64 k_n_ra = alloc(8); unsafe { *(k_n_ra as uint64) = N }
+    uint64 kp2 = alloc(4 * 8)
+    unsafe { *(kp2        as uint64) = k_x }
+    unsafe { *((kp2 +  8) as uint64) = k_a2 }
+    unsafe { *((kp2 + 16) as uint64) = k_y }
+    unsafe { *((kp2 + 24) as uint64) = k_n_ra }
+
+    err = hipModuleLaunchKernel(fh_residual_add, grid_x, 1, 1, block_x, 1, 1, 0, 0, kp2, 0)
+    if err != 0 { die("launch residual_add", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    // Pull result.
+    uint64 h_y = alloc(bytes)
+    err = hipMemcpy(h_y, d_y, bytes, 2); if err != 0 { die("D2H", err) }
+
+    // Verify: y == x + silu(gate)*up, cell by cell.
+    uint64 fail = 0
+    uint64 first_bad = 0xFFFFFFFFFFFFFFFF
+    uint32 first_bad_ref_bits = 0
+    uint32 first_bad_dev_bits = 0
+    f32 thresh = 0.001
+    f32 floor  = 0.000001
+    i = 0
+    while i < N {
+        uint64 px = h_x    + i * 4; f32 xv = 0.0; unsafe { *(px as f32) -> xv }
+        uint64 pg = h_gate + i * 4; f32 gv = 0.0; unsafe { *(pg as f32) -> gv }
+        uint64 pu = h_up   + i * 4; f32 uv = 0.0; unsafe { *(pu as f32) -> uv }
+        f32 ref = ref_chain(xv, gv, uv)
+        uint64 py = h_y    + i * 4; f32 dev = 0.0; unsafe { *(py as f32) -> dev }
+
+        f32 d = ref - dev
+        if d < 0.0 { d = 0.0 - d }
+        f32 ar = ref
+        if ar < 0.0 { ar = 0.0 - ar }
+        if ar < floor { ar = floor }
+        f32 rel = d / ar
+
+        if rel > thresh {
+            fail = fail + 1
+            if first_bad == 0xFFFFFFFFFFFFFFFF {
+                first_bad = i
+                uint64 rb = alloc(4); unsafe { *(rb as f32) = ref }
+                unsafe { *(rb as uint32) -> first_bad_ref_bits }
+                uint64 db = alloc(4); unsafe { *(db as f32) = dev }
+                unsafe { *(db as uint32) -> first_bad_dev_bits }
+            }
+        }
+        i = i + 1
+    }
+
+    print_label_val("N",                  1, N)
+    print_label_val("kernels_launched",  16, 2)
+    print_label_val("cells_failed",      12, fail)
+    print_label_val("first_bad_idx",     13, first_bad)
+    print_label_val("first_bad_ref_bits", 18, first_bad_ref_bits)
+    print_label_val("first_bad_dev_bits", 18, first_bad_dev_bits)
+
+    hipFree(d_x); hipFree(d_gate); hipFree(d_up); hipFree(d_act); hipFree(d_y)
+    exit(0)
+}

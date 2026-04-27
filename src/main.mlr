@@ -4693,6 +4693,18 @@ fn main() {
                 write(1, rp_path, rpl)
                 write(1, " (amdgpu rope-f32 code object)\n", 32)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-residual-add-f32=", 31) != 0 {
+                uint64 ra_path = arg + 31
+                uint64 ra_rc = emit_amdgpu_residual_add_f32_blob(ra_path)
+                if ra_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-residual-add-f32 failed\n", 45)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 ral = str_len(ra_path)
+                write(1, ra_path, ral)
+                write(1, " (amdgpu residual-add-f32 code object)\n", 40)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-softmax-f32=", 26) != 0 {
                 uint64 sx_path = arg + 26
                 uint64 sx_rc = emit_amdgpu_softmax_f32_blob(sx_path)
