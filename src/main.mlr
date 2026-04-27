@@ -4633,6 +4633,18 @@ fn main() {
                 write(1, gl_path, gll)
                 write(1, " (amdgpu gemm-f32-lds code object)\n", 35)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-softmax-f32=", 26) != 0 {
+                uint64 sx_path = arg + 26
+                uint64 sx_rc = emit_amdgpu_softmax_f32_blob(sx_path)
+                if sx_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-softmax-f32 failed\n", 39)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 sxl = str_len(sx_path)
+                write(1, sx_path, sxl)
+                write(1, " (amdgpu softmax-f32 code object)\n", 34)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-gemm-f16f32-wmma=", 31) != 0 {
                 // LLM Phase A milestone 5 native-emit (task #72).
                 // WMMA-tiled f16/f32 GEMM, 1 wave per 16x16 output tile.

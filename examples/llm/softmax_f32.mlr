@@ -1,0 +1,25 @@
+// LLM Phase 2 — softmax_f32. Placeholder source; --target=amdgpu-native
+// routes the @kernel name to amdgpu_lower_llm_softmax_f32 which emits
+// the hand-tuned LDS-based reduction kernel (block=256, n must be 256).
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+
+@kernel
+fn softmax_f32(uint64 in_ptr, uint64 out_ptr, uint64 m, uint64 n) {
+    uint64 row = block_idx_x()
+    uint64 tid = tid_local_x()
+    if row < m {
+        if tid < n {
+            f32 x = 0.0
+            uint64 ip = in_ptr + (row * n + tid) * 4
+            unsafe { *(ip as f32) -> x }
+            uint64 op = out_ptr + (row * n + tid) * 4
+            unsafe { *(op as f32) = x }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}
