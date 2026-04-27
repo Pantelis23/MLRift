@@ -964,9 +964,12 @@ fn hipModuleLoadData(uint64 mod_out, uint64 blob_ptr) -> uint32 {
 
 // hipModuleGetFunction returns a function handle. We need to remember
 // kernarg_size for hipModuleLaunchKernel, so the handle is a small
-// wrapper struct (16 bytes):
-//   [0x00] kd_va         (u64)  — what kfd_dispatch wants
-//   [0x08] kernarg_size  (u64)  — read from the kernel descriptor
+// wrapper struct (32 bytes):
+//   [0x00] kd_va               (u64)  — what kfd_dispatch wants
+//   [0x08] kernarg_size        (u64)  — read from the kernel descriptor
+//   [0x10] nargs               (u64)  — kernarg_size/8, precomputed
+//   [0x18] group_segment_size  (u64)  — KD's static LDS bytes; the shim
+//                                       needs this to populate AQL
 fn hipModuleGetFunction(uint64 fn_out, uint64 mod, uint64 name_cstr) -> uint32 {
     uint64 kd_va = kernel_get_function(mod, name_cstr)
     if kd_va == 0 {
@@ -976,13 +979,13 @@ fn hipModuleGetFunction(uint64 fn_out, uint64 mod, uint64 name_cstr) -> uint32 {
         return 500
     }
     uint64 ks    = kernel_kernarg_size(mod, kd_va)
-    // 24-byte handle: kd_va, kernarg_size, nargs (= ks/8 precomputed,
-    // saves one division per launch in the hot loop).
-    uint64 wrap  = alloc(24)
+    uint64 gss   = kernel_group_segment_size(mod, kd_va)
+    uint64 wrap  = alloc(32)
     unsafe { *((wrap + 0x00) as uint64) = kd_va }
     unsafe { *((wrap + 0x08) as uint64) = ks }
     uint64 nargs = ks / 8
     unsafe { *((wrap + 0x10) as uint64) = nargs }
+    unsafe { *((wrap + 0x18) as uint64) = gss }
     unsafe { *(fn_out as uint64) = wrap }
     return 0
 }
@@ -1009,6 +1012,7 @@ fn hipModuleLaunchKernel(
     uint64 kd_va = 0; unsafe { *((fn_handle + 0x00) as uint64) -> kd_va }
     uint64 ks    = 0; unsafe { *((fn_handle + 0x08) as uint64) -> ks }
     uint64 nargs = 0; unsafe { *((fn_handle + 0x10) as uint64) -> nargs }
+    uint64 gss   = 0; unsafe { *((fn_handle + 0x18) as uint64) -> gss }
     if ks > _HIPKFD_KARG_SLOT_SZ {
         kfd_die("hipModuleLaunchKernel: kernarg_size > 256 (shim slot)", ks)
     }
@@ -1135,7 +1139,13 @@ fn hipModuleLaunchKernel(
     uint32 g_y = grid_y * block_y; unsafe { *((packet + 0x10) as uint32) = g_y }
     uint32 g_z = grid_z * block_z; unsafe { *((packet + 0x14) as uint32) = g_z }
     uint32 priv0 = 0;    unsafe { *((packet + 0x18) as uint32) = priv0 }
-    uint32 grp0  = 0;    unsafe { *((packet + 0x1C) as uint32) = grp0  }
+    // AQL group_segment_size = KD static LDS + caller's dynamic shared.
+    // KFD CP allocates LDS based on AQL, NOT KD; without this, kernels
+    // declaring static LDS in KD silently get 0 bytes allocated and
+    // ds_load returns 0 (LDS round-trip fails). HIP runtime sets this
+    // bit; we have to as well or LDS-using kernels are dead on arrival.
+    uint32 grp0  = gss + shared_bytes
+    unsafe { *((packet + 0x1C) as uint32) = grp0  }
     unsafe { *((packet + 0x20) as uint64) = kd_va }
     unsafe { *((packet + 0x28) as uint64) = karg_va }
     uint64 r2 = 0;       unsafe { *((packet + 0x30) as uint64) = r2 }

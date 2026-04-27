@@ -1066,6 +1066,21 @@ fn kernel_kernarg_size(uint64 mod, uint64 kd_va) -> uint64 {
     return ks
 }
 
+// Read group_segment_fixed_size (LDS bytes per WG) out of the KD. Stored
+// at KD offset 0x00 (first 4 bytes of the kernel descriptor). The shim
+// needs this at launch time to populate the AQL packet's
+// group_segment_size field — KFD/CP allocates LDS based on AQL, not KD,
+// despite the KD storing the static-LDS size.
+@export
+fn kernel_group_segment_size(uint64 mod, uint64 kd_va) -> uint64 {
+    uint64 image_base_va   = 0; unsafe { *((mod + 0x10) as uint64) -> image_base_va }
+    uint64 image_base_host = 0; unsafe { *((mod + 0x20) as uint64) -> image_base_host }
+    uint64 kd_host = image_base_host + (kd_va - image_base_va)
+    uint64 gss = 0
+    unsafe { *((kd_host + 0x00) as uint32) -> gss }
+    return gss
+}
+
 fn kernel_load(uint64 co_path) -> uint64 {
     if _kfd_initialized == 0 { kfd_init() }
 
