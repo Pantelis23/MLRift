@@ -4729,6 +4729,62 @@ fn main() {
                 write(1, sx_path, sxl)
                 write(1, " (amdgpu softmax-f32 code object)\n", 34)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-rmsnorm-f32-N=", 28) != 0 {
+                // Format: --emit-amdgpu-rmsnorm-f32-N=<N>:<path>
+                uint64 rnn_arg = arg + 28
+                uint64 rnn_N = 0
+                uint64 rnn_i = 0
+                while 1 == 1 {
+                    uint64 rnn_p = rnn_arg + rnn_i
+                    uint64 rnn_c = 0
+                    unsafe { *(rnn_p as uint8) -> rnn_c }
+                    if rnn_c == 0 || rnn_c == 58 { break }
+                    if rnn_c < 48 || rnn_c > 57 {
+                        write(2, "mlrc: --emit-amdgpu-rmsnorm-f32-N: expected <N>:<path>\n", 56)
+                        exit(1)
+                    }
+                    rnn_N = rnn_N * 10 + (rnn_c - 48)
+                    rnn_i = rnn_i + 1
+                }
+                uint64 rnn_path = rnn_arg + rnn_i + 1
+                uint64 rnn_rc = emit_amdgpu_rmsnorm_f32_N_blob(rnn_path, rnn_N)
+                if rnn_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-rmsnorm-f32-N failed\n", 41)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 rnnl = str_len(rnn_path)
+                write(1, rnn_path, rnnl)
+                write(1, " (amdgpu rmsnorm-f32 code object, N-parametric)\n", 49)
+                exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-layernorm-f32-N=", 30) != 0 {
+                // Format: --emit-amdgpu-layernorm-f32-N=<N>:<path>
+                uint64 lnn_arg = arg + 30
+                uint64 lnn_N = 0
+                uint64 lnn_i = 0
+                while 1 == 1 {
+                    uint64 lnn_p = lnn_arg + lnn_i
+                    uint64 lnn_c = 0
+                    unsafe { *(lnn_p as uint8) -> lnn_c }
+                    if lnn_c == 0 || lnn_c == 58 { break }
+                    if lnn_c < 48 || lnn_c > 57 {
+                        write(2, "mlrc: --emit-amdgpu-layernorm-f32-N: expected <N>:<path>\n", 58)
+                        exit(1)
+                    }
+                    lnn_N = lnn_N * 10 + (lnn_c - 48)
+                    lnn_i = lnn_i + 1
+                }
+                uint64 lnn_path = lnn_arg + lnn_i + 1
+                uint64 lnn_rc = emit_amdgpu_layernorm_f32_N_blob(lnn_path, lnn_N)
+                if lnn_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-layernorm-f32-N failed\n", 43)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 lnnl = str_len(lnn_path)
+                write(1, lnn_path, lnnl)
+                write(1, " (amdgpu layernorm-f32 code object, N-parametric)\n", 51)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-softmax-f32-N=", 28) != 0 {
                 // Format: --emit-amdgpu-softmax-f32-N=<N>:<path>
                 // e.g.    --emit-amdgpu-softmax-f32-N=512:/tmp/softmax_n512.co

@@ -1,0 +1,145 @@
+// Launcher for shape-parametric rmsnorm_f32. Picks /tmp/rmsnorm_n<N>.co
+// based on env var N. Block = N, grid = M.
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 { i = i - 1; uint64 d = tmp - (tmp / 10) * 10; uint64 p = buf + i; uint8 c = d + 48; unsafe { *(p as uint8) = c }; tmp = tmp / 10 }
+    return n
+}
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128); uint64 i = 0
+    while i < label_len { uint64 sp = label + i; uint64 c = 0; unsafe { *(sp as uint8) -> c }; uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }; i = i + 1 }
+    uint64 cp = buf + label_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1; uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+fn die(uint64 msg, uint64 code) { puts(msg); print_label_val("e", 1, code); exit(1) }
+fn parse_env_count(uint64 name) -> uint64 {
+    uint64 s = getenv(name); if s == 0 { return 0 }
+    uint64 v = 0; uint64 i = 0
+    while 1 == 1 { uint64 cp = s + i; uint64 c = 0; unsafe { *(cp as uint8) -> c }; if c == 0 { break }; if c >= 48 && c <= 57 { v = v * 10 + (c - 48); i = i + 1; continue }; break }
+    return v
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+    uint64 M = 4
+    uint64 me = parse_env_count("M"); if me != 0 { M = me }
+    uint64 N = 256
+    uint64 ne = parse_env_count("N"); if ne != 0 { N = ne }
+
+    uint64 path = alloc(64)
+    uint64 prefix = "/tmp/rmsnorm_n"
+    uint64 pi = 0
+    while pi < 14 { uint64 sp = prefix + pi; uint64 c = 0; unsafe { *(sp as uint8) -> c }; uint64 dp = path + pi; uint8 cb = c; unsafe { *(dp as uint8) = cb }; pi = pi + 1 }
+    uint64 nlen = u64_to_ascii_decimal(N, path + 14)
+    uint64 suffix = ".co"
+    uint64 si = 0
+    while si < 3 { uint64 sp = suffix + si; uint64 c = 0; unsafe { *(sp as uint8) -> c }; uint64 dp = path + 14 + nlen + si; uint8 cb = c; unsafe { *(dp as uint8) = cb }; si = si + 1 }
+    uint64 nul_p = path + 14 + nlen + 3; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+
+    uint64 fd = file_open(path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { puts("missing co:"); puts(path); exit(1) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "rmsnorm_f32"); if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    uint64 in_bytes = M * N * 4
+    uint64 g_bytes  = N * 4
+    uint64 d_in = 0; uint64 d_out = 0; uint64 d_g = 0
+    uint64 slot = alloc(8); err = hipMalloc(slot, in_bytes); if err != 0 { die("mIn",  err) }; unsafe { *(slot as uint64) -> d_in }
+    slot = alloc(8); err = hipMalloc(slot, in_bytes); if err != 0 { die("mOut", err) }; unsafe { *(slot as uint64) -> d_out }
+    slot = alloc(8); err = hipMalloc(slot, g_bytes);  if err != 0 { die("mG",   err) }; unsafe { *(slot as uint64) -> d_g }
+
+    uint64 h_in = alloc(in_bytes)
+    uint64 h_g  = alloc(g_bytes)
+    uint64 r = 0
+    while r < M {
+        uint64 c = 0
+        while c < N {
+            f64 vd = int_to_f64(r + 1) * 0.1 + (int_to_f64(c) - int_to_f64(N / 2)) * 0.005
+            uint64 p = h_in + (r * N + c) * 4
+            unsafe { *(p as f32) = f64_to_f32(vd) }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    uint64 c2 = 0
+    while c2 < N {
+        f64 gd = 0.5 + int_to_f64(c2) / int_to_f64(N)
+        uint64 p = h_g + c2 * 4
+        unsafe { *(p as f32) = f64_to_f32(gd) }
+        c2 = c2 + 1
+    }
+    err = hipMemcpy(d_in, h_in, in_bytes, 1); if err != 0 { die("H2D in", err) }
+    err = hipMemcpy(d_g,  h_g,  g_bytes,  1); if err != 0 { die("H2D g",  err) }
+
+    uint64 k_in = alloc(8); unsafe { *(k_in as uint64) = d_in }
+    uint64 k_out = alloc(8); unsafe { *(k_out as uint64) = d_out }
+    uint64 k_g_p = alloc(8); unsafe { *(k_g_p as uint64) = d_g }
+    uint64 k_m = alloc(8); uint64 mv = M; unsafe { *(k_m as uint64) = mv }
+    uint64 k_n = alloc(8); unsafe { *(k_n as uint64) = N }
+    uint64 kp = alloc(5 * 8)
+    unsafe { *(kp        as uint64) = k_in }
+    unsafe { *((kp +  8) as uint64) = k_out }
+    unsafe { *((kp + 16) as uint64) = k_g_p }
+    unsafe { *((kp + 24) as uint64) = k_m }
+    unsafe { *((kp + 32) as uint64) = k_n }
+
+    err = hipModuleLaunchKernel(fh, M, 1, 1, N, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 h_out = alloc(in_bytes)
+    err = hipMemcpy(h_out, d_out, in_bytes, 2); if err != 0 { die("D2H", err) }
+
+    // Verify out_i = x_i * rsqrt(mean(x²) + eps) * gamma_i.
+    uint64 fail = 0
+    f32 thresh = 0.001
+    r = 0
+    while r < M {
+        f32 sumsq = 0.0
+        uint64 c = 0
+        while c < N { uint64 p = h_in + (r * N + c) * 4; f32 x = 0.0; unsafe { *(p as f32) -> x }; sumsq = sumsq + x * x; c = c + 1 }
+        f32 inv_n = 1.0 / int_to_f32(N)
+        f32 mean_sq = sumsq * inv_n
+        f32 eps = 0.00001
+        f32 inv_rms = 1.0 / sqrt_f32(mean_sq + eps)
+        c = 0
+        while c < N {
+            uint64 ip = h_in + (r * N + c) * 4; f32 x = 0.0; unsafe { *(ip as f32) -> x }
+            uint64 gp = h_g + c * 4; f32 g = 0.0; unsafe { *(gp as f32) -> g }
+            f32 ref = x * inv_rms * g
+            uint64 op = h_out + (r * N + c) * 4; f32 dev = 0.0; unsafe { *(op as f32) -> dev }
+            f32 d = ref - dev; if d < 0.0 { d = 0.0 - d }
+            if d > thresh { fail = fail + 1 }
+            c = c + 1
+        }
+        r = r + 1
+    }
+
+    print_label_val("M", 1, M)
+    print_label_val("N", 1, N)
+    print_label_val("cells_failed", 12, fail)
+
+    hipFree(d_in); hipFree(d_out); hipFree(d_g)
+    exit(0)
+}
