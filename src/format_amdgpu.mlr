@@ -7486,6 +7486,307 @@ fn amdgpu_lower_llm_residual_add_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
     return 0
 }
 
+// LLM Phase 2 — softmax_causal_f32: numerically-stable softmax with
+// autoregressive causal mask. cells with col j > row r get masked to
+// -inf before reductions, so they contribute 0 to exp-sum and don't
+// perturb max. Same shape and kernarg layout as softmax_f32.
+//
+// Kernarg layout (32 bytes, 4 args):
+//   [0x00] uint64 in_ptr   (M × 256 f32 attention scores)
+//   [0x08] uint64 out_ptr
+//   [0x10] uint64 m
+//   [0x18] uint64 n        (must equal 256)
+fn _emit_softmax_causal_f32_body(uint64 args_desc) {
+    asm_init()
+    asm_u32(0xF40C0100)
+    asm_u32(0xF8000000)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBF09080F)
+    asm_u32(0xBFA200E5)
+    asm_u32(0x960C0A0F)
+    asm_u32(0x4A02000C)
+    asm_u32(0x30080282)
+    asm_u32(0x7E060280)
+    asm_u32(0xD7006A02)
+    asm_u32(0x00020804)
+    asm_u32(0xD5207C03)
+    asm_u32(0x01AA0605)
+    asm_u32(0x7E1A0280)
+    asm_u32(0xD7006A0C)
+    asm_u32(0x00020806)
+    asm_u32(0xD5207C0D)
+    asm_u32(0x01AA1A07)
+    asm_u32(0xDC520000)
+    asm_u32(0x0A7C0002)
+    asm_u32(0xBF8903F7)
+    asm_u32(0xD449000E)
+    asm_u32(0x0002000F)
+    asm_u32(0x7E1E02FF)
+    asm_u32(0xFF800000)
+    asm_u32(0xD501000A)
+    asm_u32(0x003A1F0A)
+    asm_u32(0x7E0A030A)
+    asm_u32(0x300C0082)
+    asm_u32(0x7E120280)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80200)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x200A0F05)
+    asm_u32(0x7C9800FF)
+    asm_u32(0x00000080)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80100)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x200A0F05)
+    asm_u32(0x7C9800C0)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80080)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x200A0F05)
+    asm_u32(0x7C9800A0)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80040)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x200A0F05)
+    asm_u32(0x7C980090)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80020)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x200A0F05)
+    asm_u32(0x7C980088)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80010)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x200A0F05)
+    asm_u32(0x7C980084)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80008)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x200A0F05)
+    asm_u32(0x7C980082)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80004)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x200A0F05)
+    asm_u32(0x7C980081)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80000)
+    asm_u32(0x08000009)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x0816110A)
+    asm_u32(0xBE8C00FF)
+    asm_u32(0x3FB8AA3B)
+    asm_u32(0x1016160C)
+    asm_u32(0x7E164B0B)
+    asm_u32(0xBFBD0000)
+    asm_u32(0x7E0A030B)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80200)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x060A0F05)
+    asm_u32(0x7C9800FF)
+    asm_u32(0x00000080)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80100)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x060A0F05)
+    asm_u32(0x7C9800C0)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80080)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x060A0F05)
+    asm_u32(0x7C9800A0)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80040)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x060A0F05)
+    asm_u32(0x7C980090)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80020)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x060A0F05)
+    asm_u32(0x7C980088)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80010)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x060A0F05)
+    asm_u32(0x7C980084)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80008)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x060A0F05)
+    asm_u32(0x7C980082)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80004)
+    asm_u32(0x07000006)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x060A0F05)
+    asm_u32(0x7C980081)
+    asm_u32(0xBE8C206A)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000506)
+    asm_u32(0xBEFE000C)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    asm_u32(0xD8D80000)
+    asm_u32(0x08000009)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x7E105508)
+    asm_u32(0x100A110B)
+    asm_u32(0xDC6A0000)
+    asm_u32(0x007C050C)
+    asm_u32(0xBC7C0000)
+    asm_u32(0xBFB00000)
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+@export
+fn emit_amdgpu_softmax_causal_f32_blob(uint64 out_path) -> uint64 {
+    uint64[8] args_desc
+    _emit_softmax_causal_f32_body(args_desc)
+    uint64 size = emit_amdgpu_code_object_lds("softmax_causal_f32", 18,
+                                               asm_text_buf, asm_text_len,
+                                               32, 8, 16, 16,
+                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 4,
+                                               1024)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_softmax_causal_f32_blob: cannot open output\n", 57)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+fn amdgpu_lower_llm_softmax_causal_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
+    uint64 args_desc = alloc(8 * 8)
+    _emit_softmax_causal_f32_body(args_desc)
+    uint64 k_text_size = asm_text_len
+    uint64 k_text_buf  = alloc(k_text_size)
+    uint64 ci = 0
+    while ci < k_text_size {
+        uint64 sp = asm_text_buf + ci
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        uint64 dp = k_text_buf + ci
+        uint8 b8 = b
+        unsafe { *(dp as uint8) = b8 }
+        ci = ci + 1
+    }
+    kt_push_lds(kname_ptr, nl, k_text_buf, k_text_size,
+                args_desc, 4, 32,
+                16, 16,
+                0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                1024)
+    return 0
+}
+
 // Debug variant of N3: identical KD/dispatch/bounds, but the kernel
 // body just stores 1.0 (0x3F800000) to C[row, col]. If output cells
 // fail to receive 1.0, the bug is in dispatch/store, not LDS.
@@ -9820,6 +10121,9 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
     if tok_matches(name_tok, "residual_add_f32", 16) != 0 {
         return amdgpu_lower_llm_residual_add_f32(kname_ptr, nl)
+    }
+    if tok_matches(name_tok, "softmax_causal_f32", 18) != 0 {
+        return amdgpu_lower_llm_softmax_causal_f32(kname_ptr, nl)
     }
 
     // ── Phase 3a: AST-walking pointwise-binop recogniser ──────────────
