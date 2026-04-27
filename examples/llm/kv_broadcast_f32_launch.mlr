@@ -1,0 +1,138 @@
+// kv_broadcast_f32: GQA K/V materialised broadcast (Llama 3 8B shape).
+//
+// Each output cell (m, h, d) reads K[m, h >> 2, d].  Hardcoded layout:
+//   num_heads=32, num_kv_heads=8, group_size=4, head_dim=128.
+// All pow2 → kernel uses pure shifts (no division required).
+//
+// Used to avoid index translation inside attention matmuls when running
+// GQA models on a Q/K-symmetric attention kernel — we materialise the
+// broadcast once per layer instead.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-kv-broadcast-f32=/tmp/kv_broadcast.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/kv_broadcast_f32_launch.mlr -o /tmp/kv_broadcast_kfd
+// Run:
+//   /tmp/kv_broadcast_kfd
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 { i = i - 1; uint64 d = tmp - (tmp / 10) * 10; uint64 p = buf + i; uint8 c = d + 48; unsafe { *(p as uint8) = c }; tmp = tmp / 10 }
+    return n
+}
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128); uint64 i = 0
+    while i < label_len { uint64 sp = label + i; uint64 c = 0; unsafe { *(sp as uint8) -> c }; uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }; i = i + 1 }
+    uint64 cp = buf + label_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1; uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+fn die(uint64 msg, uint64 code) { puts(msg); print_label_val("e", 1, code); exit(1) }
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 M  = 64           // sequence positions
+    uint64 H  = 32           // num_heads
+    uint64 KH = 8            // num_kv_heads
+    uint64 D  = 128          // head_dim
+
+    uint64 fd = file_open("/tmp/kv_broadcast.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { puts("missing /tmp/kv_broadcast.co"); exit(1) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "kv_broadcast_f32"); if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    uint64 in_bytes  = M * KH * D * 4    //  64 * 8  * 128 * 4 =   262144
+    uint64 out_bytes = M * H  * D * 4    //  64 * 32 * 128 * 4 =  1048576
+
+    uint64 d_in = 0; uint64 d_out = 0
+    uint64 slot
+    slot = alloc(8); err = hipMalloc(slot, in_bytes);  if err != 0 { die("mIn",  err) }; unsafe { *(slot as uint64) -> d_in }
+    slot = alloc(8); err = hipMalloc(slot, out_bytes); if err != 0 { die("mOut", err) }; unsafe { *(slot as uint64) -> d_out }
+
+    // Fill K [M, KH, D] with deterministic values.
+    uint64 h_in = alloc(in_bytes)
+    uint64 m = 0
+    while m < M {
+        uint64 kh = 0
+        while kh < KH {
+            uint64 d = 0
+            while d < D {
+                f64 v = int_to_f64(m) * 0.001 + int_to_f64(kh) * 0.1 + int_to_f64(d) * 0.0003
+                uint64 p = h_in + ((m * KH + kh) * D + d) * 4
+                unsafe { *(p as f32) = f64_to_f32(v) }
+                d = d + 1
+            }
+            kh = kh + 1
+        }
+        m = m + 1
+    }
+    err = hipMemcpy(d_in, h_in, in_bytes, 1); if err != 0 { die("H2D", err) }
+
+    // 2 args: in_ptr, out_ptr
+    uint64 k_in  = alloc(8); unsafe { *(k_in  as uint64) = d_in }
+    uint64 k_out = alloc(8); unsafe { *(k_out as uint64) = d_out }
+    uint64 kp = alloc(2 * 8)
+    unsafe { *(kp        as uint64) = k_in  }
+    unsafe { *((kp +  8) as uint64) = k_out }
+
+    uint32 grid  = M * H        // M * num_heads
+    uint32 block = D            // head_dim
+    err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 h_out = alloc(out_bytes)
+    err = hipMemcpy(h_out, d_out, out_bytes, 2); if err != 0 { die("D2H", err) }
+
+    // Bit-exact verification: out[m, h, d] must equal K[m, h>>2, d].
+    // Compare uint32 bit-pattern (no float arithmetic in verifier).
+    uint64 mismatch = 0
+    m = 0
+    while m < M {
+        uint64 h = 0
+        while h < H {
+            uint64 kh = h / 4
+            uint64 d = 0
+            while d < D {
+                uint64 ip = h_in  + ((m * KH + kh) * D + d) * 4
+                uint64 op = h_out + ((m * H  + h ) * D + d) * 4
+                uint32 ib = 0; uint32 ob = 0
+                unsafe { *(ip as uint32) -> ib }
+                unsafe { *(op as uint32) -> ob }
+                if ib != ob { mismatch = mismatch + 1 }
+                d = d + 1
+            }
+            h = h + 1
+        }
+        m = m + 1
+    }
+
+    print_label_val("M",         1, M)
+    print_label_val("H",         1, H)
+    print_label_val("KH",        2, KH)
+    print_label_val("D",         1, D)
+    print_label_val("out_cells", 9, M * H * D)
+    print_label_val("mismatch",  8, mismatch)
+
+    hipFree(d_in); hipFree(d_out)
+    exit(0)
+}

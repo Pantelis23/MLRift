@@ -4733,6 +4733,18 @@ fn main() {
                 write(1, ra_path, ral)
                 write(1, " (amdgpu residual-add-f32 code object)\n", 40)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-kv-broadcast-f32=", 31) != 0 {
+                uint64 kvb_path = arg + 31
+                uint64 kvb_rc = emit_amdgpu_kv_broadcast_f32_blob(kvb_path)
+                if kvb_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-kv-broadcast-f32 failed\n", 45)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 kvbl = str_len(kvb_path)
+                write(1, kvb_path, kvbl)
+                write(1, " (amdgpu kv-broadcast-f32 code object)\n", 40)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-softmax-causal-f32=", 33) != 0 {
                 uint64 sc_path = arg + 33
                 uint64 sc_rc = emit_amdgpu_softmax_causal_f32_blob(sc_path)

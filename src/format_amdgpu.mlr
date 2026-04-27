@@ -8682,6 +8682,84 @@ fn _emit_residual_add_f32_body(uint64 args_desc) {
     uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
 }
 
+// LLM Phase 2 — kv_broadcast_f32: GQA K/V materialised broadcast.
+// Hardcoded shape: num_heads=32, num_kv_heads=8, group_size=4,
+// head_dim=128 (Llama 3 8B / Qwen3-7B-with-pow2-config layout).
+// Each output element (m, h, d) reads from K[m, h>>2, d].  All
+// pow2 → all index extractions are shifts; non-pow2 group_size
+// (Qwen3 family: 5/6/7) needs multiply-by-reciprocal magic-number
+// division — deferred to a follow-up slice.
+//
+// Block = 128 (head_dim, one lane per element).
+// Grid = M * 32 (one workgroup per (m, h)).
+// Kernarg layout (16 bytes, 2 args):
+//   [0x00] uint64 in_ptr   (M × 8 × 128 f32)
+//   [0x08] uint64 out_ptr  (M × 32 × 128 f32)
+fn _emit_kv_broadcast_f32_body(uint64 args_desc) {
+    asm_init()
+    asm_u32(0xF4080100)
+    asm_u32(0xF8000000)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x8508850F)
+    asm_u32(0x8B099F0F)
+    asm_u32(0x850A8209)
+    asm_u32(0x840B8C08)
+    asm_u32(0x840C890A)
+    asm_u32(0x800B0C0B)
+    asm_u32(0x840D890F)
+    asm_u32(0x30020082)
+    asm_u32(0x7E060280)
+    asm_u32(0xD7006A02)
+    asm_u32(0x0002020B)
+    asm_u32(0xD5207C03)
+    asm_u32(0x01AA0680)
+    asm_u32(0xD7006A02)
+    asm_u32(0x00020404)
+    asm_u32(0xD5207C03)
+    asm_u32(0x01AA0605)
+    asm_u32(0x7E0A0280)
+    asm_u32(0xD7006A04)
+    asm_u32(0x0002020D)
+    asm_u32(0xD5207C05)
+    asm_u32(0x01AA0A80)
+    asm_u32(0xD7006A04)
+    asm_u32(0x00020806)
+    asm_u32(0xD5207C05)
+    asm_u32(0x01AA0A07)
+    asm_u32(0xDC520000)
+    asm_u32(0x067C0002)
+    asm_u32(0xBF8903F7)
+    asm_u32(0xDC6A0000)
+    asm_u32(0x007C0604)
+    asm_u32(0xBC7C0000)
+    asm_u32(0xBFB00000)
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+}
+
+@export
+fn emit_amdgpu_kv_broadcast_f32_blob(uint64 out_path) -> uint64 {
+    uint64[4] args_desc
+    _emit_kv_broadcast_f32_body(args_desc)
+    uint64 size = emit_amdgpu_code_object_lds("kv_broadcast_f32", 16,
+                                               asm_text_buf, asm_text_len,
+                                               16, 8, 16, 7,
+                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 2,
+                                               0)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_kv_broadcast_f32_blob: cannot open output\n", 55)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 @export
 fn emit_amdgpu_residual_add_f32_blob(uint64 out_path) -> uint64 {
     uint64[8] args_desc
