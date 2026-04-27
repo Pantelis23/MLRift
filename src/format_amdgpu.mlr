@@ -8255,6 +8255,191 @@ fn amdgpu_lower_noesis_lif(uint64 kname_ptr, uint64 nl) -> uint64 {
     return 0
 }
 
+// Phase 3a — pointwise binary-op kernels.
+//
+// First piece of the AST-walking @kernel compiler. Recognises the
+// shape:
+//
+//   @kernel fn name(uint64 buf, uint64 n, f32 scalar) {
+//       uint64 gid = block_idx_x() * 256 + tid_local_x()
+//       if gid < n {
+//           uint64 p = buf + gid * 4
+//           f32 v = 0.0
+//           unsafe { *(p as f32) -> v }
+//           v = v <op> scalar           // op ∈ {*, +, -, /}
+//           unsafe { *(p as f32) = v }
+//       }
+//   }
+//
+// The arithmetic is the only thing that varies — every other line is a
+// fixed template. The recogniser checks structure (two top-level stmts,
+// then five inside the if), extracts the operator from the BinOp's
+// op-token, and emits the same prologue/epilogue + the operator-
+// specific VOP2 instruction. Unlike the Phase 2 name-matched routers,
+// this is not tied to any specific kernel name — it accepts any
+// @kernel that fits the body shape.
+//
+// Returns 0 on success; non-zero means "doesn't match the 3a shape"
+// and the caller should fall through to other recognisers.
+fn amdgpu_lower_pointwise_3a(uint64 fn_node, uint64 source,
+                              uint64 kname_ptr, uint64 nl) -> uint64 {
+    // ── shape: 3 params ──────────────────────────────────────────
+    uint64 n_params = 0
+    uint64 wp = ast_child(fn_node)
+    while wp != 0 {
+        n_params = n_params + 1
+        wp = ast_next(wp)
+    }
+    if n_params != 3 { return 1 }
+
+    // ── shape: body has Block, Block has 2 stmts (gid_decl, if) ──
+    // FnDecl.body lives in data3 (not next, despite the AstKind comment).
+    uint32 body = ast_data3(fn_node)
+    if body == 0 { return 1 }
+    if ast_kind(body) != 15 { return 1 }   // 15 = Block
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }  // 10 = VarDecl (gid)
+    uint32 stmt1 = ast_next(stmt0)
+    if stmt1 == 0 { return 1 }
+    if ast_kind(stmt1) != 13 { return 1 }  // 13 = If
+    if ast_next(stmt1) != 0 { return 1 }
+
+    // ── shape: if-then has Block with 5 stmts ────────────────────
+    uint32 then_block = ast_data1(stmt1)
+    if then_block == 0 { return 1 }
+    if ast_kind(then_block) != 15 { return 1 }
+    uint32 ts0 = ast_child(then_block)
+    if ts0 == 0 { return 1 }
+    if ast_kind(ts0) != 10 { return 1 }   // VarDecl p
+    uint32 ts1 = ast_next(ts0)
+    if ts1 == 0 || ast_kind(ts1) != 10 { return 1 }   // VarDecl v
+    uint32 ts2 = ast_next(ts1)
+    if ts2 == 0 || ast_kind(ts2) != 41 { return 1 }   // PtrLoad
+    uint32 ts3 = ast_next(ts2)
+    if ts3 == 0 || ast_kind(ts3) != 11 { return 1 }   // Assign v = ...
+    uint32 ts4 = ast_next(ts3)
+    if ts4 == 0 || ast_kind(ts4) != 42 { return 1 }   // PtrStore
+    if ast_next(ts4) != 0 { return 1 }
+
+    // PtrLoad / PtrStore must be f32 (fkind=2, type_size=4).
+    if ast_data1(ts2) != 4 { return 1 }
+    if ast_data3(ts2) != 2 { return 1 }
+    if ast_data1(ts4) != 4 { return 1 }
+    if ast_data3(ts4) != 2 { return 1 }
+
+    // The Assign value must be a BinOp(Ident(v), Ident(scalar)).
+    uint32 assign_val = ast_child(ts3)
+    if assign_val == 0 || ast_kind(assign_val) != 33 { return 1 }   // 33 = BinOp
+    uint32 op_tok = ast_data1(assign_val)
+    uint64 op_kind = tok_kind_at_raw(op_tok)
+    // Star=22, Plus=30, Minus=31, Slash=32.
+    if op_kind != 22 && op_kind != 30 && op_kind != 31 && op_kind != 32 {
+        return 1
+    }
+    uint32 lhs = ast_child(assign_val)
+    uint32 rhs = ast_data2(assign_val)
+    if lhs == 0 || rhs == 0 { return 1 }
+    if ast_kind(lhs) != 32 || ast_kind(rhs) != 32 { return 1 }   // both Idents
+
+    // Param tokens for buf, n, scalar.
+    uint32 p0 = ast_child(fn_node)
+    uint32 p1 = ast_next(p0)
+    uint32 p2 = ast_next(p1)
+    uint32 p2_name = ast_data2(p2)
+    uint32 rhs_tok = ast_data1(rhs)
+    if tok_text_eq(rhs_tok, p2_name) == 0 { return 1 }
+
+    // ── emit ISA ─────────────────────────────────────────────────
+    // gid lives entirely in 32-bit v1; the saveexec dance mirrors
+    // gemv's pattern with v_cmpx (compare-and-set-exec) so we don't
+    // depend on v1's high half being zero (it isn't, on gfx11 wave32
+    // — only X workitem id is auto-loaded, so v1 holds garbage on
+    // entry). v_mul_lo_u32 + v_add_nc_u32 keep everything 32-bit.
+    asm_init()
+    asm_u32(0xF4080100); asm_u32(0xF8000000)   // s_load_b128 s[4:7], s[0:1], 0x0
+    asm_u32(0xF4000200); asm_u32(0xF8000010)   // s_load_b32  s8, s[0:1], 0x10
+    asm_u32(0xBF89FC07)                         // s_waitcnt   lgkmcnt(0)
+    asm_u32(0xBE8900FF); asm_u32(0x00000100)   // s_mov_b32   s9, 0x100 (=256)
+    asm_u32(0xD72C0001); asm_u32(0x0000120F)   // v_mul_lo_u32 v1, s15, s9 (wg_id_x lives at s15 with USER_SGPR_COUNT=15)
+    asm_u32(0x4A020300)                         // v_add_nc_u32_e32 v1, v0, v1  (tid_x + wgid*256)
+    asm_u32(0xBE89007E)                         // s_mov_b32   s9, exec_lo
+    asm_u32(0x7C980206)                         // v_cmp_gt_u32_e32 vcc_lo, s6, v1
+    asm_u32(0x8B7E6A7E)                         // s_and_b32   exec_lo, exec_lo, vcc_lo
+    asm_u32(0xBFA5000D)                         // s_cbranch_execz +13 → .Lend
+    asm_u32(0x30040282)                         // v_lshlrev_b32_e32 v2, 2, v1  (gid*4 lo)
+    asm_u32(0x7E060280)                         // v_mov_b32_e32 v3, 0          (gid*4 hi)
+    asm_u32(0xD7006A02); asm_u32(0x00020404)   // v_add_co_u32 v2, vcc_lo, s4, v2
+    asm_u32(0xD5207C03); asm_u32(0x01AA0605)   // v_add_co_ci_u32_e64 v3, null, s5, v3, vcc_lo
+    asm_u32(0xDC520000); asm_u32(0x057C0002)   // global_load_b32 v5, v[2:3], off
+    asm_u32(0xBF8903F7)                         // s_waitcnt vmcnt(0)
+    // Operator-specific VOP2 (e32, src0=s8 = scalar param, dst=src1=v5):
+    //   v_mul_f32_e32 v5, s8, v5  → 0x100A0A08   (op 0x08)
+    //   v_add_f32_e32 v5, s8, v5  → 0x060A0A08   (op 0x03)
+    //   v_sub_f32_e32 v5, s8, v5  → 0x080A0A08   (op 0x04)  // s8 - v5
+    //   v_div_scale_f32 isn't used; for /: emit reciprocal + multiply
+    //
+    // VOP2 e32 layout: bits 31:25=0x0 (VOP2 prefix not strictly 0; the
+    // top byte encodes opcode). Actually the encoding is just opcode*2
+    // followed by the operands. The high byte for v_mul_f32_e32 is
+    // 0x10, for v_add 0x06, for v_sub 0x08.
+    if op_kind == 22 {
+        asm_u32(0x100A0A08)                     // v_mul_f32_e32 v5, s8, v5
+    } else if op_kind == 30 {
+        asm_u32(0x060A0A08)                     // v_add_f32_e32 v5, s8, v5
+    } else if op_kind == 31 {
+        asm_u32(0x080A0A08)                     // v_sub_f32_e32 v5, s8, v5
+    } else {
+        // op_kind == 32: division. v_div_f32 isn't a single op on
+        // gfx11. Use v_rcp_f32 v6, s8 then v_mul_f32 v5, v5, v6.
+        // v_rcp_f32_e64 v6, s8 = 0xD5A50006 0x00000008
+        // v_mul_f32_e32 v5, v6, v5 = 0x100A0B06
+        asm_u32(0xD5A50006); asm_u32(0x00000008)
+        asm_u32(0x100A0B06)
+    }
+    asm_u32(0xDC6A0000); asm_u32(0x007C0502)   // global_store_b32 v[2:3], v5, off
+    asm_u32(0xBC7C0000)                         // s_waitcnt_vscnt null, 0
+    asm_u32(0xBFB00000)                         // s_endpgm
+
+    // ── kernarg layout: 3 args of 8 bytes ────────────────────────
+    uint64 args_desc = alloc(6 * 16)
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    // Snapshot ISA before the next kernel's asm_init() can clobber it.
+    uint64 k_text_size = asm_text_len
+    uint64 k_text_buf  = alloc(k_text_size)
+    uint64 ci = 0
+    while ci < k_text_size {
+        uint64 sp = asm_text_buf + ci
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        uint64 dp = k_text_buf + ci
+        uint8 b8 = b
+        unsafe { *(dp as uint8) = b8 }
+        ci = ci + 1
+    }
+
+    // rsrc1 vgpr_granulated=1 → 16 VGPRs (kernel uses v0..v6 = 7;
+    // 8 alloc would suffice but matches gemv N1 setting which also
+    // works under the auto governor).
+    // sgpr_granulated=1 → 16 SGPRs (kernel uses s0..s9 = 10).
+    uint64 rsrc1 = 0xE0AF0041
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    kt_push(kname_ptr, nl, k_text_buf, k_text_size,
+            args_desc, 3, 24,
+            10, 7,
+            rsrc1, rsrc2, rsrc3, props)
+    return 0
+}
+
 // Lower one @kernel fn_node into the kernel table. Returns 0 on
 // success, 1 on unsupported shape. Recognises the same two shapes
 // the M1d/M1e lowerer already handled:
@@ -8340,6 +8525,14 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     if tok_matches(name_tok, "gemm_f16f32_wmma", 16) != 0 {
         return amdgpu_lower_llm_gemm_f16f32_wmma(kname_ptr, nl)
     }
+
+    // ── Phase 3a: AST-walking pointwise-binop recogniser ──────────────
+    // Handles any @kernel with 3 params + the canonical pointwise body
+    // (gid + bounds-check, single-op f32 update via scalar param). This
+    // is the first non-name-matched lowerer — body shape alone tells us
+    // we can handle it. See docs/PHASE3_DESIGN.md.
+    uint64 pw_rc = amdgpu_lower_pointwise_3a(fn_node, source, kname_ptr, nl)
+    if pw_rc == 0 { return 0 }
     // spike_reduce uses two u64 atomic_add ops on a 16-byte result
     // buffer (total + active counts). Not yet lowered natively; skip
     // (return 2) so the launcher resolves it from the fallback .co.

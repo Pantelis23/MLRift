@@ -1,0 +1,36 @@
+// MLRift LLM Phase 3a — pointwise scale by scalar.
+//
+// First kernel lowered by the AST-walking pointwise compiler in
+// src/format_amdgpu.mlr (amdgpu_lower_pointwise_3a). The body shape
+// the compiler recognises is:
+//
+//   uint64 gid = block_idx_x() * 256 + tid_local_x()
+//   if gid < n {
+//       uint64 p = buf + gid * 4
+//       f32 v = 0.0
+//       unsafe { *(p as f32) -> v }
+//       v = v * factor             // or v + bias, etc.
+//       unsafe { *(p as f32) = v }
+//   }
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/scale_f32.mlr -o /tmp/scale_f32
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+
+@kernel
+fn scale_f32(uint64 buf, uint64 n, f32 factor) {
+    uint64 gid = block_idx_x() * 256 + tid_local_x()
+    if gid < n {
+        uint64 p = buf + gid * 4
+        f32 v = 0.0
+        unsafe { *(p as f32) -> v }
+        v = v * factor
+        unsafe { *(p as f32) = v }
+    }
+}
+
+fn main() {
+    exit(0)
+}
