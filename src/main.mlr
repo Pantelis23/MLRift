@@ -4729,6 +4729,34 @@ fn main() {
                 write(1, sx_path, sxl)
                 write(1, " (amdgpu softmax-f32 code object)\n", 34)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-softmax-causal-f32-N=", 35) != 0 {
+                // Format: --emit-amdgpu-softmax-causal-f32-N=<N>:<path>
+                uint64 scn_arg = arg + 35
+                uint64 scn_N = 0
+                uint64 scn_i = 0
+                while 1 == 1 {
+                    uint64 scn_p = scn_arg + scn_i
+                    uint64 scn_c = 0
+                    unsafe { *(scn_p as uint8) -> scn_c }
+                    if scn_c == 0 || scn_c == 58 { break }
+                    if scn_c < 48 || scn_c > 57 {
+                        write(2, "mlrc: --emit-amdgpu-softmax-causal-f32-N: expected <N>:<path>\n", 63)
+                        exit(1)
+                    }
+                    scn_N = scn_N * 10 + (scn_c - 48)
+                    scn_i = scn_i + 1
+                }
+                uint64 scn_path = scn_arg + scn_i + 1
+                uint64 scn_rc = emit_amdgpu_softmax_causal_f32_N_blob(scn_path, scn_N)
+                if scn_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-softmax-causal-f32-N failed\n", 49)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 scnl = str_len(scn_path)
+                write(1, scn_path, scnl)
+                write(1, " (amdgpu softmax-causal-f32 code object, N-parametric)\n", 56)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-rmsnorm-f32-N=", 28) != 0 {
                 // Format: --emit-amdgpu-rmsnorm-f32-N=<N>:<path>
                 uint64 rnn_arg = arg + 28

@@ -8227,6 +8227,111 @@ fn amdgpu_lower_llm_softmax_causal_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
     return 0
 }
 
+// Shape-parametric softmax_causal_f32. Same body as parametric softmax
+// plus a 3-dword causal-mask injection right after the load: lanes
+// where col j > row r set v10 = -inf so they contribute 0 to exp-sum
+// and don't perturb the max.  N power of two in [32, 1024] = max
+// seq_len for the attention-score row.
+fn _emit_softmax_causal_f32_body_N(uint64 args_desc, uint64 N) {
+    asm_init()
+
+    // ── Prologue + load ────────────────────────────────────────────
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)
+    asm_u32(0xBF89FC07)             // s_waitcnt
+    asm_u32(0xBF09080F)             // s_cmp_ge_u32 s15, s8
+    uint64 cbranch_dword_idx = asm_text_len / 4
+    asm_u32(0xBFA20000)             // s_cbranch_scc1 → .Lend (patched)
+    asm_u32(0x960C0A0F)
+    asm_u32(0x4A02000C)
+    asm_u32(0x30080282)
+    asm_u32(0x7E060280)
+    asm_u32(0xD7006A02); asm_u32(0x00020804)
+    asm_u32(0xD5207C03); asm_u32(0x01AA0605)
+    asm_u32(0x7E1A0280)
+    asm_u32(0xD7006A0C); asm_u32(0x00020806)
+    asm_u32(0xD5207C0D); asm_u32(0x01AA1A07)
+    asm_u32(0xDC520000); asm_u32(0x0A7C0002)
+    asm_u32(0xBF8903F7)             // s_waitcnt vmcnt(0)
+
+    // ── Causal mask: if v0 (lane=col) > s15 (row), v10 = -inf ──────
+    asm_u32(0xD449000E); asm_u32(0x0002000F)   // v_cmp_lt_u32_e64 s14, s15, v0
+    asm_u32(0x7E1E02FF); asm_u32(0xFF800000)   // v_mov_b32 v15, -inf
+    asm_u32(0xD501000A); asm_u32(0x003A1F0A)   // v_cndmask_b32_e64 v10, v10, v15, s14
+
+    asm_u32(0x7E0A030A)             // v_mov_b32 v5, v10
+    asm_u32(0x300C0082)
+    asm_u32(0x7E120280)
+    asm_u32(0xD8340000); asm_u32(0x00000506)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+
+    // ── Phase A: max-reduce ────────────────────────────────────────
+    _emit_lds_reduce_pow2(N, 0x200A0F05, 12)
+
+    // ── Mid: e = exp(x - max) ──────────────────────────────────────
+    asm_u32(0xD8D80000); asm_u32(0x08000009)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x0816110A)             // v_sub_f32 v11, v10, v8
+    asm_u32(0xBE8C00FF); asm_u32(0x3FB8AA3B)   // log2(e)
+    asm_u32(0x1016160C)             // v_mul_f32 v11, s12, v11
+    asm_u32(0x7E164B0B)             // v_exp_f32 v11, v11
+    asm_u32(0xBFBD0000)
+    asm_u32(0x7E0A030B)             // v5 = v11
+    asm_u32(0xD8340000); asm_u32(0x00000506)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+
+    // ── Phase B: sum-reduce e ──────────────────────────────────────
+    _emit_lds_reduce_pow2(N, 0x060A0F05, 12)
+
+    // ── Finalize ───────────────────────────────────────────────────
+    asm_u32(0xD8D80000); asm_u32(0x08000009)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x7E105508)             // v_rcp_f32 v8, v8
+    asm_u32(0x100A110B)             // v_mul_f32 v5, v11, v8
+    asm_u32(0xDC6A0000); asm_u32(0x007C050C)
+    asm_u32(0xBC7C0000)
+    asm_u32(0xBFB00000)
+
+    uint64 total_dwords = asm_text_len / 4
+    uint64 simm16 = total_dwords - cbranch_dword_idx - 2
+    asm_patch_u32(cbranch_dword_idx, 0xBFA20000 | (simm16 & 0xFFFF))
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+@export
+fn emit_amdgpu_softmax_causal_f32_N_blob(uint64 out_path, uint64 N) -> uint64 {
+    if _ilog2_pow2(N) == 0xFF || N < 32 || N > 1024 {
+        write(2, "emit_amdgpu_softmax_causal_f32_N_blob: N must be power of two in [32, 1024]\n", 78)
+        return 1
+    }
+    uint64[8] args_desc
+    _emit_softmax_causal_f32_body_N(args_desc, N)
+    uint64 lds_bytes = N * 4
+    uint64 size = emit_amdgpu_code_object_lds("softmax_causal_f32", 18,
+                                               asm_text_buf, asm_text_len,
+                                               32, 8, 16, 16,
+                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 4,
+                                               lds_bytes)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_softmax_causal_f32_N_blob: cannot open output\n", 59)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 // Debug variant of N3: identical KD/dispatch/bounds, but the kernel
 // body just stores 1.0 (0x3F800000) to C[row, col]. If output cells
 // fail to receive 1.0, the bug is in dispatch/store, not LDS.
