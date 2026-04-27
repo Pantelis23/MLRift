@@ -1,0 +1,50 @@
+// MLRift LLM Phase A milestone 5 — gemm f16-storage / f32-accum WMMA.
+//
+// The body below is a placeholder: --target=amdgpu-native ignores it
+// and routes the @kernel name to the hand-tuned WMMA emitter (N5,
+// emit_amdgpu_gemm_f16f32_wmma_blob in src/format_amdgpu.mlr) which
+// emits gfx1100 v_wmma_f32_16x16x16_f16 ISA. The body has to parse so
+// the rest of the compiler (typecheck, launcher symbol resolution) is
+// happy, but no code is generated from it.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/gemm_f16f32_wmma.mlr -o /tmp/gemm_f16f32_wmma
+
+fn tid_local_x() -> uint64 { return 0 }
+fn block_idx_x() -> uint64 { return 0 }
+fn block_idx_y() -> uint64 { return 0 }
+
+@kernel
+fn gemm_f16f32_wmma(
+    uint64 a_ptr,    // [M × K] f16
+    uint64 b_ptr,    // [K × N] f16
+    uint64 c_ptr,    // [M × N] f32
+    uint64 m,
+    uint64 n,
+    uint64 k_dim
+) {
+    // Placeholder body — Phase 2 routing emits hand-tuned WMMA ISA
+    // instead. See src/format_amdgpu.mlr emit_amdgpu_gemm_f16f32_wmma_blob.
+    uint64 lane = tid_local_x()
+    uint64 tile_col = block_idx_x()
+    uint64 tile_row = block_idx_y()
+    if lane < 32 {
+        if tile_row * 16 < m {
+            if tile_col * 16 < n {
+                uint64 row = tile_row * 16 + (lane - (lane / 16) * 16)
+                uint64 col = tile_col * 16 + (lane - (lane / 16) * 16)
+                if row < m {
+                    if col < n {
+                        f32 zero = 0.0
+                        uint64 cp = c_ptr + (row * n + col) * 4
+                        unsafe { *(cp as f32) = zero }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}
