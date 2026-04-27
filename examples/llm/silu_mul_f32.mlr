@@ -1,0 +1,23 @@
+// LLM Phase 2 — silu_mul_f32 placeholder. --target=amdgpu-native
+// routes the @kernel name to the fused SiLU(gate) * up kernel.
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+
+@kernel
+fn silu_mul_f32(uint64 gate_ptr, uint64 up_ptr, uint64 out_ptr, uint64 n) {
+    uint64 gid = block_idx_x() * 256 + tid_local_x()
+    if gid < n {
+        f32 g = 0.0
+        uint64 gp = gate_ptr + gid * 4
+        unsafe { *(gp as f32) -> g }
+        uint64 up = up_ptr + gid * 4
+        unsafe { *(up as f32) -> g }
+        uint64 op = out_ptr + gid * 4
+        unsafe { *(op as f32) = g }
+    }
+}
+
+fn main() {
+    exit(0)
+}
