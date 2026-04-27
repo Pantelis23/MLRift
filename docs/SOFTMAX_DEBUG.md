@@ -86,6 +86,45 @@ N3 regression existed on a clean tree too — sclk reads `0 MHz` from
 sysfs, GPU is in deep-sleep state. Reverted all debug changes; the
 softmax kernel + metadata fix are not committed.
 
+## Session 3 (2026-04-27, post-reboot): metadata fix landed, probe still fails
+
+After a reboot to clear the stuck KFD state, ran the probes again:
+
+- **N3 LDS GEMM works** (0 max_abs across N ∈ {64, 128, 256, 512, 1024}).
+- Applied the one-line metadata fix permanently — `amd_emit_metadata_body`
+  now reads `group_seg_sz` from kt entry index 13 and emits via `mp_uint`.
+  `.group_segment_fixed_size: 2048` correctly appears in N3's note (was
+  hardcoded 0 before).
+- 439/439 tests still pass. N3 still GREEN with the fix.
+- **But probe5/5b/5d/5e still output 0**, even with the metadata fix.
+
+Probe variations tried (all reverted, none worked):
+- probe5: all lanes write 0xCAFEBABE to LDS[0], broadcast read.
+- probe5b: per-lane slot LDS[tid*4], write+read own slot.
+- probe5c: write LDS but skip read (write v5 directly to out) — **works**,
+  confirms v5 holds the literal correctly and ds_store isn't blocking.
+- probe5d: dummy global_load before ds_store (mimics N3 flow) — fails.
+- probe5e: s_delay_alu before ds_store/ds_load — fails.
+- KD swept: rsrc1 ∈ {0xE0AF0001, 0xE0AF0082}, rsrc2 ∈ {0x009E, 0x099E},
+  group_segment ∈ {1024, 2048}, dispatch ∈ {1D 256, 2D 16×16} — none
+  produce out[*]=0xCAFEBABE in probe5.
+- buffer_gl0_inv after barrier — fails.
+
+**What's strange:** probe5b is structurally identical to N3's LDS
+write+read minus the global_load source. KD bytes match N3 except for
+kernarg_size (32 vs 48) and group_segment (1024 vs 2048). The probe's
+disasm matches what mc emits from the `.s`. Yet the LDS round-trip
+returns 0. This suggests the bug isn't in obvious "what bits are in
+the KD" but in something more subtle — possibly the kt_push_lds
+entry's relationship to AQL packet construction in the shim, or the
+kernel's specific `ds_store/ds_load` pattern interacting with how the
+hardware/firmware allocates LDS for very small allocations. N3's
+write→barrier→read works, ours doesn't.
+
+**Decision:** Land the metadata fix (real improvement, lossless,
+verified by N3 still GREEN + correct note), revert the probe and
+softmax addon, document the residual mystery for a future session.
+
 ## Things NOT tried — start here next session
 
 The core finding from session 2 is that **LDS round-trip itself fails**

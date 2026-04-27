@@ -396,6 +396,7 @@ fn amd_emit_metadata_body() -> uint64 {
         uint64 kernarg_sz   = kt_get(ki, 6)
         uint64 sgpr_count   = kt_get(ki, 7)
         uint64 vgpr_count   = kt_get(ki, 8)
+        uint64 group_seg_sz = kt_get(ki, 13)
 
         // 16-entry inner map: needs map16 not fixmap (caps at 15).
         mp_map16(16)
@@ -433,7 +434,7 @@ fn amd_emit_metadata_body() -> uint64 {
             aoff = aoff + sz
             aai  = aai + 1
         }
-        mp_str_lit(".group_segment_fixed_size");   mp_uint(0)
+        mp_str_lit(".group_segment_fixed_size");   mp_uint(group_seg_sz)
         mp_str_lit(".kernarg_segment_align");      mp_uint(8)
         mp_str_lit(".kernarg_segment_size");       mp_uint(kernarg_sz)
         mp_str_lit(".max_flat_workgroup_size");    mp_uint(1024)
@@ -5889,7 +5890,7 @@ fn amdgpu_lower_llm_gemm_f32_lds(uint64 kname_ptr, uint64 nl) -> uint64 {
     kt_push_lds(kname_ptr, nl, k_text_buf, k_text_size,
                 args_desc, 6, 48,
                 24, 19,
-                0xE0AF0082, 0x0000099E, 0x00000010, 0x0408,
+                0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
                 2048)
     return 0
 }
@@ -6055,7 +6056,7 @@ fn amdgpu_lower_llm_gemm_f16f32(uint64 kname_ptr, uint64 nl) -> uint64 {
     kt_push_lds(kname_ptr, nl, k_text_buf, k_text_size,
                 args_desc, 6, 48,
                 24, 19,
-                0xE0AF0082, 0x0000099E, 0x00000010, 0x0408,
+                0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
                 2048)
     return 0
 }
