@@ -104,10 +104,12 @@ fn main() {
     unsafe { *((kp + 24) as uint64) = k_m }
     unsafe { *((kp + 32) as uint64) = k_n }
 
-    // Block size = round_up_pow2(N) (Np). Padding lanes are identity-
-    // filled in the kernel; output gating prevents OOB stores.
+    // Block size:
+    //   N ≤ 1024 → round_up_pow2(N) (small-N path, single load per lane)
+    //   N > 1024 → 1024 (large-N path, thread-coarsening with K chunks)
     uint64 Np = 1
     while Np < N { Np = Np << 1 }
+    if Np > 1024 { Np = 1024 }
     uint32 block_x = Np
     err = hipModuleLaunchKernel(fh, M, 1, 1, block_x, 1, 1, 0, 0, kp, 0)
     if err != 0 { die("launch", err) }

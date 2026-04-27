@@ -910,6 +910,29 @@ fn _emit_store_gate(uint64 mask_sgpr, uint64 n_kernarg_sgpr) {
     asm_u32(0xBE800000 | ((mask_sgpr & 0x7F) << 16) | 0x2000 | (mask_sgpr & 0x7F))
 }
 
+// Bump a 64-bit VGPR pair (vp_lo:vp_lo+1) by a 32-bit immediate.
+// Used by thread-coarsened kernels to advance the in/out/gamma
+// addresses by 4096 (= 1024 lanes × 4 bytes) between chunks.
+//
+//   s_mov_b32 s14, imm
+//   v_add_co_u32   vp_lo,  vcc_lo, s14, vp_lo
+//   v_add_co_ci_u32_e64 vp_lo+1, null, 0, vp_lo+1, vcc_lo
+fn _emit_vpair_add_imm(uint64 vp_lo, uint64 imm) {
+    // s_mov_b32 s14, imm  (literal-escape encoding)
+    asm_u32(0xBE8E00FF)
+    asm_u32(imm)
+    // v_add_co_u32 vp_lo, vcc_lo, s14, vp_lo
+    asm_u32(0xD7006A00 | (vp_lo & 0xFF))
+    uint64 vp_lo_field = 0x100 | (vp_lo & 0xFF)        // VGPR src encoding
+    asm_u32((vp_lo_field << 9) | 0x0E)                  // src0 = s14, src1 = vp_lo
+    // v_add_co_ci_u32_e64 vp_lo+1, null, 0, vp_lo+1, vcc_lo
+    uint64 vp_hi = vp_lo + 1
+    asm_u32(0xD5207C00 | (vp_hi & 0xFF))
+    uint64 vp_hi_field = 0x100 | (vp_hi & 0xFF)
+    // src0 = 0 inline (0x80), src1 = vp_hi, src2 = vcc_lo (0x6A)
+    asm_u32((0x6A << 18) | (vp_hi_field << 9) | 0x80)
+}
+
 // ── SOPP format (single 32-bit word) ────────────────────────────────
 // [31:23] = 0x17F   (SOPP prefix on gfx11)
 // [22:16] = 7-bit opcode
@@ -7663,21 +7686,191 @@ fn _emit_rmsnorm_f32_body_N(uint64 args_desc, uint64 N) {
     uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
 }
 
+// Thread-coarsened rmsnorm body for N > 1024. Block size is fixed at
+// 1024 lanes (gfx11 max workgroup size); each lane processes K =
+// ceil(N / 1024) elements across two passes (reduce + apply) over the
+// row.  Last chunk's partial-coverage lanes use an identity-fill
+// gated load (default 0) and the final store is gated to lane<remainder.
+//
+//   PASS 1: v5 = sum(x_chunk² for chunk in 0..K-1)
+//   LDS pairwise tree at depth log2(1024) = 10
+//   inv_rms = rsqrt(sum / N + eps)
+//   PASS 2: for each chunk, out_chunk = x_chunk * inv_rms * gamma_chunk
+//
+// Re-loads x in PASS 2 instead of caching to keep VGPR pressure
+// manageable.  Uses _emit_vpair_add_imm to bump in/out/gamma addrs by
+// 4096 bytes between chunks.
+fn _emit_rmsnorm_f32_body_NL(uint64 args_desc, uint64 N) {
+    asm_init()
+    uint64 K = (N + 1023) / 1024
+    uint64 last_chunk_size = N - (K - 1) * 1024     // 1..1024
+    uint64 last_partial = 0
+    if last_chunk_size != 1024 { last_partial = 1 }
+    uint64 inv_n_bits = _f32_bits_recip(N)
+
+    // ── Prologue ────────────────────────────────────────────────────
+    asm_u32(0xF40C0100)             // s_load_b256 s[4:11], s[0:1], 0x0
+    asm_u32(0xF8000000)
+    asm_u32(0xF4040300)             // s_load_b64  s[12:13], s[0:1], 0x20
+    asm_u32(0xF8000020)
+    asm_u32(0xBF89FC07)             // s_waitcnt
+    asm_u32(0xBF090A0F)             // s_cmp_ge_u32 s15, s10
+    uint64 cbranch_dword_idx = asm_text_len / 4
+    asm_u32(0xBFA20000)             // s_cbranch_scc1 → .Lend (patched)
+    asm_u32(0x960E0C0F)             // s_mul_i32 s14, s15, s12 (row * n)
+    asm_u32(0x4A02000E)             // v_add_nc_u32 v1, s14, v0
+    asm_u32(0x30080282)             // v_lshlrev_b32 v4, 2, v1  (chunk-0 byte off)
+    // Build v[2:3] = in_ptr + v4
+    asm_u32(0x7E060280)
+    asm_u32(0xD7006A02); asm_u32(0x00020804)
+    asm_u32(0xD5207C03); asm_u32(0x01AA0605)
+    // Build v[12:13] = out_ptr + v4
+    asm_u32(0x7E1A0280)
+    asm_u32(0xD7006A0C); asm_u32(0x00020806)
+    asm_u32(0xD5207C0D); asm_u32(0x01AA1A07)
+    // Build v[16:17] = gamma_ptr + (lane*4).  v6 = lane*4, computed below.
+    asm_u32(0x300C0082)             // v_lshlrev_b32 v6, 2, v0
+    asm_u32(0x7E220280)             // v_mov_b32 v17, 0
+    asm_u32(0xD7006A10); asm_u32(0x00020C08)   // v_add_co_u32 v16, vcc_lo, s8, v6
+    asm_u32(0xD5207C11); asm_u32(0x01AA2209)   // v_add_co_ci_u32_e64 v17, null, s9, v17, vcc_lo
+    // Initialise reduction accumulator v5 = 0.
+    asm_u32(0x7E0A0280)             // v_mov_b32 v5, 0
+
+    // ── PASS 1: accumulate sum(x²) across K chunks ──────────────────
+    uint64 c = 0
+    while c < K {
+        if c > 0 {
+            _emit_vpair_add_imm(2, 4096)   // v[2:3] += 4096
+        }
+        if c == K - 1 && last_partial != 0 {
+            // Set s14 = last_chunk_size, then gated load with default 0.
+            // _emit_gated_load_v10 expects an n-kernarg sgpr; we
+            // synthesise one by writing last_chunk_size into s14.
+            asm_u32(0xBE8E00FF); asm_u32(last_chunk_size)
+            _emit_gated_load_v10(14, 14, 0x00000000)
+            // ↑ mask_sgpr=14 reuses s14 (will overwrite the size, fine
+            // since we don't need it after this gated load).
+        } else {
+            asm_u32(0xDC520000); asm_u32(0x0A7C0002)   // global_load v10
+            asm_u32(0xBF8903F7)                         // s_waitcnt
+        }
+        // v_fmac_f32 v5, v10, v10  (v5 += v10*v10)
+        asm_u32(0x560A150A)
+        c = c + 1
+    }
+
+    // ── LDS reduction tree at block size 1024 ──────────────────────
+    asm_u32(0x7E120280)             // v_mov_b32 v9, 0  (broadcast read addr)
+    asm_u32(0xD8340000); asm_u32(0x00000506)   // ds_store v6, v5
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    _emit_lds_reduce_pow2(1024, 0x060A0F05, 14)
+
+    // ── Compute inv_rms ────────────────────────────────────────────
+    asm_u32(0xD8D80000); asm_u32(0x08000009)   // ds_load v8, v9
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBE8E00FF); asm_u32(inv_n_bits)   // s14 = 1/N
+    asm_u32(0x1010100E)             // v_mul_f32 v8, s14, v8 (mean_sq)
+    asm_u32(0xBE8E00FF); asm_u32(0x3727C5AC)   // s14 = eps
+    asm_u32(0x0610100E)             // v_add_f32 v8, s14, v8
+    asm_u32(0x7E105D08)             // v_rsq_f32 v8, v8 (inv_rms)
+
+    // ── Rebuild v[2:3] and v[12:13] from v4 for PASS 2 ─────────────
+    asm_u32(0x7E060280)
+    asm_u32(0xD7006A02); asm_u32(0x00020804)
+    asm_u32(0xD5207C03); asm_u32(0x01AA0605)
+    asm_u32(0x7E1A0280)
+    asm_u32(0xD7006A0C); asm_u32(0x00020806)
+    asm_u32(0xD5207C0D); asm_u32(0x01AA1A07)
+    // Rebuild v[16:17] (gamma addr) — bumped K-1 times in PASS 2 if K>1
+    asm_u32(0x7E220280)
+    asm_u32(0xD7006A10); asm_u32(0x00020C08)
+    asm_u32(0xD5207C11); asm_u32(0x01AA2209)
+
+    // ── PASS 2: store output ───────────────────────────────────────
+    c = 0
+    while c < K {
+        if c > 0 {
+            _emit_vpair_add_imm(2, 4096)
+            _emit_vpair_add_imm(12, 4096)
+            _emit_vpair_add_imm(16, 4096)
+        }
+        // Load x (gated for last partial chunk; default 0).
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8E00FF); asm_u32(last_chunk_size)
+            _emit_gated_load_v10(14, 14, 0x00000000)
+        } else {
+            asm_u32(0xDC520000); asm_u32(0x0A7C0002)
+            asm_u32(0xBF8903F7)
+        }
+        // Load gamma (always — page slack handles last-row OOB).
+        asm_u32(0xDC520000); asm_u32(0x0B7C0010)   // global_load v11, v[16:17]
+        asm_u32(0xBF8903F7)
+        // v_mul_f32 v5, v10, v8 (x * inv_rms)
+        asm_u32(0x100A110A)
+        // v_mul_f32 v5, v5, v11 (* gamma)
+        asm_u32(0x100A1705)
+        // Store (gated for last partial chunk).
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8E00FF); asm_u32(last_chunk_size)
+            _emit_store_gate(14, 14)
+        }
+        asm_u32(0xDC6A0000); asm_u32(0x007C050C)   // global_store v[12:13], v5
+        if c == K - 1 && last_partial != 0 {
+            // Restore exec for any subsequent waitcnt — actually we go
+            // straight to s_endpgm after the loop, so exec restore is
+            // unnecessary. But if not the last iteration this matters.
+            // (Only the last chunk gates, and it's followed by endpgm.)
+        }
+        c = c + 1
+    }
+
+    asm_u32(0xBC7C0000)             // s_waitcnt_vscnt null, 0
+    asm_u32(0xBFB00000)             // s_endpgm
+
+    uint64 total_dwords = asm_text_len / 4
+    uint64 simm16 = total_dwords - cbranch_dword_idx - 2
+    asm_patch_u32(cbranch_dword_idx, 0xBFA20000 | (simm16 & 0xFFFF))
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a8 = args_desc + 64;  unsafe { *(a8 as uint64) = 8 }
+    uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
 @export
 fn emit_amdgpu_rmsnorm_f32_N_blob(uint64 out_path, uint64 N) -> uint64 {
-    if N < 32 || N > 1024 {
-        write(2, "emit_amdgpu_rmsnorm_f32_N_blob: N must be in [32, 1024]\n", 56)
+    if N < 32 || N > 8192 {
+        write(2, "emit_amdgpu_rmsnorm_f32_N_blob: N must be in [32, 8192]\n", 56)
         return 1
     }
     uint64[10] args_desc
-    _emit_rmsnorm_f32_body_N(args_desc, N)
-    // LDS allocation is for the padded block size Np = round_up_pow2(N).
-    uint64 Np = _round_up_pow2(N)
-    uint64 lds_bytes = Np * 4
+    uint64 lds_bytes = 0
+    if N <= 1024 {
+        // Small-N path: single-pass, block = round_up_pow2(N).
+        _emit_rmsnorm_f32_body_N(args_desc, N)
+        uint64 Np = _round_up_pow2(N)
+        lds_bytes = Np * 4
+    } else {
+        // Large-N path: thread-coarsening, block = 1024 fixed.
+        _emit_rmsnorm_f32_body_NL(args_desc, N)
+        lds_bytes = 4096
+    }
+    // VGPR count: small-N path uses ≤16, large-N path uses ≤24 (v17
+    // for the gamma addr hi).  Use rsrc1 byte 0 = 0x02 (24 VGPRs)
+    // unconditionally to cover both; small-N occupancy hit is minor.
+    uint64 rsrc1 = 0xE0AF0001
+    if N > 1024 { rsrc1 = 0xE0AF0002 }
     uint64 size = emit_amdgpu_code_object_lds("rmsnorm_f32", 11,
                                                asm_text_buf, asm_text_len,
-                                               40, 8, 16, 16,
-                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               40, 8, 16, 18,
+                                               rsrc1, 0x0000009E, 0x00000010, 0x0408,
                                                args_desc, 5,
                                                lds_bytes)
     uint64 fd = file_open(out_path, 1)
