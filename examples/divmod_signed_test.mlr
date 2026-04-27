@@ -1,0 +1,44 @@
+// Empirical test of int64 div/mod with negative operands.
+// Codegen at src/ir.mlr:5298 (IR_DIV) emits `xor rdx,rdx; div r64` — unsigned.
+// For negative signed dividends this should give wildly wrong answers.
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+
+fn u64_to_dec(uint64 v, uint64 buf) -> uint64 {
+    if v == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 t = v
+    while t > 0 { n = n + 1; t = t / 10 }
+    uint64 i = n; t = v
+    while i > 0 { i = i - 1; uint64 d = t - (t / 10) * 10; uint64 p = buf + i; uint8 c = d + 48; unsafe { *(p as uint8) = c }; t = t / 10 }
+    return n
+}
+fn print_bits(uint64 lbl, uint64 ll, uint64 v) {
+    write(1, lbl, ll); uint64 buf = alloc(64); uint64 d = u64_to_dec(v, buf); write(1, buf, d)
+    uint8 nl = 10; uint64 nlp = alloc(1); unsafe { *(nlp as uint8) = nl }; write(1, nlp, 1)
+}
+
+fn main() {
+    // Case 1: -10 / 3 — if signed, expect -3 = 0xFFFFFFFFFFFFFFFD.
+    //                  if unsigned, expect 0xFFFFFFFFFFFFFFF6 / 3 = 6148914691236517202.
+    int64 a = 0 - 10
+    int64 b = 3
+    int64 q = a / b
+    print_bits("(-10) / 3 raw bits = ", 21, q)
+
+    // Case 2: -10 % 3 directly via %
+    int64 r = a % b
+    print_bits("(-10) % 3 raw = ", 16, r)
+    // Case 2b: also via (-10) - q*3 to corroborate
+    int64 r2 = a - (a / b) * b
+    print_bits("(-10) - q*3 = ", 14, r2)
+
+    // Case 3: small unsigned still works
+    uint64 c = 100
+    uint64 d = 7
+    uint64 qu = c / d
+    print_bits("100u / 7u = ", 12, qu)
+    uint64 ru = c - (c / d) * d
+    print_bits("100u %% 7u = ", 13, ru)
+
+    exit(0)
+}

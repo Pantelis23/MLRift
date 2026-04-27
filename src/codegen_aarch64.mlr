@@ -305,6 +305,12 @@ fn emit_a64_udiv(uint64 rd, uint64 rn, uint64 rm) {
     emit_a64(insn)
 }
 
+// SDIV Xd, Xn, Xm — signed 64-bit division.
+fn emit_a64_sdiv(uint64 rd, uint64 rn, uint64 rm) {
+    uint64 insn = 0x9AC00C00 | (rm << 16) | (rn << 5) | rd
+    emit_a64(insn)
+}
+
 // MSUB Xd, Xn, Xm, Xa (Xd = Xa - Xn*Xm, for modulo)
 fn emit_a64_msub(uint64 rd, uint64 rn, uint64 rm, uint64 ra) {
     uint64 insn = 0x9B008000 | (rm << 16) | (ra << 10) | (rn << 5) | rd

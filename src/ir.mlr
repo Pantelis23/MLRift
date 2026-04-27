@@ -129,6 +129,11 @@ static uint64 IR_SCMP_LE = 121      // dest = (src1 <= src2) signed
 static uint64 IR_SCMP_GT = 122      // dest = (src1 > src2) signed
 static uint64 IR_SCMP_GE = 123      // dest = (src1 >= src2) signed
 
+// 124/125 are taken (IR_FMT_BOOL / IR_FMT_F64) — assign signed div/mod
+// past the highest existing opcode to avoid colliding with format ops.
+static uint64 IR_SDIV = 132         // dest = src1 / src2 (signed: cqo+idiv)
+static uint64 IR_SMOD = 133         // dest = src1 % src2 (signed: cqo+idiv)
+
 // Typed print formatters: dest=len_vreg, src1=buf_vreg, src2=val_vreg
 static uint64 IR_FMT_BOOL = 124     // format bool as "true"/"false" into buf
 static uint64 IR_FMT_F64 = 125      // format f64 as decimal into buf
@@ -1177,12 +1182,24 @@ fn ir_lower_expr(uint64 node) -> uint64 {
             ir_vreg_fkind_set(dest, lhs_fk)
             return dest
         }
+        // Pick signed variants for div/mod when either operand is
+        // signed. ADD/SUB/MUL produce identical bits in two's complement,
+        // so they keep using the unsigned ops; only div/mod and ordered
+        // compares actually need a separate instruction.
+        uint64 lhs_s = ir_vreg_signed_get(lhs)
+        uint64 rhs_s = ir_vreg_signed_get(rhs)
+        uint64 use_signed = 0
+        if lhs_s != 0 || rhs_s != 0 { use_signed = 1 }
         uint64 ir_op = IR_ADD
         if op_kind == 30 || op_kind == 45 { ir_op = IR_ADD }     // + +=
         if op_kind == 31 || op_kind == 46 { ir_op = IR_SUB }     // - -=
         if op_kind == 22 || op_kind == 47 { ir_op = IR_MUL }     // * *=
-        if op_kind == 32 || op_kind == 48 { ir_op = IR_DIV }     // / /=
-        if op_kind == 33 || op_kind == 49 { ir_op = IR_MOD }     // % %=
+        if op_kind == 32 || op_kind == 48 {
+            if use_signed != 0 { ir_op = IR_SDIV } else { ir_op = IR_DIV }   // / /=
+        }
+        if op_kind == 33 || op_kind == 49 {
+            if use_signed != 0 { ir_op = IR_SMOD } else { ir_op = IR_MOD }   // % %=
+        }
         if op_kind == 23 || op_kind == 50 { ir_op = IR_AND }     // & &=
         if op_kind == 24 || op_kind == 51 { ir_op = IR_OR }      // | |=
         if op_kind == 25 || op_kind == 52 { ir_op = IR_XOR }     // ^ ^=
@@ -1193,7 +1210,7 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         // result of arithmetic stays signed for downstream comparisons.
         // (ADD/SUB/MUL produce identical bits regardless of signedness;
         // we only need the flag so a later `< 0` picks IR_SCMP_LT.)
-        if ir_vreg_signed_get(lhs) != 0 || ir_vreg_signed_get(rhs) != 0 {
+        if use_signed != 0 {
             ir_vreg_signed_set(dest, 1)
         }
         return dest
@@ -3934,6 +3951,8 @@ fn ir_opcode_name(uint64 op) -> uint64 {
     if op == 121 { return "scmp_le" }
     if op == 122 { return "scmp_gt" }
     if op == 123 { return "scmp_ge" }
+    if op == 132 { return "sdiv" }
+    if op == 133 { return "smod" }
     return "???"
 }
 
@@ -5347,6 +5366,63 @@ fn ir_emit_x86_insn(uint64 ii) {
         uint8 mod_m = mod_modrm
         emit_byte(mod_m)
         // Remainder in rdx -> move to dst
+        if dst_r != 0xFFFFFFFF {
+            ir_emit_mov_r64_r64(dst_r, 2)
+        } else {
+            ir_emit_store_spill(2, dest_v)
+        }
+        return
+    }
+
+    if op == 132 {
+        // IR_SDIV: signed 64-bit division. mov rax, dividend; cqo
+        // (sign-extend rax → rdx:rax); idiv r/m64; result in rax.
+        // Without cqo, rdx stays as whatever-was-there and idiv
+        // returns garbage; without idiv (using div instead), -10/3
+        // becomes (2^64-10)/3 ≈ 6.15e18 instead of -3.
+        uint64 a_reg = ir_resolve_src(s1_v, 0)
+        uint64 b_reg = ir_resolve_src(s2_v, 1)
+        ir_emit_mov_r64_r64(0, a_reg)
+        // cqo: 48 99
+        emit_byte(0x48); emit_byte(0x99)
+        if b_reg == 0 || b_reg == 2 {
+            ir_emit_mov_r64_r64(1, b_reg)
+            b_reg = 1
+        }
+        // idiv b_reg: REX.W + F7 /7  (modrm 0xF8 | b)
+        uint8 sdiv_rex = 0x48
+        if b_reg >= 8 { sdiv_rex = sdiv_rex | 1 }
+        emit_byte(sdiv_rex)
+        emit_byte(0xF7)
+        uint64 sdiv_modrm = 0xF8 | (b_reg & 7)
+        uint8 sdiv_m = sdiv_modrm
+        emit_byte(sdiv_m)
+        if dst_r != 0xFFFFFFFF {
+            ir_emit_mov_r64_r64(dst_r, 0)
+        } else {
+            ir_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    if op == 133 {
+        // IR_SMOD: signed 64-bit remainder. Same as SDIV but result
+        // is in rdx (high half of the cqo+idiv pair).
+        uint64 a_reg = ir_resolve_src(s1_v, 0)
+        uint64 b_reg = ir_resolve_src(s2_v, 1)
+        ir_emit_mov_r64_r64(0, a_reg)
+        emit_byte(0x48); emit_byte(0x99)    // cqo
+        if b_reg == 0 || b_reg == 2 {
+            ir_emit_mov_r64_r64(1, b_reg)
+            b_reg = 1
+        }
+        uint8 smod_rex = 0x48
+        if b_reg >= 8 { smod_rex = smod_rex | 1 }
+        emit_byte(smod_rex)
+        emit_byte(0xF7)
+        uint64 smod_modrm = 0xF8 | (b_reg & 7)
+        uint8 smod_m = smod_modrm
+        emit_byte(smod_m)
         if dst_r != 0xFFFFFFFF {
             ir_emit_mov_r64_r64(dst_r, 2)
         } else {
