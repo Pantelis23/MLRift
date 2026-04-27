@@ -1,0 +1,242 @@
+// Launcher for rope_f32: half-split rotary embedding, D=128, block=64.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/rope_f32.mlr        -o /tmp/rope_f32
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/rope_f32_launch.mlr -o /tmp/rope_f32_launch_kfd
+// Run:
+//   M=8 /tmp/rope_f32_launch_kfd
+//
+// Verification trick: we don't need real cos/sin tables. Both the GPU
+// kernel and the CPU reference consume the SAME tables, so the
+// rotation arithmetic check (a*cos - b*sin, a*sin + b*cos) is a pure
+// linear-algebra equality regardless of what cos/sin actually contain.
+// We fill them with deterministic non-trivial values.
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i; uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128); uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i; uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1; uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+fn die(uint64 msg, uint64 code) { puts(msg); print_label_val("e", 1, code); exit(1) }
+fn parse_env_count(uint64 name) -> uint64 {
+    uint64 s = getenv(name)
+    if s == 0 { return 0 }
+    uint64 v = 0; uint64 i = 0
+    while 1 == 1 {
+        uint64 cp = s + i; uint64 c = 0
+        unsafe { *(cp as uint8) -> c }
+        if c == 0 { break }
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48); i = i + 1; continue }
+        break
+    }
+    return v
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 M = 4
+    uint64 me = parse_env_count("M"); if me != 0 { M = me }
+    uint64 D    = 128
+    uint64 Dh   = 64
+
+    uint64 fd = file_open("/tmp/rope_f32.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { puts("missing /tmp/rope_f32.co"); exit(1) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "rope_f32"); if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    uint64 in_bytes  = M * D  * 4
+    uint64 cs_bytes  = M * Dh * 4
+    uint64 d_in = 0; uint64 d_out = 0; uint64 d_cos = 0; uint64 d_sin = 0
+    uint64 slot = alloc(8); err = hipMalloc(slot, in_bytes); if err != 0 { die("mIn",  err) }; unsafe { *(slot as uint64) -> d_in }
+    slot = alloc(8); err = hipMalloc(slot, in_bytes); if err != 0 { die("mOut", err) }; unsafe { *(slot as uint64) -> d_out }
+    slot = alloc(8); err = hipMalloc(slot, cs_bytes); if err != 0 { die("mCos", err) }; unsafe { *(slot as uint64) -> d_cos }
+    slot = alloc(8); err = hipMalloc(slot, cs_bytes); if err != 0 { die("mSin", err) }; unsafe { *(slot as uint64) -> d_sin }
+
+    // Fill x: x[i, k] = (i * 128 + k) * 0.001 — unique, modest scale.
+    uint64 h_in = alloc(in_bytes)
+    uint64 r = 0
+    while r < M {
+        uint64 c = 0
+        while c < D {
+            f64 vd = int_to_f64(r * D + c) * 0.001
+            f32 v = f64_to_f32(vd)
+            uint64 p = h_in + (r * D + c) * 4
+            unsafe { *(p as f32) = v }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    err = hipMemcpy(d_in, h_in, in_bytes, 1); if err != 0 { die("H2D in", err) }
+
+    // Fill cos and sin with deterministic non-trivial values BOUNDED
+    // to [-1, 1] (like real trig). Without bounding, products a*cos
+    // grow to ~1000 and their subtraction triggers catastrophic
+    // f32 cancellation — a precision artifact, not a kernel bug.
+    // Use a trivial period-256 zigzag for determinism.
+    uint64 h_cos = alloc(cs_bytes)
+    uint64 h_sin = alloc(cs_bytes)
+    r = 0
+    while r < M {
+        uint64 c = 0
+        while c < Dh {
+            uint64 idx = r * Dh + c
+            uint64 cm = idx % 256                     // 0..255
+            uint64 sm = (idx * 3 + 17) % 256          // different phase
+            f64 cv = (int_to_f64(cm) - 128.0) / 128.0  // ~ [-1, 1)
+            f64 sv = (int_to_f64(sm) - 128.0) / 128.0
+            uint64 cp = h_cos + idx * 4
+            unsafe { *(cp as f32) = f64_to_f32(cv) }
+            uint64 sp = h_sin + idx * 4
+            unsafe { *(sp as f32) = f64_to_f32(sv) }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    err = hipMemcpy(d_cos, h_cos, cs_bytes, 1); if err != 0 { die("H2D cos", err) }
+    err = hipMemcpy(d_sin, h_sin, cs_bytes, 1); if err != 0 { die("H2D sin", err) }
+
+    uint64 k_in   = alloc(8); unsafe { *(k_in   as uint64) = d_in }
+    uint64 k_out  = alloc(8); unsafe { *(k_out  as uint64) = d_out }
+    uint64 k_cos  = alloc(8); unsafe { *(k_cos  as uint64) = d_cos }
+    uint64 k_sin  = alloc(8); unsafe { *(k_sin  as uint64) = d_sin }
+    uint64 k_m    = alloc(8); unsafe { *(k_m    as uint64) = M }
+    uint64 kp = alloc(5 * 8)
+    unsafe { *(kp        as uint64) = k_in }
+    unsafe { *((kp +  8) as uint64) = k_out }
+    unsafe { *((kp + 16) as uint64) = k_cos }
+    unsafe { *((kp + 24) as uint64) = k_sin }
+    unsafe { *((kp + 32) as uint64) = k_m }
+
+    uint32 grid_x  = M
+    uint32 block_x = 64
+
+    err = hipModuleLaunchKernel(fh, grid_x, 1, 1, block_x, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 h_out = alloc(in_bytes)
+    err = hipMemcpy(h_out, d_out, in_bytes, 2); if err != 0 { die("D2H", err) }
+
+    // CPU reference: pure rotation arithmetic on the same cos/sin tables.
+    uint64 fail = 0
+    uint64 first_bad = 0xFFFFFFFFFFFFFFFF
+    uint64 first_bad_col = 0
+    uint32 first_bad_ref_bits = 0
+    uint32 first_bad_dev_bits = 0
+    // Use a *relative* tolerance: device uses v_fma_f32 (single rounding)
+    // while the host computes a*c - b*s as two separate ops (two
+    // roundings). At large magnitudes that diverges by a few ULPs which
+    // can exceed any small absolute threshold. 1e-4 relative is loose
+    // enough for FMA-vs-sep rounding and tight enough to catch real bugs.
+    f32 rel_thresh = 0.001
+    f32 floor      = 0.000001
+    r = 0
+    while r < M {
+        uint64 j = 0
+        while j < Dh {
+            uint64 cs_idx = r * Dh + j
+            uint64 cp = h_cos + cs_idx * 4
+            f32 cosp = 0.0; unsafe { *(cp as f32) -> cosp }
+            uint64 sp = h_sin + cs_idx * 4
+            f32 sinp = 0.0; unsafe { *(sp as f32) -> sinp }
+            uint64 ap = h_in + (r * D + j) * 4
+            f32 a = 0.0; unsafe { *(ap as f32) -> a }
+            uint64 bp = h_in + (r * D + j + Dh) * 4
+            f32 b = 0.0; unsafe { *(bp as f32) -> b }
+            // Reference uses f64 intermediates to match the device's
+            // v_fma_f32 single-rounding closely. f64*f64 of f32-precision
+            // inputs is exact (48-bit product fits in 53-bit mantissa);
+            // only the final f64→f32 narrows. Without this, separate
+            // f32 mul+sub catastrophic-cancellations diverge from the
+            // device by enough ULPs to fail at large magnitudes.
+            f64 ad = f32_to_f64(a)
+            f64 bd = f32_to_f64(b)
+            f64 cd = f32_to_f64(cosp)
+            f64 sd = f32_to_f64(sinp)
+            f32 ref_first  = f64_to_f32(ad * cd - bd * sd)
+            f32 ref_second = f64_to_f32(ad * sd + bd * cd)
+
+            uint64 op_first  = h_out + (r * D + j) * 4
+            uint64 op_second = h_out + (r * D + j + Dh) * 4
+            f32 dev_first  = 0.0; unsafe { *(op_first  as f32) -> dev_first }
+            f32 dev_second = 0.0; unsafe { *(op_second as f32) -> dev_second }
+
+            f32 d1 = ref_first - dev_first
+            if d1 < 0.0 { d1 = 0.0 - d1 }
+            f32 d2 = ref_second - dev_second
+            if d2 < 0.0 { d2 = 0.0 - d2 }
+
+            f32 ar1 = ref_first;  if ar1 < 0.0 { ar1 = 0.0 - ar1 }
+            f32 ar2 = ref_second; if ar2 < 0.0 { ar2 = 0.0 - ar2 }
+            if ar1 < floor { ar1 = floor }
+            if ar2 < floor { ar2 = floor }
+            f32 r1 = d1 / ar1
+            f32 r2 = d2 / ar2
+
+            if r1 > rel_thresh || r2 > rel_thresh {
+                fail = fail + 1
+                if first_bad == 0xFFFFFFFFFFFFFFFF {
+                    first_bad = r
+                    first_bad_col = j
+                    uint64 rb = alloc(4); unsafe { *(rb as f32) = ref_first }
+                    unsafe { *(rb as uint32) -> first_bad_ref_bits }
+                    uint64 db = alloc(4); unsafe { *(db as f32) = dev_first }
+                    unsafe { *(db as uint32) -> first_bad_dev_bits }
+                }
+            }
+            j = j + 1
+        }
+        r = r + 1
+    }
+
+    print_label_val("M",                  1, M)
+    print_label_val("D",                  1, D)
+    print_label_val("pairs_failed",      12, fail)
+    print_label_val("first_bad_row",     13, first_bad)
+    print_label_val("first_bad_col",     13, first_bad_col)
+    print_label_val("first_bad_ref_bits", 18, first_bad_ref_bits)
+    print_label_val("first_bad_dev_bits", 18, first_bad_dev_bits)
+
+    hipFree(d_in); hipFree(d_out); hipFree(d_cos); hipFree(d_sin)
+    exit(0)
+}

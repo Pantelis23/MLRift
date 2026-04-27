@@ -1,0 +1,28 @@
+// LLM Phase 2 — rope_f32 placeholder. --target=amdgpu-native routes
+// the @kernel name to the half-split rotary-embedding kernel.
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+
+@kernel
+fn rope_f32(uint64 in_ptr, uint64 out_ptr, uint64 cos_ptr, uint64 sin_ptr, uint64 m) {
+    uint64 row = block_idx_x()
+    uint64 j   = tid_local_x()
+    if row < m {
+        if j < 64 {
+            f32 a = 0.0
+            uint64 ia = in_ptr + (row * 128 + j) * 4
+            unsafe { *(ia as f32) -> a }
+            uint64 oa = out_ptr + (row * 128 + j) * 4
+            unsafe { *(oa as f32) = a }
+            uint64 cp = cos_ptr + (row * 64 + j) * 4
+            unsafe { *(cp as f32) -> a }
+            uint64 sp = sin_ptr + (row * 64 + j) * 4
+            unsafe { *(sp as f32) -> a }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}

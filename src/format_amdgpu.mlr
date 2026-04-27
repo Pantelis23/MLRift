@@ -7258,6 +7258,135 @@ fn amdgpu_lower_llm_silu_mul_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
     return 0
 }
 
+// LLM Phase 2 — rope_f32: GPT-NeoX/Qwen half-split rotary embedding.
+// Per row i (token position), pair element j with j+64:
+//   cos_p = cos[i*64 + j];  sin_p = sin[i*64 + j]
+//   a = in[i*128 + j];      b = in[i*128 + j + 64]
+//   out[i*128 + j]      = a*cos_p - b*sin_p
+//   out[i*128 + j + 64] = a*sin_p + b*cos_p
+// Block = 64 (one lane per pair), grid = M. D = 128 hardcoded.
+// cos/sin tables precomputed by host (each [M, 64] f32).
+//
+// Kernarg layout (40 bytes, 5 args):
+//   [0x00] uint64 in_ptr   (M × 128 f32)
+//   [0x08] uint64 out_ptr  (M × 128 f32)
+//   [0x10] uint64 cos_ptr  (M × 64 f32)
+//   [0x18] uint64 sin_ptr  (M × 64 f32)
+//   [0x20] uint64 m
+//
+// VGPRs: 17 active (v0..v16) — bumps rsrc1 byte 0 from 0x01 (≤16) to
+// 0x02 (≤24) versus the layernorm/softmax/rmsnorm/silu/silu_mul pattern.
+fn _emit_rope_f32_body(uint64 args_desc) {
+    asm_init()
+    asm_u32(0xF40C0100)
+    asm_u32(0xF8000000)
+    asm_u32(0xF4000300)
+    asm_u32(0xF8000020)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBF090C0F)
+    asm_u32(0xBFA2002D)
+    asm_u32(0x840D890F)
+    asm_u32(0x30020082)
+    asm_u32(0x4A02020D)
+    asm_u32(0x7E060280)
+    asm_u32(0xD7006A02)
+    asm_u32(0x00020204)
+    asm_u32(0xD5207C03)
+    asm_u32(0x01AA0605)
+    asm_u32(0x7E0A0280)
+    asm_u32(0xD7006A04)
+    asm_u32(0x00020206)
+    asm_u32(0xD5207C05)
+    asm_u32(0x01AA0A07)
+    asm_u32(0x840D880F)
+    asm_u32(0x30200082)
+    asm_u32(0x4A20200D)
+    asm_u32(0x7E0E0280)
+    asm_u32(0xD7006A06)
+    asm_u32(0x00022008)
+    asm_u32(0xD5207C07)
+    asm_u32(0x01AA0E09)
+    asm_u32(0x7E120280)
+    asm_u32(0xD7006A08)
+    asm_u32(0x0002200A)
+    asm_u32(0xD5207C09)
+    asm_u32(0x01AA120B)
+    asm_u32(0xDC520000)
+    asm_u32(0x0A7C0002)
+    asm_u32(0xDC520100)
+    asm_u32(0x0B7C0002)
+    asm_u32(0xDC520000)
+    asm_u32(0x0C7C0006)
+    asm_u32(0xDC520000)
+    asm_u32(0x0D7C0008)
+    asm_u32(0xBF8903F7)
+    asm_u32(0x101C1B0B)
+    asm_u32(0xD613000E)
+    asm_u32(0x843A190A)
+    asm_u32(0x101E1B0A)
+    asm_u32(0x561E190B)
+    asm_u32(0xDC6A0000)
+    asm_u32(0x007C0E04)
+    asm_u32(0xDC6A0100)
+    asm_u32(0x007C0F04)
+    asm_u32(0xBC7C0000)
+    asm_u32(0xBFB00000)
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a8 = args_desc + 64;  unsafe { *(a8 as uint64) = 8 }
+    uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+@export
+fn emit_amdgpu_rope_f32_blob(uint64 out_path) -> uint64 {
+    uint64[10] args_desc
+    _emit_rope_f32_body(args_desc)
+    uint64 size = emit_amdgpu_code_object_lds("rope_f32", 8,
+                                               asm_text_buf, asm_text_len,
+                                               40, 8, 16, 17,
+                                               0xE0AF0002, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 5,
+                                               0)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_rope_f32_blob: cannot open output\n", 47)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+fn amdgpu_lower_llm_rope_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
+    uint64 args_desc = alloc(10 * 8)
+    _emit_rope_f32_body(args_desc)
+    uint64 k_text_size = asm_text_len
+    uint64 k_text_buf  = alloc(k_text_size)
+    uint64 ci = 0
+    while ci < k_text_size {
+        uint64 sp = asm_text_buf + ci
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        uint64 dp = k_text_buf + ci
+        uint8 b8 = b
+        unsafe { *(dp as uint8) = b8 }
+        ci = ci + 1
+    }
+    kt_push_lds(kname_ptr, nl, k_text_buf, k_text_size,
+                args_desc, 5, 40,
+                16, 17,
+                0xE0AF0002, 0x0000009E, 0x00000010, 0x0408,
+                0)
+    return 0
+}
+
 // Debug variant of N3: identical KD/dispatch/bounds, but the kernel
 // body just stores 1.0 (0x3F800000) to C[row, col]. If output cells
 // fail to receive 1.0, the bug is in dispatch/store, not LDS.
@@ -9586,6 +9715,9 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     }
     if tok_matches(name_tok, "silu_mul_f32", 12) != 0 {
         return amdgpu_lower_llm_silu_mul_f32(kname_ptr, nl)
+    }
+    if tok_matches(name_tok, "rope_f32", 8) != 0 {
+        return amdgpu_lower_llm_rope_f32(kname_ptr, nl)
     }
 
     // ── Phase 3a: AST-walking pointwise-binop recogniser ──────────────

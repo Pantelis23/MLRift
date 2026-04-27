@@ -4681,6 +4681,18 @@ fn main() {
                 write(1, sm_path, sml)
                 write(1, " (amdgpu silu-mul-f32 code object)\n", 36)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-rope-f32=", 23) != 0 {
+                uint64 rp_path = arg + 23
+                uint64 rp_rc = emit_amdgpu_rope_f32_blob(rp_path)
+                if rp_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-rope-f32 failed\n", 37)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 rpl = str_len(rp_path)
+                write(1, rp_path, rpl)
+                write(1, " (amdgpu rope-f32 code object)\n", 32)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-softmax-f32=", 26) != 0 {
                 uint64 sx_path = arg + 26
                 uint64 sx_rc = emit_amdgpu_softmax_f32_blob(sx_path)
