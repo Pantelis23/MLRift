@@ -762,6 +762,154 @@ fn _f32_bits_recip_pow2(uint64 N) -> uint64 {
     return (127 - e) << 23
 }
 
+// Smallest power of two ≥ N. For N already a power of two returns N.
+fn _round_up_pow2(uint64 N) -> uint64 {
+    if N == 0 { return 1 }
+    if (N & (N - 1)) == 0 { return N }
+    uint64 p = 1
+    while p < N { p = p << 1 }
+    return p
+}
+
+// f32 bit pattern for 1/N for ANY N (used for non-power-of-two
+// hidden_dim values like Qwen3-0.6B's 896 or Qwen3-1.5B's 1536).
+// Computed by manual division: bias 127, then encode (1 + frac) * 2^e
+// where 2^e ≤ 1/N < 2*2^e.  Uses round-to-nearest-even.
+fn _f32_bits_recip(uint64 N) -> uint64 {
+    if N == 0 { return 0 }
+    // Find exponent e such that 2^-(e+1) < 1/N ≤ 2^-e, i.e.
+    //   2^e ≤ N < 2^(e+1).  Same as floor(log2(N)).
+    uint64 e = 0
+    uint64 m = N
+    while m > 1 { m = m >> 1; e = e + 1 }
+    // Now 2^e ≤ N < 2^(e+1).  Need 1/N as (1 + frac) * 2^-(e+1)
+    // when N > 2^e, else exact 2^-e when N == 2^e.
+    if (N & (N - 1)) == 0 {
+        // power of two, exact
+        return (127 - e) << 23
+    }
+    // 1/N in [2^-(e+1), 2^-e); represent as 1.frac * 2^-(e+1)
+    // where 1.frac = 2^(e+1) / N.  Compute (2^(e+1) << 23) / N to get
+    // the 24-bit integer 1.frac (top bit = 1, rest = 23-bit mantissa).
+    uint64 num = 1
+    num = num << (e + 1 + 23)
+    uint64 q = num / N
+    uint64 rem = num - q * N
+    // round-to-nearest-even: if 2*rem > N, round up; if ==, round to even.
+    uint64 two_rem = rem * 2
+    if two_rem > N {
+        q = q + 1
+    } else if two_rem == N {
+        if (q & 1) != 0 { q = q + 1 }
+    }
+    // q is now the 24-bit value 1.frac (in 23 fractional bits + leading 1).
+    // Strip the leading 1 bit (q's bit 23).  If rounding overflowed, adjust.
+    if q == (1 << 24) {
+        // rounded up to 2.0 → 1.0 * 2^-(e); shift exponent
+        return (127 - e) << 23
+    }
+    uint64 mantissa = q & 0x7FFFFF
+    uint64 exp_field = 127 - (e + 1)
+    return (exp_field << 23) | mantissa
+}
+
+// Identity-fill preamble: for lanes where v0 (lane id) >= N, overwrite
+// v10 with `identity_bits` so the subsequent reduction sees an
+// identity element from the padding lanes.  Used when block size is
+// Np = round_up_pow2(N) > N to handle non-power-of-two N.  Caller is
+// responsible for ensuring the global_load that produced v10 was
+// either gated to lane<N or had safe slack in the buffer (otherwise
+// padding lanes' loads can fault on the last row).
+//
+//   v_cmp_lt_u32_e64 sX, v0, sN            (sX.lane = (lane < N))
+//   v_mov_b32_e32    v15, identity_bits
+//   v_cndmask_b32_e64 v10, v15, v10, sX    (lane<N → v10; lane>=N → v15)
+//
+// `mask_sgpr` is the SGPR used for the predicate (also used by the
+// reduction tree as saved_exec — fine since the cndmask consumes it
+// before the tree starts).  `n_kernarg_sgpr` holds the runtime N.
+fn _emit_identity_fill_v10(uint64 mask_sgpr, uint64 n_kernarg_sgpr,
+                           uint64 identity_bits) {
+    // v_cmp_lt_u32_e64 mask_sgpr, v0, n_kernarg_sgpr
+    asm_u32(0xD4490000 | (mask_sgpr & 0x7F))
+    asm_u32(((n_kernarg_sgpr & 0xFF) << 9) | 0x100)
+    // v_mov_b32_e32 v15, identity_bits  (literal-escape encoding)
+    asm_u32(0x7E1E02FF)
+    asm_u32(identity_bits)
+    // v_cndmask_b32_e64 v10, v15, v10, mask_sgpr
+    asm_u32(0xD501000A)
+    asm_u32(0x0002150F | ((mask_sgpr & 0xFF) << 18))
+}
+
+// Identity-fill on v5 (instead of v10).  Used by layernorm in the
+// mid-section to clear padding-lane v5 before Phase B's initial LDS
+// store, since v5 = diff² = mean² for padding lanes (where v10 = 0
+// makes diff = -mean) would pollute the variance reduction.
+//
+// v_cmp_lt_u32_e64 mask_sgpr, v0, sN
+// v_mov_b32_e32    v15, identity_bits
+// v_cndmask_b32_e64 v5, v15, v5, mask_sgpr   (lane<N → v5; lane>=N → v15)
+//   src0 = v15 (0x10F), src1 = v5 (0x105), src2 = sX
+//   low  = 0x10F | (0x105 << 9) | (sX << 18) = 0x20B0F | (sX << 18)
+fn _emit_identity_fill_v5(uint64 mask_sgpr, uint64 n_kernarg_sgpr,
+                          uint64 identity_bits) {
+    asm_u32(0xD4490000 | (mask_sgpr & 0x7F))
+    asm_u32(((n_kernarg_sgpr & 0xFF) << 9) | 0x100)
+    asm_u32(0x7E1E02FF)
+    asm_u32(identity_bits)
+    asm_u32(0xD5010005)
+    asm_u32(0x00020B0F | ((mask_sgpr & 0xFF) << 18))
+}
+
+// Gated global_load: load v10 from v[2:3] only on lanes where
+// v0 < n_kernarg_sgpr.  Padding lanes get v10 = identity_bits (no
+// load issued from them, so no risk of OOB faults on the last row).
+//
+//   v_cmp_lt_u32_e64 sX, v0, sN
+//   v_mov_b32_e32    v10, identity_bits   ; default for masked lanes
+//   s_and_saveexec_b32 sY, sX
+//   global_load_b32 v10, v[2:3], off
+//   s_waitcnt vmcnt(0)
+//   s_mov_b32 exec_lo, sY                 ; restore exec for full block
+//
+// `mask_sgpr` and `save_sgpr` should be different so the saveexec'd
+// value of exec is preserved for restoration.  They share a register
+// in our use because mask_sgpr is dead by the time we restore (post-
+// cndmask).  We pass the same sgpr for both.
+fn _emit_gated_load_v10(uint64 mask_sgpr, uint64 n_kernarg_sgpr,
+                        uint64 identity_bits) {
+    // v_cmp_lt_u32_e64 mask_sgpr, v0, n_kernarg_sgpr
+    asm_u32(0xD4490000 | (mask_sgpr & 0x7F))
+    asm_u32(((n_kernarg_sgpr & 0xFF) << 9) | 0x100)
+    // v_mov_b32_e32 v10, identity_bits
+    asm_u32(0x7E1402FF)
+    asm_u32(identity_bits)
+    // s_and_saveexec_b32 mask_sgpr, mask_sgpr
+    asm_u32(0xBE800000 | ((mask_sgpr & 0x7F) << 16) | 0x2000 | (mask_sgpr & 0x7F))
+    // global_load_b32 v10, v[2:3], off
+    asm_u32(0xDC520000)
+    asm_u32(0x0A7C0002)
+    // s_waitcnt vmcnt(0)
+    asm_u32(0xBF8903F7)
+    // s_mov_b32 exec_lo, mask_sgpr  (restore)
+    asm_u32(0xBEFE0000 | (mask_sgpr & 0xFF))
+}
+
+// Final-store gating preamble: mask off lanes where v0 >= N so they
+// don't write past the row's end.  Skips exec restore — caller must
+// follow with s_endpgm.
+//
+//   v_cmp_lt_u32_e64 sX, v0, sN
+//   s_and_saveexec_b32 sX, sX            (exec &= sX; sX := old exec)
+fn _emit_store_gate(uint64 mask_sgpr, uint64 n_kernarg_sgpr) {
+    // v_cmp_lt_u32_e64 mask_sgpr, v0, n_kernarg_sgpr
+    asm_u32(0xD4490000 | (mask_sgpr & 0x7F))
+    asm_u32(((n_kernarg_sgpr & 0xFF) << 9) | 0x100)
+    // s_and_saveexec_b32 mask_sgpr, mask_sgpr
+    // SOP1 encoding: bits 31:23 = 0x17D (fixed), sdst<<16, opcode 0x20<<8, ssrc0
+    asm_u32(0xBE800000 | ((mask_sgpr & 0x7F) << 16) | 0x2000 | (mask_sgpr & 0x7F))
+}
+
 // ── SOPP format (single 32-bit word) ────────────────────────────────
 // [31:23] = 0x17F   (SOPP prefix on gfx11)
 // [22:16] = 7-bit opcode
@@ -6618,6 +6766,7 @@ fn emit_amdgpu_softmax_f32_blob(uint64 out_path) -> uint64 {
 // per element of the row).  LDS allocation = 4*N bytes.
 fn _emit_softmax_f32_body_N(uint64 args_desc, uint64 N) {
     asm_init()
+    uint64 Np = _round_up_pow2(N)
 
     // ── Prologue (kernarg load + bounds check + per-lane setup) ─────
     asm_u32(0xF40C0100)             // s_load_b256 s[4:11], s[0:1], 0x0
@@ -6639,9 +6788,17 @@ fn _emit_softmax_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0x00020806)
     asm_u32(0xD5207C0D)             // v_add_co_ci_u32 v13, null, s7, v13, vcc_lo
     asm_u32(0x01AA1A07)
-    asm_u32(0xDC520000)             // global_load_b32 v10, v[2:3], off
-    asm_u32(0x0A7C0002)
-    asm_u32(0xBF8903F7)             // s_waitcnt vmcnt(0)
+    // Load x. For non-pow2 N: gate to lane<N (default v10 = -inf, the
+    // identity for max-reduce). The same -inf carries into Phase B's
+    // v5 = exp(x - max) since exp(-inf - max) = 0 (the identity for
+    // sum-reduce), so no extra fill needed there.
+    if N != Np {
+        _emit_gated_load_v10(12, 10, 0xFF800000)
+    } else {
+        asm_u32(0xDC520000)         // global_load_b32 v10, v[2:3], off
+        asm_u32(0x0A7C0002)
+        asm_u32(0xBF8903F7)         // s_waitcnt vmcnt(0)
+    }
     asm_u32(0x7E0A030A)             // v_mov_b32 v5, v10  (stash x in v5)
     asm_u32(0x300C0082)             // v_lshlrev_b32 v6, 2, v0  (LDS slot)
     asm_u32(0x7E120280)             // v_mov_b32 v9, 0
@@ -6650,9 +6807,9 @@ fn _emit_softmax_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0xBF89FC07)             // s_waitcnt lgkmcnt(0)
     asm_u32(0xBFBD0000)             // s_barrier
 
-    // ── Phase A: max-reduce over N lanes via LDS pairwise tree ──────
+    // ── Phase A: max-reduce over Np lanes via LDS pairwise tree ─────
     // v_max_f32_e32 v5, v5, v7 = 0x200A0F05
-    _emit_lds_reduce_pow2(N, 0x200A0F05, 12)
+    _emit_lds_reduce_pow2(Np, 0x200A0F05, 12)
 
     // ── Mid: broadcast max, e = exp(x - max) via 2^((x-max)*log2e) ──
     asm_u32(0xD8D80000)             // ds_load_b32 v8, v9  (LDS[0] = max)
@@ -6670,9 +6827,9 @@ fn _emit_softmax_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0xBF89FC07)             // s_waitcnt
     asm_u32(0xBFBD0000)             // s_barrier
 
-    // ── Phase B: sum-reduce e over N lanes ──────────────────────────
+    // ── Phase B: sum-reduce e over Np lanes ─────────────────────────
     // v_add_f32_e32 v5, v5, v7 = 0x060A0F05
-    _emit_lds_reduce_pow2(N, 0x060A0F05, 12)
+    _emit_lds_reduce_pow2(Np, 0x060A0F05, 12)
 
     // ── Finalize: out = e / sum ─────────────────────────────────────
     asm_u32(0xD8D80000)             // ds_load_b32 v8, v9  (LDS[0] = sum)
@@ -6680,6 +6837,7 @@ fn _emit_softmax_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0xBF89FC07)
     asm_u32(0x7E105508)             // v_rcp_f32 v8, v8
     asm_u32(0x100A110B)             // v_mul_f32 v5, v11, v8
+    if N != Np { _emit_store_gate(12, 10) }
     asm_u32(0xDC6A0000)             // global_store_b32 v[12:13], v5, off
     asm_u32(0x007C050C)
     asm_u32(0xBC7C0000)             // s_waitcnt_vscnt null, 0
@@ -6702,19 +6860,22 @@ fn _emit_softmax_f32_body_N(uint64 args_desc, uint64 N) {
     uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
 }
 
-// Shape-parametric softmax_f32 .co emit. N ∈ {32, 64, 128, 256, 512, 1024}.
+// Shape-parametric softmax_f32 .co emit. N in [32, 1024], any value
+// (round_up_pow2(N) ≤ 1024 = gfx11 max workgroup size).
 @export
 fn emit_amdgpu_softmax_f32_N_blob(uint64 out_path, uint64 N) -> uint64 {
-    if _ilog2_pow2(N) == 0xFF || N < 32 || N > 1024 {
-        write(2, "emit_amdgpu_softmax_f32_N_blob: N must be power of two in [32, 1024]\n", 70)
+    if N < 32 || N > 1024 {
+        write(2, "emit_amdgpu_softmax_f32_N_blob: N must be in [32, 1024]\n", 56)
         return 1
     }
     uint64[8] args_desc
     _emit_softmax_f32_body_N(args_desc, N)
-    uint64 lds_bytes = N * 4
+    // LDS sized for the padded block (Np = round_up_pow2(N)).
+    uint64 Np = _round_up_pow2(N)
+    uint64 lds_bytes = Np * 4
     uint64 size = emit_amdgpu_code_object_lds("softmax_f32", 11,
                                                asm_text_buf, asm_text_len,
-                                               32, 8, 16, 14,
+                                               32, 8, 16, 16,
                                                0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
                                                args_desc, 4,
                                                lds_bytes)
@@ -7058,7 +7219,8 @@ fn amdgpu_lower_llm_layernorm_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
 // (x - mean) / sqrt(var + eps), eps = 1e-5).
 fn _emit_layernorm_f32_body_N(uint64 args_desc, uint64 N) {
     asm_init()
-    uint64 inv_n_bits = _f32_bits_recip_pow2(N)
+    uint64 Np = _round_up_pow2(N)
+    uint64 inv_n_bits = _f32_bits_recip(N)
 
     // ── Prologue (kernarg + bounds + setup + initial store) ─────────
     asm_u32(0xF40C0100)             // s_load_b256 s[4:11], s[0:1], 0x0
@@ -7080,9 +7242,15 @@ fn _emit_layernorm_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0x00020806)
     asm_u32(0xD5207C0D)
     asm_u32(0x01AA1A07)
-    asm_u32(0xDC520000)             // global_load_b32 v10, v[2:3], off
-    asm_u32(0x0A7C0002)
-    asm_u32(0xBF8903F7)
+    // Load x. For non-pow2 N: gate to lane<N (default v10 = 0, the
+    // identity for sum-of-x reduce).
+    if N != Np {
+        _emit_gated_load_v10(12, 10, 0x00000000)
+    } else {
+        asm_u32(0xDC520000)         // global_load_b32 v10, v[2:3], off
+        asm_u32(0x0A7C0002)
+        asm_u32(0xBF8903F7)
+    }
     asm_u32(0x7E0A030A)             // v5 = x  (for sum-of-x reduce)
     asm_u32(0x300C0082)             // v6 = lane*4
     asm_u32(0x7E120280)             // v9 = 0
@@ -7092,7 +7260,7 @@ fn _emit_layernorm_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0xBFBD0000)
 
     // ── Phase A: sum-reduce x ───────────────────────────────────────
-    _emit_lds_reduce_pow2(N, 0x060A0F05, 12)
+    _emit_lds_reduce_pow2(Np, 0x060A0F05, 12)
 
     // ── Mid: mean = sum/N; diff = x - mean; v5 = diff² for Phase B ──
     asm_u32(0xD8D80000)             // ds_load v8, v9 (LDS[0] = sum)
@@ -7103,6 +7271,13 @@ fn _emit_layernorm_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0x1010100C)             // v_mul_f32 v8, s12, v8  (mean)
     asm_u32(0x0816110A)             // v_sub_f32 v11, v10, v8 (diff)
     asm_u32(0x100A170B)             // v_mul_f32 v5, v11, v11 (diff²)
+    // For non-pow2 N: padding lanes have v10=0 → diff=-mean → v5=mean².
+    // Overwrite v5 = 0 for lane >= N so they contribute the identity to
+    // Phase B's sum-reduce.  Recompute the lane<N predicate in s12
+    // (which is dead at this point — the v_mul above uses literal-
+    // escape s_mov for the constant, so s12 was reused).  Note: this
+    // helper writes v15 too; v15 is dead.
+    if N != Np { _emit_identity_fill_v5(12, 10, 0x00000000) }
     asm_u32(0xBFBD0000)             // s_barrier
     asm_u32(0xD8340000)             // ds_store v6, v5
     asm_u32(0x00000506)
@@ -7110,7 +7285,7 @@ fn _emit_layernorm_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0xBFBD0000)
 
     // ── Phase B: sum-reduce diff² ───────────────────────────────────
-    _emit_lds_reduce_pow2(N, 0x060A0F05, 12)
+    _emit_lds_reduce_pow2(Np, 0x060A0F05, 12)
 
     // ── Finalize: var = sumsq/N; out = diff * rsqrt(var + eps) ─────
     asm_u32(0xD8D80000)             // ds_load v8, v9 (LDS[0] = sumsq)
@@ -7124,6 +7299,7 @@ fn _emit_layernorm_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0x0610100C)             // v_add_f32 v8, s12, v8  (var+eps)
     asm_u32(0x7E105D08)             // v_rsq_f32 v8, v8       (1/sqrt)
     asm_u32(0x100A110B)             // v_mul_f32 v5, v11, v8  (out)
+    if N != Np { _emit_store_gate(12, 10) }
     asm_u32(0xDC6A0000)             // global_store
     asm_u32(0x007C050C)
     asm_u32(0xBC7C0000)
@@ -7145,16 +7321,17 @@ fn _emit_layernorm_f32_body_N(uint64 args_desc, uint64 N) {
 
 @export
 fn emit_amdgpu_layernorm_f32_N_blob(uint64 out_path, uint64 N) -> uint64 {
-    if _ilog2_pow2(N) == 0xFF || N < 32 || N > 1024 {
-        write(2, "emit_amdgpu_layernorm_f32_N_blob: N must be power of two in [32, 1024]\n", 72)
+    if N < 32 || N > 1024 {
+        write(2, "emit_amdgpu_layernorm_f32_N_blob: N must be in [32, 1024]\n", 58)
         return 1
     }
     uint64[8] args_desc
     _emit_layernorm_f32_body_N(args_desc, N)
-    uint64 lds_bytes = N * 4
+    uint64 Np = _round_up_pow2(N)
+    uint64 lds_bytes = Np * 4
     uint64 size = emit_amdgpu_code_object_lds("layernorm_f32", 13,
                                                asm_text_buf, asm_text_len,
-                                               32, 8, 16, 14,
+                                               32, 8, 16, 16,
                                                0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
                                                args_desc, 4,
                                                lds_bytes)
@@ -7382,12 +7559,17 @@ fn amdgpu_lower_llm_rmsnorm_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
     return 0
 }
 
-// Shape-parametric rmsnorm_f32. N power of two in [32, 1024].
+// Shape-parametric rmsnorm_f32. N in [32, 1024] (any value, not just
+// power of two). For non-pow2 N, the LDS reduction tree runs at depth
+// log2(round_up_pow2(N)); padding lanes are identity-filled (0 for
+// sum-of-x²) at load time and gated out at the final store.
 // out_i = x_i * rsqrt(mean(x²) + eps) * gamma_i (gamma is row-shared).
 // Saved-exec SGPR is s14 (s12/s13 hold `n` from the second kernarg load).
+// Block size at launch must be Np = round_up_pow2(N).
 fn _emit_rmsnorm_f32_body_N(uint64 args_desc, uint64 N) {
     asm_init()
-    uint64 inv_n_bits = _f32_bits_recip_pow2(N)
+    uint64 Np = _round_up_pow2(N)
+    uint64 inv_n_bits = _f32_bits_recip(N)
 
     // ── Prologue ────────────────────────────────────────────────────
     asm_u32(0xF40C0100)             // s_load_b256 s[4:11], s[0:1], 0x0
@@ -7411,9 +7593,17 @@ fn _emit_rmsnorm_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0x00020806)
     asm_u32(0xD5207C0D)
     asm_u32(0x01AA1A07)
-    asm_u32(0xDC520000)             // global_load v10, x
-    asm_u32(0x0A7C0002)
-    asm_u32(0xBF8903F7)
+    // Load x. For non-pow2 N, gate the load to lane<N to avoid OOB
+    // reads on the last row (could fault on multi-WG launches);
+    // padding lanes get v10 = 0 so x*x = 0 contributes 0 to sumsq.
+    if N != Np {
+        _emit_gated_load_v10(14, 12, 0x00000000)
+    } else {
+        asm_u32(0xDC520000)         // global_load v10, x
+        asm_u32(0x0A7C0002)
+        asm_u32(0xBF8903F7)
+    }
+
     asm_u32(0x30040082)             // rebuild v[2:3] as gamma addr
     asm_u32(0x7E060280)
     asm_u32(0xD7006A02)
@@ -7421,8 +7611,9 @@ fn _emit_rmsnorm_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0xD5207C03)
     asm_u32(0x01AA0609)
     asm_u32(0xDC520000)             // global_load v11, gamma
-    asm_u32(0x0B7C0002)
-    asm_u32(0xBF8903F7)
+    asm_u32(0x0B7C0002)             // (gamma is N f32; padding lanes
+    asm_u32(0xBF8903F7)             //  read into hipMalloc page slack)
+
     asm_u32(0x100A150A)             // v_mul_f32 v5, v10, v10  (x²)
     asm_u32(0x300C0082)             // v6 = lane*4
     asm_u32(0x7E120280)
@@ -7431,8 +7622,8 @@ fn _emit_rmsnorm_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0xBF89FC07)
     asm_u32(0xBFBD0000)
 
-    // ── Sum-reduce x² over N lanes ──────────────────────────────────
-    _emit_lds_reduce_pow2(N, 0x060A0F05, 14)
+    // ── Sum-reduce x² over Np lanes (pow2 reduction) ────────────────
+    _emit_lds_reduce_pow2(Np, 0x060A0F05, 14)
 
     // ── Finalize: var = sumsq/N; out = x * rsqrt(var+eps) * gamma ──
     asm_u32(0xD8D80000)             // ds_load v8, v9
@@ -7447,6 +7638,10 @@ fn _emit_rmsnorm_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0x7E105D08)             // v_rsq_f32 v8, v8
     asm_u32(0x100A110A)             // v_mul_f32 v5, v10, v8 (x*inv_rms)
     asm_u32(0x100A1705)             // v_mul_f32 v5, v5, v11 (* gamma)
+    // For non-pow2 N: gate the global_store on lane < N so padding
+    // lanes don't write past the row's end.  No exec restore — the
+    // s_endpgm that follows ignores exec.
+    if N != Np { _emit_store_gate(14, 12) }
     asm_u32(0xDC6A0000)
     asm_u32(0x007C050C)
     asm_u32(0xBC7C0000)
@@ -7470,16 +7665,18 @@ fn _emit_rmsnorm_f32_body_N(uint64 args_desc, uint64 N) {
 
 @export
 fn emit_amdgpu_rmsnorm_f32_N_blob(uint64 out_path, uint64 N) -> uint64 {
-    if _ilog2_pow2(N) == 0xFF || N < 32 || N > 1024 {
-        write(2, "emit_amdgpu_rmsnorm_f32_N_blob: N must be power of two in [32, 1024]\n", 70)
+    if N < 32 || N > 1024 {
+        write(2, "emit_amdgpu_rmsnorm_f32_N_blob: N must be in [32, 1024]\n", 56)
         return 1
     }
     uint64[10] args_desc
     _emit_rmsnorm_f32_body_N(args_desc, N)
-    uint64 lds_bytes = N * 4
+    // LDS allocation is for the padded block size Np = round_up_pow2(N).
+    uint64 Np = _round_up_pow2(N)
+    uint64 lds_bytes = Np * 4
     uint64 size = emit_amdgpu_code_object_lds("rmsnorm_f32", 11,
                                                asm_text_buf, asm_text_len,
-                                               40, 8, 16, 14,
+                                               40, 8, 16, 16,
                                                0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
                                                args_desc, 5,
                                                lds_bytes)
@@ -8234,6 +8431,7 @@ fn amdgpu_lower_llm_softmax_causal_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
 // seq_len for the attention-score row.
 fn _emit_softmax_causal_f32_body_N(uint64 args_desc, uint64 N) {
     asm_init()
+    uint64 Np = _round_up_pow2(N)
 
     // ── Prologue + load ────────────────────────────────────────────
     asm_u32(0xF40C0100); asm_u32(0xF8000000)
@@ -8250,8 +8448,15 @@ fn _emit_softmax_causal_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0x7E1A0280)
     asm_u32(0xD7006A0C); asm_u32(0x00020806)
     asm_u32(0xD5207C0D); asm_u32(0x01AA1A07)
-    asm_u32(0xDC520000); asm_u32(0x0A7C0002)
-    asm_u32(0xBF8903F7)             // s_waitcnt vmcnt(0)
+    // Load x. Non-pow2 N: gate to lane<N (default v10 = -inf, which is
+    // also the identity for max-reduce AND would-be result of the
+    // causal mask for padding lanes since j>=N > r is always true).
+    if N != Np {
+        _emit_gated_load_v10(12, 10, 0xFF800000)
+    } else {
+        asm_u32(0xDC520000); asm_u32(0x0A7C0002)
+        asm_u32(0xBF8903F7)         // s_waitcnt vmcnt(0)
+    }
 
     // ── Causal mask: if v0 (lane=col) > s15 (row), v10 = -inf ──────
     asm_u32(0xD449000E); asm_u32(0x0002000F)   // v_cmp_lt_u32_e64 s14, s15, v0
@@ -8266,7 +8471,7 @@ fn _emit_softmax_causal_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0xBFBD0000)
 
     // ── Phase A: max-reduce ────────────────────────────────────────
-    _emit_lds_reduce_pow2(N, 0x200A0F05, 12)
+    _emit_lds_reduce_pow2(Np, 0x200A0F05, 12)
 
     // ── Mid: e = exp(x - max) ──────────────────────────────────────
     asm_u32(0xD8D80000); asm_u32(0x08000009)
@@ -8282,13 +8487,14 @@ fn _emit_softmax_causal_f32_body_N(uint64 args_desc, uint64 N) {
     asm_u32(0xBFBD0000)
 
     // ── Phase B: sum-reduce e ──────────────────────────────────────
-    _emit_lds_reduce_pow2(N, 0x060A0F05, 12)
+    _emit_lds_reduce_pow2(Np, 0x060A0F05, 12)
 
     // ── Finalize ───────────────────────────────────────────────────
     asm_u32(0xD8D80000); asm_u32(0x08000009)
     asm_u32(0xBF89FC07)
     asm_u32(0x7E105508)             // v_rcp_f32 v8, v8
     asm_u32(0x100A110B)             // v_mul_f32 v5, v11, v8
+    if N != Np { _emit_store_gate(12, 10) }
     asm_u32(0xDC6A0000); asm_u32(0x007C050C)
     asm_u32(0xBC7C0000)
     asm_u32(0xBFB00000)
@@ -8309,13 +8515,14 @@ fn _emit_softmax_causal_f32_body_N(uint64 args_desc, uint64 N) {
 
 @export
 fn emit_amdgpu_softmax_causal_f32_N_blob(uint64 out_path, uint64 N) -> uint64 {
-    if _ilog2_pow2(N) == 0xFF || N < 32 || N > 1024 {
-        write(2, "emit_amdgpu_softmax_causal_f32_N_blob: N must be power of two in [32, 1024]\n", 78)
+    if N < 32 || N > 1024 {
+        write(2, "emit_amdgpu_softmax_causal_f32_N_blob: N must be in [32, 1024]\n", 64)
         return 1
     }
     uint64[8] args_desc
     _emit_softmax_causal_f32_body_N(args_desc, N)
-    uint64 lds_bytes = N * 4
+    uint64 Np = _round_up_pow2(N)
+    uint64 lds_bytes = Np * 4
     uint64 size = emit_amdgpu_code_object_lds("softmax_causal_f32", 18,
                                                asm_text_buf, asm_text_len,
                                                32, 8, 16, 16,

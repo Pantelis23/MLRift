@@ -91,7 +91,10 @@ fn main() {
     unsafe { *((kp + 16) as uint64) = k_m }
     unsafe { *((kp + 24) as uint64) = k_n }
 
-    err = hipModuleLaunchKernel(fh, M, 1, 1, N, 1, 1, 0, 0, kp, 0)
+    uint64 Np = 1
+    while Np < N { Np = Np << 1 }
+    uint32 block_x = Np
+    err = hipModuleLaunchKernel(fh, M, 1, 1, block_x, 1, 1, 0, 0, kp, 0)
     if err != 0 { die("launch", err) }
     err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
 

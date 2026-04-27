@@ -137,8 +137,12 @@ fn main() {
     unsafe { *((kp + 16) as uint64) = k_m }
     unsafe { *((kp + 24) as uint64) = k_n }
 
+    // Block = round_up_pow2(N) (Np). Padding lanes are identity-filled
+    // and gated out of the final store.
+    uint64 Np = 1
+    while Np < N { Np = Np << 1 }
     uint32 grid_x  = M
-    uint32 block_x = N
+    uint32 block_x = Np
 
     err = hipModuleLaunchKernel(fh, grid_x, 1, 1, block_x, 1, 1, 0, 0, kp, 0)
     if err != 0 { die("launch", err) }
