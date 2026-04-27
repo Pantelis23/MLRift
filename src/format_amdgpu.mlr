@@ -5714,6 +5714,11 @@ fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
     asm_u32(0xF4040300); asm_u32(0xF8000020)
     asm_u32(0xF4040380); asm_u32(0xF8000028)
     asm_u32(0xBF89FC07)
+    // gfx11 packs both X and Y workitem ids into v0 when rsrc2's
+    // ENABLE_VGPR_WORKITEM_ID = 1: v0[9:0] = tx, v0[19:10] = ty.
+    // v1 is NOT auto-loaded as ty (lesson hard-learned in N3 debug).
+    asm_u32(0xD6100001); asm_u32(0x02291500)   // v_bfe_u32 v1, v0, 10, 10  (extract ty)
+    asm_u32(0x360000FF); asm_u32(0x000003FF)   // v_and_b32 v0, 0x3FF, v0   (mask tx)
     // row=tile_row*16+ty, col=tile_col*16+tx (no divide; 2-D dispatch).
     asm_u32(0x84108403)                         // s_lshl_b32 s16, s3, 4
     asm_u32(0x84118402)                         // s_lshl_b32 s17, s2, 4
@@ -5812,13 +5817,18 @@ fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
 
     // rsrc1 with granulated_workitem_vgpr_count = 2 (24 vgprs allocated;
     // kernel uses v0..v18 = 19). LDS = 2048 bytes (2 KiB).
+    // rsrc1 0xE0AF0082 = vgpr_granulated=2 (24 vgprs alloc) +
+    // sgpr_granulated=2 (bits 6..9 = 2 → 24 sgprs alloc; kernel uses
+    // s0..s23). N2's 0xE0AF0001 had sgpr_granulated=0 (only 8 sgprs)
+    // and got away with using s14 — the heisenbug at 256/320/768 in
+    // N3 may have been the same shape of latent under-allocation
+    // since our LDS GEMM uses 24 sgprs.
     // rsrc2 = 0x99E enables WORKGROUP_ID_Y (bit 8) and VGPR workitem
-    // X+Y (bits 11-12 = 1) — the 2-D dispatch needs s3=blockIdx.y
-    // and v1=threadIdx.y preloaded by HW.
+    // X+Y (bits 11-12 = 1).
     uint64 size = emit_amdgpu_code_object_lds("gemm_f32_lds", 12,
                                                asm_text_buf, asm_text_len,
                                                48, 8, 24, 19,
-                                               0xE0AF0002, 0x0000099E, 0x00000010, 0x0408,
+                                               0xE0AF0082, 0x0000099E, 0x00000010, 0x0408,
                                                args_desc, 6,
                                                2048)
 
