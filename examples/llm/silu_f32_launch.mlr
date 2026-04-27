@@ -1,0 +1,219 @@
+// Launcher for silu_f32: pointwise y = x * sigmoid(x).
+// block=256, grid=ceil(N/256). N is variable (unlike softmax/layernorm).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/silu_f32.mlr        -o /tmp/silu_f32
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/silu_f32_launch.mlr -o /tmp/silu_f32_launch_kfd
+// Run:
+//   N=1024 /tmp/silu_f32_launch_kfd
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i; uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128); uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i; uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1; uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) { puts(msg); print_label_val("e", 1, code); exit(1) }
+
+fn parse_env_count(uint64 name) -> uint64 {
+    uint64 s = getenv(name)
+    if s == 0 { return 0 }
+    uint64 v = 0; uint64 i = 0
+    while 1 == 1 {
+        uint64 cp = s + i; uint64 c = 0
+        unsafe { *(cp as uint8) -> c }
+        if c == 0 { break }
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48); i = i + 1; continue }
+        break
+    }
+    return v
+}
+
+// Inline exp_f64 — avoids needing libm linkage. Range-reduce
+//   exp(x) = 2^k * exp(r),  k = round(x / ln2),  r = x - k*ln2
+// then Taylor-7 on r ∈ [-ln2/2, ln2/2]. 2^k via repeated *2.
+//
+// Branch on f64 sign rather than int64, since MLRift treats int64
+// comparisons as unsigned (so int64 < 0 never fires, hanging negative
+// inputs). Same reason we recompute |k| from the f64 directly.
+fn host_exp_f64(f64 x) -> f64 {
+    f64 LN2     = 0.6931471805599453
+    f64 INV_LN2 = 1.4426950408889634
+    f64 kf = x * INV_LN2
+    uint64 neg = 0
+    if kf < 0.0 { neg = 1; kf = 0.0 - kf }
+    kf = kf + 0.5    // round-toward-zero of the |kf|+0.5 gives nearest
+    uint64 ak = f64_to_int(kf)    // |k| as nonneg
+    f64 kd = int_to_f64(ak)
+    if neg != 0 { kd = 0.0 - kd }
+    f64 r = x - kd * LN2
+    // Taylor: 1 + r + r²/2 + r³/6 + r⁴/24 + r⁵/120 + r⁶/720 + r⁷/5040
+    f64 r2 = r * r
+    f64 r3 = r2 * r
+    f64 r4 = r2 * r2
+    f64 r5 = r4 * r
+    f64 r6 = r4 * r2
+    f64 r7 = r6 * r
+    f64 e_r = 1.0 + r
+                  + r2 * 0.5
+                  + r3 * 0.16666666666666666
+                  + r4 * 0.041666666666666664
+                  + r5 * 0.008333333333333333
+                  + r6 * 0.001388888888888889
+                  + r7 * 0.0001984126984126984
+    // 2^|k| via repeated mul, then invert if needed.
+    f64 two_ak = 1.0
+    uint64 i = 0
+    while i < ak { two_ak = two_ak * 2.0; i = i + 1 }
+    f64 two_k = two_ak
+    if neg != 0 { two_k = 1.0 / two_ak }
+    return two_k * e_r
+}
+
+// CPU reference: y = x / (1 + exp(-x)). Threshold 1e-3 relative is
+// generous enough for v_exp_f32 + v_rcp_f32 (~few ULP each at gfx11)
+// vs the host's Taylor-based exp.
+fn ref_silu(f32 x) -> f32 {
+    f64 xd = f32_to_f64(x)
+    f64 e = host_exp_f64(0.0 - xd)
+    f64 y = xd / (1.0 + e)
+    return f64_to_f32(y)
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 N = 1024
+    uint64 ne = parse_env_count("N"); if ne != 0 { N = ne }
+
+    uint64 fd = file_open("/tmp/silu_f32.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { puts("missing /tmp/silu_f32.co"); exit(1) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "silu_f32"); if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    uint64 bytes = N * 4
+    uint64 d_in = 0; uint64 d_out = 0
+    uint64 slot = alloc(8); err = hipMalloc(slot, bytes); if err != 0 { die("mIn",  err) }; unsafe { *(slot as uint64) -> d_in }
+    slot = alloc(8); err = hipMalloc(slot, bytes); if err != 0 { die("mOut", err) }; unsafe { *(slot as uint64) -> d_out }
+
+    // Sweep across negatives, zeros, positives covering the saturating
+    // tails. x ∈ [-8, +8] in steps so we hit sigmoid(±large)≈0/1 edges.
+    uint64 h_in = alloc(bytes)
+    uint64 i = 0
+    while i < N {
+        f64 t  = (int_to_f64(i) / int_to_f64(N - 1)) * 16.0 - 8.0
+        f32 v  = f64_to_f32(t)
+        uint64 p = h_in + i * 4
+        unsafe { *(p as f32) = v }
+        i = i + 1
+    }
+    err = hipMemcpy(d_in, h_in, bytes, 1); if err != 0 { die("H2D", err) }
+
+    uint64 k_in  = alloc(8); unsafe { *(k_in  as uint64) = d_in }
+    uint64 k_out = alloc(8); unsafe { *(k_out as uint64) = d_out }
+    uint64 k_n   = alloc(8); unsafe { *(k_n   as uint64) = N }
+    uint64 kp = alloc(3 * 8)
+    unsafe { *(kp        as uint64) = k_in }
+    unsafe { *((kp +  8) as uint64) = k_out }
+    unsafe { *((kp + 16) as uint64) = k_n }
+
+    uint32 grid_x  = (N + 255) / 256
+    uint32 block_x = 256
+
+    err = hipModuleLaunchKernel(fh, grid_x, 1, 1, block_x, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 h_out = alloc(bytes)
+    err = hipMemcpy(h_out, d_out, bytes, 2); if err != 0 { die("D2H", err) }
+
+    // Verify: |dev - ref| / max(|ref|, 1e-6) ≤ 1e-3. v_rcp_f32 is ~1ulp,
+    // v_exp_f32 is also ~1ulp at gfx11; combined error ≈ a few ulp at
+    // unit scale. Threshold 1e-3 is generous and catches gross bugs.
+    uint64 fail = 0
+    uint64 first_bad = 0xFFFFFFFFFFFFFFFF
+    uint32 first_bad_x_bits = 0
+    uint32 first_bad_ref_bits = 0
+    uint32 first_bad_dev_bits = 0
+    f32 thresh = 0.001
+    i = 0
+    while i < N {
+        uint64 ip = h_in + i * 4
+        f32 x = 0.0; unsafe { *(ip as f32) -> x }
+        f32 ref = ref_silu(x)
+        uint64 op = h_out + i * 4
+        f32 dev = 0.0; unsafe { *(op as f32) -> dev }
+
+        f32 d = ref - dev
+        if d < 0.0 { d = 0.0 - d }
+        f32 ar = ref
+        if ar < 0.0 { ar = 0.0 - ar }
+        f32 floor = 0.000001
+        if ar < floor { ar = floor }
+        f32 rel = d / ar
+
+        if rel > thresh {
+            fail = fail + 1
+            if first_bad == 0xFFFFFFFFFFFFFFFF {
+                first_bad = i
+                uint64 xb = alloc(4); unsafe { *(xb as f32) = x }
+                unsafe { *(xb as uint32) -> first_bad_x_bits }
+                uint64 rb = alloc(4); unsafe { *(rb as f32) = ref }
+                unsafe { *(rb as uint32) -> first_bad_ref_bits }
+                uint64 db = alloc(4); unsafe { *(db as f32) = dev }
+                unsafe { *(db as uint32) -> first_bad_dev_bits }
+            }
+        }
+        i = i + 1
+    }
+
+    print_label_val("N",                  1, N)
+    print_label_val("cells_failed",      12, fail)
+    print_label_val("first_bad_idx",     13, first_bad)
+    print_label_val("first_bad_x_bits",  16, first_bad_x_bits)
+    print_label_val("first_bad_ref_bits", 18, first_bad_ref_bits)
+    print_label_val("first_bad_dev_bits", 18, first_bad_dev_bits)
+
+    hipFree(d_in); hipFree(d_out)
+    exit(0)
+}

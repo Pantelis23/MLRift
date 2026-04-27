@@ -4657,6 +4657,18 @@ fn main() {
                 write(1, rn_path, rnl)
                 write(1, " (amdgpu rmsnorm-f32 code object)\n", 35)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-silu-f32=", 23) != 0 {
+                uint64 si_path = arg + 23
+                uint64 si_rc = emit_amdgpu_silu_f32_blob(si_path)
+                if si_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-silu-f32 failed\n", 37)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 sil = str_len(si_path)
+                write(1, si_path, sil)
+                write(1, " (amdgpu silu-f32 code object)\n", 32)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-softmax-f32=", 26) != 0 {
                 uint64 sx_path = arg + 26
                 uint64 sx_rc = emit_amdgpu_softmax_f32_blob(sx_path)
