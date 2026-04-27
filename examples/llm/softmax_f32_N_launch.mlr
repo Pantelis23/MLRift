@@ -137,10 +137,11 @@ fn main() {
     unsafe { *((kp + 16) as uint64) = k_m }
     unsafe { *((kp + 24) as uint64) = k_n }
 
-    // Block = round_up_pow2(N) (Np). Padding lanes are identity-filled
-    // and gated out of the final store.
+    // Block size: small-N uses round_up_pow2(N); large-N (>1024) uses
+    // 1024 with thread-coarsening inside the kernel.
     uint64 Np = 1
     while Np < N { Np = Np << 1 }
+    if Np > 1024 { Np = 1024 }
     uint32 grid_x  = M
     uint32 block_x = Np
 

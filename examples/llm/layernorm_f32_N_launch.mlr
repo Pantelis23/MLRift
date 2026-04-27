@@ -104,6 +104,7 @@ fn main() {
 
     uint64 Np = 1
     while Np < N { Np = Np << 1 }
+    if Np > 1024 { Np = 1024 }
     uint32 grid_x = M
     uint32 block_x = Np
     err = hipModuleLaunchKernel(fh, grid_x, 1, 1, block_x, 1, 1, 0, 0, kp, 0)

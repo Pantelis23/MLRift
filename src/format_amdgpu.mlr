@@ -910,6 +910,54 @@ fn _emit_store_gate(uint64 mask_sgpr, uint64 n_kernarg_sgpr) {
     asm_u32(0xBE800000 | ((mask_sgpr & 0x7F) << 16) | 0x2000 | (mask_sgpr & 0x7F))
 }
 
+// Build address pair v[lo:lo+1] = s[base_lo:base_lo+1] + v_off.  Used
+// by thread-coarsened kernels to (re)build chunk-0 addresses from
+// the saved byte-offset VGPR (typically v4).
+fn _emit_vpair_build_from_sbase(uint64 vp_lo, uint64 sgpr_lo, uint64 v_off) {
+    uint64 vp_hi = vp_lo + 1
+    uint64 sgpr_hi = sgpr_lo + 1
+    // v_mov_b32 v_hi, 0   — encoding 0x7E000280 | (vp_hi << 17)
+    asm_u32(0x7E000280 | ((vp_hi & 0xFF) << 17))
+    // v_add_co_u32 v_lo, vcc_lo, s_lo, v_off
+    //   0xD7006A00 | vp_lo,  src0=s_lo, src1=v_off
+    asm_u32(0xD7006A00 | (vp_lo & 0xFF))
+    asm_u32(((0x100 | (v_off & 0xFF)) << 9) | (sgpr_lo & 0xFF))
+    // v_add_co_ci_u32_e64 v_hi, null, s_hi, v_hi, vcc_lo
+    //   0xD5207C00 | vp_hi
+    asm_u32(0xD5207C00 | (vp_hi & 0xFF))
+    asm_u32((0x6A << 18) | ((0x100 | (vp_hi & 0xFF)) << 9) | (sgpr_hi & 0xFF))
+}
+
+// Compute v_pos VGPR = chunk_off + v0.  Used by thread-coarsened
+// causal attention to compute the global-element index for the mask.
+// VOP2 vdst occupies bits 23:17 (= vdst << 17); the existing prologue
+// pattern v_add_nc_u32 v1, s12, v0 = 0x4A02000C confirms byte 2 =
+// (vdst<<1) (& 0xFF), so we shift the vdst number by 17 bits.
+fn _emit_vpos_for_chunk(uint64 v_pos, uint64 chunk_off) {
+    if chunk_off == 0 {
+        // v_add_nc_u32 v_pos, 0, v0
+        asm_u32(0x4A000080 | ((v_pos & 0xFF) << 17))
+    } else {
+        // v_add_nc_u32 v_pos, lit, v0
+        asm_u32(0x4A0000FF | ((v_pos & 0xFF) << 17))
+        asm_u32(chunk_off)
+    }
+}
+
+// Causal mask injection (large-N variant): v10 = (v_pos > s15) ? -inf
+// : v10.  Uses v15 as identity scratch and sX as predicate sgpr.
+fn _emit_causal_mask_v10(uint64 mask_sgpr, uint64 v_pos) {
+    // v_cmp_lt_u32_e64 mask_sgpr, s15, v_pos
+    asm_u32(0xD4490000 | (mask_sgpr & 0x7F))
+    asm_u32(((0x100 | (v_pos & 0xFF)) << 9) | 0x0F)   // src0 = s15 (0x0F)
+    // v_mov_b32 v15, -inf
+    asm_u32(0x7E1E02FF)
+    asm_u32(0xFF800000)
+    // v_cndmask_b32_e64 v10, v10, v15, mask_sgpr
+    asm_u32(0xD501000A)
+    asm_u32(0x00021F0A | ((mask_sgpr & 0xFF) << 18))
+}
+
 // Bump a 64-bit VGPR pair (vp_lo:vp_lo+1) by a 32-bit immediate.
 // Used by thread-coarsened kernels to advance the in/out/gamma
 // addresses by 4096 (= 1024 lanes × 4 bytes) between chunks.
@@ -6883,23 +6931,147 @@ fn _emit_softmax_f32_body_N(uint64 args_desc, uint64 N) {
     uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
 }
 
-// Shape-parametric softmax_f32 .co emit. N in [32, 1024], any value
-// (round_up_pow2(N) ≤ 1024 = gfx11 max workgroup size).
+// Thread-coarsened softmax body for N > 1024.  Same template as
+// softmax_causal large-N but without the per-chunk causal mask.
+fn _emit_softmax_f32_body_NL(uint64 args_desc, uint64 N) {
+    asm_init()
+    uint64 K = (N + 1023) / 1024
+    uint64 last_chunk_size = N - (K - 1) * 1024
+    uint64 last_partial = 0
+    if last_chunk_size != 1024 { last_partial = 1 }
+
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBF09080F)
+    uint64 cbranch_dword_idx = asm_text_len / 4
+    asm_u32(0xBFA20000)
+    asm_u32(0x960C0A0F)
+    asm_u32(0x4A02000C)
+    asm_u32(0x30080282)
+    _emit_vpair_build_from_sbase(2, 4, 4)
+    _emit_vpair_build_from_sbase(12, 6, 4)
+    asm_u32(0x300C0082); asm_u32(0x7E120280)
+    asm_u32(0x7E0A02FF); asm_u32(0xFF800000)   // v5 = -inf
+
+    // PASS 1: max-reduce (no causal mask)
+    uint64 c = 0
+    while c < K {
+        if c > 0 { _emit_vpair_add_imm(2, 4096) }
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8C00FF); asm_u32(last_chunk_size)
+            _emit_gated_load_v10(12, 12, 0xFF800000)
+        } else {
+            asm_u32(0xDC520000); asm_u32(0x0A7C0002)
+            asm_u32(0xBF8903F7)
+        }
+        asm_u32(0x200A1505)             // v_max_f32 v5, v5, v10
+        c = c + 1
+    }
+    asm_u32(0xD8340000); asm_u32(0x00000506)
+    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
+    _emit_lds_reduce_pow2(1024, 0x200A0F05, 12)
+
+    asm_u32(0xD8D80000); asm_u32(0x08000009)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x7E260308)             // v19 = v8 (save max)
+    asm_u32(0xBFBD0000)
+    _emit_vpair_build_from_sbase(2, 4, 4)
+    asm_u32(0x7E0A0280)             // v5 = 0 for sum
+
+    // PASS 2: sum-of-exp
+    c = 0
+    while c < K {
+        if c > 0 { _emit_vpair_add_imm(2, 4096) }
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8C00FF); asm_u32(last_chunk_size)
+            _emit_gated_load_v10(12, 12, 0xFF800000)
+        } else {
+            asm_u32(0xDC520000); asm_u32(0x0A7C0002)
+            asm_u32(0xBF8903F7)
+        }
+        asm_u32(0x0816270A)             // diff = v10 - v19
+        asm_u32(0xBE8C00FF); asm_u32(0x3FB8AA3B)
+        asm_u32(0x1016160C)             // v11 *= log2e
+        asm_u32(0x7E164B0B)             // v11 = exp(v11)
+        asm_u32(0x060A1705)             // v5 += v11
+        c = c + 1
+    }
+    asm_u32(0xD8340000); asm_u32(0x00000506)
+    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
+    _emit_lds_reduce_pow2(1024, 0x060A0F05, 12)
+
+    asm_u32(0xD8D80000); asm_u32(0x08000009)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x7E105508)             // v_rcp_f32 v8, v8 (inv_sum)
+
+    _emit_vpair_build_from_sbase(2, 4, 4)
+    _emit_vpair_build_from_sbase(12, 6, 4)
+
+    // PASS 3: apply
+    c = 0
+    while c < K {
+        if c > 0 {
+            _emit_vpair_add_imm(2, 4096)
+            _emit_vpair_add_imm(12, 4096)
+        }
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8C00FF); asm_u32(last_chunk_size)
+            _emit_gated_load_v10(12, 12, 0xFF800000)
+        } else {
+            asm_u32(0xDC520000); asm_u32(0x0A7C0002)
+            asm_u32(0xBF8903F7)
+        }
+        asm_u32(0x0816270A)             // diff
+        asm_u32(0xBE8C00FF); asm_u32(0x3FB8AA3B)
+        asm_u32(0x1016160C)
+        asm_u32(0x7E164B0B)
+        asm_u32(0x100A110B)             // out = e * inv_sum
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8C00FF); asm_u32(last_chunk_size)
+            _emit_store_gate(12, 12)
+        }
+        asm_u32(0xDC6A0000); asm_u32(0x007C050C)
+        c = c + 1
+    }
+
+    asm_u32(0xBC7C0000); asm_u32(0xBFB00000)
+
+    uint64 total_dwords = asm_text_len / 4
+    uint64 simm16 = total_dwords - cbranch_dword_idx - 2
+    asm_patch_u32(cbranch_dword_idx, 0xBFA20000 | (simm16 & 0xFFFF))
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
 @export
 fn emit_amdgpu_softmax_f32_N_blob(uint64 out_path, uint64 N) -> uint64 {
-    if N < 32 || N > 1024 {
-        write(2, "emit_amdgpu_softmax_f32_N_blob: N must be in [32, 1024]\n", 56)
+    if N < 32 || N > 8192 {
+        write(2, "emit_amdgpu_softmax_f32_N_blob: N must be in [32, 8192]\n", 56)
         return 1
     }
     uint64[8] args_desc
-    _emit_softmax_f32_body_N(args_desc, N)
-    // LDS sized for the padded block (Np = round_up_pow2(N)).
-    uint64 Np = _round_up_pow2(N)
-    uint64 lds_bytes = Np * 4
+    uint64 lds_bytes = 0
+    if N <= 1024 {
+        _emit_softmax_f32_body_N(args_desc, N)
+        uint64 Np = _round_up_pow2(N)
+        lds_bytes = Np * 4
+    } else {
+        _emit_softmax_f32_body_NL(args_desc, N)
+        lds_bytes = 4096
+    }
+    uint64 rsrc1 = 0xE0AF0001
+    if N > 1024 { rsrc1 = 0xE0AF0002 }
     uint64 size = emit_amdgpu_code_object_lds("softmax_f32", 11,
                                                asm_text_buf, asm_text_len,
-                                               32, 8, 16, 16,
-                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               32, 8, 16, 20,
+                                               rsrc1, 0x0000009E, 0x00000010, 0x0408,
                                                args_desc, 4,
                                                lds_bytes)
     uint64 fd = file_open(out_path, 1)
@@ -7342,20 +7514,161 @@ fn _emit_layernorm_f32_body_N(uint64 args_desc, uint64 N) {
     uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
 }
 
+// Thread-coarsened layernorm body for N > 1024. Three passes (sum-of-x,
+// sum-of-(x-mean)², apply). Padding lanes in PASS 2 must contribute 0
+// to variance — gated load defaults v10 = 0, then `diff = -mean`
+// pollutes if not zeroed; we cndmask v11 (= diff) to 0 for padding
+// lanes before the diff² accumulate via v_fmac.
+fn _emit_layernorm_f32_body_NL(uint64 args_desc, uint64 N) {
+    asm_init()
+    uint64 K = (N + 1023) / 1024
+    uint64 last_chunk_size = N - (K - 1) * 1024
+    uint64 last_partial = 0
+    if last_chunk_size != 1024 { last_partial = 1 }
+    uint64 inv_n_bits = _f32_bits_recip(N)
+
+    // ── Prologue ────────────────────────────────────────────────────
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBF09080F)
+    uint64 cbranch_dword_idx = asm_text_len / 4
+    asm_u32(0xBFA20000)
+    asm_u32(0x960C0A0F)             // s_mul_i32 s12, s15, s10
+    asm_u32(0x4A02000C)
+    asm_u32(0x30080282)
+    _emit_vpair_build_from_sbase(2, 4, 4)
+    _emit_vpair_build_from_sbase(12, 6, 4)
+    asm_u32(0x300C0082); asm_u32(0x7E120280)
+    asm_u32(0x7E0A0280)             // v5 = 0
+
+    // ── PASS 1: sum-of-x ────────────────────────────────────────────
+    uint64 c = 0
+    while c < K {
+        if c > 0 { _emit_vpair_add_imm(2, 4096) }
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8C00FF); asm_u32(last_chunk_size)
+            _emit_gated_load_v10(12, 12, 0x00000000)
+        } else {
+            asm_u32(0xDC520000); asm_u32(0x0A7C0002)
+            asm_u32(0xBF8903F7)
+        }
+        asm_u32(0x060A1505)             // v_add_f32 v5, v5, v10
+        c = c + 1
+    }
+    asm_u32(0xD8340000); asm_u32(0x00000506)
+    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
+    _emit_lds_reduce_pow2(1024, 0x060A0F05, 12)
+
+    asm_u32(0xD8D80000); asm_u32(0x08000009)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBE8C00FF); asm_u32(inv_n_bits)
+    asm_u32(0x1010100C)             // v_mul_f32 v8, s12, v8 (mean)
+    asm_u32(0x7E260308)             // v19 = v8 (save mean)
+    asm_u32(0xBFBD0000)
+    _emit_vpair_build_from_sbase(2, 4, 4)
+    asm_u32(0x7E0A0280)             // v5 = 0
+
+    // ── PASS 2: sum-of-(x - mean)² ──────────────────────────────────
+    c = 0
+    while c < K {
+        if c > 0 { _emit_vpair_add_imm(2, 4096) }
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8C00FF); asm_u32(last_chunk_size)
+            _emit_gated_load_v10(12, 12, 0x00000000)
+        } else {
+            asm_u32(0xDC520000); asm_u32(0x0A7C0002)
+            asm_u32(0xBF8903F7)
+        }
+        asm_u32(0x0816270A)             // v11 = v10 - v19 (diff)
+        if c == K - 1 && last_partial != 0 {
+            // Zero out v11 for padding lanes (lane >= last_chunk_size).
+            // gated_load clobbered s12 with old-exec; re-load the
+            // last_chunk_size into s12 so the comparison is correct.
+            asm_u32(0xBE8C00FF); asm_u32(last_chunk_size)
+            asm_u32(0xD449000C); asm_u32(0x00001900)   // v_cmp_lt_u32_e64 s12, v0, s12
+            asm_u32(0xD501000B); asm_u32(0x00321680)   // v_cndmask v11, 0, v11, s12
+        }
+        // v_fmac_f32 v5, v11, v11  (v5 += v11²)
+        asm_u32(0x560A170B)
+        c = c + 1
+    }
+    asm_u32(0xD8340000); asm_u32(0x00000506)
+    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
+    _emit_lds_reduce_pow2(1024, 0x060A0F05, 12)
+
+    asm_u32(0xD8D80000); asm_u32(0x08000009)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBE8C00FF); asm_u32(inv_n_bits)
+    asm_u32(0x1010100C)             // v_mul_f32 v8, s12, v8 (variance)
+    asm_u32(0xBE8C00FF); asm_u32(0x3727C5AC)   // eps
+    asm_u32(0x0610100C)             // v_add_f32 v8, s12, v8 (var+eps)
+    asm_u32(0x7E105D08)             // v_rsq_f32 v8, v8 (inv_stddev)
+
+    _emit_vpair_build_from_sbase(2, 4, 4)
+    _emit_vpair_build_from_sbase(12, 6, 4)
+
+    // ── PASS 3: apply (out = (x - mean) * inv_stddev) ──────────────
+    c = 0
+    while c < K {
+        if c > 0 {
+            _emit_vpair_add_imm(2, 4096)
+            _emit_vpair_add_imm(12, 4096)
+        }
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8C00FF); asm_u32(last_chunk_size)
+            _emit_gated_load_v10(12, 12, 0x00000000)
+        } else {
+            asm_u32(0xDC520000); asm_u32(0x0A7C0002)
+            asm_u32(0xBF8903F7)
+        }
+        asm_u32(0x0816270A)             // v11 = v10 - v19 (diff)
+        asm_u32(0x100A110B)             // v_mul_f32 v5, v11, v8 (out)
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8C00FF); asm_u32(last_chunk_size)
+            _emit_store_gate(12, 12)
+        }
+        asm_u32(0xDC6A0000); asm_u32(0x007C050C)
+        c = c + 1
+    }
+
+    asm_u32(0xBC7C0000); asm_u32(0xBFB00000)
+
+    uint64 total_dwords = asm_text_len / 4
+    uint64 simm16 = total_dwords - cbranch_dword_idx - 2
+    asm_patch_u32(cbranch_dword_idx, 0xBFA20000 | (simm16 & 0xFFFF))
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
 @export
 fn emit_amdgpu_layernorm_f32_N_blob(uint64 out_path, uint64 N) -> uint64 {
-    if N < 32 || N > 1024 {
-        write(2, "emit_amdgpu_layernorm_f32_N_blob: N must be in [32, 1024]\n", 58)
+    if N < 32 || N > 8192 {
+        write(2, "emit_amdgpu_layernorm_f32_N_blob: N must be in [32, 8192]\n", 58)
         return 1
     }
     uint64[8] args_desc
-    _emit_layernorm_f32_body_N(args_desc, N)
-    uint64 Np = _round_up_pow2(N)
-    uint64 lds_bytes = Np * 4
+    uint64 lds_bytes = 0
+    if N <= 1024 {
+        _emit_layernorm_f32_body_N(args_desc, N)
+        uint64 Np = _round_up_pow2(N)
+        lds_bytes = Np * 4
+    } else {
+        _emit_layernorm_f32_body_NL(args_desc, N)
+        lds_bytes = 4096
+    }
+    uint64 rsrc1 = 0xE0AF0001
+    if N > 1024 { rsrc1 = 0xE0AF0002 }
     uint64 size = emit_amdgpu_code_object_lds("layernorm_f32", 13,
                                                asm_text_buf, asm_text_len,
-                                               32, 8, 16, 16,
-                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               32, 8, 16, 20,
+                                               rsrc1, 0x0000009E, 0x00000010, 0x0408,
                                                args_desc, 4,
                                                lds_bytes)
     uint64 fd = file_open(out_path, 1)
@@ -8706,20 +9019,184 @@ fn _emit_softmax_causal_f32_body_N(uint64 args_desc, uint64 N) {
     uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
 }
 
+// Thread-coarsened softmax_causal body for N > 1024. Same approach as
+// rmsnorm large-N: block fixed at 1024, K = ceil(N/1024) chunks per
+// lane, three passes over the row (max-reduce, sum-of-exp, apply).
+// Re-loads x in each pass (no caching).  Causal mask is computed
+// per-chunk from v_pos = chunk_off + v0.
+fn _emit_softmax_causal_f32_body_NL(uint64 args_desc, uint64 N) {
+    asm_init()
+    uint64 K = (N + 1023) / 1024
+    uint64 last_chunk_size = N - (K - 1) * 1024
+    uint64 last_partial = 0
+    if last_chunk_size != 1024 { last_partial = 1 }
+
+    // ── Prologue ────────────────────────────────────────────────────
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBF09080F)             // s_cmp_ge_u32 s15, s8 (m bound)
+    uint64 cbranch_dword_idx = asm_text_len / 4
+    asm_u32(0xBFA20000)             // s_cbranch_scc1 → .Lend (patched)
+    asm_u32(0x960C0A0F)             // s_mul_i32 s12, s15, s10 (row * n)
+    asm_u32(0x4A02000C)             // v_add_nc_u32 v1, s12, v0
+    asm_u32(0x30080282)             // v_lshlrev_b32 v4, 2, v1
+    _emit_vpair_build_from_sbase(2, 4, 4)    // v[2:3] = in_ptr + v4
+    _emit_vpair_build_from_sbase(12, 6, 4)   // v[12:13] = out_ptr + v4
+    asm_u32(0x300C0082)             // v_lshlrev_b32 v6, 2, v0
+    asm_u32(0x7E120280)             // v_mov_b32 v9, 0
+    // Initialise v5 = -inf for max-reduce.
+    asm_u32(0x7E0A02FF); asm_u32(0xFF800000)
+
+    // ── PASS 1: max-reduce with causal mask ────────────────────────
+    uint64 c = 0
+    while c < K {
+        if c > 0 { _emit_vpair_add_imm(2, 4096) }
+        // v_pos = c*1024 + v0  in v18
+        _emit_vpos_for_chunk(18, c * 1024)
+        // Load x (gated for last partial; default = -inf so masked
+        // padding lanes don't perturb the max).
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8C00FF); asm_u32(last_chunk_size)   // s12 = limit
+            _emit_gated_load_v10(12, 12, 0xFF800000)
+        } else {
+            asm_u32(0xDC520000); asm_u32(0x0A7C0002)
+            asm_u32(0xBF8903F7)
+        }
+        // Causal mask via v_pos > s15.
+        _emit_causal_mask_v10(12, 18)
+        // v5 = max(v5, v10)  → v_max_f32 v5, v5, v10 = 0x200A1505
+        asm_u32(0x200A1505)
+        c = c + 1
+    }
+
+    // ── LDS max-reduce tree at 1024 ─────────────────────────────────
+    asm_u32(0xD8340000); asm_u32(0x00000506)   // ds_store v6, v5
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    _emit_lds_reduce_pow2(1024, 0x200A0F05, 12)
+
+    // ── Broadcast max into v8, save to v19 (lives until PASS 3) ─────
+    asm_u32(0xD8D80000); asm_u32(0x08000009)   // ds_load v8, v9
+    asm_u32(0xBF89FC07)
+    asm_u32(0x7E260308)             // v_mov_b32 v19, v8
+    asm_u32(0xBFBD0000)             // s_barrier (release LDS)
+
+    // ── Rebuild v[2:3] for PASS 2 ──────────────────────────────────
+    _emit_vpair_build_from_sbase(2, 4, 4)
+
+    // ── Initialise v5 = 0 for sum-of-exp reduce ────────────────────
+    asm_u32(0x7E0A0280)             // v_mov_b32 v5, 0
+
+    // ── PASS 2: sum-of-exp reduce ──────────────────────────────────
+    c = 0
+    while c < K {
+        if c > 0 { _emit_vpair_add_imm(2, 4096) }
+        _emit_vpos_for_chunk(18, c * 1024)
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8C00FF); asm_u32(last_chunk_size)
+            _emit_gated_load_v10(12, 12, 0xFF800000)
+        } else {
+            asm_u32(0xDC520000); asm_u32(0x0A7C0002)
+            asm_u32(0xBF8903F7)
+        }
+        _emit_causal_mask_v10(12, 18)
+        // diff = v10 - v19 (= x - max)  → v_sub_f32 v11, v10, v19
+        asm_u32(0x0816270A)
+        // s12 = log2(e); v11 *= s12
+        asm_u32(0xBE8C00FF); asm_u32(0x3FB8AA3B)
+        asm_u32(0x1016160C)             // v_mul_f32 v11, s12, v11
+        // v11 = 2^v11 = exp(diff)
+        asm_u32(0x7E164B0B)
+        // v5 += v11  → v_add_f32 v5, v5, v11 = 0x060A1705
+        asm_u32(0x060A1705)
+        c = c + 1
+    }
+
+    // ── LDS sum-reduce tree at 1024 ────────────────────────────────
+    asm_u32(0xD8340000); asm_u32(0x00000506)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    _emit_lds_reduce_pow2(1024, 0x060A0F05, 12)
+
+    // ── Broadcast sum into v8, compute inv_sum = rcp(v8) ───────────
+    asm_u32(0xD8D80000); asm_u32(0x08000009)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x7E105508)             // v_rcp_f32 v8, v8
+
+    // ── Rebuild v[2:3] and v[12:13] for PASS 3 ─────────────────────
+    _emit_vpair_build_from_sbase(2, 4, 4)
+    _emit_vpair_build_from_sbase(12, 6, 4)
+
+    // ── PASS 3: apply (out = exp(diff) * inv_sum) ──────────────────
+    c = 0
+    while c < K {
+        if c > 0 {
+            _emit_vpair_add_imm(2, 4096)
+            _emit_vpair_add_imm(12, 4096)
+        }
+        _emit_vpos_for_chunk(18, c * 1024)
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8C00FF); asm_u32(last_chunk_size)
+            _emit_gated_load_v10(12, 12, 0xFF800000)
+        } else {
+            asm_u32(0xDC520000); asm_u32(0x0A7C0002)
+            asm_u32(0xBF8903F7)
+        }
+        _emit_causal_mask_v10(12, 18)
+        // Recompute e = exp((x - max)*log2e)
+        asm_u32(0x0816270A)
+        asm_u32(0xBE8C00FF); asm_u32(0x3FB8AA3B)
+        asm_u32(0x1016160C)
+        asm_u32(0x7E164B0B)
+        // out = e * inv_sum  → v_mul_f32 v5, v11, v8
+        asm_u32(0x100A110B)
+        if c == K - 1 && last_partial != 0 {
+            asm_u32(0xBE8C00FF); asm_u32(last_chunk_size)
+            _emit_store_gate(12, 12)
+        }
+        asm_u32(0xDC6A0000); asm_u32(0x007C050C)
+        c = c + 1
+    }
+
+    asm_u32(0xBC7C0000)
+    asm_u32(0xBFB00000)             // s_endpgm
+
+    uint64 total_dwords = asm_text_len / 4
+    uint64 simm16 = total_dwords - cbranch_dword_idx - 2
+    asm_patch_u32(cbranch_dword_idx, 0xBFA20000 | (simm16 & 0xFFFF))
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
 @export
 fn emit_amdgpu_softmax_causal_f32_N_blob(uint64 out_path, uint64 N) -> uint64 {
-    if N < 32 || N > 1024 {
-        write(2, "emit_amdgpu_softmax_causal_f32_N_blob: N must be in [32, 1024]\n", 64)
+    if N < 32 || N > 8192 {
+        write(2, "emit_amdgpu_softmax_causal_f32_N_blob: N must be in [32, 8192]\n", 64)
         return 1
     }
     uint64[8] args_desc
-    _emit_softmax_causal_f32_body_N(args_desc, N)
-    uint64 Np = _round_up_pow2(N)
-    uint64 lds_bytes = Np * 4
+    uint64 lds_bytes = 0
+    if N <= 1024 {
+        _emit_softmax_causal_f32_body_N(args_desc, N)
+        uint64 Np = _round_up_pow2(N)
+        lds_bytes = Np * 4
+    } else {
+        _emit_softmax_causal_f32_body_NL(args_desc, N)
+        lds_bytes = 4096
+    }
+    uint64 rsrc1 = 0xE0AF0001
+    if N > 1024 { rsrc1 = 0xE0AF0002 }
     uint64 size = emit_amdgpu_code_object_lds("softmax_causal_f32", 18,
                                                asm_text_buf, asm_text_len,
-                                               32, 8, 16, 16,
-                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               32, 8, 16, 20,
+                                               rsrc1, 0x0000009E, 0x00000010, 0x0408,
                                                args_desc, 4,
                                                lds_bytes)
     uint64 fd = file_open(out_path, 1)

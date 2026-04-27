@@ -93,6 +93,7 @@ fn main() {
 
     uint64 Np = 1
     while Np < N { Np = Np << 1 }
+    if Np > 1024 { Np = 1024 }
     uint32 block_x = Np
     err = hipModuleLaunchKernel(fh, M, 1, 1, block_x, 1, 1, 0, 0, kp, 0)
     if err != 0 { die("launch", err) }
@@ -133,6 +134,27 @@ fn main() {
     print_label_val("N", 1, N)
     print_label_val("rows_failed_sum", 15, fail_sum)
     print_label_val("rows_failed_mask", 16, fail_mask)
+    uint64 dbg_r = 0; uint64 dbg_c = 0; uint32 dbg_bits = 0; uint64 found = 0
+    r = 0
+    while r < M {
+        if found == 0 {
+            uint64 r_clamped2 = r; if r_clamped2 > N - 1 { r_clamped2 = N - 1 }
+            uint64 c2 = r_clamped2 + 1
+            while c2 < N {
+                if found == 0 {
+                    uint64 p = h_out + (r * N + c2) * 4
+                    uint64 vp = alloc(4); f32 v = 0.0; unsafe { *(p as f32) -> v }
+                    unsafe { *(vp as f32) = v }; uint32 vbits = 0; unsafe { *(vp as uint32) -> vbits }
+                    if vbits != 0 { dbg_r = r; dbg_c = c2; dbg_bits = vbits; found = 1 }
+                }
+                c2 = c2 + 1
+            }
+        }
+        r = r + 1
+    }
+    print_label_val("first_bad_r", 11, dbg_r)
+    print_label_val("first_bad_c", 11, dbg_c)
+    print_label_val("first_bad_bits", 14, dbg_bits)
 
     hipFree(d_in); hipFree(d_out)
     exit(0)
