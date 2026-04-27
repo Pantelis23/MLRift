@@ -1113,7 +1113,26 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         // Check if LHS is float-typed
         uint64 lhs_fk = ir_vreg_fkind_get(lhs)
         if lhs_fk != 0 {
-            // Float arithmetic
+            // Float arithmetic. Mirror the float-compare fix: f32 OP f64 in
+            // the same expression must share an fkind, otherwise the f32
+            // ADDSS/SUBSS/MULSS/DIVSS reads only the low 32 bits of the
+            // f64 bit pattern in the GPR and silently zeros operands like
+            // 1.0/2.0 (whose low 32 bits are 0). Widen the narrower side
+            // to f64 — VarDecl/Assign narrow back to f32 if the LHS was
+            // declared f32 (see vd_fk==2 && fk_from_val==1 path).
+            uint64 rhs_fk = ir_vreg_fkind_get(rhs)
+            if lhs_fk == 2 && rhs_fk == 1 {
+                uint64 lhs_w = ir_new_vreg()
+                ir_emit(IR_F32TOF64, lhs_w, lhs, 0, 0, ir_current_bb)
+                ir_vreg_fkind_set(lhs_w, 1)
+                lhs = lhs_w
+                lhs_fk = 1
+            } else if lhs_fk == 1 && rhs_fk == 2 {
+                uint64 rhs_w = ir_new_vreg()
+                ir_emit(IR_F32TOF64, rhs_w, rhs, 0, 0, ir_current_bb)
+                ir_vreg_fkind_set(rhs_w, 1)
+                rhs = rhs_w
+            }
             uint64 ir_op = IR_FADD
             if op_kind == 30 || op_kind == 45 { ir_op = IR_FADD }   // + +=
             if op_kind == 31 || op_kind == 46 { ir_op = IR_FSUB }   // - -=
@@ -3008,7 +3027,25 @@ fn ir_lower_stmt(uint64 node) {
                     ir_emit(IR_ITOF, f64v, val, 0, 0, ir_current_bb)
                     ir_vreg_fkind_set(f64v, 1)
                     val = f64v
+                    val_fk = 1
                 }
+            }
+            // f64 → f32 narrow for `f32_var = f64_expr`. Mirrors VarDecl.
+            // Without this, `f32 t = 0.0; t = a - 1.0` would alias t to
+            // an f64 vreg (after the BinOp widen-to-f64 fix), and reading
+            // t back through anything assuming f32 bit layout reads garbage.
+            if lhs_fk == 2 && val_fk == 1 {
+                uint64 f32v = ir_new_vreg()
+                ir_emit(IR_F64TOF32, f32v, val, 0, 0, ir_current_bb)
+                ir_vreg_fkind_set(f32v, 2)
+                val = f32v
+            }
+            // Symmetric f32 → f64 widen for `f64_var = f32_expr`.
+            if lhs_fk == 1 && val_fk == 2 {
+                uint64 f64v = ir_new_vreg()
+                ir_emit(IR_F32TOF64, f64v, val, 0, 0, ir_current_bb)
+                ir_vreg_fkind_set(f64v, 1)
+                val = f64v
             }
             ir_var_set(name_tok, val)
             return

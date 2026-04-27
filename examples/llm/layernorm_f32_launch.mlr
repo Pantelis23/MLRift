@@ -152,15 +152,12 @@ fn main() {
         }
         f32 row_var = row_sumsq * inv_n
 
-        f32 zero = 0.0
-        f32 one  = 1.0
         f32 mean_d = row_mean
-        if mean_d < zero { mean_d = zero - mean_d }
-        f32 var_d = row_var - one
-        if var_d < zero { var_d = zero - var_d }
+        if mean_d < 0.0 { mean_d = 0.0 - mean_d }
+        f32 var_d = row_var - 1.0
+        if var_d < 0.0 { var_d = 0.0 - var_d }
 
-        f32 thresh = 0.01
-        if mean_d > thresh || var_d > thresh {
+        if mean_d > 0.01 || var_d > 0.01 {
             fail = fail + 1
             if first_bad == 0xFFFFFFFFFFFFFFFF {
                 first_bad = r

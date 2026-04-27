@@ -135,11 +135,9 @@ fn main() {
             row_sum = row_sum + v
             c = c + 1
         }
-        f32 one = 1.0
-        f32 d = row_sum - one
+        f32 d = row_sum - 1.0
         if d < 0.0 { d = 0.0 - d }
-        f32 thresh = 0.01
-        if d > thresh {
+        if d > 0.01 {
             fail = fail + 1
             if first_bad == 0xFFFFFFFFFFFFFFFF {
                 first_bad = r
