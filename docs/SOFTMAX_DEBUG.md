@@ -49,23 +49,63 @@ s_barrier
    bounds-check + n-multiplier were wrong. After fix, ALL rows fail
    (was: row 0 only).
 
+## Second debug pass (2026-04-27, also reverted)
+
+Built five progressively simpler probes that replaced the kernel body
+while keeping the same KD setup (group_segment_fixed_size=1024,
+kt_push_lds, rsrc1=0xE0AF0041, rsrc2=0x009E):
+
+- probe1: full max-reduce, no exp/sum — out = 0 everywhere
+- probe2: pure passthrough (no LDS at all) — **works**, out[i]=in[i]
+- probe3: lane k writes tid as f32 to LDS[tid], reads LDS[(255-tid)*4]
+  — out = 0 everywhere
+- probe4: only lane 0 writes 0xCAFEBABE to LDS[0] (saveexec dance),
+  all lanes broadcast-read — out = 0 everywhere
+- probe5: ALL lanes write 0xCAFEBABE to LDS[0] (no gating), broadcast
+  read — out = 0 everywhere
+
+**Bug found:** the AMDGPU metadata note (NT_AMDGPU_METADATA in .note)
+hardcodes `.group_segment_fixed_size: 0` regardless of what KD says.
+At line 436 of `amd_emit_metadata_body`. The runtime trusts this note
+over KD for LDS allocation, so even though KD reserves 1024 bytes the
+actual LDS region is 0.
+
+**Fix:** read group_segment_size from kt entry (field index 13) and
+emit it in metadata.
+
+**Why N3 LDS still works without the fix:** unclear — N3 has an
+identical layer-cake (kt_push_lds + group_segment=2048 in KD + 0 in
+metadata) and produces correct results most of the time. Either the
+runtime falls back to KD when metadata says 0, or the heisenbug pattern
+that hit 256/320/768³ in the past is the SAME bug just less obvious.
+
+**State at end of session 2:** applied the metadata fix and verified
+the .co's note now says 1024. But probe5 still produced out=0 — and
+N3 LDS GEMM also regressed (max_abs ≈ 0x7F7FFFFF). Then verified the
+N3 regression existed on a clean tree too — sclk reads `0 MHz` from
+sysfs, GPU is in deep-sleep state. Reverted all debug changes; the
+softmax kernel + metadata fix are not committed.
+
 ## Things NOT tried — start here next session
 
-1. **Probe what max-reduce actually produces** — modify the kernel to
-   write `max_value` to `out[row, 0]` (skip the exp/sum chain). If
-   max is correct, bug is in exp or sum-reduce. If max is junk, bug
-   is in max-reduce.
-2. **Add `buffer_gl0_inv` after each `s_barrier`** — N3 LDS GEMM
-   needed this; LDS-only ops technically shouldn't, but RDNA3 has
-   surprising ordering quirks.
-3. **Verify lane 0 actually reads LDS[0] correctly** — the broadcast
-   read uses `v9 = 0` as the addr; check this isn't getting clobbered
-   between the reduction and the broadcast read.
-4. **Use `s_barrier_signal` + `s_barrier_wait` (gfx11 split form)**
-   instead of plain `s_barrier`.
-5. **Single-wave version (block=32, n=32)** — sidesteps cross-wave
-   barriers entirely; if that works, the multi-wave LDS sync is the
-   issue.
+The core finding from session 2 is that **LDS round-trip itself fails**
+in the current setup even at the most reduced probe (probe5), despite
+group_segment in KD = 1024. So before debugging softmax-specific logic,
+fix the LDS infrastructure. Order of operations:
+
+1. **Re-test the probes when GPU is in a healthy clock state** — at
+   end of session 2 sclk read 0 MHz and N3 LDS GEMM also regressed.
+   Force the GPU into known-good state first (`scripts/mlrift-gpu-perf-mode.sh
+   high` with sudo, or run a long workload to wake it). Re-run probe5;
+   if 0xCAFEBABE comes through, the metadata fix alone resolves it.
+2. **Apply the metadata fix permanently** — `amd_emit_metadata_body` at
+   line 436 reads `group_seg_sz` from kt entry index 13 and emits via
+   `mp_uint`. The fix is one line. Once probe5 works, audit N3/N4 for
+   regression (N3 had heisenbug history that may be the same bug).
+3. **Then proceed to the original "things not tried" list:**
+   probe-max-only (write LDS[0] to out, skip exp/sum), buffer_gl0_inv
+   placement, lane-0 broadcast read with explicit zero VGPR, gfx11
+   split barrier (s_barrier_signal/wait), single-wave version.
 
 ## Files (all reverted)
 
