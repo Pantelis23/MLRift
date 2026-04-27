@@ -4633,6 +4633,21 @@ fn main() {
                 write(1, gl_path, gll)
                 write(1, " (amdgpu gemm-f32-lds code object)\n", 35)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-gemm-f16f32=", 26) != 0 {
+                // LLM Phase A milestone 4 native-emit (task #71).
+                // f16-storage GEMM with f32 accumulator. Same 16x16
+                // LDS-tiled shape as N3, with f16 loads + f32 cvt.
+                uint64 gh_path = arg + 26
+                uint64 gh_rc = emit_amdgpu_gemm_f16f32_blob(gh_path)
+                if gh_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-gemm-f16f32 failed\n", 39)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 ghl = str_len(gh_path)
+                write(1, gh_path, ghl)
+                write(1, " (amdgpu gemm-f16f32 code object)\n", 34)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-gemm-f32-lds-debug=", 33) != 0 {
                 // Debug variant: same KD, but kernel body just stores 1.0.
                 uint64 gd_path = arg + 33

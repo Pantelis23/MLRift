@@ -5849,6 +5849,143 @@ fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
     return 0
 }
 
+// LLM Phase A milestone 4 — gemm f16 storage, f32 accum, native-emit.
+// Identical structure to N3 (16x16 LDS-tiled, 2-D dispatch) except:
+//   - A and B are f16 in global memory (2 bytes/element, not 4).
+//   - global_load_d16_b16 reads f16; v_cvt_f32_f16 converts to f32.
+//   - LDS still holds f32 (2 KiB layout unchanged from N3).
+//   - C output is f32 (store unchanged).
+//   - Address arithmetic for A/B: lshlrev_b64 by 1 (×2) instead of 2 (×4).
+@export
+fn emit_amdgpu_gemm_f16f32_blob(uint64 out_path) -> uint64 {
+    asm_init()
+    // Kernarg load.
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)
+    asm_u32(0xF4040300); asm_u32(0xF8000020)
+    asm_u32(0xF4040380); asm_u32(0xF8000028)
+    asm_u32(0xBF89FC07)
+    // Extract ty/tx from packed v0.
+    asm_u32(0xD6100001); asm_u32(0x02291500)   // v_bfe_u32 v1, v0, 10, 10
+    asm_u32(0x360000FF); asm_u32(0x000003FF)   // v_and_b32 v0, 0x3FF, v0
+    // row, col.
+    asm_u32(0x84108403)                         // s_lshl_b32 s16, s3, 4
+    asm_u32(0x84118402)                         // s_lshl_b32 s17, s2, 4
+    asm_u32(0x4A060210)                         // v_add_nc_u32 v3, s16, v1
+    asm_u32(0x4A080011)                         // v_add_nc_u32 v4, s17, v0
+    // Bounds.
+    asm_u32(0xBE82007E)
+    asm_u32(0x7C98060A)
+    asm_u32(0x8B7E6A7E)
+    asm_u32(0x7C98080C)
+    asm_u32(0x8B7E6A7E)
+    asm_u32(0xBFA5005A)                         // s_cbranch_execz +90 → .Lend
+    // num_kt, sum, kt counter.
+    asm_u32(0x8512840E)                         // s_lshr_b32 s18, s14, 4
+    asm_u32(0x7E0C0280)                         // v_mov_b32 v6, 0
+    asm_u32(0xBE930080)                         // s_mov_b32 s19, 0
+    // LDS write idx (BYTES) = (ty*16 + tx) * 4.
+    asm_u32(0x300A0284)                         // v_lshlrev_b32 v5, 4, v1
+    asm_u32(0x4A0A0105)                         // v_add_nc_u32 v5, v5, v0
+    asm_u32(0x300A0A82)                         // v_lshlrev_b32 v5, 2, v5
+    // LDS read base.
+    asm_u32(0x30220286)                         // v_lshlrev_b32 v17, 6, v1
+    asm_u32(0x30240082)                         // v_lshlrev_b32 v18, 2, v0
+    asm_u32(0xD5250012); asm_u32(0x0001FF12); asm_u32(0x00000400)
+    asm_u32(0xBF068012)
+    asm_u32(0xBFA20040)                         // s_cbranch_scc1 +64 → .Lstore
+    // .Lkt_loop:
+    asm_u32(0x84148413)                         // s_lshl_b32 s20, s19, 4
+    asm_u32(0x4A0E0014)                         // v_add_nc_u32 v7, s20, v0
+    asm_u32(0xD72C0008); asm_u32(0x00001D03)   // v_mul_lo_u32 v8, v3, s14
+    asm_u32(0x4A100F08)                         // v_add_nc_u32 v8, v8, v7
+    asm_u32(0x7E120280)                         // v_mov_b32 v9, 0
+    asm_u32(0xD73C0008); asm_u32(0x00021081)   // v_lshlrev_b64 v[8:9], 1, v[8:9]  (×2 for f16)
+    asm_u32(0xD7006A08); asm_u32(0x00021004)
+    asm_u32(0xD5207C09); asm_u32(0x01AA1205)
+    asm_u32(0xBF870001)                         // s_delay_alu instid0(VALU_DEP_1)
+    asm_u32(0xDC820000); asm_u32(0x0A7C0008)   // global_load_d16_b16 v10, v[8:9], off
+    asm_u32(0x4A160214)                         // v_add_nc_u32 v11, s20, v1
+    asm_u32(0xD72C000C); asm_u32(0x0000190B)
+    asm_u32(0x4A18090C)
+    asm_u32(0x7E1A0280)
+    asm_u32(0xD73C000C); asm_u32(0x00021881)   // v_lshlrev_b64 v[12:13], 1, v[12:13]
+    asm_u32(0xD7006A0C); asm_u32(0x00021806)
+    asm_u32(0xD5207C0D); asm_u32(0x01AA1A07)
+    asm_u32(0xBF870001)                         // s_delay_alu instid0(VALU_DEP_1)
+    asm_u32(0xDC820000); asm_u32(0x0E7C000C)   // global_load_d16_b16 v14, v[12:13], off
+    asm_u32(0xBF8903F7)                         // s_waitcnt vmcnt(0)
+    asm_u32(0x7E14170A)                         // v_cvt_f32_f16 v10, v10
+    asm_u32(0x7E1C170E)                         // v_cvt_f32_f16 v14, v14
+    asm_u32(0xBF870001)                         // s_delay_alu instid0(VALU_DEP_1) — covers cvt → ds_store
+    asm_u32(0xD8340000); asm_u32(0x00000A05)   // ds_store_b32 v5, v10
+    asm_u32(0xD8340400); asm_u32(0x00000E05)   // ds_store_b32 v5, v14, offset:1024
+    asm_u32(0xBF89FC07)                         // s_waitcnt lgkmcnt(0)
+    asm_u32(0xBFBD0000)                         // s_barrier
+    asm_u32(0xE0AC0000); asm_u32(0x00000000)   // buffer_gl0_inv
+    asm_u32(0xBE940080)                         // s_mov_b32 s20, 0
+    asm_u32(0x7E1E0311)                         // v_mov_b32 v15, v17
+    asm_u32(0x7E200312)                         // v_mov_b32 v16, v18
+    // .Linner:
+    asm_u32(0xBF870002)                         // s_delay_alu instid0(VALU_DEP_2)
+    asm_u32(0xD8D80000); asm_u32(0x0900000F)   // ds_load_b32 v9, v15
+    asm_u32(0xD8D80000); asm_u32(0x0A000010)   // ds_load_b32 v10, v16
+    asm_u32(0xBF89FC07)                         // s_waitcnt lgkmcnt(0)
+    asm_u32(0x560C1509)                         // v_fmac_f32 v6, v9, v10
+    asm_u32(0xD525000F); asm_u32(0x0001090F)   // v_add_nc_u32 v15, v15, 4
+    asm_u32(0xD5250010); asm_u32(0x00018110)   // v_add_nc_u32 v16, v16, 64
+    asm_u32(0x80148114)
+    asm_u32(0xBF0A9014)
+    asm_u32(0xBFA2FFF2)                         // s_cbranch_scc1 -14 → .Linner
+    // Barrier + outer increment.
+    asm_u32(0xBFBD0000)
+    asm_u32(0xE0AC0000); asm_u32(0x00000000)
+    asm_u32(0x80138113)
+    asm_u32(0xBF0A1213)
+    asm_u32(0xBFA2FFC0)                         // s_cbranch_scc1 -64 → .Lkt_loop
+    // .Lstore: c is f32 (×4 stride).
+    asm_u32(0xD72C0008); asm_u32(0x00001903)
+    asm_u32(0x4A100908)
+    asm_u32(0x7E120280)
+    asm_u32(0xD73C0008); asm_u32(0x00021082)   // v_lshlrev_b64 v[8:9], 2, v[8:9] (×4 for f32 C)
+    asm_u32(0xD7006A08); asm_u32(0x00021008)
+    asm_u32(0xD5207C09); asm_u32(0x01AA1209)
+    asm_u32(0xDC6A0000); asm_u32(0x007C0608)
+    asm_u32(0xBC7C0000)
+    // .Lend:
+    asm_u32(0xBFB00000)
+
+    // 6 args: same as N3 (3 GLOBAL_BUFFER + 3 BY_VALUE).
+    uint64[12] args_desc
+    uint64 a0  = args_desc + 0;   unsafe { *(a0  as uint64) = 8 }
+    uint64 a1  = args_desc + 8;   unsafe { *(a1  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2  = args_desc + 16;  unsafe { *(a2  as uint64) = 8 }
+    uint64 a3  = args_desc + 24;  unsafe { *(a3  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4  = args_desc + 32;  unsafe { *(a4  as uint64) = 8 }
+    uint64 a5  = args_desc + 40;  unsafe { *(a5  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6  = args_desc + 48;  unsafe { *(a6  as uint64) = 8 }
+    uint64 a7  = args_desc + 56;  unsafe { *(a7  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a8  = args_desc + 64;  unsafe { *(a8  as uint64) = 8 }
+    uint64 a9  = args_desc + 72;  unsafe { *(a9  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a10 = args_desc + 80;  unsafe { *(a10 as uint64) = 8 }
+    uint64 a11 = args_desc + 88;  unsafe { *(a11 as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    uint64 size = emit_amdgpu_code_object_lds("gemm_f16f32", 11,
+                                               asm_text_buf, asm_text_len,
+                                               48, 8, 24, 19,
+                                               0xE0AF0082, 0x0000099E, 0x00000010, 0x0408,
+                                               args_desc, 6,
+                                               2048)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_gemm_f16f32_blob: cannot open output\n", 49)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 // Debug variant of N3: identical KD/dispatch/bounds, but the kernel
 // body just stores 1.0 (0x3F800000) to C[row, col]. If output cells
 // fail to receive 1.0, the bug is in dispatch/store, not LDS.
