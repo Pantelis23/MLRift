@@ -1,11 +1,12 @@
-// MLRift LLM end-to-end forward driver — FULL block: embedding →
-// attention → MLP → final norm → LM head → argmax.  21 kernel
-// launches chained on-device, token IDs in → token IDs out.
-// Includes device-side K^T transpose (no host roundtrip).
+// MLRift LLM end-to-end forward driver — FULL block with MULTI-HEAD
+// attention: embedding → multi-head attention → MLP → final norm →
+// LM head → argmax.  56 kernel launches chained on-device at
+// HEADS=4, token IDs in → token IDs out.  Device-side K^T transpose
+// per-head; head_extract / head_insert plumbing for the per-head loop.
 //
-// Single-head attention (HEADS=1, HD=HIDDEN) for demo simplicity;
-// multi-head requires per-head loop or batched gemm — open follow-up.
-// K^T is computed via the native device transpose kernel.
+// Multi-head attention (HEADS=4, HD=256, HIDDEN=1024); per-head
+// dispatch loop with head_extract / head_insert plumbing.  K^T per
+// head is computed via the native device transpose kernel.
 //
 // Forward pipeline:
 //   x       = embedding_lookup(token_ids, W_embed)     [SEQ, H]
@@ -108,7 +109,9 @@ fn main() {
     uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
 
     uint64 SEQ    = 32                  // softmax_causal pow2 N min
-    uint64 HIDDEN = 1024                // = embedding D cap; HEADS=1 so HD=HIDDEN
+    uint64 HIDDEN = 1024                // = embedding D cap
+    uint64 HEADS  = 4
+    uint64 HD     = 256                 // HEADS * HD == HIDDEN
     uint64 INTER  = 2048                // MLP intermediate
     uint64 VOCAB  = 4096                // demo vocab; argmax handles any V
 
@@ -121,6 +124,8 @@ fn main() {
     uint64 fh_resadd  = load_kernel("/tmp/residual_add_f32.co",      "residual_add_f32")
     uint64 fh_argmax  = load_kernel("/tmp/argmax_logits_f32.co",     "argmax_logits_f32")
     uint64 fh_trans   = load_kernel("/tmp/transpose_f32.co",         "transpose_f32")
+    uint64 fh_ext     = load_kernel("/tmp/head_extract_f32.co",      "head_extract_f32")
+    uint64 fh_ins     = load_kernel("/tmp/head_insert_f32.co",       "head_insert_f32")
 
     uint64 tok_bytes      = SEQ * 4
     uint64 act_bytes      = SEQ * HIDDEN * 4
@@ -134,12 +139,16 @@ fn main() {
     uint64 W_emb_bytes    = VOCAB * HIDDEN * 4
     uint64 gamma_bytes    = HIDDEN * 4
     uint64 K_T_bytes      = HIDDEN * SEQ * 4
+    uint64 head_bytes     = SEQ * HD * 4
+    uint64 head_T_bytes   = HD * SEQ * 4
 
     // === Allocate device buffers ===
     uint64 d_tok = 0; uint64 d_W_embed = 0
     uint64 d_x = 0; uint64 d_resid = 0; uint64 d_x_n = 0
     uint64 d_Q = 0; uint64 d_K = 0; uint64 d_Vv = 0
     uint64 d_K_T = 0
+    uint64 d_Q_h = 0; uint64 d_K_h = 0; uint64 d_V_h = 0
+    uint64 d_K_h_T = 0; uint64 d_ctx_h = 0
     uint64 d_scores = 0; uint64 d_attn = 0; uint64 d_ctx = 0
     uint64 d_att_out = 0
     uint64 d_gate = 0; uint64 d_up = 0; uint64 d_ffn = 0; uint64 d_x_proj = 0
@@ -158,6 +167,11 @@ fn main() {
     slot = alloc(8); err = hipMalloc(slot, act_bytes);    if err != 0 { die("mK", err) };     unsafe { *(slot as uint64) -> d_K }
     slot = alloc(8); err = hipMalloc(slot, act_bytes);    if err != 0 { die("mV", err) };     unsafe { *(slot as uint64) -> d_Vv }
     slot = alloc(8); err = hipMalloc(slot, K_T_bytes);    if err != 0 { die("mKt", err) };    unsafe { *(slot as uint64) -> d_K_T }
+    slot = alloc(8); err = hipMalloc(slot, head_bytes);   if err != 0 { die("mQh", err) };    unsafe { *(slot as uint64) -> d_Q_h }
+    slot = alloc(8); err = hipMalloc(slot, head_bytes);   if err != 0 { die("mKh", err) };    unsafe { *(slot as uint64) -> d_K_h }
+    slot = alloc(8); err = hipMalloc(slot, head_bytes);   if err != 0 { die("mVh", err) };    unsafe { *(slot as uint64) -> d_V_h }
+    slot = alloc(8); err = hipMalloc(slot, head_T_bytes); if err != 0 { die("mKhT", err) };   unsafe { *(slot as uint64) -> d_K_h_T }
+    slot = alloc(8); err = hipMalloc(slot, head_bytes);   if err != 0 { die("mCh", err) };    unsafe { *(slot as uint64) -> d_ctx_h }
     slot = alloc(8); err = hipMalloc(slot, scores_bytes); if err != 0 { die("mSc", err) };    unsafe { *(slot as uint64) -> d_scores }
     slot = alloc(8); err = hipMalloc(slot, scores_bytes); if err != 0 { die("mAt", err) };    unsafe { *(slot as uint64) -> d_attn }
     slot = alloc(8); err = hipMalloc(slot, act_bytes);    if err != 0 { die("mCt", err) };    unsafe { *(slot as uint64) -> d_ctx }
@@ -284,68 +298,113 @@ fn main() {
     unsafe { *(kp_v as uint64) = v_a }; unsafe { *((kp_v+8) as uint64) = v_b }; unsafe { *((kp_v+16) as uint64) = v_c }; unsafe { *((kp_v+24) as uint64) = v_m }; unsafe { *((kp_v+32) as uint64) = v_n }; unsafe { *((kp_v+40) as uint64) = v_k }
     err = hipModuleLaunchKernel(fh_gemm, grid_qkv, 1, 1, 256, 1, 1, 0, 0, kp_v, 0); if err != 0 { die("L gemm V", err) } 
 
-    // 6. scale Q by 1/sqrt(HIDDEN).  HIDDEN=1024 → scalar = 1/32 = 0.03125 (f32: 0x3D000000).
-    f32 inv_sqrt_h = 0.03125
-    uint64 isb = alloc(4); unsafe { *(isb as f32) = inv_sqrt_h }
-    uint32 inv_sqrt_h_bits = 0; unsafe { *(isb as uint32) -> inv_sqrt_h_bits }
-    uint64 sc_buf = alloc(8); unsafe { *(sc_buf as uint64) = d_Q }
-    uint64 sc_n   = alloc(8); unsafe { *(sc_n   as uint64) = SEQ * HIDDEN }
-    uint64 sc_f   = alloc(8); uint64 fb = inv_sqrt_h_bits; unsafe { *(sc_f as uint64) = fb }
-    uint64 kp_sc = alloc(3 * 8)
-    unsafe { *(kp_sc as uint64) = sc_buf }; unsafe { *((kp_sc+8) as uint64) = sc_n }; unsafe { *((kp_sc+16) as uint64) = sc_f }
-    uint32 grid_sc = (SEQ * HIDDEN + 255) / 256
-    err = hipModuleLaunchKernel(fh_scale, grid_sc, 1, 1, 256, 1, 1, 0, 0, kp_sc, 0); if err != 0 { die("L scale", err) } 
+    // === 6. Per-head attention loop ===
+    // For each head h in [0..HEADS):
+    //   Q_h, K_h, V_h = head_extract(Q/K/V, h)            [SEQ, HD]
+    //   Q_h         *= 1/sqrt(HD)                         (scale)
+    //   K_h_T       = transpose(K_h)                      [HD, SEQ]
+    //   scores      = Q_h @ K_h_T                         [SEQ, SEQ]
+    //   attn        = softmax_causal(scores)              [SEQ, SEQ]
+    //   ctx_h       = attn @ V_h                          [SEQ, HD]
+    //   head_insert(ctx_h, h) → d_ctx                     [SEQ, HEADS*HD]
+    // HD=256 → 1/sqrt(HD) = 1/16 = 0.0625 (f32: 0x3D800000).
+    f32 inv_sqrt_hd = 0.0625
+    uint64 isb = alloc(4); unsafe { *(isb as f32) = inv_sqrt_hd }
+    uint32 inv_sqrt_hd_bits = 0; unsafe { *(isb as uint32) -> inv_sqrt_hd_bits }
 
-    // 7. K^T = transpose(K)  — device-side kernel, no host roundtrip.
-    //    transpose_f32 args: (in, out, M, N) with output [N, M].
-    //    K is [SEQ, HIDDEN] → K^T is [HIDDEN, SEQ].
-    uint64 t_in  = alloc(8); unsafe { *(t_in  as uint64) = d_K }
-    uint64 t_out = alloc(8); unsafe { *(t_out as uint64) = d_K_T }
-    uint64 t_m   = alloc(8); unsafe { *(t_m   as uint64) = SEQ }
-    uint64 t_n   = alloc(8); unsafe { *(t_n   as uint64) = HIDDEN }
-    uint64 kp_t = alloc(4 * 8)
-    unsafe { *(kp_t        as uint64) = t_in }
-    unsafe { *((kp_t +  8) as uint64) = t_out }
-    unsafe { *((kp_t + 16) as uint64) = t_m }
-    unsafe { *((kp_t + 24) as uint64) = t_n }
-    uint32 grid_t = ((SEQ + 15) / 16) * ((HIDDEN + 15) / 16)
-    err = hipModuleLaunchKernel(fh_trans, grid_t, 1, 1, 256, 1, 1, 0, 0, kp_t, 0)
-    if err != 0 { die("L transpose Kt", err) }
+    uint64 h_idx = 0
+    while h_idx < HEADS {
+        // 6a. Extract Q_h, K_h, V_h.
+        uint64 dIn_arr = alloc(3 * 8); uint64 dOut_arr = alloc(3 * 8)
+        unsafe { *(dIn_arr        as uint64) = d_Q  }; unsafe { *(dOut_arr        as uint64) = d_Q_h }
+        unsafe { *((dIn_arr +  8) as uint64) = d_K  }; unsafe { *((dOut_arr +  8) as uint64) = d_K_h }
+        unsafe { *((dIn_arr + 16) as uint64) = d_Vv }; unsafe { *((dOut_arr + 16) as uint64) = d_V_h }
+        uint64 j = 0
+        while j < 3 {
+            uint64 dI = 0; uint64 dO = 0
+            unsafe { *((dIn_arr  + j * 8) as uint64) -> dI }
+            unsafe { *((dOut_arr + j * 8) as uint64) -> dO }
+            uint64 ea = alloc(8); unsafe { *(ea as uint64) = dI }
+            uint64 eb = alloc(8); unsafe { *(eb as uint64) = dO }
+            uint64 eh = alloc(8); unsafe { *(eh as uint64) = HD }
+            uint64 ehh = alloc(8); unsafe { *(ehh as uint64) = HEADS }
+            uint64 ehi = alloc(8); unsafe { *(ehi as uint64) = h_idx }
+            uint64 kp_e = alloc(5 * 8)
+            unsafe { *(kp_e as uint64) = ea }; unsafe { *((kp_e+8) as uint64) = eb }
+            unsafe { *((kp_e+16) as uint64) = eh }; unsafe { *((kp_e+24) as uint64) = ehh }; unsafe { *((kp_e+32) as uint64) = ehi }
+            err = hipModuleLaunchKernel(fh_ext, SEQ, 1, 1, HD, 1, 1, 0, 0, kp_e, 0); if err != 0 { die("L extract", err) }
+            j = j + 1
+        }
 
-    // 8. scores = Q @ K^T  (M=SEQ, N=SEQ, K=HIDDEN)
-    uint64 s_a = alloc(8); unsafe { *(s_a as uint64) = d_Q }
-    uint64 s_b = alloc(8); unsafe { *(s_b as uint64) = d_K_T }
-    uint64 s_c = alloc(8); unsafe { *(s_c as uint64) = d_scores }
-    uint64 s_m = alloc(8); unsafe { *(s_m as uint64) = SEQ }
-    uint64 s_n = alloc(8); unsafe { *(s_n as uint64) = SEQ }
-    uint64 s_k = alloc(8); unsafe { *(s_k as uint64) = HIDDEN }
-    uint64 kp_s = alloc(6 * 8)
-    unsafe { *(kp_s as uint64) = s_a }; unsafe { *((kp_s+8) as uint64) = s_b }; unsafe { *((kp_s+16) as uint64) = s_c }; unsafe { *((kp_s+24) as uint64) = s_m }; unsafe { *((kp_s+32) as uint64) = s_n }; unsafe { *((kp_s+40) as uint64) = s_k }
-    uint32 grid_s = (SEQ / 16) * (SEQ / 16)
-    err = hipModuleLaunchKernel(fh_gemm, grid_s, 1, 1, 256, 1, 1, 0, 0, kp_s, 0); if err != 0 { die("L gemm QKt", err) } 
+        // 6b. scale Q_h by 1/sqrt(HD).
+        uint64 sc_buf = alloc(8); unsafe { *(sc_buf as uint64) = d_Q_h }
+        uint64 sc_n   = alloc(8); unsafe { *(sc_n   as uint64) = SEQ * HD }
+        uint64 sc_f   = alloc(8); uint64 fb = inv_sqrt_hd_bits; unsafe { *(sc_f as uint64) = fb }
+        uint64 kp_sc = alloc(3 * 8)
+        unsafe { *(kp_sc as uint64) = sc_buf }; unsafe { *((kp_sc+8) as uint64) = sc_n }; unsafe { *((kp_sc+16) as uint64) = sc_f }
+        uint32 grid_sc = (SEQ * HD + 255) / 256
+        err = hipModuleLaunchKernel(fh_scale, grid_sc, 1, 1, 256, 1, 1, 0, 0, kp_sc, 0); if err != 0 { die("L scale", err) }
 
-    // 9. attn = softmax_causal(scores)  [M=SEQ, N=SEQ]
-    uint64 sm_in  = alloc(8); unsafe { *(sm_in  as uint64) = d_scores }
-    uint64 sm_out = alloc(8); unsafe { *(sm_out as uint64) = d_attn }
-    uint64 sm_m   = alloc(8); unsafe { *(sm_m   as uint64) = SEQ }
-    uint64 sm_n   = alloc(8); unsafe { *(sm_n   as uint64) = SEQ }
-    uint64 kp_sm = alloc(4 * 8)
-    unsafe { *(kp_sm as uint64) = sm_in }; unsafe { *((kp_sm+8) as uint64) = sm_out }; unsafe { *((kp_sm+16) as uint64) = sm_m }; unsafe { *((kp_sm+24) as uint64) = sm_n }
-    // Block = N for N-parametric softmax_causal (kernel uses lane-indexed
-    // row scan — block must match N exactly, not the canonical 256).
-    err = hipModuleLaunchKernel(fh_smc, SEQ, 1, 1, SEQ, 1, 1, 0, 0, kp_sm, 0); if err != 0 { die("L softmax_causal", err) }
+        // 6c. K_h_T = transpose(K_h)  [SEQ, HD] → [HD, SEQ]
+        uint64 t_in  = alloc(8); unsafe { *(t_in  as uint64) = d_K_h }
+        uint64 t_out = alloc(8); unsafe { *(t_out as uint64) = d_K_h_T }
+        uint64 t_m   = alloc(8); unsafe { *(t_m   as uint64) = SEQ }
+        uint64 t_n   = alloc(8); unsafe { *(t_n   as uint64) = HD }
+        uint64 kp_t = alloc(4 * 8)
+        unsafe { *(kp_t as uint64) = t_in }; unsafe { *((kp_t+8) as uint64) = t_out }
+        unsafe { *((kp_t+16) as uint64) = t_m }; unsafe { *((kp_t+24) as uint64) = t_n }
+        uint32 grid_t = ((SEQ + 15) / 16) * ((HD + 15) / 16)
+        err = hipModuleLaunchKernel(fh_trans, grid_t, 1, 1, 256, 1, 1, 0, 0, kp_t, 0); if err != 0 { die("L transpose Kh", err) }
 
-    // 10. ctx = attn @ V  (M=SEQ, N=HIDDEN, K=SEQ)
-    uint64 c_a = alloc(8); unsafe { *(c_a as uint64) = d_attn }
-    uint64 c_b = alloc(8); unsafe { *(c_b as uint64) = d_Vv }
-    uint64 c_c = alloc(8); unsafe { *(c_c as uint64) = d_ctx }
-    uint64 c_m = alloc(8); unsafe { *(c_m as uint64) = SEQ }
-    uint64 c_n = alloc(8); unsafe { *(c_n as uint64) = HIDDEN }
-    uint64 c_k = alloc(8); unsafe { *(c_k as uint64) = SEQ }
-    uint64 kp_c = alloc(6 * 8)
-    unsafe { *(kp_c as uint64) = c_a }; unsafe { *((kp_c+8) as uint64) = c_b }; unsafe { *((kp_c+16) as uint64) = c_c }; unsafe { *((kp_c+24) as uint64) = c_m }; unsafe { *((kp_c+32) as uint64) = c_n }; unsafe { *((kp_c+40) as uint64) = c_k }
-    uint32 grid_c = (SEQ / 16) * (HIDDEN / 16)
-    err = hipModuleLaunchKernel(fh_gemm, grid_c, 1, 1, 256, 1, 1, 0, 0, kp_c, 0); if err != 0 { die("L gemm attnV", err) } 
+        // 6d. scores = Q_h @ K_h_T  (M=SEQ, N=SEQ, K=HD)
+        uint64 s_a = alloc(8); unsafe { *(s_a as uint64) = d_Q_h }
+        uint64 s_b = alloc(8); unsafe { *(s_b as uint64) = d_K_h_T }
+        uint64 s_c = alloc(8); unsafe { *(s_c as uint64) = d_scores }
+        uint64 s_m = alloc(8); unsafe { *(s_m as uint64) = SEQ }
+        uint64 s_n = alloc(8); unsafe { *(s_n as uint64) = SEQ }
+        uint64 s_k = alloc(8); unsafe { *(s_k as uint64) = HD }
+        uint64 kp_s = alloc(6 * 8)
+        unsafe { *(kp_s as uint64) = s_a }; unsafe { *((kp_s+8) as uint64) = s_b }; unsafe { *((kp_s+16) as uint64) = s_c }
+        unsafe { *((kp_s+24) as uint64) = s_m }; unsafe { *((kp_s+32) as uint64) = s_n }; unsafe { *((kp_s+40) as uint64) = s_k }
+        uint32 grid_s = (SEQ / 16) * (SEQ / 16)
+        err = hipModuleLaunchKernel(fh_gemm, grid_s, 1, 1, 256, 1, 1, 0, 0, kp_s, 0); if err != 0 { die("L gemm QKt_h", err) }
+
+        // 6e. attn = softmax_causal(scores)  block = SEQ for parametric N
+        uint64 sm_in  = alloc(8); unsafe { *(sm_in  as uint64) = d_scores }
+        uint64 sm_out = alloc(8); unsafe { *(sm_out as uint64) = d_attn }
+        uint64 sm_m   = alloc(8); unsafe { *(sm_m   as uint64) = SEQ }
+        uint64 sm_n   = alloc(8); unsafe { *(sm_n   as uint64) = SEQ }
+        uint64 kp_sm = alloc(4 * 8)
+        unsafe { *(kp_sm as uint64) = sm_in }; unsafe { *((kp_sm+8) as uint64) = sm_out }
+        unsafe { *((kp_sm+16) as uint64) = sm_m }; unsafe { *((kp_sm+24) as uint64) = sm_n }
+        err = hipModuleLaunchKernel(fh_smc, SEQ, 1, 1, SEQ, 1, 1, 0, 0, kp_sm, 0); if err != 0 { die("L smc_h", err) }
+
+        // 6f. ctx_h = attn @ V_h  (M=SEQ, N=HD, K=SEQ)
+        uint64 cv_a = alloc(8); unsafe { *(cv_a as uint64) = d_attn }
+        uint64 cv_b = alloc(8); unsafe { *(cv_b as uint64) = d_V_h }
+        uint64 cv_c = alloc(8); unsafe { *(cv_c as uint64) = d_ctx_h }
+        uint64 cv_m = alloc(8); unsafe { *(cv_m as uint64) = SEQ }
+        uint64 cv_n = alloc(8); unsafe { *(cv_n as uint64) = HD }
+        uint64 cv_k = alloc(8); unsafe { *(cv_k as uint64) = SEQ }
+        uint64 kp_cv = alloc(6 * 8)
+        unsafe { *(kp_cv as uint64) = cv_a }; unsafe { *((kp_cv+8) as uint64) = cv_b }; unsafe { *((kp_cv+16) as uint64) = cv_c }
+        unsafe { *((kp_cv+24) as uint64) = cv_m }; unsafe { *((kp_cv+32) as uint64) = cv_n }; unsafe { *((kp_cv+40) as uint64) = cv_k }
+        uint32 grid_cv = (SEQ / 16) * (HD / 16)
+        err = hipModuleLaunchKernel(fh_gemm, grid_cv, 1, 1, 256, 1, 1, 0, 0, kp_cv, 0); if err != 0 { die("L gemm AV_h", err) }
+
+        // 6g. head_insert(ctx_h → d_ctx, h)
+        uint64 ii_in  = alloc(8); unsafe { *(ii_in  as uint64) = d_ctx_h }
+        uint64 ii_out = alloc(8); unsafe { *(ii_out as uint64) = d_ctx }
+        uint64 ii_hd  = alloc(8); unsafe { *(ii_hd  as uint64) = HD }
+        uint64 ii_hh  = alloc(8); unsafe { *(ii_hh  as uint64) = HEADS }
+        uint64 ii_hi  = alloc(8); unsafe { *(ii_hi  as uint64) = h_idx }
+        uint64 kp_ii = alloc(5 * 8)
+        unsafe { *(kp_ii as uint64) = ii_in }; unsafe { *((kp_ii+8) as uint64) = ii_out }
+        unsafe { *((kp_ii+16) as uint64) = ii_hd }; unsafe { *((kp_ii+24) as uint64) = ii_hh }; unsafe { *((kp_ii+32) as uint64) = ii_hi }
+        err = hipModuleLaunchKernel(fh_ins, SEQ, 1, 1, HD, 1, 1, 0, 0, kp_ii, 0); if err != 0 { die("L insert", err) }
+
+        h_idx = h_idx + 1
+    }
 
     // 11. att_out = ctx @ W_o  (M=SEQ, N=HIDDEN, K=HIDDEN)
     uint64 ao_a = alloc(8); unsafe { *(ao_a as uint64) = d_ctx }
@@ -510,12 +569,16 @@ fn main() {
     print_label_val("HIDDEN",         6, HIDDEN)
     print_label_val("INTER",          5, INTER)
     print_label_val("VOCAB",          5, VOCAB)
-    print_label_val("kernels_chained",15, 21)
+    // 1 embed + 3 rmsnorm + 3 QKV gemms + HEADS×9 + 1 Wo gemm + 2 resadd
+    // + 4 MLP (gate/up/silu_mul/down) + 1 LM-head gemm + 1 argmax
+    // = 9 + HEADS*9 + 5 + 4 + 2 = 56 launches at HEADS=4.
+    print_label_val("kernels_chained",15, 56)
     print_label_val("valid_tokens",  12, valid)
     print_label_val("max_token_id",  12, max_seen)
 
     hipFree(d_tok); hipFree(d_W_embed); hipFree(d_x); hipFree(d_resid); hipFree(d_x_n)
     hipFree(d_Q); hipFree(d_K); hipFree(d_Vv); hipFree(d_K_T)
+    hipFree(d_Q_h); hipFree(d_K_h); hipFree(d_V_h); hipFree(d_K_h_T); hipFree(d_ctx_h)
     hipFree(d_scores); hipFree(d_attn); hipFree(d_ctx); hipFree(d_att_out)
     hipFree(d_gate); hipFree(d_up); hipFree(d_ffn); hipFree(d_x_proj)
     hipFree(d_logits); hipFree(d_tokens)
