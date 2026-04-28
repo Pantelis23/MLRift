@@ -39,12 +39,31 @@ fn main() {
     print_str("attn_decode_f32 loaded\n")
 
     // Allocate dummy device buffers.
+    u64 q_bytes  = 16 * 128 * 4   // 8 KB
+    u64 kv_bytes = 64 * 8 * 128 * 4   // 256 KB
     u64 d_q = 0; u64 d_kc = 0; u64 d_vc = 0; u64 d_out = 0
     u64 slot
-    slot = alloc(8); err = hipMalloc(slot, 16 * 128 * 4); if err != 0 { die("mq",  err) }; unsafe { *(slot as u64) -> d_q }
-    slot = alloc(8); err = hipMalloc(slot, 64 * 8 * 128 * 4); if err != 0 { die("mkc", err) }; unsafe { *(slot as u64) -> d_kc }
-    slot = alloc(8); err = hipMalloc(slot, 64 * 8 * 128 * 4); if err != 0 { die("mvc", err) }; unsafe { *(slot as u64) -> d_vc }
-    slot = alloc(8); err = hipMalloc(slot, 16 * 128 * 4); if err != 0 { die("mo",  err) }; unsafe { *(slot as u64) -> d_out }
+    slot = alloc(8); err = hipMalloc(slot, q_bytes);  if err != 0 { die("mq",  err) }; unsafe { *(slot as u64) -> d_q }
+    slot = alloc(8); err = hipMalloc(slot, kv_bytes); if err != 0 { die("mkc", err) }; unsafe { *(slot as u64) -> d_kc }
+    slot = alloc(8); err = hipMalloc(slot, kv_bytes); if err != 0 { die("mvc", err) }; unsafe { *(slot as u64) -> d_vc }
+    slot = alloc(8); err = hipMalloc(slot, q_bytes);  if err != 0 { die("mo",  err) }; unsafe { *(slot as u64) -> d_out }
+
+    // Initialise Q with a deterministic pattern: q[i] = i * 0.001.
+    u64 h_q = alloc(q_bytes)
+    u64 h_out = alloc(q_bytes)
+    u64 i = 0
+    while i < 16 * 128 {
+        f64 v = int_to_f64(i) * 0.001
+        u64 p = h_q + i * 4
+        unsafe { *(p as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+    err = hipMemcpy(d_q, h_q, q_bytes, 1); if err != 0 { die("H2D q", err) }
+    // Zero out d_out so we can detect writes.
+    u64 h_zero = alloc(q_bytes)
+    i = 0
+    while i < 16 * 128 { u64 p = h_zero + i * 4; unsafe { *(p as f32) = 0.0 }; i = i + 1 }
+    err = hipMemcpy(d_out, h_zero, q_bytes, 1); if err != 0 { die("H2D zero", err) }
 
     // Build kernarg.
     u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_q }
@@ -66,7 +85,36 @@ fn main() {
     if err != 0 { die("L", err) }
     err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
     u64 t1 = time_now()
+    err = hipMemcpy(h_out, d_out, q_bytes, 2); if err != 0 { die("D2H", err) }
     print_str("kernel_us="); u64 s = fmt_dec((t1 - t0) / 1000); print_str(s); dealloc(s); print_str("\n")
-    print_str("OK — scaffold dispatches cleanly.  Real body is next.\n")
+
+    // Verify Q-passthrough: out should bit-equal q.
+    u64 fail = 0
+    i = 0
+    while i < 16 * 128 {
+        u32 q_bits = 0; u32 out_bits = 0
+        unsafe { *((h_q   + i * 4) as u32) -> q_bits   }
+        unsafe { *((h_out + i * 4) as u32) -> out_bits }
+        if q_bits != out_bits { fail = fail + 1 }
+        i = i + 1
+    }
+    print_str("Q-passthrough fail count (out of 2048): "); u64 sf = fmt_dec(fail); print_str(sf); dealloc(sf); print_str("\n")
+    if fail == 0 {
+        print_str("OK — Q load + b128 store + addressing all working.\n")
+    } else {
+        print_str("FAIL — first 8 (q / out):\n")
+        u64 j = 0
+        while j < 8 {
+            u32 qb = 0; u32 ob = 0
+            unsafe { *((h_q   + j * 4) as u32) -> qb }
+            unsafe { *((h_out + j * 4) as u32) -> ob }
+            u64 qb64 = qb; u64 ob64 = ob
+            print_str("  ["); u64 sj = fmt_dec(j); print_str(sj); dealloc(sj)
+            print_str("] q="); u64 sq = fmt_dec(qb64); print_str(sq); dealloc(sq)
+            print_str(" out="); u64 so = fmt_dec(ob64); print_str(so); dealloc(so)
+            print_str("\n")
+            j = j + 1
+        }
+    }
     exit(0)
 }

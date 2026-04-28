@@ -6228,11 +6228,51 @@ fn emit_amdgpu_gemv_coop_bf16_f32_blob(uint64 out_path) -> uint64 {
 // LDS: 32 × 4 (lane reduce) + 64 × 4 (max_seq scores) = 384 B,
 // allocate 1024 for safety.
 //
-// STUB BODY: just s_endpgm (no compute, no writes).  Validates that
-// the kernel descriptor + kernarg layout + dispatch path all work
-// before we incrementally fill in the real attention body.
+// MILESTONE 1 BODY: Q-passthrough.  Each WG (head h) loads its
+// 128-element Q slice via per-lane b128 (each lane gets 4 f32) and
+// writes it through to out[h, :].  Validates Q-base address arithmetic,
+// b128 load, b128 store; doesn't yet compute attention.  Next milestone
+// adds the score loop on top of this.
 fn _emit_attn_decode_f32_body(uint64 args_desc) {
     asm_init()
+
+    // Kernarg load.
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)       // s_load_b256 s[4:11], s[0:1], 0x0
+    asm_u32(0xF4040300); asm_u32(0xF8000020)       // s_load_b64  s[12:13], s[0:1], 0x20
+    asm_u32(0xBF89FC07)                            // s_waitcnt   lgkmcnt(0)
+
+    // Q-passthrough body (now with correct kernarg-to-SGPR mapping):
+    //   s_load_b256 s[4:11], s[0:1], 0x0  loads kernargs 0..31 into
+    //   s4 (bytes 0-3), s5 (4-7), ..., s11 (28-31).  So:
+    //     q_ptr  (offset 0x00..0x07)  → s[4:5]
+    //     kc_ptr (offset 0x08..0x0F)  → s[6:7]
+    //     vc_ptr (offset 0x10..0x17)  → s[8:9]
+    //     out_ptr(offset 0x18..0x1F)  → s[10:11]
+    //   Earlier debug attempted to write to s[8:9] which is vc_ptr,
+    //   not out_ptr — wrote into the V cache by mistake.
+
+    // s14 = head * 512 (Q row stride in bytes; 128 f32 × 4 = 512).
+    asm_u32(0x840E890F)                            // s_lshl_b32 s14, s15, 9
+
+    // s[16:17] = q_ptr + head*512  (Q row base for this head)
+    asm_u32(0x80100E04)                            // s_add_u32  s16, s4, s14
+    asm_u32(0x82118005)                            // s_addc_u32 s17, s5, 0
+
+    // s[24:25] = out_ptr + head*512  (out row base for this head)
+    asm_u32(0x80180E0A)                            // s_add_u32  s24, s10, s14
+    asm_u32(0x8219800B)                            // s_addc_u32 s25, s11, 0
+
+    // Q-passthrough per-lane: each lane copies q[head, lane*4..+3]
+    // to out[head, lane*4..+3].
+    // CRITICAL: store-offset vgpr must not alias the loaded quad.
+    // v[4:7] holds the load result; v8 = lane*16 byte offset.
+    asm_u32(0x30100084)                            // v_lshlrev_b32 v8, 4, v0
+    asm_s_delay_alu(0x01)                          // VALU→VMEM wait state
+    asm_u32(0xDC5E0000); asm_u32(0x04100008)       // global_load_b128 v[4:7], v8, s[16:17]
+    asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)
+    asm_u32(0xDC760000); asm_u32(0x00180408)       // global_store_b128 v8, v[4:7], s[24:25]
+    asm_u32(0xBC7C0000)                            // s_waitcnt_vscnt null, 0
+
     asm_u32(0xBFB00000)                            // s_endpgm
 
     // args_desc fill — 5 args, all 8 bytes.
