@@ -1,0 +1,255 @@
+// Bisection diagnostic — bf16→dequant→gemv with REAL Qwen3 q_proj
+// weights, but using the same direct dispatch shape as the
+// bf16_gemv_decode_bench_launch (no wrapper, no cache, no other
+// kernels in between).  If this shows divergence vs CPU, the bug
+// is in the kernel handling real bf16 NaN/denormal weight values.
+// If it matches CPU, the bug is in std/inference_gpu.mlr's wrapper.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-bf16-to-f32=/tmp/bf16_to_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-gemv-f32=/tmp/gemv_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/bf16_gemv_real_weight_launch.mlr -o /tmp/bf16_gemv_real_weight_kfd
+// Run:
+//   /tmp/bf16_gemv_real_weight_kfd
+
+import "../../std/hip.mlr"
+import "../../std/safetensors.mlr"
+import "../../std/inference.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/thread.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn die(uint64 msg, uint64 code) {
+    print_str(msg)
+    print_str(" e=")
+    u64 s = fmt_dec(code); print_str(s); dealloc(s)
+    print_str("\n")
+    exit(1)
+}
+
+fn load_kernel(uint64 co_path, uint64 fname) -> uint64 {
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    uint32 err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fname); if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+    return fh
+}
+
+fn main() {
+    u64 num_workers = 16
+    thread_pool_init(num_workers)
+
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 fh_dq   = load_kernel("/tmp/bf16_to_f32.co", "bf16_to_f32")
+    uint64 fh_gemv = load_kernel("/tmp/gemv_f32.co",    "gemv_f32")
+
+    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-0.6B/model.safetensors"
+    SafetensorFile st = safetensors_open(path)
+    if st.file_size == 0 { die("open", 0) }
+
+    SafetensorView wv = safetensors_get(st, "model.layers.0.self_attn.q_proj.weight")
+    if wv.ptr == 0 { die("q_proj not found", 0) }
+
+    u64 N = 2048
+    u64 K = 1024
+    if wv.len != N * K * 2 { die("unexpected length", wv.len) }
+
+    // Bf16-pre-scan: count NaN / Inf / denormal / zero / normal
+    u64 cnt_nan = 0; u64 cnt_inf = 0; u64 cnt_den = 0; u64 cnt_zero = 0; u64 cnt_norm = 0
+    u64 i = 0
+    while i < N * K {
+        u64 wp = wv.ptr + i * 2
+        u16 b16 = 0; unsafe { *(wp as u16) -> b16 }
+        u64 b64 = b16
+        u64 exp = (b64 >> 7) & 0xFF
+        u64 man = b64 & 0x7F
+        if exp == 0xFF {
+            if man == 0 { cnt_inf = cnt_inf + 1 }
+            else { cnt_nan = cnt_nan + 1 }
+        } else if exp == 0 {
+            if man == 0 { cnt_zero = cnt_zero + 1 }
+            else { cnt_den = cnt_den + 1 }
+        } else {
+            cnt_norm = cnt_norm + 1
+        }
+        i = i + 1
+    }
+    print_str("bf16 weight stats:\n")
+    print_str("  total:    "); u64 sa = fmt_dec(N * K); print_str(sa); print_str("\n"); dealloc(sa)
+    print_str("  normal:   "); u64 sb = fmt_dec(cnt_norm); print_str(sb); print_str("\n"); dealloc(sb)
+    print_str("  zero:     "); u64 sc = fmt_dec(cnt_zero); print_str(sc); print_str("\n"); dealloc(sc)
+    print_str("  denormal: "); u64 sd = fmt_dec(cnt_den); print_str(sd); print_str("\n"); dealloc(sd)
+    print_str("  inf:      "); u64 se = fmt_dec(cnt_inf); print_str(se); print_str("\n"); dealloc(se)
+    print_str("  nan:      "); u64 sf = fmt_dec(cnt_nan); print_str(sf); print_str("\n"); dealloc(sf)
+
+    u64 b_bytes_f32  = K * 4
+    u64 W_bytes_bf16 = N * K * 2
+    u64 W_bytes_f32  = N * K * 4
+    u64 c_bytes_f32  = N * 4
+
+    u64 d_b = 0; u64 d_W_bf16 = 0; u64 d_W_f32 = 0; u64 d_c = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, b_bytes_f32);  if err != 0 { die("mb",  err) }; unsafe { *(slot as u64) -> d_b }
+    slot = alloc(8); err = hipMalloc(slot, W_bytes_bf16); if err != 0 { die("mWb", err) }; unsafe { *(slot as u64) -> d_W_bf16 }
+    slot = alloc(8); err = hipMalloc(slot, W_bytes_f32);  if err != 0 { die("mWf", err) }; unsafe { *(slot as u64) -> d_W_f32 }
+    slot = alloc(8); err = hipMalloc(slot, c_bytes_f32);  if err != 0 { die("mc",  err) }; unsafe { *(slot as u64) -> d_c }
+
+    // Synthetic input vector (deterministic) — same as bench.
+    u64 h_b = alloc(b_bytes_f32)
+    i = 0
+    while i < K {
+        f64 v = (int_to_f64(i) * 0.0003) - 0.05
+        u64 p = h_b + i * 4
+        unsafe { *(p as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+
+    err = hipMemcpy(d_b,      h_b,    b_bytes_f32,  1); if err != 0 { die("H2D b", err) }
+    err = hipMemcpy(d_W_bf16, wv.ptr, W_bytes_bf16, 1); if err != 0 { die("H2D W", err) }
+
+    // Dequant.
+    u64 dq_in  = alloc(8); unsafe { *(dq_in  as u64) = d_W_bf16 }
+    u64 dq_out = alloc(8); unsafe { *(dq_out as u64) = d_W_f32 }
+    u64 dq_n   = alloc(8); unsafe { *(dq_n   as u64) = N * K }
+    u64 kp_dq = alloc(3 * 8)
+    unsafe { *(kp_dq        as u64) = dq_in }
+    unsafe { *((kp_dq +  8) as u64) = dq_out }
+    unsafe { *((kp_dq + 16) as u64) = dq_n }
+    u64 grid_dq_u = (N * K + 255) / 256
+    u32 grid_dq32 = grid_dq_u
+    err = hipModuleLaunchKernel(fh_dq, grid_dq32, 1, 1, 256, 1, 1, 0, 0, kp_dq, 0)
+    if err != 0 { die("L dequant", err) }
+
+    // GEMV.
+    u64 gv_a = alloc(8); unsafe { *(gv_a as u64) = d_W_f32 }
+    u64 gv_b = alloc(8); unsafe { *(gv_b as u64) = d_b }
+    u64 gv_c = alloc(8); unsafe { *(gv_c as u64) = d_c }
+    u64 gv_m = alloc(8); unsafe { *(gv_m as u64) = N }
+    u64 gv_k = alloc(8); unsafe { *(gv_k as u64) = K }
+    u64 kp_gv = alloc(5 * 8)
+    unsafe { *(kp_gv        as u64) = gv_a }
+    unsafe { *((kp_gv +  8) as u64) = gv_b }
+    unsafe { *((kp_gv + 16) as u64) = gv_c }
+    unsafe { *((kp_gv + 24) as u64) = gv_m }
+    unsafe { *((kp_gv + 32) as u64) = gv_k }
+    u64 grid_gv_u = (N + 255) / 256
+    u32 grid_gv32 = grid_gv_u
+    err = hipModuleLaunchKernel(fh_gemv, grid_gv32, 1, 1, 256, 1, 1, 0, 0, kp_gv, 0)
+    if err != 0 { die("L gemv", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    u64 h_c_gpu = alloc(c_bytes_f32)
+    err = hipMemcpy(h_c_gpu, d_c, c_bytes_f32, 2); if err != 0 { die("D2H", err) }
+
+    // CPU reference.
+    u64 h_c_cpu = alloc(c_bytes_f32)
+    matmul_bf16_weights_f32_mt(h_c_cpu, h_b, wv.ptr, 1, N, K, num_workers)
+
+    u64 fail_001 = 0; u64 fail_01 = 0; u64 nan_cpu = 0; u64 nan_gpu = 0
+    u64 max_finite_diff_bits = 0
+    u64 j = 0
+    while j < N {
+        u64 cp = h_c_cpu + j * 4
+        u64 gp = h_c_gpu + j * 4
+        u32 cb = 0; u32 gb = 0
+        unsafe { *(cp as u32) -> cb }
+        unsafe { *(gp as u32) -> gb }
+        u32 c_exp = (cb >> 23) & 0xFF; u32 c_man = cb & 0x7FFFFF
+        u32 g_exp = (gb >> 23) & 0xFF; u32 g_man = gb & 0x7FFFFF
+        if c_exp == 0xFF && c_man != 0 { nan_cpu = nan_cpu + 1 }
+        if g_exp == 0xFF && g_man != 0 { nan_gpu = nan_gpu + 1 }
+        f32 cv = 0.0; f32 gv = 0.0
+        unsafe { *(cp as f32) -> cv }
+        unsafe { *(gp as f32) -> gv }
+        f32 d = gv - cv
+        if d < 0.0 { d = 0.0 - d }
+        if d > 0.001 { fail_001 = fail_001 + 1 }
+        if d > 0.01  { fail_01  = fail_01  + 1 }
+        u64 dbuf = alloc(4); unsafe { *(dbuf as f32) = d }
+        u32 dbits = 0; unsafe { *(dbuf as u32) -> dbits }
+        u32 d_exp = (dbits >> 23) & 0xFF
+        if d_exp != 0xFF {
+            u64 db64 = dbits
+            if db64 > max_finite_diff_bits { max_finite_diff_bits = db64 }
+        }
+        j = j + 1
+    }
+
+    print_str("verify (no wrapper, direct dispatch):\n")
+    print_str("  cells:                 "); u64 sg = fmt_dec(N);          print_str(sg); print_str("\n"); dealloc(sg)
+    print_str("  fail_count (>0.001):   "); u64 sh = fmt_dec(fail_001);   print_str(sh); print_str("\n"); dealloc(sh)
+    print_str("  fail_count (>0.01):    "); u64 si = fmt_dec(fail_01);    print_str(si); print_str("\n"); dealloc(si)
+    print_str("  nan_cells_cpu:         "); u64 sj = fmt_dec(nan_cpu);    print_str(sj); print_str("\n"); dealloc(sj)
+    print_str("  nan_cells_gpu:         "); u64 sk = fmt_dec(nan_gpu);    print_str(sk); print_str("\n"); dealloc(sk)
+    print_str("  max_finite_diff_bits:  "); u64 sl = fmt_dec(max_finite_diff_bits); print_str(sl); print_str("\n"); dealloc(sl)
+
+    // Diagnostic: dump cells around workgroup boundaries.
+    u64 probe_idx = alloc(16 * 8)
+    unsafe { *((probe_idx +   0) as u64) = 0 }
+    unsafe { *((probe_idx +   8) as u64) = 1 }
+    unsafe { *((probe_idx +  16) as u64) = 254 }
+    unsafe { *((probe_idx +  24) as u64) = 255 }
+    unsafe { *((probe_idx +  32) as u64) = 256 }
+    unsafe { *((probe_idx +  40) as u64) = 257 }
+    unsafe { *((probe_idx +  48) as u64) = 511 }
+    unsafe { *((probe_idx +  56) as u64) = 512 }
+    unsafe { *((probe_idx +  64) as u64) = 768 }
+    unsafe { *((probe_idx +  72) as u64) = 1023 }
+    unsafe { *((probe_idx +  80) as u64) = 1024 }
+    unsafe { *((probe_idx +  88) as u64) = 1280 }
+    unsafe { *((probe_idx +  96) as u64) = 1535 }
+    unsafe { *((probe_idx + 104) as u64) = 1536 }
+    unsafe { *((probe_idx + 112) as u64) = 1791 }
+    unsafe { *((probe_idx + 120) as u64) = 2047 }
+    print_str("  probe cells (idx / cpu_bits / gpu_bits):\n")
+    u64 dii = 0
+    while dii < 16 {
+        u64 idx = 0; unsafe { *((probe_idx + dii * 8) as u64) -> idx }
+        u64 cp = h_c_cpu + idx * 4
+        u64 gp = h_c_gpu + idx * 4
+        u32 cb = 0; u32 gb = 0
+        unsafe { *(cp as u32) -> cb }
+        unsafe { *(gp as u32) -> gb }
+        u64 cb64 = cb; u64 gb64 = gb
+        print_str("    ["); u64 sx = fmt_dec(idx); print_str(sx); dealloc(sx)
+        print_str("] cpu="); u64 sy = fmt_dec(cb64); print_str(sy); dealloc(sy)
+        print_str(" gpu="); u64 sz = fmt_dec(gb64); print_str(sz); dealloc(sz)
+        print_str("\n")
+        dii = dii + 1
+    }
+
+    // First-divergent-cell scan.
+    u64 first_div = N + 1
+    u64 jj = 0
+    while jj < N {
+        u64 cp = h_c_cpu + jj * 4
+        u64 gp = h_c_gpu + jj * 4
+        f32 cv = 0.0; f32 gv = 0.0
+        unsafe { *(cp as f32) -> cv }
+        unsafe { *(gp as f32) -> gv }
+        f32 d = gv - cv
+        if d < 0.0 { d = 0.0 - d }
+        if d > 0.01 {
+            if first_div == N + 1 { first_div = jj }
+        }
+        jj = jj + 1
+    }
+    print_str("  first cell with diff > 0.01: "); u64 sfd = fmt_dec(first_div); print_str(sfd); print_str("\n"); dealloc(sfd)
+
+    safetensors_free(st)
+    thread_pool_shutdown()
+    exit(0)
+}

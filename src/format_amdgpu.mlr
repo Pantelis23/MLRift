@@ -5764,8 +5764,8 @@ fn emit_amdgpu_loop_demo_blob(uint64 out_path) -> uint64 {
 //
 // Each lane computes one row of c[M] = A[M×K] · b[K]. Dispatch is
 // (block=256, grid=ceil(M/256)). KD enables USER_SGPR_KERNARG_PTR=2
-// and WORKGROUP_ID_X=1 so the GPU pre-loads s[0:1] and s2 before the
-// kernel runs.
+// and WORKGROUP_ID_X=1 with USER_SGPR_COUNT=15 (rsrc2=0x9E), so the
+// GPU pre-loads s[0:1] = kernarg_ptr and wg_id_x = s15.
 //
 // Kernarg layout (40 bytes, 8-byte aligned):
 //   [0..7]   a_ptr (u64)
@@ -5780,7 +5780,7 @@ fn emit_amdgpu_loop_demo_blob(uint64 out_path) -> uint64 {
 //   s_load_b64        s[12:13], s[0:1], 0x20         ; k_dim
 //   s_waitcnt         lgkmcnt(0)
 //   s_mov_b32         s14, 0x100                     ; blockDim.x = 256
-//   v_mad_u64_u32     v[1:2], null, s2, s14, v[0:1]  ; row = wgid*256 + lane
+//   v_mad_u64_u32     v[1:2], null, s15, s14, v[0:1] ; row = wgid*256 + lane
 //   s_mov_b32         s2, exec_lo                    ; (saveexec for cmpx)
 //   v_cmpx_lt_u64     s[10:11], v[1:2]               ; exec &= row<m
 //   s_cbranch_execz   .Lend
@@ -5823,7 +5823,11 @@ fn _emit_gemv_f32_body(uint64 args_desc) {
     asm_u32(0xF4040300); asm_u32(0xF8000020)
     asm_u32(0xBF89FC07)
     asm_u32(0xBE8E00FF); asm_u32(0x00000100)
-    asm_u32(0xD6FE7C01); asm_u32(0x04001C02)
+    // v_mad_u64_u32 v[1:2], null, s15, s14, v[0:1]  — wg_id_x is at s15
+    // under rsrc2=0x9E (USER_SGPR_COUNT=15). src0 field = 0x00F (s15);
+    // earlier emit used 0x002 (s2) which is zero for *every* workgroup,
+    // so only wg 0's 256 cells were written and wg 1..N-1 overwrote them.
+    asm_u32(0xD6FE7C01); asm_u32(0x04001C0F)
 
     // Bounds check + skip-to-end if row >= m.
     asm_u32(0xBE82007E)

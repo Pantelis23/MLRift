@@ -102,28 +102,69 @@ fn main() {
         // Compare.  Bf16 quantisation is identical on both paths (CPU
         // also dequants from the same bf16 source), so the only diff
         // is f32 fma reordering across K=1024.
-        u64 max_abs_bits = 0
-        u64 fail_count = 0
-        f32 thresh = 0.01
+        u64 fail_001 = 0
+        u64 fail_01  = 0
+        u64 nan_cpu  = 0
+        u64 nan_gpu  = 0
+        f32 max_finite_abs = 0.0
         u64 j = 0
         while j < N {
             u64 cp = out_cpu + j * 4
             u64 gp = out_gpu + j * 4
+            u32 cb = 0; u32 gb = 0
+            unsafe { *(cp as u32) -> cb }
+            unsafe { *(gp as u32) -> gb }
+            // NaN check: exponent all-ones && mantissa nonzero.
+            u32 c_exp = (cb >> 23) & 0xFF
+            u32 g_exp = (gb >> 23) & 0xFF
+            u32 c_man = cb & 0x7FFFFF
+            u32 g_man = gb & 0x7FFFFF
+            if c_exp == 0xFF && c_man != 0 { nan_cpu = nan_cpu + 1 }
+            if g_exp == 0xFF && g_man != 0 { nan_gpu = nan_gpu + 1 }
             f32 cv = 0.0; f32 gv = 0.0
             unsafe { *(cp as f32) -> cv }
             unsafe { *(gp as f32) -> gv }
             f32 d = gv - cv
             if d < 0.0 { d = 0.0 - d }
-            if d > thresh { fail_count = fail_count + 1 }
+            // d > thresh tests are false for NaN, so NaN cells don't pollute the counters.
+            if d > 0.001 { fail_001 = fail_001 + 1 }
+            if d > 0.01  { fail_01  = fail_01  + 1 }
+            // track max FINITE abs diff (skip NaN/Inf)
             u64 dbuf = alloc(4); unsafe { *(dbuf as f32) = d }
-            u64 db_bits = 0; unsafe { *(dbuf as u32) -> db_bits }
-            if db_bits > max_abs_bits { max_abs_bits = db_bits }
+            u32 dbits = 0; unsafe { *(dbuf as u32) -> dbits }
+            u32 d_exp = (dbits >> 23) & 0xFF
+            if d_exp != 0xFF {
+                if d > max_finite_abs { max_finite_abs = d }
+            }
             j = j + 1
         }
+        u64 mfb = alloc(4); unsafe { *(mfb as f32) = max_finite_abs }
+        u32 mfb_bits = 0; unsafe { *(mfb as u32) -> mfb_bits }
+        u64 mfb_bits64 = mfb_bits
         print_str("Verify CPU vs GPU:\n")
-        print_str("  cells:        "); u64 sd = fmt_dec(N);            print_str(sd); print_str("\n"); dealloc(sd)
-        print_str("  fail_count:   "); u64 se = fmt_dec(fail_count);   print_str(se); print_str("\n"); dealloc(se)
-        print_str("  max_abs_bits: "); u64 sf = fmt_dec(max_abs_bits); print_str(sf); print_str("\n"); dealloc(sf)
+        print_str("  cells:                "); u64 sd = fmt_dec(N);            print_str(sd); print_str("\n"); dealloc(sd)
+        print_str("  fail_count (>0.001):  "); u64 sea = fmt_dec(fail_001);    print_str(sea); print_str("\n"); dealloc(sea)
+        print_str("  fail_count (>0.01):   "); u64 seb = fmt_dec(fail_01);     print_str(seb); print_str("\n"); dealloc(seb)
+        print_str("  nan_cells_cpu:        "); u64 sng = fmt_dec(nan_cpu);     print_str(sng); print_str("\n"); dealloc(sng)
+        print_str("  nan_cells_gpu:        "); u64 snh = fmt_dec(nan_gpu);     print_str(snh); print_str("\n"); dealloc(snh)
+        print_str("  max_finite_abs_bits:  "); u64 sf = fmt_dec(mfb_bits64);   print_str(sf); print_str("\n"); dealloc(sf)
+
+        // Dump first 8 cells, both sides, in raw u32 bit pattern.
+        print_str("  diag (first 8 cells, u32 bits):\n")
+        u64 di = 0
+        while di < 8 {
+            u64 cp = out_cpu + di * 4
+            u64 gp = out_gpu + di * 4
+            u32 cb = 0; u32 gb = 0
+            unsafe { *(cp as u32) -> cb }
+            unsafe { *(gp as u32) -> gb }
+            u64 cb64 = cb; u64 gb64 = gb
+            print_str("    ["); u64 sx = fmt_dec(di); print_str(sx); dealloc(sx)
+            print_str("] cpu="); u64 sy = fmt_dec(cb64); print_str(sy); dealloc(sy)
+            print_str(" gpu=");  u64 sz = fmt_dec(gb64); print_str(sz); dealloc(sz)
+            print_str("\n")
+            di = di + 1
+        }
     }
 
     safetensors_free(st)
