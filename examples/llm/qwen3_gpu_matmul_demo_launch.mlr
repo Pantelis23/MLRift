@@ -1,0 +1,132 @@
+// qwen3 GPU matmul demo — exercises std/inference_gpu.mlr's
+// matmul_bf16_weights_f32_gpu against a real Qwen3-0.6B q_proj.weight
+// pulled out of model.safetensors.  Compares device output against
+// CPU reference for one M=1 decode-shape matmul.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-bf16-to-f32=/tmp/bf16_to_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-gemv-f32=/tmp/gemv_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-gemm-f32=/tmp/gemm_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/qwen3_gpu_matmul_demo_launch.mlr -o /tmp/qwen3_gpu_matmul_demo_kfd
+// Run:
+//   MLRIFT_GPU_MATMUL=1 /tmp/qwen3_gpu_matmul_demo_kfd
+
+import "../../std/hip.mlr"
+import "../../std/inference_gpu.mlr"
+import "../../std/safetensors.mlr"
+import "../../std/inference.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/thread.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn main() {
+    u64 num_workers = 16
+    thread_pool_init(num_workers)
+
+    u32 err = hipSetDevice(0)
+    if err != 0 { puts("setDev failed"); exit(1) }
+
+    u64 enabled = gpu_matmul_enabled()
+    if enabled == 0 {
+        puts("gpu_matmul DISABLED — set MLRIFT_GPU_MATMUL=1 and ensure")
+        puts("/tmp/{bf16_to_f32,gemv_f32}.co exist.  Falling back to CPU-only run.")
+    } else {
+        puts("gpu_matmul ENABLED")
+    }
+
+    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-0.6B/model.safetensors"
+    SafetensorFile st = safetensors_open(path)
+    if st.file_size == 0 { puts("[demo] safetensors_open failed"); exit(1) }
+
+    // Pull q_proj from layer 0.  Shape: [num_heads * head_dim, hidden] = [2048, 1024]
+    SafetensorView wv = safetensors_get(st, "model.layers.0.self_attn.q_proj.weight")
+    if wv.ptr == 0 { puts("[demo] q_proj not found"); exit(1) }
+    u64 N = 2048
+    u64 K = 1024
+    if wv.len != N * K * 2 {
+        puts("[demo] unexpected q_proj byte length")
+        exit(1)
+    }
+
+    // Synthetic input vector x[K], deterministic.
+    u64 x_bytes = K * 4
+    u64 x = alloc(x_bytes)
+    u64 i = 0
+    while i < K {
+        f64 v = (int_to_f64(i) * 0.0003) - 0.05
+        f32 vf = f64_to_f32(v)
+        u64 p = x + i * 4
+        unsafe { *(p as f32) = vf }
+        i = i + 1
+    }
+
+    u64 out_bytes = N * 4
+    u64 out_cpu = alloc(out_bytes)
+    u64 out_gpu = alloc(out_bytes)
+
+    // === CPU reference ===
+    u64 cpu_t0 = time_now()
+    matmul_bf16_weights_f32_mt(out_cpu, x, wv.ptr, 1, N, K, num_workers)
+    u64 cpu_t1 = time_now()
+    u64 cpu_us = (cpu_t1 - cpu_t0) / 1000
+    puts("CPU matmul:")
+    print_str("  per_call_us: ")
+    u64 sa = fmt_dec(cpu_us); print_str(sa); print_str("\n"); dealloc(sa)
+
+    // === GPU dispatch ===
+    if enabled == 1 {
+        // First call (cold; includes one-shot dequant).
+        u64 g_t0 = time_now()
+        u64 rc = matmul_bf16_weights_f32_gpu(out_gpu, x, wv.ptr, 1, N, K)
+        u64 g_t1 = time_now()
+        u64 gpu_cold_us = (g_t1 - g_t0) / 1000
+        if rc != 0 { puts("[demo] GPU dispatch returned 1 (fall-through)"); exit(1) }
+
+        // Hot call (cached weight; per-call cost as in the bench).
+        u64 h_t0 = time_now()
+        u64 rc2 = matmul_bf16_weights_f32_gpu(out_gpu, x, wv.ptr, 1, N, K)
+        u64 h_t1 = time_now()
+        u64 gpu_hot_us = (h_t1 - h_t0) / 1000
+        if rc2 != 0 { puts("[demo] GPU 2nd call fall-through"); exit(1) }
+
+        puts("GPU matmul:")
+        print_str("  cold_us (incl one-shot dequant): "); u64 sb = fmt_dec(gpu_cold_us); print_str(sb); print_str("\n"); dealloc(sb)
+        print_str("  hot_us  (cached weight):         "); u64 sc = fmt_dec(gpu_hot_us);  print_str(sc); print_str("\n"); dealloc(sc)
+
+        // Compare.  Bf16 quantisation is identical on both paths (CPU
+        // also dequants from the same bf16 source), so the only diff
+        // is f32 fma reordering across K=1024.
+        u64 max_abs_bits = 0
+        u64 fail_count = 0
+        f32 thresh = 0.01
+        u64 j = 0
+        while j < N {
+            u64 cp = out_cpu + j * 4
+            u64 gp = out_gpu + j * 4
+            f32 cv = 0.0; f32 gv = 0.0
+            unsafe { *(cp as f32) -> cv }
+            unsafe { *(gp as f32) -> gv }
+            f32 d = gv - cv
+            if d < 0.0 { d = 0.0 - d }
+            if d > thresh { fail_count = fail_count + 1 }
+            u64 dbuf = alloc(4); unsafe { *(dbuf as f32) = d }
+            u64 db_bits = 0; unsafe { *(dbuf as u32) -> db_bits }
+            if db_bits > max_abs_bits { max_abs_bits = db_bits }
+            j = j + 1
+        }
+        print_str("Verify CPU vs GPU:\n")
+        print_str("  cells:        "); u64 sd = fmt_dec(N);            print_str(sd); print_str("\n"); dealloc(sd)
+        print_str("  fail_count:   "); u64 se = fmt_dec(fail_count);   print_str(se); print_str("\n"); dealloc(se)
+        print_str("  max_abs_bits: "); u64 sf = fmt_dec(max_abs_bits); print_str(sf); print_str("\n"); dealloc(sf)
+    }
+
+    safetensors_free(st)
+    thread_pool_shutdown()
+    exit(0)
+}
