@@ -1,0 +1,527 @@
+// MLRift LLM end-to-end forward driver — FULL block: embedding →
+// attention → MLP → final norm → LM head → argmax.  19 kernel
+// launches chained on-device, token IDs in → token IDs out.
+//
+// Single-head attention (HEADS=1, HD=HIDDEN) for demo simplicity;
+// multi-head requires per-head loop or batched gemm — open follow-up.
+// K^T computed on host (D2H K → host transpose → H2D K^T) since we
+// don't have a device transpose kernel yet.
+//
+// Forward pipeline:
+//   x       = embedding_lookup(token_ids, W_embed)     [SEQ, H]
+//   resid   = x
+//   x_n     = rmsnorm(x, γ_attn)                       [SEQ, H]
+//   Q       = x_n @ W_q                                [SEQ, H]
+//   K       = x_n @ W_k                                [SEQ, H]
+//   V       = x_n @ W_v                                [SEQ, H]
+//   Q       = scale(Q, 1/sqrt(H))                      [SEQ, H]
+//   K^T     = host_transpose(K)                        [H, SEQ]   (D2H+H2D)
+//   scores  = Q @ K^T                                  [SEQ, SEQ]
+//   attn    = softmax_causal(scores)                   [SEQ, SEQ]
+//   ctx     = attn @ V                                 [SEQ, H]
+//   att_out = ctx @ W_o                                [SEQ, H]
+//   x       = residual_add(resid, att_out)             [SEQ, H]
+//   resid   = x
+//   x_n     = rmsnorm(x, γ_ffn)                        [SEQ, H]
+//   gate    = x_n @ W_gate                             [SEQ, I]
+//   up      = x_n @ W_up                               [SEQ, I]
+//   ffn     = silu_mul(gate, up)                       [SEQ * I]
+//   x_proj  = ffn @ W_down                             [SEQ, H]
+//   x       = residual_add(resid, x_proj)              [SEQ * H]
+//   x_n     = rmsnorm(x, γ_final)                      [SEQ, H]
+//   logits  = x_n @ W_lm_head                          [SEQ, V]
+//   tokens  = argmax_logits(logits)                    [SEQ]
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-embedding-lookup-f32=/tmp/embedding_lookup_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-rmsnorm-f32-N=1024:/tmp/rmsnorm_n1024.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-gemm-f32=/tmp/gemm_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-softmax-causal-f32-N=32:/tmp/softmax_causal_n32.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/scale_f32.mlr        -o /tmp/scale_f32
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/silu_mul_f32.mlr     -o /tmp/silu_mul_f32
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/residual_add_f32.mlr -o /tmp/residual_add_f32
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-argmax-logits-f32=/tmp/argmax_logits_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/qwen3_full_forward_launch.mlr -o /tmp/qwen3_full_forward_kfd
+// Run:
+//   /tmp/qwen3_full_forward_kfd
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 { i = i - 1; uint64 d = tmp - (tmp / 10) * 10; uint64 p = buf + i; uint8 c = d + 48; unsafe { *(p as uint8) = c }; tmp = tmp / 10 }
+    return n
+}
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128); uint64 i = 0
+    while i < label_len { uint64 sp = label + i; uint64 c = 0; unsafe { *(sp as uint8) -> c }; uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }; i = i + 1 }
+    uint64 cp = buf + label_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1; uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+fn die(uint64 msg, uint64 code) { puts(msg); print_label_val("e", 1, code); exit(1) }
+
+fn load_kernel(uint64 co_path, uint64 fname) -> uint64 {
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { puts("missing co"); puts(co_path); exit(1) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    uint32 err = hipModuleLoadData(mod_slot, blob)
+    if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fname)
+    if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+    return fh
+}
+
+fn fill_random_weight(uint64 buf, uint64 rows, uint64 cols, uint64 seed_a, uint64 seed_b) {
+    uint64 r = 0
+    while r < rows {
+        uint64 c = 0
+        while c < cols {
+            uint64 mix = ((r * seed_a + c * seed_b) * 2654435761) & 0xFFFF
+            f64 vd = (int_to_f64(mix) - 32768.0) * 0.0001
+            uint64 p = buf + (r * cols + c) * 4
+            unsafe { *(p as f32) = f64_to_f32(vd) }
+            c = c + 1
+        }
+        r = r + 1
+    }
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 SEQ    = 32                  // softmax_causal pow2 N min
+    uint64 HIDDEN = 1024                // = embedding D cap; HEADS=1 so HD=HIDDEN
+    uint64 INTER  = 2048                // MLP intermediate
+    uint64 VOCAB  = 4096                // demo vocab; argmax handles any V
+
+    uint64 fh_embed   = load_kernel("/tmp/embedding_lookup_f32.co", "embedding_lookup_f32")
+    uint64 fh_norm    = load_kernel("/tmp/rmsnorm_n1024.co",         "rmsnorm_f32")
+    uint64 fh_gemm    = load_kernel("/tmp/gemm_f32.co",              "gemm_f32")
+    uint64 fh_smc     = load_kernel("/tmp/softmax_causal_n32.co",    "softmax_causal_f32")
+    uint64 fh_scale   = load_kernel("/tmp/scale_f32.co",             "scale_f32")
+    uint64 fh_silumul = load_kernel("/tmp/silu_mul_f32.co",          "silu_mul_f32")
+    uint64 fh_resadd  = load_kernel("/tmp/residual_add_f32.co",      "residual_add_f32")
+    uint64 fh_argmax  = load_kernel("/tmp/argmax_logits_f32.co",     "argmax_logits_f32")
+
+    uint64 tok_bytes      = SEQ * 4
+    uint64 act_bytes      = SEQ * HIDDEN * 4
+    uint64 inter_bytes    = SEQ * INTER * 4
+    uint64 logits_bytes   = SEQ * VOCAB * 4
+    uint64 scores_bytes   = SEQ * SEQ * 4
+    uint64 W_HxH_bytes    = HIDDEN * HIDDEN * 4
+    uint64 W_HxI_bytes    = HIDDEN * INTER * 4
+    uint64 W_IxH_bytes    = INTER * HIDDEN * 4
+    uint64 W_lm_bytes     = HIDDEN * VOCAB * 4
+    uint64 W_emb_bytes    = VOCAB * HIDDEN * 4
+    uint64 gamma_bytes    = HIDDEN * 4
+    uint64 K_T_bytes      = HIDDEN * SEQ * 4
+
+    // === Allocate device buffers ===
+    uint64 d_tok = 0; uint64 d_W_embed = 0
+    uint64 d_x = 0; uint64 d_resid = 0; uint64 d_x_n = 0
+    uint64 d_Q = 0; uint64 d_K = 0; uint64 d_Vv = 0
+    uint64 d_K_T = 0
+    uint64 d_scores = 0; uint64 d_attn = 0; uint64 d_ctx = 0
+    uint64 d_att_out = 0
+    uint64 d_gate = 0; uint64 d_up = 0; uint64 d_ffn = 0; uint64 d_x_proj = 0
+    uint64 d_logits = 0; uint64 d_tokens = 0
+    uint64 d_W_q = 0; uint64 d_W_k = 0; uint64 d_W_v = 0; uint64 d_W_o = 0
+    uint64 d_W_gate = 0; uint64 d_W_up = 0; uint64 d_W_down = 0; uint64 d_W_lmhead = 0
+    uint64 d_gamma_attn = 0; uint64 d_gamma_ffn = 0; uint64 d_gamma_fin = 0
+
+    uint64 slot
+    slot = alloc(8); err = hipMalloc(slot, tok_bytes);    if err != 0 { die("mTok", err) };  unsafe { *(slot as uint64) -> d_tok }
+    slot = alloc(8); err = hipMalloc(slot, W_emb_bytes);  if err != 0 { die("mWemb", err) }; unsafe { *(slot as uint64) -> d_W_embed }
+    slot = alloc(8); err = hipMalloc(slot, act_bytes);    if err != 0 { die("mX", err) };     unsafe { *(slot as uint64) -> d_x }
+    slot = alloc(8); err = hipMalloc(slot, act_bytes);    if err != 0 { die("mR", err) };     unsafe { *(slot as uint64) -> d_resid }
+    slot = alloc(8); err = hipMalloc(slot, act_bytes);    if err != 0 { die("mXn", err) };    unsafe { *(slot as uint64) -> d_x_n }
+    slot = alloc(8); err = hipMalloc(slot, act_bytes);    if err != 0 { die("mQ", err) };     unsafe { *(slot as uint64) -> d_Q }
+    slot = alloc(8); err = hipMalloc(slot, act_bytes);    if err != 0 { die("mK", err) };     unsafe { *(slot as uint64) -> d_K }
+    slot = alloc(8); err = hipMalloc(slot, act_bytes);    if err != 0 { die("mV", err) };     unsafe { *(slot as uint64) -> d_Vv }
+    slot = alloc(8); err = hipMalloc(slot, K_T_bytes);    if err != 0 { die("mKt", err) };    unsafe { *(slot as uint64) -> d_K_T }
+    slot = alloc(8); err = hipMalloc(slot, scores_bytes); if err != 0 { die("mSc", err) };    unsafe { *(slot as uint64) -> d_scores }
+    slot = alloc(8); err = hipMalloc(slot, scores_bytes); if err != 0 { die("mAt", err) };    unsafe { *(slot as uint64) -> d_attn }
+    slot = alloc(8); err = hipMalloc(slot, act_bytes);    if err != 0 { die("mCt", err) };    unsafe { *(slot as uint64) -> d_ctx }
+    slot = alloc(8); err = hipMalloc(slot, act_bytes);    if err != 0 { die("mAo", err) };    unsafe { *(slot as uint64) -> d_att_out }
+    slot = alloc(8); err = hipMalloc(slot, inter_bytes);  if err != 0 { die("mGa", err) };    unsafe { *(slot as uint64) -> d_gate }
+    slot = alloc(8); err = hipMalloc(slot, inter_bytes);  if err != 0 { die("mUp", err) };    unsafe { *(slot as uint64) -> d_up }
+    slot = alloc(8); err = hipMalloc(slot, inter_bytes);  if err != 0 { die("mFfn", err) };   unsafe { *(slot as uint64) -> d_ffn }
+    slot = alloc(8); err = hipMalloc(slot, act_bytes);    if err != 0 { die("mXp", err) };    unsafe { *(slot as uint64) -> d_x_proj }
+    slot = alloc(8); err = hipMalloc(slot, logits_bytes); if err != 0 { die("mLog", err) };   unsafe { *(slot as uint64) -> d_logits }
+    slot = alloc(8); err = hipMalloc(slot, tok_bytes);    if err != 0 { die("mNtok", err) };  unsafe { *(slot as uint64) -> d_tokens }
+    slot = alloc(8); err = hipMalloc(slot, W_HxH_bytes);  if err != 0 { die("mWq", err) };    unsafe { *(slot as uint64) -> d_W_q }
+    slot = alloc(8); err = hipMalloc(slot, W_HxH_bytes);  if err != 0 { die("mWk", err) };    unsafe { *(slot as uint64) -> d_W_k }
+    slot = alloc(8); err = hipMalloc(slot, W_HxH_bytes);  if err != 0 { die("mWv", err) };    unsafe { *(slot as uint64) -> d_W_v }
+    slot = alloc(8); err = hipMalloc(slot, W_HxH_bytes);  if err != 0 { die("mWo", err) };    unsafe { *(slot as uint64) -> d_W_o }
+    slot = alloc(8); err = hipMalloc(slot, W_HxI_bytes);  if err != 0 { die("mWg", err) };    unsafe { *(slot as uint64) -> d_W_gate }
+    slot = alloc(8); err = hipMalloc(slot, W_HxI_bytes);  if err != 0 { die("mWu", err) };    unsafe { *(slot as uint64) -> d_W_up }
+    slot = alloc(8); err = hipMalloc(slot, W_IxH_bytes);  if err != 0 { die("mWd", err) };    unsafe { *(slot as uint64) -> d_W_down }
+    slot = alloc(8); err = hipMalloc(slot, W_lm_bytes);   if err != 0 { die("mWlm", err) };   unsafe { *(slot as uint64) -> d_W_lmhead }
+    slot = alloc(8); err = hipMalloc(slot, gamma_bytes);  if err != 0 { die("mGat", err) };   unsafe { *(slot as uint64) -> d_gamma_attn }
+    slot = alloc(8); err = hipMalloc(slot, gamma_bytes);  if err != 0 { die("mGff", err) };   unsafe { *(slot as uint64) -> d_gamma_ffn }
+    slot = alloc(8); err = hipMalloc(slot, gamma_bytes);  if err != 0 { die("mGfn", err) };   unsafe { *(slot as uint64) -> d_gamma_fin }
+
+    // === Host-side fill ===
+    uint64 h_tok = alloc(tok_bytes)
+    uint64 i = 0
+    while i < SEQ {
+        uint64 hash = (i + 1) * 2654435761
+        uint64 t = hash - (hash / VOCAB) * VOCAB
+        uint32 tid = t
+        uint64 p = h_tok + i * 4
+        unsafe { *(p as uint32) = tid }
+        i = i + 1
+    }
+    err = hipMemcpy(d_tok, h_tok, tok_bytes, 1); if err != 0 { die("H2D tok", err) }
+
+    uint64 h_W_embed = alloc(W_emb_bytes)
+    uint64 v = 0
+    while v < VOCAB {
+        uint64 d = 0
+        while d < HIDDEN {
+            f64 x = (int_to_f64(v) * 0.0001 + int_to_f64(d) * 0.0002) - 0.05
+            uint64 p = h_W_embed + (v * HIDDEN + d) * 4
+            unsafe { *(p as f32) = f64_to_f32(x) }
+            d = d + 1
+        }
+        v = v + 1
+    }
+    err = hipMemcpy(d_W_embed, h_W_embed, W_emb_bytes, 1); if err != 0 { die("H2D Wemb", err) }
+
+    uint64 h_gamma = alloc(gamma_bytes)
+    uint64 g = 0
+    while g < HIDDEN { uint64 p = h_gamma + g * 4; f32 one = 1.0; unsafe { *(p as f32) = one }; g = g + 1 }
+    err = hipMemcpy(d_gamma_attn, h_gamma, gamma_bytes, 1); if err != 0 { die("H2D γat", err) }
+    err = hipMemcpy(d_gamma_ffn,  h_gamma, gamma_bytes, 1); if err != 0 { die("H2D γff", err) }
+    err = hipMemcpy(d_gamma_fin,  h_gamma, gamma_bytes, 1); if err != 0 { die("H2D γfn", err) }
+
+    uint64 h_W = alloc(W_emb_bytes)        // largest scratch
+    fill_random_weight(h_W, HIDDEN, HIDDEN, 13, 7);    err = hipMemcpy(d_W_q,      h_W, W_HxH_bytes, 1); if err != 0 { die("H2D Wq", err) }
+    fill_random_weight(h_W, HIDDEN, HIDDEN, 17, 11);   err = hipMemcpy(d_W_k,      h_W, W_HxH_bytes, 1); if err != 0 { die("H2D Wk", err) }
+    fill_random_weight(h_W, HIDDEN, HIDDEN, 19, 13);   err = hipMemcpy(d_W_v,      h_W, W_HxH_bytes, 1); if err != 0 { die("H2D Wv", err) }
+    fill_random_weight(h_W, HIDDEN, HIDDEN, 23, 17);   err = hipMemcpy(d_W_o,      h_W, W_HxH_bytes, 1); if err != 0 { die("H2D Wo", err) }
+    fill_random_weight(h_W, HIDDEN, INTER,  29, 19);   err = hipMemcpy(d_W_gate,   h_W, W_HxI_bytes, 1); if err != 0 { die("H2D Wg", err) }
+    fill_random_weight(h_W, HIDDEN, INTER,  31, 23);   err = hipMemcpy(d_W_up,     h_W, W_HxI_bytes, 1); if err != 0 { die("H2D Wu", err) }
+    fill_random_weight(h_W, INTER,  HIDDEN, 37, 29);   err = hipMemcpy(d_W_down,   h_W, W_IxH_bytes, 1); if err != 0 { die("H2D Wd", err) }
+    fill_random_weight(h_W, HIDDEN, VOCAB,  41, 31);   err = hipMemcpy(d_W_lmhead, h_W, W_lm_bytes,  1); if err != 0 { die("H2D Wlm", err) }
+
+    // ============ FORWARD PASS ============
+
+    // 1. embedding_lookup
+    uint64 e_tok = alloc(8); unsafe { *(e_tok as uint64) = d_tok }
+    uint64 e_emb = alloc(8); unsafe { *(e_emb as uint64) = d_W_embed }
+    uint64 e_out = alloc(8); unsafe { *(e_out as uint64) = d_x }
+    uint64 e_d   = alloc(8); unsafe { *(e_d   as uint64) = HIDDEN }
+    uint64 kp_e = alloc(4 * 8)
+    unsafe { *(kp_e as uint64) = e_tok }; unsafe { *((kp_e+8) as uint64) = e_emb }; unsafe { *((kp_e+16) as uint64) = e_out }; unsafe { *((kp_e+24) as uint64) = e_d }
+    err = hipModuleLaunchKernel(fh_embed, SEQ, 1, 1, HIDDEN, 1, 1, 0, 0, kp_e, 0); if err != 0 { die("L embed", err) } 
+
+    // resid = x  (D2D)
+    err = hipMemcpy(d_resid, d_x, act_bytes, 3); if err != 0 { die("D2D resid attn", err) }
+
+    // === ATTENTION BLOCK ===
+
+    // 2. x_n = rmsnorm(x, γ_attn)
+    uint64 r_in = alloc(8); unsafe { *(r_in as uint64) = d_x }
+    uint64 r_out = alloc(8); unsafe { *(r_out as uint64) = d_x_n }
+    uint64 r_g = alloc(8); unsafe { *(r_g as uint64) = d_gamma_attn }
+    uint64 r_m = alloc(8); unsafe { *(r_m as uint64) = SEQ }
+    uint64 r_n = alloc(8); unsafe { *(r_n as uint64) = HIDDEN }
+    uint64 kp_r1 = alloc(5 * 8)
+    unsafe { *(kp_r1 as uint64) = r_in }; unsafe { *((kp_r1+8) as uint64) = r_out }; unsafe { *((kp_r1+16) as uint64) = r_g }; unsafe { *((kp_r1+24) as uint64) = r_m }; unsafe { *((kp_r1+32) as uint64) = r_n }
+    err = hipModuleLaunchKernel(fh_norm, SEQ, 1, 1, HIDDEN, 1, 1, 0, 0, kp_r1, 0); if err != 0 { die("L rmsn1", err) } 
+
+    // 3. Q = x_n @ W_q  (M=SEQ, N=HIDDEN, K=HIDDEN)
+    uint64 q_a = alloc(8); unsafe { *(q_a as uint64) = d_x_n }
+    uint64 q_b = alloc(8); unsafe { *(q_b as uint64) = d_W_q }
+    uint64 q_c = alloc(8); unsafe { *(q_c as uint64) = d_Q }
+    uint64 q_m = alloc(8); unsafe { *(q_m as uint64) = SEQ }
+    uint64 q_n = alloc(8); unsafe { *(q_n as uint64) = HIDDEN }
+    uint64 q_k = alloc(8); unsafe { *(q_k as uint64) = HIDDEN }
+    uint64 kp_q = alloc(6 * 8)
+    unsafe { *(kp_q as uint64) = q_a }; unsafe { *((kp_q+8) as uint64) = q_b }; unsafe { *((kp_q+16) as uint64) = q_c }; unsafe { *((kp_q+24) as uint64) = q_m }; unsafe { *((kp_q+32) as uint64) = q_n }; unsafe { *((kp_q+40) as uint64) = q_k }
+    uint32 grid_qkv = (SEQ / 16) * (HIDDEN / 16)
+    err = hipModuleLaunchKernel(fh_gemm, grid_qkv, 1, 1, 256, 1, 1, 0, 0, kp_q, 0); if err != 0 { die("L gemm Q", err) } 
+
+    // 4. K = x_n @ W_k
+    uint64 k_a = alloc(8); unsafe { *(k_a as uint64) = d_x_n }
+    uint64 k_b = alloc(8); unsafe { *(k_b as uint64) = d_W_k }
+    uint64 k_c = alloc(8); unsafe { *(k_c as uint64) = d_K }
+    uint64 k_m = alloc(8); unsafe { *(k_m as uint64) = SEQ }
+    uint64 k_n2 = alloc(8); unsafe { *(k_n2 as uint64) = HIDDEN }
+    uint64 k_k2 = alloc(8); unsafe { *(k_k2 as uint64) = HIDDEN }
+    uint64 kp_k = alloc(6 * 8)
+    unsafe { *(kp_k as uint64) = k_a }; unsafe { *((kp_k+8) as uint64) = k_b }; unsafe { *((kp_k+16) as uint64) = k_c }; unsafe { *((kp_k+24) as uint64) = k_m }; unsafe { *((kp_k+32) as uint64) = k_n2 }; unsafe { *((kp_k+40) as uint64) = k_k2 }
+    err = hipModuleLaunchKernel(fh_gemm, grid_qkv, 1, 1, 256, 1, 1, 0, 0, kp_k, 0); if err != 0 { die("L gemm K", err) } 
+
+    // 5. V = x_n @ W_v
+    uint64 v_a = alloc(8); unsafe { *(v_a as uint64) = d_x_n }
+    uint64 v_b = alloc(8); unsafe { *(v_b as uint64) = d_W_v }
+    uint64 v_c = alloc(8); unsafe { *(v_c as uint64) = d_Vv }
+    uint64 v_m = alloc(8); unsafe { *(v_m as uint64) = SEQ }
+    uint64 v_n = alloc(8); unsafe { *(v_n as uint64) = HIDDEN }
+    uint64 v_k = alloc(8); unsafe { *(v_k as uint64) = HIDDEN }
+    uint64 kp_v = alloc(6 * 8)
+    unsafe { *(kp_v as uint64) = v_a }; unsafe { *((kp_v+8) as uint64) = v_b }; unsafe { *((kp_v+16) as uint64) = v_c }; unsafe { *((kp_v+24) as uint64) = v_m }; unsafe { *((kp_v+32) as uint64) = v_n }; unsafe { *((kp_v+40) as uint64) = v_k }
+    err = hipModuleLaunchKernel(fh_gemm, grid_qkv, 1, 1, 256, 1, 1, 0, 0, kp_v, 0); if err != 0 { die("L gemm V", err) } 
+
+    // 6. scale Q by 1/sqrt(HIDDEN).  HIDDEN=1024 → scalar = 1/32 = 0.03125 (f32: 0x3D000000).
+    f32 inv_sqrt_h = 0.03125
+    uint64 isb = alloc(4); unsafe { *(isb as f32) = inv_sqrt_h }
+    uint32 inv_sqrt_h_bits = 0; unsafe { *(isb as uint32) -> inv_sqrt_h_bits }
+    uint64 sc_buf = alloc(8); unsafe { *(sc_buf as uint64) = d_Q }
+    uint64 sc_n   = alloc(8); unsafe { *(sc_n   as uint64) = SEQ * HIDDEN }
+    uint64 sc_f   = alloc(8); uint64 fb = inv_sqrt_h_bits; unsafe { *(sc_f as uint64) = fb }
+    uint64 kp_sc = alloc(3 * 8)
+    unsafe { *(kp_sc as uint64) = sc_buf }; unsafe { *((kp_sc+8) as uint64) = sc_n }; unsafe { *((kp_sc+16) as uint64) = sc_f }
+    uint32 grid_sc = (SEQ * HIDDEN + 255) / 256
+    err = hipModuleLaunchKernel(fh_scale, grid_sc, 1, 1, 256, 1, 1, 0, 0, kp_sc, 0); if err != 0 { die("L scale", err) } 
+
+    // 7. K^T = host_transpose(K).  D2H K → transpose into K_T → H2D K_T.
+    err = hipDeviceSynchronize(); if err != 0 { die("sync pre-transpose", err) }
+    uint64 h_K   = alloc(act_bytes)
+    uint64 h_K_T = alloc(K_T_bytes)
+    err = hipMemcpy(h_K, d_K, act_bytes, 2); if err != 0 { die("D2H K", err) }
+    uint64 ki = 0
+    while ki < SEQ {
+        uint64 kj = 0
+        while kj < HIDDEN {
+            uint64 src = h_K   + (ki * HIDDEN + kj) * 4
+            uint64 dst = h_K_T + (kj * SEQ    + ki) * 4
+            uint32 v32 = 0; unsafe { *(src as uint32) -> v32 }
+            unsafe { *(dst as uint32) = v32 }
+            kj = kj + 1
+        }
+        ki = ki + 1
+    }
+    err = hipMemcpy(d_K_T, h_K_T, K_T_bytes, 1); if err != 0 { die("H2D Kt", err) }
+
+    // 8. scores = Q @ K^T  (M=SEQ, N=SEQ, K=HIDDEN)
+    uint64 s_a = alloc(8); unsafe { *(s_a as uint64) = d_Q }
+    uint64 s_b = alloc(8); unsafe { *(s_b as uint64) = d_K_T }
+    uint64 s_c = alloc(8); unsafe { *(s_c as uint64) = d_scores }
+    uint64 s_m = alloc(8); unsafe { *(s_m as uint64) = SEQ }
+    uint64 s_n = alloc(8); unsafe { *(s_n as uint64) = SEQ }
+    uint64 s_k = alloc(8); unsafe { *(s_k as uint64) = HIDDEN }
+    uint64 kp_s = alloc(6 * 8)
+    unsafe { *(kp_s as uint64) = s_a }; unsafe { *((kp_s+8) as uint64) = s_b }; unsafe { *((kp_s+16) as uint64) = s_c }; unsafe { *((kp_s+24) as uint64) = s_m }; unsafe { *((kp_s+32) as uint64) = s_n }; unsafe { *((kp_s+40) as uint64) = s_k }
+    uint32 grid_s = (SEQ / 16) * (SEQ / 16)
+    err = hipModuleLaunchKernel(fh_gemm, grid_s, 1, 1, 256, 1, 1, 0, 0, kp_s, 0); if err != 0 { die("L gemm QKt", err) } 
+
+    // 9. attn = softmax_causal(scores)  [M=SEQ, N=SEQ]
+    uint64 sm_in  = alloc(8); unsafe { *(sm_in  as uint64) = d_scores }
+    uint64 sm_out = alloc(8); unsafe { *(sm_out as uint64) = d_attn }
+    uint64 sm_m   = alloc(8); unsafe { *(sm_m   as uint64) = SEQ }
+    uint64 sm_n   = alloc(8); unsafe { *(sm_n   as uint64) = SEQ }
+    uint64 kp_sm = alloc(4 * 8)
+    unsafe { *(kp_sm as uint64) = sm_in }; unsafe { *((kp_sm+8) as uint64) = sm_out }; unsafe { *((kp_sm+16) as uint64) = sm_m }; unsafe { *((kp_sm+24) as uint64) = sm_n }
+    // Block = N for N-parametric softmax_causal (kernel uses lane-indexed
+    // row scan — block must match N exactly, not the canonical 256).
+    err = hipModuleLaunchKernel(fh_smc, SEQ, 1, 1, SEQ, 1, 1, 0, 0, kp_sm, 0); if err != 0 { die("L softmax_causal", err) }
+
+    // 10. ctx = attn @ V  (M=SEQ, N=HIDDEN, K=SEQ)
+    uint64 c_a = alloc(8); unsafe { *(c_a as uint64) = d_attn }
+    uint64 c_b = alloc(8); unsafe { *(c_b as uint64) = d_Vv }
+    uint64 c_c = alloc(8); unsafe { *(c_c as uint64) = d_ctx }
+    uint64 c_m = alloc(8); unsafe { *(c_m as uint64) = SEQ }
+    uint64 c_n = alloc(8); unsafe { *(c_n as uint64) = HIDDEN }
+    uint64 c_k = alloc(8); unsafe { *(c_k as uint64) = SEQ }
+    uint64 kp_c = alloc(6 * 8)
+    unsafe { *(kp_c as uint64) = c_a }; unsafe { *((kp_c+8) as uint64) = c_b }; unsafe { *((kp_c+16) as uint64) = c_c }; unsafe { *((kp_c+24) as uint64) = c_m }; unsafe { *((kp_c+32) as uint64) = c_n }; unsafe { *((kp_c+40) as uint64) = c_k }
+    uint32 grid_c = (SEQ / 16) * (HIDDEN / 16)
+    err = hipModuleLaunchKernel(fh_gemm, grid_c, 1, 1, 256, 1, 1, 0, 0, kp_c, 0); if err != 0 { die("L gemm attnV", err) } 
+
+    // 11. att_out = ctx @ W_o  (M=SEQ, N=HIDDEN, K=HIDDEN)
+    uint64 ao_a = alloc(8); unsafe { *(ao_a as uint64) = d_ctx }
+    uint64 ao_b = alloc(8); unsafe { *(ao_b as uint64) = d_W_o }
+    uint64 ao_c = alloc(8); unsafe { *(ao_c as uint64) = d_att_out }
+    uint64 ao_m = alloc(8); unsafe { *(ao_m as uint64) = SEQ }
+    uint64 ao_n = alloc(8); unsafe { *(ao_n as uint64) = HIDDEN }
+    uint64 ao_k = alloc(8); unsafe { *(ao_k as uint64) = HIDDEN }
+    uint64 kp_ao = alloc(6 * 8)
+    unsafe { *(kp_ao as uint64) = ao_a }; unsafe { *((kp_ao+8) as uint64) = ao_b }; unsafe { *((kp_ao+16) as uint64) = ao_c }; unsafe { *((kp_ao+24) as uint64) = ao_m }; unsafe { *((kp_ao+32) as uint64) = ao_n }; unsafe { *((kp_ao+40) as uint64) = ao_k }
+    err = hipModuleLaunchKernel(fh_gemm, grid_qkv, 1, 1, 256, 1, 1, 0, 0, kp_ao, 0); if err != 0 { die("L gemm output_proj", err) } 
+
+    // 12. x = residual_add(resid, att_out)
+    uint64 ra1_a = alloc(8); unsafe { *(ra1_a as uint64) = d_resid }
+    uint64 ra1_b = alloc(8); unsafe { *(ra1_b as uint64) = d_att_out }
+    uint64 ra1_o = alloc(8); unsafe { *(ra1_o as uint64) = d_x }
+    uint64 ra1_n = alloc(8); unsafe { *(ra1_n as uint64) = SEQ * HIDDEN }
+    uint64 kp_ra1 = alloc(4 * 8)
+    unsafe { *(kp_ra1 as uint64) = ra1_a }; unsafe { *((kp_ra1+8) as uint64) = ra1_b }; unsafe { *((kp_ra1+16) as uint64) = ra1_o }; unsafe { *((kp_ra1+24) as uint64) = ra1_n }
+    uint32 grid_ra = (SEQ * HIDDEN + 255) / 256
+    err = hipModuleLaunchKernel(fh_resadd, grid_ra, 1, 1, 256, 1, 1, 0, 0, kp_ra1, 0); if err != 0 { die("L resadd1", err) }
+
+    // resid = x   (stash before MLP block)
+    err = hipMemcpy(d_resid, d_x, act_bytes, 3); if err != 0 { die("D2D resid mlp", err) }
+
+    // === MLP BLOCK ===
+
+    // 13. x_n = rmsnorm(x, γ_ffn)
+    uint64 r2_in = alloc(8); unsafe { *(r2_in as uint64) = d_x }
+    uint64 r2_out = alloc(8); unsafe { *(r2_out as uint64) = d_x_n }
+    uint64 r2_g = alloc(8); unsafe { *(r2_g as uint64) = d_gamma_ffn }
+    uint64 r2_m = alloc(8); unsafe { *(r2_m as uint64) = SEQ }
+    uint64 r2_n = alloc(8); unsafe { *(r2_n as uint64) = HIDDEN }
+    uint64 kp_r2 = alloc(5 * 8)
+    unsafe { *(kp_r2 as uint64) = r2_in }; unsafe { *((kp_r2+8) as uint64) = r2_out }; unsafe { *((kp_r2+16) as uint64) = r2_g }; unsafe { *((kp_r2+24) as uint64) = r2_m }; unsafe { *((kp_r2+32) as uint64) = r2_n }
+    err = hipModuleLaunchKernel(fh_norm, SEQ, 1, 1, HIDDEN, 1, 1, 0, 0, kp_r2, 0); if err != 0 { die("L rmsn2", err) }
+
+    // 14. gate = x_n @ W_gate  (M=SEQ, N=INTER, K=HIDDEN)
+    uint64 g_a = alloc(8); unsafe { *(g_a as uint64) = d_x_n }
+    uint64 g_b = alloc(8); unsafe { *(g_b as uint64) = d_W_gate }
+    uint64 g_c = alloc(8); unsafe { *(g_c as uint64) = d_gate }
+    uint64 g_m = alloc(8); unsafe { *(g_m as uint64) = SEQ }
+    uint64 g_n = alloc(8); unsafe { *(g_n as uint64) = INTER }
+    uint64 g_k = alloc(8); unsafe { *(g_k as uint64) = HIDDEN }
+    uint64 kp_g = alloc(6 * 8)
+    unsafe { *(kp_g as uint64) = g_a }; unsafe { *((kp_g+8) as uint64) = g_b }; unsafe { *((kp_g+16) as uint64) = g_c }; unsafe { *((kp_g+24) as uint64) = g_m }; unsafe { *((kp_g+32) as uint64) = g_n }; unsafe { *((kp_g+40) as uint64) = g_k }
+    uint32 grid_gu = (SEQ / 16) * (INTER / 16)
+    err = hipModuleLaunchKernel(fh_gemm, grid_gu, 1, 1, 256, 1, 1, 0, 0, kp_g, 0); if err != 0 { die("L gemm gate", err) }
+
+    // 15. up = x_n @ W_up
+    uint64 u_a = alloc(8); unsafe { *(u_a as uint64) = d_x_n }
+    uint64 u_b = alloc(8); unsafe { *(u_b as uint64) = d_W_up }
+    uint64 u_c = alloc(8); unsafe { *(u_c as uint64) = d_up }
+    uint64 u_m = alloc(8); unsafe { *(u_m as uint64) = SEQ }
+    uint64 u_n = alloc(8); unsafe { *(u_n as uint64) = INTER }
+    uint64 u_k = alloc(8); unsafe { *(u_k as uint64) = HIDDEN }
+    uint64 kp_u = alloc(6 * 8)
+    unsafe { *(kp_u as uint64) = u_a }; unsafe { *((kp_u+8) as uint64) = u_b }; unsafe { *((kp_u+16) as uint64) = u_c }; unsafe { *((kp_u+24) as uint64) = u_m }; unsafe { *((kp_u+32) as uint64) = u_n }; unsafe { *((kp_u+40) as uint64) = u_k }
+    err = hipModuleLaunchKernel(fh_gemm, grid_gu, 1, 1, 256, 1, 1, 0, 0, kp_u, 0); if err != 0 { die("L gemm up", err) }
+
+    // 16. ffn = silu_mul(gate, up)
+    uint64 sm2_g = alloc(8); unsafe { *(sm2_g as uint64) = d_gate }
+    uint64 sm2_u = alloc(8); unsafe { *(sm2_u as uint64) = d_up }
+    uint64 sm2_o = alloc(8); unsafe { *(sm2_o as uint64) = d_ffn }
+    uint64 sm2_n = alloc(8); unsafe { *(sm2_n as uint64) = SEQ * INTER }
+    uint64 kp_sm2 = alloc(4 * 8)
+    unsafe { *(kp_sm2 as uint64) = sm2_g }; unsafe { *((kp_sm2+8) as uint64) = sm2_u }; unsafe { *((kp_sm2+16) as uint64) = sm2_o }; unsafe { *((kp_sm2+24) as uint64) = sm2_n }
+    uint32 grid_sm2 = (SEQ * INTER + 255) / 256
+    err = hipModuleLaunchKernel(fh_silumul, grid_sm2, 1, 1, 256, 1, 1, 0, 0, kp_sm2, 0); if err != 0 { die("L silu_mul", err) }
+
+    // 17. x_proj = ffn @ W_down  (M=SEQ, N=HIDDEN, K=INTER)
+    uint64 d_a = alloc(8); unsafe { *(d_a as uint64) = d_ffn }
+    uint64 d_b = alloc(8); unsafe { *(d_b as uint64) = d_W_down }
+    uint64 d_c = alloc(8); unsafe { *(d_c as uint64) = d_x_proj }
+    uint64 d_m = alloc(8); unsafe { *(d_m as uint64) = SEQ }
+    uint64 d_n = alloc(8); unsafe { *(d_n as uint64) = HIDDEN }
+    uint64 d_k = alloc(8); unsafe { *(d_k as uint64) = INTER }
+    uint64 kp_d = alloc(6 * 8)
+    unsafe { *(kp_d as uint64) = d_a }; unsafe { *((kp_d+8) as uint64) = d_b }; unsafe { *((kp_d+16) as uint64) = d_c }; unsafe { *((kp_d+24) as uint64) = d_m }; unsafe { *((kp_d+32) as uint64) = d_n }; unsafe { *((kp_d+40) as uint64) = d_k }
+    err = hipModuleLaunchKernel(fh_gemm, grid_qkv, 1, 1, 256, 1, 1, 0, 0, kp_d, 0); if err != 0 { die("L gemm down", err) }
+
+    // 18. x = residual_add(resid, x_proj)
+    uint64 ra2_a = alloc(8); unsafe { *(ra2_a as uint64) = d_resid }
+    uint64 ra2_b = alloc(8); unsafe { *(ra2_b as uint64) = d_x_proj }
+    uint64 ra2_o = alloc(8); unsafe { *(ra2_o as uint64) = d_x }
+    uint64 ra2_n = alloc(8); unsafe { *(ra2_n as uint64) = SEQ * HIDDEN }
+    uint64 kp_ra2 = alloc(4 * 8)
+    unsafe { *(kp_ra2 as uint64) = ra2_a }; unsafe { *((kp_ra2+8) as uint64) = ra2_b }; unsafe { *((kp_ra2+16) as uint64) = ra2_o }; unsafe { *((kp_ra2+24) as uint64) = ra2_n }
+    err = hipModuleLaunchKernel(fh_resadd, grid_ra, 1, 1, 256, 1, 1, 0, 0, kp_ra2, 0); if err != 0 { die("L resadd2", err) }
+
+    // === LM HEAD ===
+
+    // 19. x_n = rmsnorm(x, γ_final)
+    uint64 r3_in = alloc(8); unsafe { *(r3_in as uint64) = d_x }
+    uint64 r3_out = alloc(8); unsafe { *(r3_out as uint64) = d_x_n }
+    uint64 r3_g = alloc(8); unsafe { *(r3_g as uint64) = d_gamma_fin }
+    uint64 r3_m = alloc(8); unsafe { *(r3_m as uint64) = SEQ }
+    uint64 r3_n = alloc(8); unsafe { *(r3_n as uint64) = HIDDEN }
+    uint64 kp_r3 = alloc(5 * 8)
+    unsafe { *(kp_r3 as uint64) = r3_in }; unsafe { *((kp_r3+8) as uint64) = r3_out }; unsafe { *((kp_r3+16) as uint64) = r3_g }; unsafe { *((kp_r3+24) as uint64) = r3_m }; unsafe { *((kp_r3+32) as uint64) = r3_n }
+    err = hipModuleLaunchKernel(fh_norm, SEQ, 1, 1, HIDDEN, 1, 1, 0, 0, kp_r3, 0); if err != 0 { die("L rmsn3", err) }
+
+    // 20. logits = x_n @ W_lm_head  (M=SEQ, N=VOCAB, K=HIDDEN)
+    uint64 lm_a = alloc(8); unsafe { *(lm_a as uint64) = d_x_n }
+    uint64 lm_b = alloc(8); unsafe { *(lm_b as uint64) = d_W_lmhead }
+    uint64 lm_c = alloc(8); unsafe { *(lm_c as uint64) = d_logits }
+    uint64 lm_m = alloc(8); unsafe { *(lm_m as uint64) = SEQ }
+    uint64 lm_n = alloc(8); unsafe { *(lm_n as uint64) = VOCAB }
+    uint64 lm_k = alloc(8); unsafe { *(lm_k as uint64) = HIDDEN }
+    uint64 kp_lm = alloc(6 * 8)
+    unsafe { *(kp_lm as uint64) = lm_a }; unsafe { *((kp_lm+8) as uint64) = lm_b }; unsafe { *((kp_lm+16) as uint64) = lm_c }; unsafe { *((kp_lm+24) as uint64) = lm_m }; unsafe { *((kp_lm+32) as uint64) = lm_n }; unsafe { *((kp_lm+40) as uint64) = lm_k }
+    uint32 grid_lm = (SEQ / 16) * (VOCAB / 16)
+    err = hipModuleLaunchKernel(fh_gemm, grid_lm, 1, 1, 256, 1, 1, 0, 0, kp_lm, 0); if err != 0 { die("L gemm lm_head", err) }
+
+    // 21. tokens = argmax_logits(logits)
+    uint64 am_l = alloc(8); unsafe { *(am_l as uint64) = d_logits }
+    uint64 am_o = alloc(8); unsafe { *(am_o as uint64) = d_tokens }
+    uint64 am_v = alloc(8); unsafe { *(am_v as uint64) = VOCAB }
+    uint64 am_p = alloc(8); unsafe { *(am_p as uint64) = 0 }
+    uint64 kp_am = alloc(4 * 8)
+    unsafe { *(kp_am as uint64) = am_l }; unsafe { *((kp_am+8) as uint64) = am_o }; unsafe { *((kp_am+16) as uint64) = am_v }; unsafe { *((kp_am+24) as uint64) = am_p }
+    err = hipModuleLaunchKernel(fh_argmax, SEQ, 1, 1, 32, 1, 1, 0, 0, kp_am, 0); if err != 0 { die("L argmax", err) }
+
+    err = hipDeviceSynchronize(); if err != 0 { die("sync end", err) }
+
+    // === D2H + report ===
+    uint64 h_tokens = alloc(tok_bytes)
+    err = hipMemcpy(h_tokens, d_tokens, tok_bytes, 2); if err != 0 { die("D2H tokens", err) }
+
+    uint64 valid = 0
+    uint64 max_seen = 0
+    i = 0
+    while i < SEQ {
+        uint64 p = h_tokens + i * 4
+        uint32 tid = 0; unsafe { *(p as uint32) -> tid }
+        uint64 tid64 = tid
+        if tid64 < VOCAB { valid = valid + 1 }
+        if tid64 > max_seen { max_seen = tid64 }
+        i = i + 1
+    }
+
+    puts("input_token_ids:")
+    i = 0
+    while i < SEQ {
+        uint64 p = h_tok + i * 4
+        uint32 tid = 0; unsafe { *(p as uint32) -> tid }
+        uint64 tid64 = tid
+        print_label_val("  in",  4, tid64)
+        i = i + 1
+    }
+    puts("output_token_ids:")
+    i = 0
+    while i < SEQ {
+        uint64 p = h_tokens + i * 4
+        uint32 tid = 0; unsafe { *(p as uint32) -> tid }
+        uint64 tid64 = tid
+        print_label_val("  out", 5, tid64)
+        i = i + 1
+    }
+
+    print_label_val("SEQ",            3, SEQ)
+    print_label_val("HIDDEN",         6, HIDDEN)
+    print_label_val("INTER",          5, INTER)
+    print_label_val("VOCAB",          5, VOCAB)
+    print_label_val("kernels_chained",15, 20)
+    print_label_val("valid_tokens",  12, valid)
+    print_label_val("max_token_id",  12, max_seen)
+
+    hipFree(d_tok); hipFree(d_W_embed); hipFree(d_x); hipFree(d_resid); hipFree(d_x_n)
+    hipFree(d_Q); hipFree(d_K); hipFree(d_Vv); hipFree(d_K_T)
+    hipFree(d_scores); hipFree(d_attn); hipFree(d_ctx); hipFree(d_att_out)
+    hipFree(d_gate); hipFree(d_up); hipFree(d_ffn); hipFree(d_x_proj)
+    hipFree(d_logits); hipFree(d_tokens)
+    hipFree(d_W_q); hipFree(d_W_k); hipFree(d_W_v); hipFree(d_W_o)
+    hipFree(d_W_gate); hipFree(d_W_up); hipFree(d_W_down); hipFree(d_W_lmhead)
+    hipFree(d_gamma_attn); hipFree(d_gamma_ffn); hipFree(d_gamma_fin)
+    exit(0)
+}
