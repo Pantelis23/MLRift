@@ -215,6 +215,32 @@ fn main() {
         i0 = i0 + 1
     }
 
+    // Optional full-GPU forward path: keep the residual carry device-
+    // resident throughout the 28-layer sweep, sync only at the layer-
+    // half boundaries.  Gated by MLRIFT_GPU_FULL_FORWARD=1.
+    u64 use_gpu_full = 0
+    u64 d_x_a = 0; u64 d_x_a_h = 0
+    u64 d_x_b = 0; u64 d_x_b_h = 0
+    u64 ev_full = getenv("MLRIFT_GPU_FULL_FORWARD")
+    if ev_full != 0 {
+        u8 cf = 0; unsafe { *(ev_full as u8) -> cf }
+        if cf != 48 {
+            // Need MLRIFT_GPU_MATMUL=1 too — gpu_pipeline_ready depends on it.
+            if gpu_pipeline_ready() == 1 {
+                d_x_a = dev_try_alloc_host_visible(hidden * 4)
+                d_x_b = dev_try_alloc_host_visible(hidden * 4)
+                if d_x_a != 0 && d_x_b != 0 {
+                    d_x_a_h = dev_host_ptr(d_x_a)
+                    d_x_b_h = dev_host_ptr(d_x_b)
+                    use_gpu_full = 1
+                    eout("[qwen3_generate] full-GPU forward ENABLED\n")
+                }
+            } else {
+                eout("[qwen3_generate] MLRIFT_GPU_FULL_FORWARD set but pipeline NOT ready\n")
+            }
+        }
+    }
+
     u64 pos = 0
     u64 step = 0
     u64 decode_start_ns = time_now()
@@ -232,15 +258,38 @@ fn main() {
         // Sweep 28 layers at this position; each writes K/V into cache[layer][pos].
         u64 layer_start_ns = time_now()
         u64 layer = 0
-        while layer < n_layers {
-            Qwen3LayerWeights w = layers_arr + layer * 88
-            u64 kc = k_cache + layer * layer_stride
-            u64 vc = v_cache + layer * layer_stride
-            qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
-            u64 tmp = x_cur
-            x_cur = x_nxt
-            x_nxt = tmp
-            layer = layer + 1
+        if use_gpu_full != 0 {
+            // Full-GPU forward path.  Initial H2D into d_x_a; ping-pong
+            // through 28 layers; final D2H back to x_cur.
+            memcpy(d_x_a_h, x_cur, hidden * 4)
+            u64 d_in = d_x_a; u64 d_out = d_x_b
+            u64 d_in_h = d_x_a_h; u64 d_out_h = d_x_b_h
+            while layer < n_layers {
+                Qwen3LayerWeights w = layers_arr + layer * 88
+                u64 kc = k_cache + layer * layer_stride
+                u64 vc = v_cache + layer * layer_stride
+                u64 rc = qwen3_forward_layer_gpu(d_in, d_out, w, pos, kc, vc, num_workers)
+                if rc != 0 {
+                    eout("[qwen3_generate] GPU forward failed at layer "); eu64(layer); eout("\n")
+                    exit(1)
+                }
+                u64 tmp = d_in; d_in = d_out; d_out = tmp
+                u64 tmp_h = d_in_h; d_in_h = d_out_h; d_out_h = tmp_h
+                layer = layer + 1
+            }
+            // d_in now holds the final residual; D2H back to x_cur.
+            memcpy(x_cur, d_in_h, hidden * 4)
+        } else {
+            while layer < n_layers {
+                Qwen3LayerWeights w = layers_arr + layer * 88
+                u64 kc = k_cache + layer * layer_stride
+                u64 vc = v_cache + layer * layer_stride
+                qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+                u64 tmp = x_cur
+                x_cur = x_nxt
+                x_nxt = tmp
+                layer = layer + 1
+            }
         }
         sum_layer_ns = sum_layer_ns + time_elapsed(layer_start_ns)
 

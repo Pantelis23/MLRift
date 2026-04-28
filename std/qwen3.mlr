@@ -1085,3 +1085,188 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     dealloc(mid); dealloc(mid_norm)
     dealloc(gate_buf); dealloc(up_buf); dealloc(ff_buf); dealloc(ff_out)
 }
+
+// ─── Full-GPU forward layer ──────────────────────────────────────────
+// Parallel implementation of qwen3_forward_layer that keeps every
+// intermediate device-resident and chains the GPU ops with a single
+// flush per layer-half (one before CPU attention, one at the layer
+// boundary).  Two syncs per layer instead of four.
+//
+// Inputs:
+//   d_x_in          device VA of the residual carry (input).
+//   d_x_out         device VA where the new residual is written.
+//   w               layer weights (host bf16).
+//   pos             current decode position.
+//   k_cache_layer,
+//   v_cache_layer   host buffers for the KV cache (CPU attention path
+//                   stays the same — this slice keeps qknorm/rope/
+//                   attention on CPU).
+//   num_workers     unused on the GPU path (no thread-pool dispatch).
+//
+// REQUIRES: gpu_pipeline_ready() == 1 and gpu_matmul_enabled() == 1.
+// Caller must allocate d_x_in and d_x_out (hidden f32 each) and
+// initialise d_x_in with the input residual via memcpy through the
+// device's host-mapped pointer.
+
+static u64 _gpuq_init        = 0
+static u64 _gpuq_d_x_norm    = 0
+static u64 _gpuq_d_qkv       = 0
+static u64 _gpuq_d_qkv_h     = 0
+static u64 _gpuq_d_attn      = 0
+static u64 _gpuq_d_attn_h    = 0
+static u64 _gpuq_d_o         = 0
+static u64 _gpuq_d_mid       = 0
+static u64 _gpuq_d_mid_norm  = 0
+static u64 _gpuq_d_gu        = 0
+static u64 _gpuq_d_ff        = 0
+static u64 _gpuq_d_ff_out    = 0
+
+fn _qwen3_gpu_pipeline_init() -> u64 {
+    if _gpuq_init != 0 { return _gpuq_init }
+    if gpu_pipeline_ready() == 0 { return 0 }
+
+    u64 hidden  = QWEN3_HIDDEN
+    u64 q_dim   = QWEN3_Q_DIM
+    u64 kv_dim  = QWEN3_KV_DIM
+    u64 ff      = QWEN3_INTERMEDIATE
+    u64 qkv_dim = q_dim + 2 * kv_dim
+
+    u64 hslot = alloc(8)
+    _gpuq_d_x_norm = gpu_buf_reserve(hidden * 4, 0)
+    _gpuq_d_qkv    = gpu_buf_reserve(qkv_dim * 4, hslot)
+    unsafe { *(hslot as u64) -> _gpuq_d_qkv_h }
+    _gpuq_d_attn   = gpu_buf_reserve(q_dim * 4, hslot)
+    unsafe { *(hslot as u64) -> _gpuq_d_attn_h }
+    _gpuq_d_o        = gpu_buf_reserve(hidden * 4, 0)
+    _gpuq_d_mid      = gpu_buf_reserve(hidden * 4, 0)
+    _gpuq_d_mid_norm = gpu_buf_reserve(hidden * 4, 0)
+    _gpuq_d_gu       = gpu_buf_reserve(2 * ff * 4, 0)
+    _gpuq_d_ff       = gpu_buf_reserve(ff * 4, 0)
+    _gpuq_d_ff_out   = gpu_buf_reserve(hidden * 4, 0)
+
+    if _gpuq_d_x_norm == 0 { return 0 }
+    if _gpuq_d_qkv == 0 { return 0 }
+    if _gpuq_d_attn == 0 { return 0 }
+    if _gpuq_d_o == 0 { return 0 }
+    if _gpuq_d_mid == 0 { return 0 }
+    if _gpuq_d_mid_norm == 0 { return 0 }
+    if _gpuq_d_gu == 0 { return 0 }
+    if _gpuq_d_ff == 0 { return 0 }
+    if _gpuq_d_ff_out == 0 { return 0 }
+
+    _gpuq_init = 1
+    return 1
+}
+
+// Returns 0 on success.  Returns 1 if the GPU pipeline failed to
+// initialise (caller should fall back to qwen3_forward_layer).
+fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
+                            Qwen3LayerWeights w, u64 pos,
+                            u64 k_cache_layer, u64 v_cache_layer,
+                            u64 num_workers) -> u64 {
+    if _qwen3_gpu_pipeline_init() == 0 { return 1 }
+
+    u64 hidden  = QWEN3_HIDDEN
+    u64 hd      = QWEN3_HEAD_DIM
+    u64 nh      = QWEN3_N_HEADS
+    u64 nkv     = QWEN3_N_KV_HEADS
+    u64 q_dim   = QWEN3_Q_DIM
+    u64 kv_dim  = QWEN3_KV_DIM
+    u64 ff      = QWEN3_INTERMEDIATE
+    u64 qkv_dim = q_dim + 2 * kv_dim
+
+    // 1.  input_norm: x_norm = rmsnorm(x_in) * gamma_in
+    u64 d_in_gamma = gpu_cache_bf16_as_f32(w.input_norm_w, hidden)
+    if d_in_gamma == 0 { return 1 }
+    if gpu_rmsnorm_1024_to_dev(_gpuq_d_x_norm, d_x_in, d_in_gamma, 1) != 0 { return 1 }
+
+    // 2.  qkv (fused) = w.q_proj_w @ x_norm
+    if gpu_matmul_to_dev(_gpuq_d_qkv, _gpuq_d_x_norm, w.q_proj_w, qkv_dim, hidden) != 0 { return 1 }
+
+    // 3.  Sync 1 — drain so CPU can read qkv from its GTT host pointer.
+    gpu_pipeline_flush()
+
+    // 4.  CPU side: split qkv → q,k,v into the kv-cache slot, qknorm,
+    //     rope, attention.  Reads directly from _gpuq_d_qkv_h (GTT,
+    //     no D2H copy needed).
+    u64 q_buf = alloc(q_dim * 4)
+    u64 kv_row_bytes = nkv * hd * 4
+    u64 k_row = k_cache_layer + pos * kv_row_bytes
+    u64 v_row = v_cache_layer + pos * kv_row_bytes
+    memcpy(q_buf, _gpuq_d_qkv_h, q_dim * 4)
+    memcpy(k_row, _gpuq_d_qkv_h + q_dim * 4, kv_dim * 4)
+    memcpy(v_row, _gpuq_d_qkv_h + (q_dim + kv_dim) * 4, kv_dim * 4)
+
+    u64 qk_w_q = 0
+    u64 qk_w_k = 0
+    u64 qk_w_f32 = 0
+    if qwen3_norm_kind == 0 {
+        qk_w_f32 = alloc(hd * 4)
+        qwen3_bf16_row_to_f32(qk_w_f32, w.q_norm_w, hd)
+        qk_w_q = qk_w_f32
+    } else {
+        qk_w_q = w.q_norm_w
+    }
+    u64 h = 0
+    while h < nh {
+        qwen3_rmsnorm_f32_weights(q_buf + h * hd * 4, q_buf + h * hd * 4, qk_w_q, hd)
+        h = h + 1
+    }
+    if qwen3_norm_kind == 0 {
+        qwen3_bf16_row_to_f32(qk_w_f32, w.k_norm_w, hd)
+        qk_w_k = qk_w_f32
+    } else {
+        qk_w_k = w.k_norm_w
+    }
+    h = 0
+    while h < nkv {
+        qwen3_rmsnorm_f32_weights(k_row + h * hd * 4, k_row + h * hd * 4, qk_w_k, hd)
+        h = h + 1
+    }
+    if qwen3_norm_kind == 0 { dealloc(qk_w_f32) }
+
+    if qwen3_rope_cos_cache == 0 {
+        qwen3_rope_cos_cache = alloc((hd / 2) * 4)
+        qwen3_rope_sin_cache = alloc((hd / 2) * 4)
+    }
+    if qwen3_rope_cache_pos != pos {
+        f64 theta = 1000000.0
+        qwen3_rope_compute(qwen3_rope_cos_cache, qwen3_rope_sin_cache, pos, hd, theta)
+        qwen3_rope_cache_pos = pos
+    }
+    qwen3_rope_apply(q_buf, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nh, hd)
+    qwen3_rope_apply(k_row, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nkv, hd)
+
+    u64 attn_out = alloc(q_dim * 4)
+    qwen3_attn_cached(attn_out, q_buf, k_cache_layer, v_cache_layer,
+                      pos + 1, nh, nkv, hd)
+
+    // 5.  H2D attn_out → d_attn (direct GTT memcpy).
+    memcpy(_gpuq_d_attn_h, attn_out, q_dim * 4)
+    dealloc(q_buf)
+    dealloc(attn_out)
+
+    // 6.  Chained GPU section — 6 ops, no intermediate sync:
+    //     o_proj → resid → post_norm → gate_up → silu → down → resid
+    if gpu_matmul_to_dev(_gpuq_d_o, _gpuq_d_attn, w.o_proj_w, hidden, q_dim) != 0 { return 1 }
+    if gpu_resid_add_to_dev(_gpuq_d_mid, d_x_in, _gpuq_d_o, hidden) != 0 { return 1 }
+
+    u64 d_post_gamma = gpu_cache_bf16_as_f32(w.post_norm_w, hidden)
+    if d_post_gamma == 0 { return 1 }
+    if gpu_rmsnorm_1024_to_dev(_gpuq_d_mid_norm, _gpuq_d_mid, d_post_gamma, 1) != 0 { return 1 }
+
+    if gpu_matmul_to_dev(_gpuq_d_gu, _gpuq_d_mid_norm, w.gate_proj_w, 2 * ff, hidden) != 0 { return 1 }
+    if gpu_silu_mul_to_dev(_gpuq_d_ff, _gpuq_d_gu, _gpuq_d_gu + ff * 4, ff) != 0 { return 1 }
+    if gpu_matmul_to_dev(_gpuq_d_ff_out, _gpuq_d_ff, w.down_proj_w, hidden, ff) != 0 { return 1 }
+    if gpu_resid_add_to_dev(d_x_out, _gpuq_d_mid, _gpuq_d_ff_out, hidden) != 0 { return 1 }
+
+    // 7.  Sync 2 — drain before next layer reads d_x_out.
+    gpu_pipeline_flush()
+    return 0
+}
+
+// Read the host-mapped pointer of a device VA that was reserved via
+// gpu_buf_reserve.  Returns 0 if not host-visible.
+fn qwen3_gpu_dev_host_ptr(u64 dev_va) -> u64 {
+    return dev_host_ptr(dev_va)
+}
