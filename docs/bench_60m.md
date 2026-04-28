@@ -52,12 +52,31 @@ runs.
 `venv/` is gitignored.
 
 The `--target=amdgpu-native` path emits raw GFX1100 ISA into a hand-rolled
-ELF code object — no `hipcc`, no LLVM toolchain, no `.hip` source. Three
-of the four `@kernel` functions (`decay_step`, `delivery_step`,
-`lif_step`) are lowered natively. `csr_build` (a one-shot startup kernel
-that needs `v_mul_lo_u64` + 64-bit unsigned modulo we don't have ISA
-helpers for yet) still goes through hipcc; the launcher loads it via a
-dual-`.co` fallback (`NOESIS_CSR_CO_PATH=/path/to/hipcc.co`).
+ELF code object — no `hipcc`, no LLVM toolchain, no `.hip` source. **All
+four `@kernel` functions** (`csr_build`, `decay_step`, `delivery_step`,
+`lif_step`) are now lowered natively (csr_build's 64-bit unsigned modulo
+ships as a Barrett-reduction lowering — see "Spike-count footnote"
+below). The launcher's dual-`.co` fallback (`NOESIS_CSR_CO_PATH=…`) is
+retained but no longer required for the headline run; the only optional
+hipcc dependency is the `spike_reduce` host-side reduction kernel, and
+that path is bypassed entirely when `NOESIS_CSR_CO_PATH` is unset (the
+launcher just skips the on-device reduce).
+
+End-to-end reproducibility (verified 2026-04-28):
+
+```
+$ ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/noesis_60m_gpu.mlr        -o /tmp/noesis_60m_gpu
+$ ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/noesis_60m_gpu_launch.mlr -o /tmp/noesis_60m_gpu_launch
+$ /tmp/noesis_60m_gpu_launch
+init_us:        1639334     (1.64 s)
+csr_build_us:    153315     (0.15 s)
+sim_us:        26453133     (26.45 s, 13.2 ms/step over 2000 steps)
+total_spikes: 1985575926
+total_wall_us: 28594657     (28.59 s)
+```
+
+`mlrc` round-trip from source → AMDGCN code object: **3.4 ms** for all
+four kernels. No external toolchain in the build OR runtime path.
 
 ## Results
 
@@ -71,11 +90,18 @@ dual-`.co` fallback (`NOESIS_CSR_CO_PATH=/path/to/hipcc.co`).
 | **MLRift** (GPU, HIP runtime + hipcc kernels) | — | 1.50 s | **0.11 s** | **26.55 s** | **13 ms** | **28.40 s** | 1,985,575,928 |
 | **MLRift** (GPU, KFD shim + hipcc kernels)\* | — | 1.69 s | 0.18 s | **26.59 s** | **13 ms** | **29.50 s** | 1,985,575,928 |
 | **MLRift** (GPU, KFD shim + native gfx1100 ISA + spike_reduce fallback)\* | — | 1.68 s | 0.22 s | **26.63 s** | **13 ms** | **29.28 s** | 1,985,575,926 |
+| **MLRift** (GPU, KFD shim + native gfx1100 ISA, no spike_reduce)\*† | — | 1.64 s | 0.15 s | **26.45 s** | **13 ms** | **28.59 s** | 1,985,575,926 |
 
 \* zero-ROCm linkage in the launcher binary — `ldd` shows only
 `libc + ld-linux + vdso`. No `libamdhip64`, `libhsa-runtime64`,
 `libdrm`, `libdrm_amdgpu`. Built with `--target=amdgpu-native` on
 the launcher source.
+
+† Reproduced 2026-04-28 with all four kernels native (csr_build now
+bit-encoded via Barrett-reduction modulo, no hipcc dependency anywhere
+in the runtime path).  `NOESIS_CSR_CO_PATH` unset, so the optional
+`spike_reduce` device path is bypassed; host-side spike total still
+matches `1,985,575,926`.
 
 \* numpy was run on the original flat-`RI` workload (1.86 B spikes).
 All other variants use the per-neuron `RI` variance (1.99 B spikes,
@@ -108,9 +134,9 @@ numpy rerun would be ~60 min.
 
 `--target=amdgpu-native` emits the same kernels via a hand-written
 GFX1100 instruction encoder in `src/format_amdgpu.mlr`. No `hipcc`,
-no LLVM toolchain, no `.hip` source. The kernels (`decay_step`,
-`delivery_step`, `lif_step`) are bit-encoded directly into an ELF
-code object, including:
+no LLVM toolchain, no `.hip` source. All four kernels (`csr_build`,
+`decay_step`, `delivery_step`, `lif_step`) are bit-encoded directly
+into an ELF code object, including:
 
 - IEEE-correct f64 division (`v_div_scale_f64` ×2, `v_rcp_f64`,
   Newton-Raphson refinement, `v_div_fma_f64`, `v_div_fixup_f64`) —
@@ -173,15 +199,17 @@ including a ~120 MB on-disk footprint and the version skew between
 `libhsa-runtime64` and the kernel-side `amdgpu` driver that has
 historically been a source of bugs.
 
-The architectural exit on this workload is the GPU `spike_reduce`
-kernel — a small reduction (two `atomic_add_u64` ops) recently added
-in service of the GPU-side D2H copy path. It's still hipcc-built and
-loaded via `NOESIS_CSR_CO_PATH` fallback while a native lowering for
-its `atomic_add_u64` shape is in progress. The KFD shim handles the
-clang offload bundle inline (no manual `clang-offload-bundler --unbundle`
-step) and zero-fills COv5 hidden kernargs before dispatch, so any
-hipcc-built kernel loads through the fallback path without source
-changes.
+The only kernel still without a native lowering is the GPU
+`spike_reduce` kernel — a small reduction (two `atomic_add_u64` ops)
+recently added in service of the GPU-side D2H copy path. It's
+optional: when `NOESIS_CSR_CO_PATH` is unset the launcher detects the
+missing function handle (`hipModuleGetFunction → 500`) and skips the
+device-side reduce entirely. With `NOESIS_CSR_CO_PATH=/path/to/hipcc.co`
+set, the KFD shim handles the clang offload bundle inline (no manual
+`clang-offload-bundler --unbundle` step) and zero-fills COv5 hidden
+kernargs before dispatch, so the hipcc-built variant loads through
+the fallback path without source changes. A native lowering for its
+`atomic_add_u64` shape is the open follow-up.
 
 #### Spike-count footnote: the 2-spike diff
 
