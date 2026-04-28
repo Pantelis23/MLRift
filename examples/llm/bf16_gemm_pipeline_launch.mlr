@@ -236,16 +236,49 @@ fn main() {
     uint32 mab_bits = 0; unsafe { *(mab_buf as uint32) -> mab_bits }
     uint64 mab_bits64 = mab_bits
 
-    print_label_val("M",             1, M)
-    print_label_val("N",             1, N)
-    print_label_val("K",             1, K)
-    print_label_val("cells",         5, M * N)
-    print_label_val("fail_count",   10, fail_count)
-    print_label_val("max_abs_bits", 12, mab_bits64)
+    // VMEM accounting.  Reuse factor for GEMM at this shape:
+    //   - W (K×N) read once per output tile but shared across all M
+    //     output rows.  In the lower bound, each weight element is
+    //     read M/16 times (one per 16x16 tile-row) — but that's still
+    //     a M/16-amplification of W_f32 traffic.  We report the
+    //     LOWER bound (each element read exactly once) here, which
+    //     matches what the analytical bandwidth model assumes for a
+    //     well-tiled gemm.  Real traffic is higher.
+    uint64 mem_x          = x_bytes_f32
+    uint64 mem_W_bf16     = w_bytes_bf16
+    uint64 mem_W_f32      = w_bytes_f32
+    uint64 mem_out        = out_bytes
+    uint64 mem_total      = mem_x + mem_W_bf16 + mem_W_f32 + mem_out
+    uint64 mem_steady     = mem_x + mem_W_f32 + mem_out
+
+    // Per-call lower-bound VMEM (single touch of each operand).
+    uint64 bytes_per_call = mem_x + mem_W_f32 + mem_out
+    uint64 gbs_x100       = (bytes_per_call * 100) / per_call_ns
+    uint64 bw_pct         = (bytes_per_call * 100) / (per_call_ns * 624)
+    uint64 compute_pct    = (flops_per_call * 100) / (per_call_ns * 47000)
+
+    print_label_val("M",                1, M)
+    print_label_val("N",                1, N)
+    print_label_val("K",                1, K)
+    print_label_val("cells",            5, M * N)
+    print_label_val("fail_count",      10, fail_count)
+    print_label_val("max_abs_bits",    12, mab_bits64)
     if first_bad != 0xFFFFFFFFFFFFFFFF { print_label_val("first_bad", 9, first_bad) }
-    print_label_val("bench_iters",  11, iters)
-    print_label_val("per_call_us",  11, per_call_ns / 1000)
-    print_label_val("gflops_x100",  11, gflops_x100)
+    print_label_val("flops_per_call",  14, flops_per_call)
+    print_label_val("bytes_per_call",  14, bytes_per_call)
+    print_label_val("bench_iters",     11, iters)
+    print_label_val("total_us",         8, elapsed_ns / 1000)
+    print_label_val("per_call_us",     11, per_call_ns / 1000)
+    print_label_val("gflops_x100",     11, gflops_x100)
+    print_label_val("gbs_x100",         8, gbs_x100)
+    print_label_val("bw_pct_of_peak",  14, bw_pct)
+    print_label_val("compute_pct",     11, compute_pct)
+    print_label_val("vram_x_kb",        9, mem_x / 1024)
+    print_label_val("vram_W_bf16_kb",  14, mem_W_bf16 / 1024)
+    print_label_val("vram_W_f32_kb",   13, mem_W_f32 / 1024)
+    print_label_val("vram_out_kb",     11, mem_out / 1024)
+    print_label_val("vram_total_kb",   13, mem_total / 1024)
+    print_label_val("vram_steady_kb",  14, mem_steady / 1024)
 
     hipFree(d_x); hipFree(d_W_bf16); hipFree(d_W_f32); hipFree(d_out)
     exit(0)

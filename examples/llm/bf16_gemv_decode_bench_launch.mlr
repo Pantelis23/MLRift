@@ -182,17 +182,55 @@ fn main() {
     uint64 flops_per_call = 2 * N * K
     uint64 gflops_x100 = (flops_per_call * 100) / per_call_ns
 
-    // Correctness proof for gemv at this shape lives in
-    // examples/llm/gemv_f32_launch.mlr (Phase A milestone, task #68
-    // GREEN at M=N=K=1024 and arbitrary GEMV_M / GEMV_K).  This launcher
-    // focuses on timing — the bench's only success signal is "1000
-    // dispatches without hanging the queue".
-    print_label_val("N",            1, N)
-    print_label_val("K",            1, K)
-    print_label_val("flops_per_call",14, 2 * N * K)
-    print_label_val("bench_iters", 11, iters)
-    print_label_val("per_call_us", 11, per_call_ns / 1000)
-    print_label_val("gflops_x100", 11, gflops_x100)
+    // Memory accounting:
+    //   d_W_bf16  = N * K * 2     (freed semantically after dequant;
+    //                              we leave the device alloc live for
+    //                              the bench so the cache is preserved)
+    //   d_W_f32   = N * K * 4     (the cached dequant weights)
+    //   d_b       = K * 4         (per-call input)
+    //   d_c       = N * 4         (per-call output)
+    uint64 mem_W_bf16     = W_bytes_bf16
+    uint64 mem_W_f32      = W_bytes_f32
+    uint64 mem_b          = b_bytes_f32
+    uint64 mem_c          = c_bytes_f32
+    uint64 mem_total      = mem_W_bf16 + mem_W_f32 + mem_b + mem_c
+    uint64 mem_steady     = mem_W_f32 + mem_b + mem_c
+
+    // Per-call VMEM traffic (read W_f32 + read b + write c).  The W_f32
+    // bandwidth dominates at decode shape (M=1) because each weight
+    // element is touched exactly once.
+    uint64 bytes_per_call = mem_W_f32 + mem_b + mem_c
+    // Effective bandwidth: bytes / time.  Report as MB/s / 100
+    // (so 100 = 1 MB/s) to keep the integer math from underflowing on
+    // small inputs.  bytes / ns = GB/s, multiply by 100 for two-decimal.
+    uint64 gbs_x100       = (bytes_per_call * 100) / per_call_ns
+
+    // RX 7800 XT GDDR6 peak BW = 624.1 GB/s.
+    // Utilisation = (effective GB/s) / 624.1 × 100 → expressed as integer percent.
+    uint64 bw_pct         = (bytes_per_call * 100) / (per_call_ns * 624)
+
+    // Theoretical FP32 peak on 7800 XT at base clock = ~37 TFLOPS;
+    // boost-clock peak ≈ 47 TFLOPS.  Compute-utilisation as percent of
+    // the boost number (low at decode shape because we're memory-bound).
+    uint64 compute_pct    = (flops_per_call * 100) / (per_call_ns * 47000)
+
+    print_label_val("N",                1, N)
+    print_label_val("K",                1, K)
+    print_label_val("flops_per_call",  14, flops_per_call)
+    print_label_val("bytes_per_call",  14, bytes_per_call)
+    print_label_val("bench_iters",     11, iters)
+    print_label_val("total_us",         8, elapsed_ns / 1000)
+    print_label_val("per_call_us",     11, per_call_ns / 1000)
+    print_label_val("gflops_x100",     11, gflops_x100)
+    print_label_val("gbs_x100",         8, gbs_x100)
+    print_label_val("bw_pct_of_peak",  14, bw_pct)
+    print_label_val("compute_pct",     11, compute_pct)
+    print_label_val("vram_W_bf16_kb",  14, mem_W_bf16 / 1024)
+    print_label_val("vram_W_f32_kb",   13, mem_W_f32 / 1024)
+    print_label_val("vram_b_bytes",    12, mem_b)
+    print_label_val("vram_c_bytes",    12, mem_c)
+    print_label_val("vram_total_kb",   13, mem_total / 1024)
+    print_label_val("vram_steady_kb",  14, mem_steady / 1024)
 
     hipFree(d_b); hipFree(d_W_bf16); hipFree(d_W_f32); hipFree(d_c)
     exit(0)
