@@ -10899,7 +10899,9 @@ fn amdgpu_lower_noesis_delivery(uint64 kname_ptr, uint64 nl) -> uint64 {
 
     // Prologue: load all 8 kernargs into SGPRs.
     // Wrap them in a single s_clause so the hardware issues them as a
-    // contiguous batch (mirrors hipcc's delivery_step).
+    // contiguous batch (mirrors hipcc's delivery_step).  Tried
+    // consolidating into b256+b128+b32 — bit-exact but +50 ms wall
+    // (b256 SMEM micro-op latency dominates the b64 issue savings).
     asm_s_clause(7)                             // 8 loads as one clause
     asm_s_load_b64(1, 0)                        // s[2:3]   = fired_ptr
     asm_s_load_b64_off(2, 0, 0x08)              // s[4:5]   = col_tgt_ptr
@@ -11199,26 +11201,22 @@ fn amdgpu_lower_noesis_lif(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_noesis_compute_gid_v1()
 
     // ── Phase 2: prologue, load all 16 kernargs into SGPRs ──
-    // Wrap the 16 SMEM loads in a single s_clause so the hardware
-    // issues them as a contiguous batch (mirrors hipcc's lif_step).
-    asm_s_clause(15)                            // 16 loads as one clause
+    // Wider-load consolidation: fold consecutive pairs of b64 loads into
+    // single b128/b256 ops where the destinations are 4-aligned and
+    // contiguous, mirroring hipcc's wide kernarg load. Reduces 16 SMEM
+    // ops to 10 (fewer issue cycles + a tighter clause). b128/b256 dst
+    // SGPRs must be multiples of 4 — s2/s12/s14/s16/s18 are not, so
+    // those stay as b64 / b32; the rest collapse.
+    asm_s_clause(9)                             // 10 loads as one clause
     asm_s_load_b64(1, 0)                        // s[2:3]   = V_ptr
-    asm_s_load_b64_off(2, 0, 0x08)              // s[4:5]   = ref_ptr
-    asm_s_load_b64_off(3, 0, 0x10)              // s[6:7]   = RI_ptr
-    asm_s_load_b64_off(4, 0, 0x18)              // s[8:9]   = s_exc_ptr
-    asm_s_load_b64_off(5, 0, 0x20)              // s[10:11] = s_inh_ptr
+    asm_u32(0xF4080100); asm_u32(0xF8000008)    // s_load_b128 s[4:7],  0x08 (ref+RI)
+    asm_u32(0xF4080200); asm_u32(0xF8000018)    // s_load_b128 s[8:11], 0x18 (s_exc+s_inh)
     asm_s_load_b64_off(6, 0, 0x28)              // s[12:13] = spike_ptr
-    // sdata_pair=8 → s[16:17] (skipping s[14:15] which holds wg_id_x's
-    // upper half + n).
-    asm_s_load_b64_off(8, 0, 0x30)              // s[16:17] = fired_ptr
+    asm_s_load_b64_off(8, 0, 0x30)              // s[16:17] = fired_ptr (skip s14:s15)
     asm_s_load_b32(7, 0, 0x38)                  // s14 = n (low 32 bits)
-    asm_s_load_b64_off(9, 0, 0x40)              // s[18:19] = dt
-    asm_s_load_b64_off(10, 0, 0x48)             // s[20:21] = V_rest
-    asm_s_load_b64_off(11, 0, 0x50)             // s[22:23] = V_reset
-    asm_s_load_b64_off(12, 0, 0x58)             // s[24:25] = V_thresh
-    asm_s_load_b64_off(13, 0, 0x60)             // s[26:27] = tau_m
-    asm_s_load_b64_off(14, 0, 0x68)             // s[28:29] = J_E
-    asm_s_load_b64_off(15, 0, 0x70)             // s[30:31] = J_I
+    asm_s_load_b64_off(9, 0, 0x40)              // s[18:19] = dt (s18 not 4-aligned)
+    asm_u32(0xF40C0500); asm_u32(0xF8000048)    // s_load_b256 s[20:27], 0x48 (V_rest+V_reset+V_thresh+tau_m)
+    asm_u32(0xF4080700); asm_u32(0xF8000068)    // s_load_b128 s[28:31], 0x68 (J_E+J_I)
     asm_s_load_b32(16, 0, 0x78)                 // s32 = ref_steps (low 32 bits)
     asm_s_waitcnt_lgkmcnt_zero()
 
