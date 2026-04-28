@@ -4637,6 +4637,23 @@ fn main() {
                 write(1, gb_path, gbl)
                 write(1, " (amdgpu gemv-coop-bf16-f32 code object)\n", 41)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-attn-decode-f32=", 30) != 0 {
+                // Fused decode-shape attention kernel (Qwen3-0.6B
+                // hardcoded shape: nh=16, nkv=8, hd=128).  Single
+                // launch per layer, all 16 heads in parallel.  Body
+                // currently a stub (s_endpgm) for KD scaffolding —
+                // real compute lands incrementally.
+                uint64 ad_path = arg + 30
+                uint64 ad_rc = emit_amdgpu_attn_decode_f32_blob(ad_path)
+                if ad_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-attn-decode-f32 failed\n", 43)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 adl = str_len(ad_path)
+                write(1, ad_path, adl)
+                write(1, " (amdgpu attn-decode-f32 code object)\n", 38)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-gemm-f32=", 23) != 0 {
                 uint64 gm_path = arg + 23
                 uint64 gm_rc = emit_amdgpu_gemm_f32_blob(gm_path)

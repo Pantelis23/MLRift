@@ -6199,6 +6199,78 @@ fn emit_amdgpu_gemv_coop_bf16_f32_blob(uint64 out_path) -> uint64 {
     return 0
 }
 
+// ─── Fused decode-shape attention ────────────────────────────────────
+// Single launch per layer: handles all 16 Q heads of Qwen3-0.6B in one
+// kernel.  One workgroup per Q head (block_x = 32, grid_x = nh = 16).
+//
+// Each lane covers `head_dim / 32 = 4` consecutive elements of the
+// head (head_dim hardcoded = 128).  Per-pos work:
+//   - load 4 K elements (1 b128 load), compute Q · K (4 fmacs, then
+//     32-lane LDS reduce → score)
+//   - lane 0 writes scaled score to LDS scores[i]
+// Then softmax over scores[0..pos_plus_1).  Then accum loop:
+//   - load 4 V elements (1 b128 load), broadcast scores[i], 4 fmacs
+//   - final write 4 elements of attn_out per lane
+//
+// Kernarg layout (40 bytes):
+//   [0x00] q_ptr            (q_dim f32 = 16 × 128 = 2048 f32 = 8 KB)
+//   [0x08] k_cache_ptr      (max_seq × nkv × hd f32; layer base)
+//   [0x10] v_cache_ptr      (same shape)
+//   [0x18] out_ptr          (q_dim f32; writes attn_out)
+//   [0x20] pos_plus_1       (u64; only low 32 used)
+//
+// HARDCODED for Qwen3-0.6B:
+//   nh = 16, nkv = 8, hd = 128
+//   kv_h = wg_id_x >> 1
+//   K/V slot stride: 8 × 128 × 4 = 4096 bytes
+//   Q row stride: 128 × 4 = 512 bytes
+//
+// LDS: 32 × 4 (lane reduce) + 64 × 4 (max_seq scores) = 384 B,
+// allocate 1024 for safety.
+//
+// STUB BODY: just s_endpgm (no compute, no writes).  Validates that
+// the kernel descriptor + kernarg layout + dispatch path all work
+// before we incrementally fill in the real attention body.
+fn _emit_attn_decode_f32_body(uint64 args_desc) {
+    asm_init()
+    asm_u32(0xBFB00000)                            // s_endpgm
+
+    // args_desc fill — 5 args, all 8 bytes.
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a8 = args_desc + 64;  unsafe { *(a8 as uint64) = 8 }
+    uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+fn emit_amdgpu_attn_decode_f32_blob(uint64 out_path) -> uint64 {
+    uint64[10] args_desc
+    _emit_attn_decode_f32_body(args_desc)
+
+    // KD: num_user_sgprs=18, num_vgprs=32 (will use v0..v24 in full
+    // body), rsrc1=0xE0AF0003 (32-vgpr allocation), rsrc2=0x9E
+    // (USER_SGPR_COUNT=15, wg_id_x at s15).  LDS = 1024 B.
+    uint64 size = emit_amdgpu_code_object_lds("attn_decode_f32", 15,
+                                               asm_text_buf, asm_text_len,
+                                               40, 8, 18, 32,
+                                               0xE0AF0003, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 5,
+                                               1024)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_attn_decode_f32_blob: cannot open output\n", 53)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 // Phase 2 routing: lower a name-matched @kernel `gemv_f32` into the
 // kernel table. Snapshots the ISA so a subsequent kernel's asm_init
 // can't clobber it before emit_amdgpu_multi_code_object runs.
