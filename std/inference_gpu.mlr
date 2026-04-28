@@ -42,6 +42,10 @@ static u64 _gpu_mm_fh_gemv     = 0
 static u64 _gpu_mm_fh_gemv_coop = 0       // cooperative-row f32 variant
 static u64 _gpu_mm_fh_gemv_coop_bf16 = 0  // bf16-direct cooperative-row variant
 static u64 _gpu_mm_fh_gemm     = 0
+// Pipeline kernels for the full-GPU forward path.
+static u64 _gpu_fh_resid_add   = 0
+static u64 _gpu_fh_silu_mul    = 0
+static u64 _gpu_fh_rmsnorm_1024 = 0       // hidden-dim rmsnorm (N=1024)
 
 // Parallel cache for bf16-direct path: maps host w_bf16 ptr → device
 // bf16 ptr (one-shot H2D, no dequant).
@@ -126,6 +130,10 @@ fn _gpu_mm_init_once() {
     _gpu_mm_fh_gemv_coop      = _gpu_mm_load_co("/tmp/gemv_coop_f32.co",      "gemv_coop_f32")
     _gpu_mm_fh_gemv_coop_bf16 = _gpu_mm_load_co("/tmp/gemv_coop_bf16_f32.co", "gemv_coop_bf16_f32")
     _gpu_mm_fh_gemm           = _gpu_mm_load_co("/tmp/gemm_f32.co",           "gemm_f32")
+    // Pipeline kernels — best-effort load; unset = full-GPU path falls back.
+    _gpu_fh_resid_add         = _gpu_mm_load_co("/tmp/residual_add_f32.co",   "residual_add_f32")
+    _gpu_fh_silu_mul          = _gpu_mm_load_co("/tmp/silu_mul_f32.co",       "silu_mul_f32")
+    _gpu_fh_rmsnorm_1024      = _gpu_mm_load_co("/tmp/rmsnorm_f32_1024.co",   "rmsnorm_f32")
     if _gpu_mm_fh_dq == 0 || _gpu_mm_fh_gemv == 0 { return }
 
     _gpu_mm_cache_keys = alloc(_gpu_mm_cache_cap * 8)
@@ -414,3 +422,108 @@ fn matmul_bf16_weights_f32_gpu(u64 out_ptr, u64 x_ptr, u64 w_bf16,
 
 // Diagnostic: how many weight matrices are currently cached on device.
 fn gpu_matmul_cache_count() -> u64 { return _gpu_mm_cache_n }
+
+// =============================================================
+// Async device-pointer pipeline API (for full-GPU forward chains)
+// =============================================================
+//
+// Convention: every `gpu_*_to_dev` function takes device-VA pointers
+// and launches its kernel WITHOUT calling hipDeviceSynchronize.  The
+// caller chains as many of these as needed, then calls gpu_pipeline_
+// flush() to drain.  Single sync per chain (per layer or per step)
+// instead of per-call.
+//
+// Validation: see examples/llm/gpu_chain_demo.mlr — confirmed 35 %
+// per-iter saving over the per-call-sync path on the test shape.
+
+// gpu_resid_add_to_dev: c[i] = a[i] + b[i] for i in [0, N).
+// Kernarg layout (matches _emit_residual_add_f32_body):
+//   [0x00] in_a (d_va)
+//   [0x08] in_b (d_va)
+//   [0x10] out  (d_va)
+//   [0x18] N    (u64, low 32 used)
+fn gpu_resid_add_to_dev(u64 d_out, u64 d_a, u64 d_b, u64 N) -> u64 {
+    if _gpu_fh_resid_add == 0 { return 1 }
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_a }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_b }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = d_out }
+    u64 a3 = alloc(8); unsafe { *(a3 as u64) = N }
+    u64 kp = alloc(4 * 8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+    unsafe { *((kp + 24) as u64) = a3 }
+    u64 grid_u = (N + 255) / 256
+    u32 grid32 = grid_u
+    u32 err = hipModuleLaunchKernel(_gpu_fh_resid_add, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
+// gpu_silu_mul_to_dev: c[i] = silu(gate[i]) * up[i] for i in [0, N).
+// Kernarg layout (matches _emit_silu_mul_f32_body):
+//   [0x00] gate
+//   [0x08] up
+//   [0x10] out
+//   [0x18] N
+fn gpu_silu_mul_to_dev(u64 d_out, u64 d_gate, u64 d_up, u64 N) -> u64 {
+    if _gpu_fh_silu_mul == 0 { return 1 }
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_gate }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_up }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = d_out }
+    u64 a3 = alloc(8); unsafe { *(a3 as u64) = N }
+    u64 kp = alloc(4 * 8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+    unsafe { *((kp + 24) as u64) = a3 }
+    u64 grid_u = (N + 255) / 256
+    u32 grid32 = grid_u
+    u32 err = hipModuleLaunchKernel(_gpu_fh_silu_mul, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
+// gpu_rmsnorm_1024_to_dev: out[m,i] = x[m,i] * rsqrt(mean(x²)+eps) * gamma[i]
+// for the hidden-dim shape (N=1024).  Block size = N (= 1024).
+// Kernarg layout (matches _emit_rmsnorm_f32_body_N):
+//   [0x00] in
+//   [0x08] out
+//   [0x10] gamma
+//   [0x18] M  (number of rows; = 1 for decode)
+//   [0x20] N  (= 1024)
+fn gpu_rmsnorm_1024_to_dev(u64 d_out, u64 d_in, u64 d_gamma, u64 M) -> u64 {
+    if _gpu_fh_rmsnorm_1024 == 0 { return 1 }
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_in }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_out }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = d_gamma }
+    u64 a3 = alloc(8); unsafe { *(a3 as u64) = M }
+    u64 a4 = alloc(8); unsafe { *(a4 as u64) = 1024 }
+    u64 kp = alloc(5 * 8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+    unsafe { *((kp + 24) as u64) = a3 }
+    unsafe { *((kp + 32) as u64) = a4 }
+    // Block must be N (rmsnorm uses one wave per row, N lanes per wave).
+    u32 grid32 = M
+    u32 err = hipModuleLaunchKernel(_gpu_fh_rmsnorm_1024, grid32, 1, 1, 1024, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
+// gpu_pipeline_flush: drain all pending kernel launches.  Call this
+// before reading any chained output via D2H.
+fn gpu_pipeline_flush() -> u64 {
+    u32 err = hipDeviceSynchronize()
+    if err != 0 { return 1 }
+    return 0
+}
+
+// Probe whether the full-GPU pipeline kernels loaded successfully.
+fn gpu_pipeline_ready() -> u64 {
+    if _gpu_fh_resid_add == 0 { return 0 }
+    if _gpu_fh_silu_mul == 0 { return 0 }
+    if _gpu_fh_rmsnorm_1024 == 0 { return 0 }
+    return 1
+}

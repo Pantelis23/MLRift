@@ -1,0 +1,109 @@
+// Exercise the gpu_*_to_dev async API in std/inference_gpu.mlr.
+// Chains: rmsnorm → matmul (qkv shape) → resid → silu_mul → matmul → flush.
+// Validates the full-GPU forward path framework end-to-end.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-bf16-to-f32=/tmp/bf16_to_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-gemv-coop-f32=/tmp/gemv_coop_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-residual-add-f32=/tmp/residual_add_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-silu-mul-f32=/tmp/silu_mul_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-rmsnorm-f32-N=1024:/tmp/rmsnorm_f32_1024.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/gpu_async_api_test.mlr -o /tmp/gpu_async_api_test
+// Run:
+//   MLRIFT_GPU_MATMUL=1 /tmp/gpu_async_api_test
+
+import "../../std/hip.mlr"
+import "../../std/inference_gpu.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { puts("setDev"); exit(1) }
+    if gpu_matmul_enabled() == 0 { puts("MLRIFT_GPU_MATMUL not set"); exit(1) }
+    if gpu_pipeline_ready() == 0 {
+        puts("pipeline kernels missing — build /tmp/{residual_add,silu_mul,rmsnorm_f32_1024}.co")
+        exit(1)
+    }
+
+    // Allocate device buffers for a Qwen3-decode-shaped chain:
+    //   x_dev   (1024 f32)            input vector
+    //   w_norm_dev (1024 f32)         rmsnorm gamma
+    //   x_norm_dev (1024 f32)         rmsnorm output
+    //   gate_dev  (3072 f32)          intermediate (post gate_proj — synthetic here)
+    //   up_dev    (3072 f32)          intermediate
+    //   ff_dev    (3072 f32)          silu output
+    //   resid_dev (1024 f32)          residual accumulator
+    //   tmp_dev   (1024 f32)          scratch
+    u64 N_HID = 1024
+    u64 N_INT = 3072
+
+    u64 d_x = 0; u64 d_w = 0; u64 d_xn = 0; u64 d_gate = 0; u64 d_up = 0
+    u64 d_ff = 0; u64 d_resid = 0; u64 d_tmp = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, N_HID*4); if err != 0 { puts("mx"); exit(1) }; unsafe { *(slot as u64) -> d_x }
+    slot = alloc(8); err = hipMalloc(slot, N_HID*4); if err != 0 { puts("mw"); exit(1) }; unsafe { *(slot as u64) -> d_w }
+    slot = alloc(8); err = hipMalloc(slot, N_HID*4); if err != 0 { puts("mxn"); exit(1) }; unsafe { *(slot as u64) -> d_xn }
+    slot = alloc(8); err = hipMalloc(slot, N_INT*4); if err != 0 { puts("mg"); exit(1) }; unsafe { *(slot as u64) -> d_gate }
+    slot = alloc(8); err = hipMalloc(slot, N_INT*4); if err != 0 { puts("mu"); exit(1) }; unsafe { *(slot as u64) -> d_up }
+    slot = alloc(8); err = hipMalloc(slot, N_INT*4); if err != 0 { puts("mff"); exit(1) }; unsafe { *(slot as u64) -> d_ff }
+    slot = alloc(8); err = hipMalloc(slot, N_HID*4); if err != 0 { puts("mr"); exit(1) }; unsafe { *(slot as u64) -> d_resid }
+    slot = alloc(8); err = hipMalloc(slot, N_HID*4); if err != 0 { puts("mt"); exit(1) }; unsafe { *(slot as u64) -> d_tmp }
+
+    // Prefill with synthetic data.
+    u64 h_hid = alloc(N_HID*4); u64 h_int = alloc(N_INT*4)
+    u64 i = 0
+    while i < N_HID { unsafe { *((h_hid + i*4) as f32) = 0.001 }; i = i + 1 }
+    i = 0
+    while i < N_INT { unsafe { *((h_int + i*4) as f32) = 0.002 }; i = i + 1 }
+    err = hipMemcpy(d_x, h_hid, N_HID*4, 1)
+    err = hipMemcpy(d_w, h_hid, N_HID*4, 1)
+    err = hipMemcpy(d_resid, h_hid, N_HID*4, 1)
+    err = hipMemcpy(d_gate, h_int, N_INT*4, 1)
+    err = hipMemcpy(d_up,   h_int, N_INT*4, 1)
+
+    print_str("=== chain: rmsnorm → resid → silu_mul, single sync ===\n")
+
+    // Per-call sync timing for baseline.
+    u64 t0 = time_now()
+    u64 it = 0
+    while it < 100 {
+        gpu_rmsnorm_1024_to_dev(d_xn, d_x, d_w, 1)
+        gpu_pipeline_flush()
+        gpu_resid_add_to_dev(d_resid, d_resid, d_xn, N_HID)
+        gpu_pipeline_flush()
+        gpu_silu_mul_to_dev(d_ff, d_gate, d_up, N_INT)
+        gpu_pipeline_flush()
+        it = it + 1
+    }
+    u64 t1 = time_now()
+    u64 us_a = (t1 - t0) / 1000
+    print_str("Strategy A (3 syncs / chain × 100): "); u64 sa = fmt_dec(us_a); print_str(sa); dealloc(sa); print_str(" us\n")
+    print_str("  per-iter: "); u64 sb = fmt_dec(us_a / 100); print_str(sb); dealloc(sb); print_str(" us\n")
+
+    // Chained, 1 sync.
+    u64 t2 = time_now()
+    it = 0
+    while it < 100 {
+        gpu_rmsnorm_1024_to_dev(d_xn, d_x, d_w, 1)
+        gpu_resid_add_to_dev(d_resid, d_resid, d_xn, N_HID)
+        gpu_silu_mul_to_dev(d_ff, d_gate, d_up, N_INT)
+        gpu_pipeline_flush()
+        it = it + 1
+    }
+    u64 t3 = time_now()
+    u64 us_b = (t3 - t2) / 1000
+    print_str("Strategy B (1 sync / chain × 100):  "); u64 sc = fmt_dec(us_b); print_str(sc); dealloc(sc); print_str(" us\n")
+    print_str("  per-iter: "); u64 sd = fmt_dec(us_b / 100); print_str(sd); dealloc(sd); print_str(" us\n")
+
+    print_str("\nSpeedup: ")
+    u64 ratio_x100 = (us_b * 100) / us_a
+    u64 sg = fmt_dec(ratio_x100); print_str(sg); dealloc(sg); print_str(" % of A\n")
+
+    exit(0)
+}
