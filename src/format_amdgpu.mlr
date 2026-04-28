@@ -10891,6 +10891,9 @@ fn amdgpu_lower_noesis_delivery(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_noesis_compute_gid_v1()
 
     // Prologue: load all 8 kernargs into SGPRs.
+    // Wrap them in a single s_clause so the hardware issues them as a
+    // contiguous batch (mirrors hipcc's delivery_step).
+    asm_s_clause(7)                             // 8 loads as one clause
     asm_s_load_b64(1, 0)                        // s[2:3]   = fired_ptr
     asm_s_load_b64_off(2, 0, 0x08)              // s[4:5]   = col_tgt_ptr
     asm_s_load_b64_off(3, 0, 0x10)              // s[6:7]   = col_w_ptr
@@ -10966,6 +10969,7 @@ fn amdgpu_lower_noesis_delivery(uint64 kname_ptr, uint64 nl) -> uint64 {
     //   tgt = col_tgt[slot]   → v[12:13]   saddr=s4
     //   w   = col_w[slot]     → v[14:15]   saddr=s6
     //   inh = col_is_inh[slot] → v[16:17]  saddr=s8
+    asm_s_clause(2)
     asm_global_load_b64(12, 4, 4)               // v[12:13] = tgt
     asm_global_load_b64(14, 4, 6)               // v[14:15] = w
     asm_global_load_b64(16, 4, 8)               // v[16:17] = inh
@@ -11182,6 +11186,9 @@ fn amdgpu_lower_noesis_lif(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_noesis_compute_gid_v1()
 
     // ── Phase 2: prologue, load all 16 kernargs into SGPRs ──
+    // Wrap the 16 SMEM loads in a single s_clause so the hardware
+    // issues them as a contiguous batch (mirrors hipcc's lif_step).
+    asm_s_clause(15)                            // 16 loads as one clause
     asm_s_load_b64(1, 0)                        // s[2:3]   = V_ptr
     asm_s_load_b64_off(2, 0, 0x08)              // s[4:5]   = ref_ptr
     asm_s_load_b64_off(3, 0, 0x10)              // s[6:7]   = RI_ptr
