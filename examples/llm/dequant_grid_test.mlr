@@ -1,0 +1,91 @@
+// Probe the bf16_to_f32 kernel grid-size limit.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-bf16-to-f32=/tmp/bf16_to_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/dequant_grid_test.mlr -o /tmp/dequant_grid_test
+// Run:
+//   GRID=N /tmp/dequant_grid_test
+
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn die(uint64 msg, uint64 code) {
+    print_str(msg); print_str(" e="); u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n"); exit(1)
+}
+
+fn main() {
+    u32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    u64 fd = file_open("/tmp/bf16_to_f32.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
+    u64 sz = file_size(fd); u64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    u64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    u64 mod = 0; unsafe { *(mod_slot as u64) -> mod }
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "bf16_to_f32"); if err != 0 { die("getFn", err) }
+    u64 fh = 0; unsafe { *(fh_slot as u64) -> fh }
+
+    u64 n_env = getenv("N_ELEMS")
+    u64 n_elems = 8192
+    if n_env != 0 {
+        u64 parsed = 0
+        u64 i = 0
+        u8 c = 0
+        unsafe { *(n_env as u8) -> c }
+        while c >= 48 && c <= 57 {
+            parsed = parsed * 10 + (c - 48)
+            i = i + 1
+            unsafe { *((n_env + i) as u8) -> c }
+        }
+        if parsed > 0 { n_elems = parsed }
+    }
+
+    print_str("n_elems="); u64 sn = fmt_dec(n_elems); print_str(sn); dealloc(sn); print_str("\n")
+    u64 grid_u = (n_elems + 255) / 256
+    print_str("grid="); u64 sg = fmt_dec(grid_u); print_str(sg); dealloc(sg); print_str("\n")
+
+    u64 d_in = 0; u64 d_out = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, n_elems * 2); if err != 0 { die("min", err) }; unsafe { *(slot as u64) -> d_in }
+    slot = alloc(8); err = hipMalloc(slot, n_elems * 4); if err != 0 { die("mout", err) }; unsafe { *(slot as u64) -> d_out }
+
+    // Mimic the wrapper: do an H2D first (fill d_in with garbage from a host alloc).
+    u64 h_buf = alloc(n_elems * 2)
+    print_str("H2D...\n")
+    u64 th0 = time_now()
+    err = hipMemcpy(d_in, h_buf, n_elems * 2, 1)
+    u64 th1 = time_now()
+    print_str("h2d_us="); u64 sh = fmt_dec((th1-th0)/1000); print_str(sh); dealloc(sh); print_str(" err="); u64 ehe = fmt_dec(err); print_str(ehe); dealloc(ehe); print_str("\n")
+    if err != 0 { die("H2D", err) }
+
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_in }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_out }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = n_elems }
+    u64 kp = alloc(3 * 8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+
+    u32 grid32 = grid_u
+    print_str("launch...\n")
+    u64 t0 = time_now()
+    err = hipModuleLaunchKernel(fh, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+    u64 t1 = time_now()
+    print_str("launch_us="); u64 sa = fmt_dec((t1-t0)/1000); print_str(sa); dealloc(sa); print_str(" err="); u64 se = fmt_dec(err); print_str(se); dealloc(se); print_str("\n")
+    if err != 0 { die("L", err) }
+    print_str("sync...\n")
+    err = hipDeviceSynchronize()
+    u64 t2 = time_now()
+    print_str("sync_us="); u64 sb = fmt_dec((t2-t1)/1000); print_str(sb); dealloc(sb); print_str(" err="); u64 see = fmt_dec(err); print_str(see); dealloc(see); print_str("\n")
+
+    exit(0)
+}

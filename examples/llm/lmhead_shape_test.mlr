@@ -1,0 +1,85 @@
+// Reproduce the lmhead-shape gemv via the inference_gpu wrapper to
+// isolate the timeout observed in qwen3_generate.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/lmhead_shape_test.mlr -o /tmp/lmhead_shape_test
+// Run:
+//   MLRIFT_GPU_MATMUL=1 /tmp/lmhead_shape_test
+
+import "../../std/hip.mlr"
+import "../../std/inference_gpu.mlr"
+import "../../std/safetensors.mlr"
+import "../../std/inference.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/thread.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn main() {
+    u64 num_workers = 16
+    thread_pool_init(num_workers)
+
+    u32 err = hipSetDevice(0); if err != 0 { puts("setDev"); exit(1) }
+
+    if gpu_matmul_enabled() == 0 { puts("GPU disabled"); exit(1) }
+
+    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-0.6B/model.safetensors"
+    SafetensorFile st = safetensors_open(path)
+    if st.file_size == 0 { puts("open fail"); exit(1) }
+
+    // Use a slice of embed_tokens.weight as a "small lmhead".
+    // Bisect grid size: 16384, 32768, 65536, 151936.
+    SafetensorView wv = safetensors_get(st, "model.embed_tokens.weight")
+    if wv.ptr == 0 { puts("missing embed"); exit(1) }
+
+    u64 env_n = getenv("LMHEAD_N")
+    u64 N = 16384
+    if env_n != 0 {
+        u64 parsed = 0
+        u64 ii = 0
+        u8 c = 0
+        unsafe { *(env_n as u8) -> c }
+        while c >= 48 && c <= 57 {
+            parsed = parsed * 10 + (c - 48)
+            ii = ii + 1
+            unsafe { *((env_n + ii) as u8) -> c }
+        }
+        if parsed > 0 { N = parsed }
+    }
+    u64 K = 1024
+    print_str("weight bytes: "); u64 sa = fmt_dec(N*K*2); print_str(sa); print_str("\n"); dealloc(sa)
+
+    u64 x = alloc(K*4)
+    u64 i = 0
+    while i < K { u64 p = x + i*4; unsafe { *(p as f32) = 0.001 }; i = i + 1 }
+
+    u64 out = alloc(N*4)
+
+    print_str("calling matmul_bf16_weights_f32_gpu...\n")
+    u64 t0 = time_now()
+    u64 rc = matmul_bf16_weights_f32_gpu(out, x, wv.ptr, 1, N, K)
+    u64 t1 = time_now()
+    print_str("rc="); u64 sb = fmt_dec(rc); print_str(sb); print_str("\n"); dealloc(sb)
+    print_str("us="); u64 sc = fmt_dec((t1-t0)/1000); print_str(sc); print_str("\n"); dealloc(sc)
+
+    if rc == 0 {
+        print_str("first 4 logits (bits): ")
+        u64 j = 0
+        while j < 4 {
+            u32 b = 0; unsafe { *((out + j*4) as u32) -> b }
+            u64 b64 = b
+            u64 sx = fmt_dec(b64); print_str(sx); print_str(" "); dealloc(sx)
+            j = j + 1
+        }
+        print_str("\n")
+    }
+
+    safetensors_free(st)
+    thread_pool_shutdown()
+    exit(0)
+}

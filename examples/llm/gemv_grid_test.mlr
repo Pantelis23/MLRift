@@ -1,0 +1,78 @@
+// Probe gemv_f32 grid-size limit in isolation.
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn die(uint64 msg, uint64 code) {
+    print_str(msg); print_str(" e="); u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n"); exit(1)
+}
+
+fn main() {
+    u32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+    u64 fd = file_open("/tmp/gemv_f32.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
+    u64 sz = file_size(fd); u64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    u64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    u64 mod = 0; unsafe { *(mod_slot as u64) -> mod }
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "gemv_f32"); if err != 0 { die("getFn", err) }
+    u64 fh = 0; unsafe { *(fh_slot as u64) -> fh }
+
+    u64 n_env = getenv("N")
+    u64 N = 131073
+    if n_env != 0 {
+        u64 parsed = 0
+        u64 i = 0
+        u8 c = 0
+        unsafe { *(n_env as u8) -> c }
+        while c >= 48 && c <= 57 {
+            parsed = parsed * 10 + (c - 48)
+            i = i + 1
+            unsafe { *((n_env + i) as u8) -> c }
+        }
+        if parsed > 0 { N = parsed }
+    }
+    u64 K = 1024
+    u64 grid_u = (N + 255) / 256
+    print_str("N="); u64 sn = fmt_dec(N); print_str(sn); dealloc(sn)
+    print_str(" grid="); u64 sg = fmt_dec(grid_u); print_str(sg); dealloc(sg); print_str("\n")
+
+    u64 d_a = 0; u64 d_b = 0; u64 d_c = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, N*K*4); if err != 0 { die("mA", err) }; unsafe { *(slot as u64) -> d_a }
+    slot = alloc(8); err = hipMalloc(slot, K*4);   if err != 0 { die("mB", err) }; unsafe { *(slot as u64) -> d_b }
+    slot = alloc(8); err = hipMalloc(slot, N*4);   if err != 0 { die("mC", err) }; unsafe { *(slot as u64) -> d_c }
+
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_a }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_b }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = d_c }
+    u64 a3 = alloc(8); unsafe { *(a3 as u64) = N }
+    u64 a4 = alloc(8); unsafe { *(a4 as u64) = K }
+    u64 kp = alloc(5*8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+    unsafe { *((kp + 24) as u64) = a3 }
+    unsafe { *((kp + 32) as u64) = a4 }
+    u32 grid32 = grid_u
+    print_str("launch...\n")
+    u64 t0 = time_now()
+    err = hipModuleLaunchKernel(fh, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+    u64 t1 = time_now()
+    print_str("launch_us="); u64 sa = fmt_dec((t1-t0)/1000); print_str(sa); dealloc(sa); print_str("\n")
+    if err != 0 { die("L", err) }
+    print_str("sync...\n")
+    err = hipDeviceSynchronize()
+    u64 t2 = time_now()
+    print_str("sync_us="); u64 sb = fmt_dec((t2-t1)/1000); print_str(sb); dealloc(sb); print_str("\n")
+    print_str("OK\n")
+    exit(0)
+}
