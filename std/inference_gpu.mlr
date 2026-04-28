@@ -43,13 +43,20 @@ static u64 _gpu_mm_fh_gemv_coop = 0    // cooperative-row variant
 static u64 _gpu_mm_fh_gemm     = 0
 
 // Weight-size threshold (bytes of bf16 weight) below which GPU is
-// not worth dispatching — for decode-shape M=1, the per-call sync
+// not worth dispatching — for decode-shape M=1 the per-call sync
 // floor (~110 µs) plus signal-write latency dwarf the actual gemv
-// runtime, so CPU 16-thread AVX2 is faster on small projections.
-// Default 32 MB lights up only the lm_head shape (≈300 MB on
-// Qwen3-0.6B vocab, ≈600 MB on bigger heads).  Tunable via
-// MLRIFT_GPU_MATMUL_MIN_BYTES env var.
-static u64 _gpu_mm_min_bytes  = 33554432       // 32 MB
+// runtime on small projections.  Tuned empirically against
+// Qwen3-0.6B greedy decode (20 tokens):
+//   T (MB)  total ms   tok/s   bit-vs-PyTorch
+//      32       598    33.4k    ✓
+//       8       557    35.9k    ✓     ← sweet spot
+//       4       710    28.1k    ✗ (drift at pos 17)
+//       1       699    28.6k    ✗
+// 8 MB lights up qkv (8 MB), gate_up (12 MB), lm_head (304 MB) but
+// keeps oproj (4 MB) and down (6 MB) on CPU where they're faster
+// (per-call sync overhead exceeds GPU compute on those shapes).
+// Tunable via MLRIFT_GPU_MATMUL_MIN_BYTES env var.
+static u64 _gpu_mm_min_bytes  = 8388608        // 8 MB
 
 // Weight cache: parallel arrays.  Keyed by the host bf16 pointer; on
 // hit the corresponding device f32 pointer is reused.  Linear-scan
