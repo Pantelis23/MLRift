@@ -6081,37 +6081,58 @@ fn _emit_gemv_coop_bf16_f32_body(uint64 args_desc) {
     asm_u32(0x30100082)                            // v_lshlrev_b32 v8, 2, v0    (b_off = lane*4)
     asm_v_mov_b32(5, 0x80)                         // v5 = 0   (sum)
     asm_u32(0xBE920080)                            // s_mov_b32  s18, 0
-    asm_u32(0x8513870C)                            // s_lshr_b32 s19, s12, 7     (K/128)
+    asm_u32(0x8513880C)                            // s_lshr_b32 s19, s12, 8     (K/256)
 
-    // .Lloop: 4× unroll, converted values written to SEPARATE vgprs
-    // (v21..v24) — earlier in-place v_lshlrev v9,16,v9 attempt produced
-    // wrong output, suspected RAW hazard between consecutive in-place
-    // VALU writes and immediate fmac reads.
+    // .Lloop: 8× unroll.  8 u16 A loads + 8 b32 B loads + 8 lshl-in-
+    // place + 8 fmac per iter.  Each lane covers 8 bf16 elements per
+    // iter.  K=1024 ⇒ 4 loop iters.  VGPRs: A in v9..v16, B in
+    // v17..v24 (22 total — fits in 32-vgpr KD allocation set by
+    // rsrc1=0xE0AF0003 below).
     uint64 loop_idx = asm_text_len / 4
 
+    // 8 u16 A loads at offsets 0/64/128/192/256/320/384/448 bytes.
     asm_u32(0xDC4A0000); asm_u32(0x09100007)       // global_load_u16 v9,  v7, s[16:17]
     asm_u32(0xDC4A0040); asm_u32(0x0A100007)       // global_load_u16 v10, v7, s[16:17] offset:64
     asm_u32(0xDC4A0080); asm_u32(0x0B100007)       // global_load_u16 v11, v7, s[16:17] offset:128
     asm_u32(0xDC4A00C0); asm_u32(0x0C100007)       // global_load_u16 v12, v7, s[16:17] offset:192
-    asm_u32(0xDC520000); asm_u32(0x0D060008)       // global_load_b32 v13, v8, s[6:7]
-    asm_u32(0xDC520080); asm_u32(0x0E060008)       // global_load_b32 v14, v8, s[6:7] offset:128
-    asm_u32(0xDC520100); asm_u32(0x0F060008)       // global_load_b32 v15, v8, s[6:7] offset:256
-    asm_u32(0xDC520180); asm_u32(0x10060008)       // global_load_b32 v16, v8, s[6:7] offset:384
+    asm_u32(0xDC4A0100); asm_u32(0x0D100007)       // global_load_u16 v13, v7, s[16:17] offset:256
+    asm_u32(0xDC4A0140); asm_u32(0x0E100007)       // global_load_u16 v14, v7, s[16:17] offset:320
+    asm_u32(0xDC4A0180); asm_u32(0x0F100007)       // global_load_u16 v15, v7, s[16:17] offset:384
+    asm_u32(0xDC4A01C0); asm_u32(0x10100007)       // global_load_u16 v16, v7, s[16:17] offset:448
+
+    // 8 b32 B loads at offsets 0/128/256/384/512/640/768/896 bytes.
+    asm_u32(0xDC520000); asm_u32(0x11060008)       // global_load_b32 v17, v8, s[6:7]
+    asm_u32(0xDC520080); asm_u32(0x12060008)       // global_load_b32 v18, v8, s[6:7] offset:128
+    asm_u32(0xDC520100); asm_u32(0x13060008)       // global_load_b32 v19, v8, s[6:7] offset:256
+    asm_u32(0xDC520180); asm_u32(0x14060008)       // global_load_b32 v20, v8, s[6:7] offset:384
+    asm_u32(0xDC520200); asm_u32(0x15060008)       // global_load_b32 v21, v8, s[6:7] offset:512
+    asm_u32(0xDC520280); asm_u32(0x16060008)       // global_load_b32 v22, v8, s[6:7] offset:640
+    asm_u32(0xDC520300); asm_u32(0x17060008)       // global_load_b32 v23, v8, s[6:7] offset:768
+    asm_u32(0xDC520380); asm_u32(0x18060008)       // global_load_b32 v24, v8, s[6:7] offset:896
     asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)
 
-    // v21..v24 = (loaded v9..v12) << 16  → f32 conversion
-    asm_u32(0x302A1290)                            // v_lshlrev_b32 v21, 16, v9
-    asm_u32(0x302C1490)                            // v_lshlrev_b32 v22, 16, v10
-    asm_u32(0x302E1690)                            // v_lshlrev_b32 v23, 16, v11
-    asm_u32(0x30301890)                            // v_lshlrev_b32 v24, 16, v12
+    // bf16 → f32 in-place via lshl 16.
+    asm_u32(0x30121290)                            // v_lshlrev_b32 v9,  16, v9
+    asm_u32(0x30141490)                            // v_lshlrev_b32 v10, 16, v10
+    asm_u32(0x30161690)                            // v_lshlrev_b32 v11, 16, v11
+    asm_u32(0x30181890)                            // v_lshlrev_b32 v12, 16, v12
+    asm_u32(0x301A1A90)                            // v_lshlrev_b32 v13, 16, v13
+    asm_u32(0x301C1C90)                            // v_lshlrev_b32 v14, 16, v14
+    asm_u32(0x301E1E90)                            // v_lshlrev_b32 v15, 16, v15
+    asm_u32(0x30202090)                            // v_lshlrev_b32 v16, 16, v16
 
-    asm_u32(0x560A1B15)                            // v_fmac_f32 v5, v21, v13
-    asm_u32(0x560A1D16)                            // v_fmac_f32 v5, v22, v14
-    asm_u32(0x560A1F17)                            // v_fmac_f32 v5, v23, v15
-    asm_u32(0x560A2118)                            // v_fmac_f32 v5, v24, v16
+    // 8 fmacs (paired A v9..v16 with B v17..v24).
+    asm_u32(0x560A2309)                            // v_fmac_f32 v5, v9,  v17
+    asm_u32(0x560A250A)                            // v_fmac_f32 v5, v10, v18
+    asm_u32(0x560A270B)                            // v_fmac_f32 v5, v11, v19
+    asm_u32(0x560A290C)                            // v_fmac_f32 v5, v12, v20
+    asm_u32(0x560A2B0D)                            // v_fmac_f32 v5, v13, v21
+    asm_u32(0x560A2D0E)                            // v_fmac_f32 v5, v14, v22
+    asm_u32(0x560A2F0F)                            // v_fmac_f32 v5, v15, v23
+    asm_u32(0x560A3110)                            // v_fmac_f32 v5, v16, v24
 
-    asm_u32(0x4A0E0EFF); asm_u32(0x00000100)       // v_add_nc_u32 v7, 256, v7
-    asm_u32(0x4A1010FF); asm_u32(0x00000200)       // v_add_nc_u32 v8, 512, v8
+    asm_u32(0x4A0E0EFF); asm_u32(0x00000200)       // v_add_nc_u32 v7, 512,  v7  (8 strides × 64 bytes)
+    asm_u32(0x4A1010FF); asm_u32(0x00000400)       // v_add_nc_u32 v8, 1024, v8  (8 strides × 128 bytes)
 
     asm_u32(0x80128112)                            // s_add_u32 s18, s18, 1
     asm_u32(0xBF0A1312)                            // s_cmp_lt_u32 s18, s19

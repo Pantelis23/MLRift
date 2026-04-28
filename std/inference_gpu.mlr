@@ -380,17 +380,20 @@ fn matmul_bf16_weights_f32_gpu(u64 out_ptr, u64 x_ptr, u64 w_bf16,
     if _gpu_mm_fh_gemv_coop != 0 {
         if N >= 4096 { use_coop = 1 }
     }
-    // bf16-direct path is opt-in until the 4× unroll lands.  Current
-    // 2× unroll is bit-exact but ~10 % slower than f32 4×-unroll coop
-    // because the bandwidth saving doesn't recover the unroll deficit.
-    // Set MLRIFT_GPU_MATMUL_BF16=1 to use bf16-direct anyway.
+    // bf16-direct path is the default whenever the kernel loaded.
+    // Halves A bandwidth on the dominant matmuls (lm_head, qkv,
+    // gate_up, down, oproj) and skips the dequant cold path entirely.
+    // 8× unroll, bit-exact vs CPU at N=64 / N=2048 / N=151936
+    // (max diff 1.9e-6 fma noise).
+    // Opt out via MLRIFT_GPU_MATMUL_BF16=0.
     u64 use_bf16 = 0
     if use_coop != 0 {
         if _gpu_mm_fh_gemv_coop_bf16 != 0 {
+            use_bf16 = 1
             u64 bf16_env = getenv("MLRIFT_GPU_MATMUL_BF16")
             if bf16_env != 0 {
                 u8 bc = 0; unsafe { *(bf16_env as u8) -> bc }
-                if bc != 48 { use_bf16 = 1 }   // not '0'
+                if bc == 48 { use_bf16 = 0 }   // explicit '0' = opt-out
             }
         }
     }
