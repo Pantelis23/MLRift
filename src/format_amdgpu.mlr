@@ -11615,6 +11615,91 @@ fn amdgpu_lower_pointwise_3a(uint64 fn_node, uint64 source,
     return 0
 }
 
+// noesis spike_reduce lowering — hand-encoded GFX1100 ISA (verified
+// against /tmp/spike_reduce.s via llvm-mc).
+//
+//   @kernel fn spike_reduce(uint64 spike_ptr, uint64 result_ptr, uint64 n) {
+//       uint64 i = tid_x()
+//       if i < n {
+//           uint64 c = spike_ptr[i]
+//           if c > 0 {
+//               atomic_add_u64(result_ptr,     c)
+//               atomic_add_u64(result_ptr + 8, 1)
+//           }
+//       }
+//   }
+//
+// Replaces the 480 MB D2H + 60M-iter CPU tally fallback at the end of
+// the noesis_60m_gpu launcher; closes the post-sim gap vs HIP.
+//
+// Kernarg layout (24 bytes):
+//   [0x00] uint64 spike_ptr   → s4,s5
+//   [0x08] uint64 result_ptr  → s6,s7
+//   [0x10] uint64 n           → s8,s9 (only s8 used)
+fn amdgpu_lower_noesis_spike_reduce(uint64 kname_ptr, uint64 nl) -> uint64 {
+    asm_init()
+    asm_u32(0xF4080100); asm_u32(0xF8000000)        // s_load_b128 s[4:7], s[0:1], 0x0
+    asm_u32(0xF4040200); asm_u32(0xF8000010)        // s_load_b64  s[8:9], s[0:1], 0x10
+    asm_u32(0xBF89FC07)                             // s_waitcnt   lgkmcnt(0)
+    asm_u32(0x840A880F)                             // s_lshl_b32  s10, s15, 8
+    asm_u32(0x4A02000A)                             // v_add_nc_u32 v1, s10, v0
+    asm_u32(0xBE82007E)                             // s_mov_b32   s2, exec_lo
+    asm_u32(0xD4C9007E); asm_u32(0x00001101)        // v_cmpx_lt_u32_e64 v1, s8
+    asm_u32(0xBFA50019)                             // s_cbranch_execz +25 → s_endpgm
+    asm_u32(0x300C0283)                             // v_lshlrev_b32 v6, 3, v1
+    asm_u32(0x7E0E0280)                             // v_mov_b32    v7, 0
+    asm_u32(0xD7006A02); asm_u32(0x00020C04)        // v_add_co_u32 v2, vcc_lo, s4, v6
+    asm_u32(0xD5207C03); asm_u32(0x01AA0E05)        // v_add_co_ci_u32_e64 v3, null, s5, v7, vcc_lo
+    asm_u32(0xDC560000); asm_u32(0x047C0002)        // global_load_b64 v[4:5], v[2:3], off
+    asm_u32(0xBF8903F7)                             // s_waitcnt vmcnt(0)
+    asm_u32(0x7CBA0880)                             // v_cmp_ne_u64 vcc_lo, 0, v[4:5]
+    asm_u32(0xBE8B206A)                             // s_and_saveexec_b32 s11, vcc_lo
+    asm_u32(0xBFA5000D)                             // s_cbranch_execz +13 → s_endpgm
+    asm_u32(0x7E040206)                             // v_mov_b32 v2, s6
+    asm_u32(0x7E060207)                             // v_mov_b32 v3, s7
+    asm_u32(0xDD0E0000); asm_u32(0x007C0402)        // global_atomic_add_u64 v[2:3], v[4:5], off
+    asm_u32(0x7E100281)                             // v_mov_b32 v8, 1
+    asm_u32(0x7E120280)                             // v_mov_b32 v9, 0
+    asm_u32(0xD7006A02); asm_u32(0x00020488)        // v_add_co_u32 v2, vcc_lo, 8, v2
+    asm_u32(0xD5207C03); asm_u32(0x01AA0680)        // v_add_co_ci_u32_e64 v3, null, 0, v3, vcc_lo
+    asm_u32(0xDD0E0000); asm_u32(0x007C0802)        // global_atomic_add_u64 v[2:3], v[8:9], off
+    asm_u32(0xBC7C0000)                             // s_waitcnt_vscnt null, 0
+    asm_u32(0xBFB00000)                             // s_endpgm
+
+    // 3 args, all 8-byte: 2 buffers + 1 by-value u64.
+    uint64 args_desc = alloc(3 * 16)
+    uint64 a0s = args_desc + 0;   unsafe { *(a0s as uint64) = 8 }
+    uint64 a0k = args_desc + 8;   unsafe { *(a0k as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a1s = args_desc + 16;  unsafe { *(a1s as uint64) = 8 }
+    uint64 a1k = args_desc + 24;  unsafe { *(a1k as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2s = args_desc + 32;  unsafe { *(a2s as uint64) = 8 }
+    uint64 a2k = args_desc + 40;  unsafe { *(a2k as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    // Snapshot asm text into its own buffer (next kernel's asm_init clobbers).
+    uint64 k_text_size = asm_text_len
+    uint64 k_text_buf  = alloc(k_text_size)
+    uint64 ci = 0
+    while ci < k_text_size {
+        uint64 sp = asm_text_buf + ci
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        uint64 dp = k_text_buf + ci
+        uint8 b8 = b
+        unsafe { *(dp as uint8) = b8 }
+        ci = ci + 1
+    }
+
+    uint64 rsrc1 = 0xE0AF0001        // VGPR granule 1 → 16 VGPRs (uses v0..v9 = 10)
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+    kt_push(kname_ptr, nl, k_text_buf, k_text_size,
+            args_desc, 3, 24,
+            16, 10,
+            rsrc1, rsrc2, rsrc3, props)
+    return 0
+}
+
 // Lower one @kernel fn_node into the kernel table. Returns 0 on
 // success, 1 on unsupported shape. Recognises the same two shapes
 // the M1d/M1e lowerer already handled:
@@ -11732,11 +11817,8 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     // we can handle it. See docs/PHASE3_DESIGN.md.
     uint64 pw_rc = amdgpu_lower_pointwise_3a(fn_node, source, kname_ptr, nl)
     if pw_rc == 0 { return 0 }
-    // spike_reduce uses two u64 atomic_add ops on a 16-byte result
-    // buffer (total + active counts). Not yet lowered natively; skip
-    // (return 2) so the launcher resolves it from the fallback .co.
     if tok_matches(name_tok, "spike_reduce", 12) != 0 {
-        return 2
+        return amdgpu_lower_noesis_spike_reduce(kname_ptr, nl)
     }
 
     // Param list — 1 or 2 params. If there are 2, the 2nd is taken
