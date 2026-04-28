@@ -5414,11 +5414,14 @@ fn gen_function_a64(uint64 fn_node) {
         return
     }
 
-    // For main: auto-insert exit(0) so programs don't segfault on return
-    // Skip when in freestanding mode
+    // For main: auto-insert exit(x0) so programs don't segfault on return
+    // AND main's return value reaches the kernel. For void main, zero x0
+    // first so fall-through still produces exit(0). Skip in freestanding.
     uint64 wnt_ep = name_tok
     if tok_matches(wnt_ep, "main", 4) != 0 && freestanding == 0 {
-        emit_a64_mov_imm(0, 0)
+        if wrt_a == 0 {
+            emit_a64_mov_imm(0, 0)
+        }
         if target_os == 2 {
             emit_a64_win_call_iat(0)
         } else {

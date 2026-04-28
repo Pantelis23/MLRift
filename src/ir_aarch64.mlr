@@ -2730,16 +2730,18 @@ fn ir_emit_arm64_function(uint64 fn_node) {
 
     // 11. Epilogue (skip for @naked)
     if is_naked == 0 {
-        // For main(): auto-insert exit(0) syscall. Without this, returning
-        // from main() jumps to an undefined LR -> segfault.
+        // For main(): auto-insert exit(x0) syscall. Without this, returning
+        // from main() jumps to an undefined LR -> segfault. x0 already
+        // holds main's return value; only zero it for void main so
+        // fall-through still produces exit(0).
         if tok_matches(fn_name_tok, "main", 4) != 0 && freestanding == 0 {
-            if target_os == 2 {
-                // Windows: ExitProcess(0) via IAT slot 0
+            uint32 ret_type_tok_a64 = ast_data2(fn_node)
+            if ret_type_tok_a64 == 0 {
                 emit_a64_mov_imm(0, 0)
+            }
+            if target_os == 2 {
                 emit_a64_win_call_iat(0)
             } else {
-                // Linux/macOS/Android: exit(0)
-                emit_a64_mov_imm(0, 0)
                 if target_os == 1 { emit_a64_syscall_nr(1) } else { emit_a64_syscall_nr(93) }
                 emit_a64_svc()
             }

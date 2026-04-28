@@ -9920,12 +9920,15 @@ fn gen_function(uint64 fn_node) {
         write(2, "'\n", 2)
     }
 
-    // For main: auto-insert exit(0) so programs don't segfault on return
-    // Skip when in freestanding mode
+    // For main: auto-insert exit(rax) so programs don't segfault on return
+    // AND the return value reaches the kernel. For void main, zero rax
+    // first so fall-through still produces exit(0).
+    // Skip when in freestanding mode.
     uint64 wnt_ep = name_tok
     if tok_matches(wnt_ep, "main", 4) != 0 && freestanding == 0 {
-        // mov edi, 0 (exit code)
-        emit_mov_rax_imm(0)
+        if wrt == 0 {
+            emit_byte(0x31); emit_byte(0xC0)            // xor eax, eax
+        }
         if target_os == 2 {
             emit_mov_rcx_rax()
             emit_win_alloc_stack(0x20)

@@ -9341,17 +9341,23 @@ fn ir_emit_x86_function(uint64 fn_node) {
 
     // 10. Epilogue (skip for @naked functions)
     if is_naked == 0 {
-        // For main(): auto-insert exit(0) so programs without explicit exit()
-        // don't segfault on return. Matches the legacy codegen behavior.
+        // For main(): auto-insert exit(rax) so programs without explicit
+        // exit() don't segfault on return AND the return value reaches
+        // the kernel. For void main, zero rax first so fall-through still
+        // produces exit(0).
         if tok_matches(fn_name_tok, "main", 4) != 0 && freestanding == 0 {
+            if wirt == 0 {
+                // void main: rax may hold scratch from last user op — zero it.
+                emit_byte(0x31); emit_byte(0xC0)         // xor eax, eax
+            }
             if target_os == 2 {
-                // Windows: ExitProcess(0) via IAT slot 0
-                emit_byte(0xB9); emit_u32_le(0)
+                // Windows: ExitProcess(rax) via IAT slot 0
+                emit_byte(0x48); emit_byte(0x89); emit_byte(0xC1)   // mov rcx, rax
                 emit_win_alloc_stack(0x20)
                 emit_win_call_iat(0)
             } else {
-                // Linux/macOS/Android: exit(0) syscall
-                emit_byte(0xBF); emit_u32_le(0)
+                // Linux/macOS/Android: exit(rax) syscall
+                emit_byte(0x48); emit_byte(0x89); emit_byte(0xC7)   // mov rdi, rax
                 if target_os == 1 { emit_byte(0xB8); emit_u32_le(0x2000001) }
                 else { emit_byte(0xB8); emit_u32_le(231) }
                 emit_byte(0x0F); emit_byte(0x05)
