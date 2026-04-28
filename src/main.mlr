@@ -4757,6 +4757,18 @@ fn main() {
                 write(1, emb_path, embl)
                 write(1, " (amdgpu embedding-lookup-f32 code object)\n", 44)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-argmax-logits-f32=", 32) != 0 {
+                uint64 am_path = arg + 32
+                uint64 am_rc = emit_amdgpu_argmax_logits_f32_blob(am_path)
+                if am_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-argmax-logits-f32 failed\n", 46)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 aml = str_len(am_path)
+                write(1, am_path, aml)
+                write(1, " (amdgpu argmax-logits-f32 code object)\n", 41)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-softmax-causal-f32=", 33) != 0 {
                 uint64 sc_path = arg + 33
                 uint64 sc_rc = emit_amdgpu_softmax_causal_f32_blob(sc_path)

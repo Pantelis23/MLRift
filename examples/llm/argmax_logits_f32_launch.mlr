@@ -1,0 +1,141 @@
+// argmax_logits_f32: out[seq] = argmax_v(logits[seq, V]).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-argmax-logits-f32=/tmp/argmax_logits_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/argmax_logits_f32_launch.mlr -o /tmp/argmax_logits_f32_kfd
+// Run:
+//   /tmp/argmax_logits_f32_kfd
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 { i = i - 1; uint64 d = tmp - (tmp / 10) * 10; uint64 p = buf + i; uint8 c = d + 48; unsafe { *(p as uint8) = c }; tmp = tmp / 10 }
+    return n
+}
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128); uint64 i = 0
+    while i < label_len { uint64 sp = label + i; uint64 c = 0; unsafe { *(sp as uint8) -> c }; uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }; i = i + 1 }
+    uint64 cp = buf + label_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1; uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+fn die(uint64 msg, uint64 code) { puts(msg); print_label_val("e", 1, code); exit(1) }
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 fd = file_open("/tmp/argmax_logits_f32.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { puts("missing /tmp/argmax_logits_f32.co"); exit(1) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "argmax_logits_f32"); if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    uint64 SEQ = 8
+    uint64 V   = 151936    // Qwen3 vocab size
+
+    uint64 logits_bytes = SEQ * V * 4
+    uint64 out_bytes    = SEQ * 4
+
+    uint64 d_logits = 0; uint64 d_out = 0
+    uint64 slot
+    slot = alloc(8); err = hipMalloc(slot, logits_bytes); if err != 0 { die("mLog", err) }; unsafe { *(slot as uint64) -> d_logits }
+    slot = alloc(8); err = hipMalloc(slot, out_bytes);    if err != 0 { die("mOut", err) }; unsafe { *(slot as uint64) -> d_out }
+
+    // Fill: each row gets a unique target index where the max lives.
+    // Surrounding values are < 1.0; the target is exactly 2.0 + row*0.01
+    // so each row's argmax is deterministic and distinct.
+    uint64 h_logits = alloc(logits_bytes)
+    uint64 h_target = alloc(SEQ * 8)   // expected argmax index per row
+    uint64 r = 0
+    while r < SEQ {
+        uint64 c = 0
+        // Background fill (small varying values).
+        while c < V {
+            uint64 mix = (r * 31 + c * 17 + 7) - ((r * 31 + c * 17 + 7) / 100) * 100
+            f64 vd = int_to_f64(mix) * 0.005
+            f32 v = f64_to_f32(vd)
+            uint64 p = h_logits + (r * V + c) * 4
+            unsafe { *(p as f32) = v }
+            c = c + 1
+        }
+        // Target index for this row (varies per row to test that lane
+        // 0's reduction picks the right one across the strided scan):
+        uint64 tgt = (r * 257 + 13) - ((r * 257 + 13) / V) * V
+        uint64 tp = h_logits + (r * V + tgt) * 4
+        f64 td = 2.0 + int_to_f64(r) * 0.01
+        f32 tv = f64_to_f32(td)
+        unsafe { *(tp as f32) = tv }
+        uint64 expp = h_target + r * 8
+        unsafe { *(expp as uint64) = tgt }
+        r = r + 1
+    }
+    err = hipMemcpy(d_logits, h_logits, logits_bytes, 1); if err != 0 { die("H2D", err) }
+
+    uint64 k_log = alloc(8); unsafe { *(k_log as uint64) = d_logits }
+    uint64 k_out = alloc(8); unsafe { *(k_out as uint64) = d_out }
+    uint64 k_v   = alloc(8); unsafe { *(k_v   as uint64) = V }
+    uint64 k_pad = alloc(8); unsafe { *(k_pad as uint64) = 0 }
+    uint64 kp = alloc(4 * 8)
+    unsafe { *(kp        as uint64) = k_log }
+    unsafe { *((kp +  8) as uint64) = k_out }
+    unsafe { *((kp + 16) as uint64) = k_v   }
+    unsafe { *((kp + 24) as uint64) = k_pad }
+
+    uint32 grid  = SEQ
+    uint32 block = 32                  // single wave32
+    err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 h_out = alloc(out_bytes)
+    err = hipMemcpy(h_out, d_out, out_bytes, 2); if err != 0 { die("D2H", err) }
+
+    uint64 mismatch = 0
+    uint64 first_bad = 0xFFFFFFFFFFFFFFFF
+    r = 0
+    while r < SEQ {
+        uint64 op = h_out + r * 4
+        uint32 got = 0; unsafe { *(op as uint32) -> got }
+        uint64 expp = h_target + r * 8
+        uint64 exp_idx = 0; unsafe { *(expp as uint64) -> exp_idx }
+        uint32 exp32 = exp_idx
+        if got != exp32 {
+            mismatch = mismatch + 1
+            if first_bad == 0xFFFFFFFFFFFFFFFF { first_bad = r }
+        }
+        r = r + 1
+    }
+
+    print_label_val("SEQ",       3, SEQ)
+    print_label_val("V",         1, V)
+    print_label_val("mismatch",  8, mismatch)
+    if mismatch > 0 {
+        print_label_val("first_bad_row", 13, first_bad)
+        uint64 op = h_out + first_bad * 4
+        uint32 got = 0; unsafe { *(op as uint32) -> got }
+        uint64 ep = h_target + first_bad * 8
+        uint64 exp_idx = 0; unsafe { *(ep as uint64) -> exp_idx }
+        print_label_val("got", 3, got)
+        print_label_val("exp", 3, exp_idx)
+    }
+
+    hipFree(d_logits); hipFree(d_out)
+    exit(0)
+}
