@@ -1,11 +1,11 @@
 // MLRift LLM end-to-end forward driver — FULL block: embedding →
-// attention → MLP → final norm → LM head → argmax.  19 kernel
+// attention → MLP → final norm → LM head → argmax.  21 kernel
 // launches chained on-device, token IDs in → token IDs out.
+// Includes device-side K^T transpose (no host roundtrip).
 //
 // Single-head attention (HEADS=1, HD=HIDDEN) for demo simplicity;
 // multi-head requires per-head loop or batched gemm — open follow-up.
-// K^T computed on host (D2H K → host transpose → H2D K^T) since we
-// don't have a device transpose kernel yet.
+// K^T is computed via the native device transpose kernel.
 //
 // Forward pipeline:
 //   x       = embedding_lookup(token_ids, W_embed)     [SEQ, H]
@@ -15,7 +15,7 @@
 //   K       = x_n @ W_k                                [SEQ, H]
 //   V       = x_n @ W_v                                [SEQ, H]
 //   Q       = scale(Q, 1/sqrt(H))                      [SEQ, H]
-//   K^T     = host_transpose(K)                        [H, SEQ]   (D2H+H2D)
+//   K^T     = transpose(K)                             [H, SEQ]   (transpose_f32)
 //   scores  = Q @ K^T                                  [SEQ, SEQ]
 //   attn    = softmax_causal(scores)                   [SEQ, SEQ]
 //   ctx     = attn @ V                                 [SEQ, H]
@@ -41,6 +41,7 @@
 //   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/silu_mul_f32.mlr     -o /tmp/silu_mul_f32
 //   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/residual_add_f32.mlr -o /tmp/residual_add_f32
 //   ./build/mlrc --arch=x86_64 --emit-amdgpu-argmax-logits-f32=/tmp/argmax_logits_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-transpose-f32=/tmp/transpose_f32.co dummy
 //   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/qwen3_full_forward_launch.mlr -o /tmp/qwen3_full_forward_kfd
 // Run:
 //   /tmp/qwen3_full_forward_kfd
@@ -119,6 +120,7 @@ fn main() {
     uint64 fh_silumul = load_kernel("/tmp/silu_mul_f32.co",          "silu_mul_f32")
     uint64 fh_resadd  = load_kernel("/tmp/residual_add_f32.co",      "residual_add_f32")
     uint64 fh_argmax  = load_kernel("/tmp/argmax_logits_f32.co",     "argmax_logits_f32")
+    uint64 fh_trans   = load_kernel("/tmp/transpose_f32.co",         "transpose_f32")
 
     uint64 tok_bytes      = SEQ * 4
     uint64 act_bytes      = SEQ * HIDDEN * 4
@@ -294,24 +296,21 @@ fn main() {
     uint32 grid_sc = (SEQ * HIDDEN + 255) / 256
     err = hipModuleLaunchKernel(fh_scale, grid_sc, 1, 1, 256, 1, 1, 0, 0, kp_sc, 0); if err != 0 { die("L scale", err) } 
 
-    // 7. K^T = host_transpose(K).  D2H K → transpose into K_T → H2D K_T.
-    err = hipDeviceSynchronize(); if err != 0 { die("sync pre-transpose", err) }
-    uint64 h_K   = alloc(act_bytes)
-    uint64 h_K_T = alloc(K_T_bytes)
-    err = hipMemcpy(h_K, d_K, act_bytes, 2); if err != 0 { die("D2H K", err) }
-    uint64 ki = 0
-    while ki < SEQ {
-        uint64 kj = 0
-        while kj < HIDDEN {
-            uint64 src = h_K   + (ki * HIDDEN + kj) * 4
-            uint64 dst = h_K_T + (kj * SEQ    + ki) * 4
-            uint32 v32 = 0; unsafe { *(src as uint32) -> v32 }
-            unsafe { *(dst as uint32) = v32 }
-            kj = kj + 1
-        }
-        ki = ki + 1
-    }
-    err = hipMemcpy(d_K_T, h_K_T, K_T_bytes, 1); if err != 0 { die("H2D Kt", err) }
+    // 7. K^T = transpose(K)  — device-side kernel, no host roundtrip.
+    //    transpose_f32 args: (in, out, M, N) with output [N, M].
+    //    K is [SEQ, HIDDEN] → K^T is [HIDDEN, SEQ].
+    uint64 t_in  = alloc(8); unsafe { *(t_in  as uint64) = d_K }
+    uint64 t_out = alloc(8); unsafe { *(t_out as uint64) = d_K_T }
+    uint64 t_m   = alloc(8); unsafe { *(t_m   as uint64) = SEQ }
+    uint64 t_n   = alloc(8); unsafe { *(t_n   as uint64) = HIDDEN }
+    uint64 kp_t = alloc(4 * 8)
+    unsafe { *(kp_t        as uint64) = t_in }
+    unsafe { *((kp_t +  8) as uint64) = t_out }
+    unsafe { *((kp_t + 16) as uint64) = t_m }
+    unsafe { *((kp_t + 24) as uint64) = t_n }
+    uint32 grid_t = ((SEQ + 15) / 16) * ((HIDDEN + 15) / 16)
+    err = hipModuleLaunchKernel(fh_trans, grid_t, 1, 1, 256, 1, 1, 0, 0, kp_t, 0)
+    if err != 0 { die("L transpose Kt", err) }
 
     // 8. scores = Q @ K^T  (M=SEQ, N=SEQ, K=HIDDEN)
     uint64 s_a = alloc(8); unsafe { *(s_a as uint64) = d_Q }
@@ -511,7 +510,7 @@ fn main() {
     print_label_val("HIDDEN",         6, HIDDEN)
     print_label_val("INTER",          5, INTER)
     print_label_val("VOCAB",          5, VOCAB)
-    print_label_val("kernels_chained",15, 20)
+    print_label_val("kernels_chained",15, 21)
     print_label_val("valid_tokens",  12, valid)
     print_label_val("max_token_id",  12, max_seen)
 

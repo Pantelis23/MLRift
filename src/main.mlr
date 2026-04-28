@@ -4745,6 +4745,18 @@ fn main() {
                 write(1, kvb_path, kvbl)
                 write(1, " (amdgpu kv-broadcast-f32 code object)\n", 40)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-transpose-f32=", 28) != 0 {
+                uint64 tr_path = arg + 28
+                uint64 tr_rc = emit_amdgpu_transpose_f32_blob(tr_path)
+                if tr_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-transpose-f32 failed\n", 42)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 trl = str_len(tr_path)
+                write(1, tr_path, trl)
+                write(1, " (amdgpu transpose-f32 code object)\n", 37)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-embedding-lookup-f32=", 35) != 0 {
                 uint64 emb_path = arg + 35
                 uint64 emb_rc = emit_amdgpu_embedding_lookup_f32_blob(emb_path)
