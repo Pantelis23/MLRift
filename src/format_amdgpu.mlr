@@ -5945,9 +5945,10 @@ fn _emit_gemv_coop_f32_body(uint64 args_desc) {
     asm_u32(0x8513870C)                            // s_lshr_b32 s19, s12, 7  (K/128)
 
     // .Lloop:  unrolled 4×.  Issue 8 VMEM loads back-to-back at
-    // offsets 0/128/256/384 so the memory pipeline streams them
-    // concurrently, drain once with vmcnt(0), then 4 fmac + 1 stride.
-    // Halves loop iters again vs unroll-2× (and quarters vs no-unroll).
+    // offsets 0/128/256/384, drain once with vmcnt(0), then 4 fmac.
+    // K=1024 ⇒ 8 loop iters total.  (Tried 8× unroll: produces wrong
+    // results — likely a register-allocator boundary at v16 in this
+    // KD config; needs deeper bisection. 4× is the verified peak.)
     uint64 loop_idx = asm_text_len / 4
     asm_u32(0xDC520000); asm_u32(0x08100007)       // global_load_b32 v8,  v7, s[16:17]
     asm_u32(0xDC520000); asm_u32(0x09060007)       // global_load_b32 v9,  v7, s[6:7]
@@ -5958,10 +5959,10 @@ fn _emit_gemv_coop_f32_body(uint64 args_desc) {
     asm_u32(0xDC520180); asm_u32(0x0E100007)       // global_load_b32 v14, v7, s[16:17] offset:384
     asm_u32(0xDC520180); asm_u32(0x0F060007)       // global_load_b32 v15, v7, s[6:7]   offset:384
     asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)
-    asm_u32(0x560A1308)                            // v_fmac_f32_e32 v5, v8,  v9
-    asm_u32(0x560A170A)                            // v_fmac_f32_e32 v5, v10, v11
-    asm_u32(0x560A1B0C)                            // v_fmac_f32_e32 v5, v12, v13
-    asm_u32(0x560A1F0E)                            // v_fmac_f32_e32 v5, v14, v15
+    asm_u32(0x560A1308)                            // v_fmac_f32 v5, v8,  v9
+    asm_u32(0x560A170A)                            // v_fmac_f32 v5, v10, v11
+    asm_u32(0x560A1B0C)                            // v_fmac_f32 v5, v12, v13
+    asm_u32(0x560A1F0E)                            // v_fmac_f32 v5, v14, v15
     asm_u32(0x4A0E0EFF); asm_u32(0x00000200)       // v_add_nc_u32_e32 v7, 512, v7
     asm_u32(0x80128112)                            // s_add_u32 s18, s18, 1
     asm_u32(0xBF0A1312)                            // s_cmp_lt_u32 s18, s19
@@ -6009,9 +6010,7 @@ fn emit_amdgpu_gemv_coop_f32_blob(uint64 out_path) -> uint64 {
     _emit_gemv_coop_f32_body(args_desc)
 
     // KD: num_user_sgprs=18, num_vgprs=16 with unroll 4× (v0..v15
-    // active: v0 lane, v3 row-addr, v5 sum, v6 lds_slot, v7 byte_off,
-    // v8..v15 = 4 pairs of (a, b) loaded values).  Reduction helper
-    // overlays its scratch on v7 (rebuilds it post-loop).  LDS = 128 B.
+    // active).  LDS = 128 B.
     uint64 size = emit_amdgpu_code_object_lds("gemv_coop_f32", 13,
                                                asm_text_buf, asm_text_len,
                                                40, 8, 18, 16,
