@@ -1,0 +1,158 @@
+// Async chain demo: matmul → residual_add → matmul, single hipDeviceSynchronize.
+//
+// Compares two strategies for "compute c = M(M(x) + r)":
+//   A) per-call sync (current wrapper semantics): 3 syncs.
+//   B) chained on-device: 1 sync.
+//
+// If (B) is faster than (A), the pattern is validated and ready to
+// roll out across qwen3's whole forward pass.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-gemv-coop-f32=/tmp/gemv_coop_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-residual-add-f32=/tmp/residual_add_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/gpu_chain_demo.mlr -o /tmp/gpu_chain_demo
+// Run:
+//   /tmp/gpu_chain_demo
+
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn die(uint64 msg, uint64 code) {
+    print_str(msg); print_str(" e="); u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n"); exit(1)
+}
+
+fn load_kernel(uint64 co_path, uint64 fname) -> uint64 {
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    uint32 err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fname); if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+    return fh
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+    uint64 fh_gemv  = load_kernel("/tmp/gemv_coop_f32.co",   "gemv_coop_f32")
+    uint64 fh_resid = load_kernel("/tmp/residual_add_f32.co", "residual_add_f32")
+
+    u64 N = 4096
+    u64 K = 1024
+    u64 ITERS = 200
+
+    // Allocate device buffers.
+    u64 d_W = 0; u64 d_x = 0; u64 d_y1 = 0; u64 d_r = 0; u64 d_y2 = 0; u64 d_out = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, N*K*4); if err != 0 { die("mW",  err) }; unsafe { *(slot as u64) -> d_W }
+    slot = alloc(8); err = hipMalloc(slot, K*4);   if err != 0 { die("mx",  err) }; unsafe { *(slot as u64) -> d_x }
+    slot = alloc(8); err = hipMalloc(slot, N*4);   if err != 0 { die("my1", err) }; unsafe { *(slot as u64) -> d_y1 }
+    slot = alloc(8); err = hipMalloc(slot, N*4);   if err != 0 { die("mr",  err) }; unsafe { *(slot as u64) -> d_r }
+    slot = alloc(8); err = hipMalloc(slot, N*4);   if err != 0 { die("my2", err) }; unsafe { *(slot as u64) -> d_y2 }
+    slot = alloc(8); err = hipMalloc(slot, N*4);   if err != 0 { die("mo",  err) }; unsafe { *(slot as u64) -> d_out }
+
+    // Initialize buffers (host stub — values don't matter, we time only).
+    u64 h = alloc(N*K*4); u64 i = 0
+    while i < N*K { u64 p = h + i*4; unsafe { *(p as f32) = 0.001 }; i = i + 1 }
+    err = hipMemcpy(d_W, h, N*K*4, 1)
+    err = hipMemcpy(d_x, h, K*4,   1)
+    err = hipMemcpy(d_r, h, N*4,   1)
+    dealloc(h)
+
+    // gemv kernarg builder.
+    u64 g0 = alloc(8); unsafe { *(g0 as u64) = d_W }
+    u64 g1 = alloc(8); unsafe { *(g1 as u64) = d_x }
+    u64 g2 = alloc(8); unsafe { *(g2 as u64) = d_y1 }
+    u64 g3 = alloc(8); unsafe { *(g3 as u64) = N }
+    u64 g4 = alloc(8); unsafe { *(g4 as u64) = K }
+    u64 kp_gemv = alloc(5*8)
+    unsafe { *(kp_gemv        as u64) = g0 }
+    unsafe { *((kp_gemv +  8) as u64) = g1 }
+    unsafe { *((kp_gemv + 16) as u64) = g2 }
+    unsafe { *((kp_gemv + 24) as u64) = g3 }
+    unsafe { *((kp_gemv + 32) as u64) = g4 }
+
+    // residual_add kernarg layout:
+    //   [0x00] in_a, [0x08] in_b, [0x10] out, [0x18] n
+    u64 r0 = alloc(8); unsafe { *(r0 as u64) = d_y1 }
+    u64 r1 = alloc(8); unsafe { *(r1 as u64) = d_r }
+    u64 r2 = alloc(8); unsafe { *(r2 as u64) = d_y2 }
+    u64 r3 = alloc(8); unsafe { *(r3 as u64) = N }
+    u64 kp_resid = alloc(4*8)
+    unsafe { *(kp_resid        as u64) = r0 }
+    unsafe { *((kp_resid +  8) as u64) = r1 }
+    unsafe { *((kp_resid + 16) as u64) = r2 }
+    unsafe { *((kp_resid + 24) as u64) = r3 }
+
+    // gemv kernarg #2 — reuse same W & shape, just different input.
+    // Use d_y2 as the input vector (only first K=1024 elements read).
+    u64 g0b = alloc(8); unsafe { *(g0b as u64) = d_W }
+    u64 g1b = alloc(8); unsafe { *(g1b as u64) = d_y2 }
+    u64 g2b = alloc(8); unsafe { *(g2b as u64) = d_out }
+    u64 g3b = alloc(8); unsafe { *(g3b as u64) = N }
+    u64 g4b = alloc(8); unsafe { *(g4b as u64) = K }
+    u64 kp_gemv2 = alloc(5*8)
+    unsafe { *(kp_gemv2        as u64) = g0b }
+    unsafe { *((kp_gemv2 +  8) as u64) = g1b }
+    unsafe { *((kp_gemv2 + 16) as u64) = g2b }
+    unsafe { *((kp_gemv2 + 24) as u64) = g3b }
+    unsafe { *((kp_gemv2 + 32) as u64) = g4b }
+
+    u32 grid_gemv  = N
+    u32 grid_resid = (N + 255) / 256
+    u32 grid_gemv2 = N
+
+    // === Strategy A: per-call sync (3 syncs per chain) ===
+    u64 t0 = time_now()
+    u64 it = 0
+    while it < ITERS {
+        err = hipModuleLaunchKernel(fh_gemv,  grid_gemv,  1, 1, 32,  1, 1, 0, 0, kp_gemv,  0)
+        err = hipDeviceSynchronize()
+        err = hipModuleLaunchKernel(fh_resid, grid_resid, 1, 1, 256, 1, 1, 0, 0, kp_resid, 0)
+        err = hipDeviceSynchronize()
+        err = hipModuleLaunchKernel(fh_gemv,  grid_gemv2, 1, 1, 32,  1, 1, 0, 0, kp_gemv2, 0)
+        err = hipDeviceSynchronize()
+        it = it + 1
+    }
+    u64 t1 = time_now()
+    u64 us_a = (t1 - t0) / 1000
+    print_str("Strategy A (3 syncs per chain × "); u64 sa = fmt_dec(ITERS); print_str(sa); dealloc(sa)
+    print_str(" iters): "); u64 sb = fmt_dec(us_a); print_str(sb); dealloc(sb); print_str(" us total\n")
+    print_str("  per-iter: "); u64 sc = fmt_dec(us_a / ITERS); print_str(sc); dealloc(sc); print_str(" us\n")
+
+    // === Strategy B: chained, 1 sync per chain ===
+    u64 t2 = time_now()
+    it = 0
+    while it < ITERS {
+        err = hipModuleLaunchKernel(fh_gemv,  grid_gemv,  1, 1, 32,  1, 1, 0, 0, kp_gemv,  0)
+        err = hipModuleLaunchKernel(fh_resid, grid_resid, 1, 1, 256, 1, 1, 0, 0, kp_resid, 0)
+        err = hipModuleLaunchKernel(fh_gemv,  grid_gemv2, 1, 1, 32,  1, 1, 0, 0, kp_gemv2, 0)
+        err = hipDeviceSynchronize()
+        it = it + 1
+    }
+    u64 t3 = time_now()
+    u64 us_b = (t3 - t2) / 1000
+    print_str("Strategy B (1 sync per chain × "); u64 sd = fmt_dec(ITERS); print_str(sd); dealloc(sd)
+    print_str(" iters): "); u64 se = fmt_dec(us_b); print_str(se); dealloc(se); print_str(" us total\n")
+    print_str("  per-iter: "); u64 sf = fmt_dec(us_b / ITERS); print_str(sf); dealloc(sf); print_str(" us\n")
+
+    print_str("\nB / A ratio (lower = better): ")
+    u64 ratio_x100 = (us_b * 100) / us_a
+    u64 sg = fmt_dec(ratio_x100); print_str(sg); dealloc(sg); print_str(" %\n")
+    print_str("B saves ")
+    u64 saved_us = us_a - us_b
+    u64 sh = fmt_dec(saved_us); print_str(sh); dealloc(sh); print_str(" us total over ")
+    u64 si = fmt_dec(ITERS); print_str(si); dealloc(si); print_str(" iters\n")
+
+    exit(0)
+}
