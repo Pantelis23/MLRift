@@ -1,0 +1,199 @@
+// Decode-shape (M=1) bf16→dequant→gemv bench — pins the GPU's actual
+// per-call throughput at the qwen3_generate autoregressive hot path
+// where M=1 (one new token per step) and dispatched matmuls are
+// naturally GEMV (matrix-vector) shapes.
+//
+// gemv_f32 args:
+//   c[M] = A[M, K] @ b[K]
+//   block = 256, grid = ceil(M/256)
+// For our HF-convention call where W is [N, K] and we want
+// out[N] = W @ x[K]:
+//   A = W   (M = N_HF, K = K_HF)
+//   b = x
+//   c = out
+//
+// Bench shape: Qwen3-0.6B q_proj decode, N=2048, K=1024.
+//   FLOPs/call = 2 * N * K = 4,194,304
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-bf16-to-f32=/tmp/bf16_to_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-gemv-f32=/tmp/gemv_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/bf16_gemv_decode_bench_launch.mlr -o /tmp/bf16_gemv_decode_bench_kfd
+// Run:
+//   /tmp/bf16_gemv_decode_bench_kfd
+
+import "../../std/hip.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 { i = i - 1; uint64 d = tmp - (tmp / 10) * 10; uint64 p = buf + i; uint8 c = d + 48; unsafe { *(p as uint8) = c }; tmp = tmp / 10 }
+    return n
+}
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128); uint64 i = 0
+    while i < label_len { uint64 sp = label + i; uint64 c = 0; unsafe { *(sp as uint8) -> c }; uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }; i = i + 1 }
+    uint64 cp = buf + label_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1; uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+fn die(uint64 msg, uint64 code) { puts(msg); print_label_val("e", 1, code); exit(1) }
+
+fn load_kernel(uint64 co_path, uint64 fname) -> uint64 {
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { puts("missing co"); puts(co_path); exit(1) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    uint32 err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fname); if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+    return fh
+}
+
+fn f32_to_bf16(f32 v) -> uint16 {
+    uint64 sb = alloc(4)
+    unsafe { *(sb as f32) = v }
+    uint32 bits = 0; unsafe { *(sb as uint32) -> bits }
+    uint32 hi = bits >> 16
+    uint16 b16 = hi
+    return b16
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 fh_dq   = load_kernel("/tmp/bf16_to_f32.co", "bf16_to_f32")
+    uint64 fh_gemv = load_kernel("/tmp/gemv_f32.co",    "gemv_f32")
+
+    // Qwen3-0.6B q_proj decode shape:
+    //   N (= num_heads * head_dim) = 16 * 128 = 2048
+    //   K (= hidden)               = 1024
+    uint64 N = 2048
+    uint64 K = 1024
+
+    uint64 b_bytes_f32  = K * 4
+    uint64 W_bytes_bf16 = N * K * 2
+    uint64 W_bytes_f32  = N * K * 4
+    uint64 c_bytes_f32  = N * 4
+
+    uint64 d_b = 0; uint64 d_W_bf16 = 0; uint64 d_W_f32 = 0; uint64 d_c = 0
+    uint64 slot
+    slot = alloc(8); err = hipMalloc(slot, b_bytes_f32);  if err != 0 { die("mb",  err) }; unsafe { *(slot as uint64) -> d_b }
+    slot = alloc(8); err = hipMalloc(slot, W_bytes_bf16); if err != 0 { die("mWb", err) }; unsafe { *(slot as uint64) -> d_W_bf16 }
+    slot = alloc(8); err = hipMalloc(slot, W_bytes_f32);  if err != 0 { die("mWf", err) }; unsafe { *(slot as uint64) -> d_W_f32 }
+    slot = alloc(8); err = hipMalloc(slot, c_bytes_f32);  if err != 0 { die("mc",  err) }; unsafe { *(slot as uint64) -> d_c }
+
+    // Host-side fill: x (vector), W (bf16 matrix), and the bf16-truncated
+    // f32 ground truth.
+    uint64 h_b      = alloc(b_bytes_f32)
+    uint64 h_W_bf16 = alloc(W_bytes_bf16)
+    uint64 h_W_f32  = alloc(W_bytes_f32)
+
+    uint64 i = 0
+    while i < K {
+        f64 v = (int_to_f64(i) * 0.0003) - 0.05
+        uint64 p = h_b + i * 4
+        unsafe { *(p as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+
+    uint64 r = 0
+    while r < N {
+        uint64 c = 0
+        while c < K {
+            f64 v = (int_to_f64(r) * 0.0007 + int_to_f64(c) * 0.0011) - 0.07
+            f32 vf32 = f64_to_f32(v)
+            uint16 b16 = f32_to_bf16(vf32)
+            uint64 pb = h_W_bf16 + (r * K + c) * 2
+            unsafe { *(pb as uint16) = b16 }
+            uint64 b64 = b16
+            uint32 bits = b64 << 16
+            uint64 sb = alloc(4); unsafe { *(sb as uint32) = bits }
+            f32 vt = 0.0; unsafe { *(sb as f32) -> vt }
+            uint64 pf = h_W_f32 + (r * K + c) * 4
+            unsafe { *(pf as f32) = vt }
+            c = c + 1
+        }
+        r = r + 1
+    }
+
+    err = hipMemcpy(d_b,      h_b,      b_bytes_f32,  1); if err != 0 { die("H2D b",  err) }
+    err = hipMemcpy(d_W_bf16, h_W_bf16, W_bytes_bf16, 1); if err != 0 { die("H2D Wb", err) }
+
+    // Stage 1: bf16_to_f32 dequant on device (one-shot per weight, models
+    // the model-load step in qwen3_generate).
+    uint64 dq_in  = alloc(8); unsafe { *(dq_in  as uint64) = d_W_bf16 }
+    uint64 dq_out = alloc(8); unsafe { *(dq_out as uint64) = d_W_f32 }
+    uint64 dq_n   = alloc(8); unsafe { *(dq_n   as uint64) = N * K }
+    uint64 kp_dq = alloc(3 * 8)
+    unsafe { *(kp_dq        as uint64) = dq_in }
+    unsafe { *((kp_dq +  8) as uint64) = dq_out }
+    unsafe { *((kp_dq + 16) as uint64) = dq_n }
+    uint32 grid_dq = (N * K + 255) / 256
+    err = hipModuleLaunchKernel(fh_dq, grid_dq, 1, 1, 256, 1, 1, 0, 0, kp_dq, 0)
+    if err != 0 { die("L dequant", err) }
+
+    // Stage 2: GEMV  c = W @ b   args: (A, b, c, M=N, K)
+    uint64 gv_a = alloc(8); unsafe { *(gv_a as uint64) = d_W_f32 }
+    uint64 gv_b = alloc(8); unsafe { *(gv_b as uint64) = d_b }
+    uint64 gv_c = alloc(8); unsafe { *(gv_c as uint64) = d_c }
+    uint64 gv_m = alloc(8); unsafe { *(gv_m as uint64) = N }
+    uint64 gv_k = alloc(8); unsafe { *(gv_k as uint64) = K }
+    uint64 kp_gv = alloc(5 * 8)
+    unsafe { *(kp_gv        as uint64) = gv_a }
+    unsafe { *((kp_gv +  8) as uint64) = gv_b }
+    unsafe { *((kp_gv + 16) as uint64) = gv_c }
+    unsafe { *((kp_gv + 24) as uint64) = gv_m }
+    unsafe { *((kp_gv + 32) as uint64) = gv_k }
+    uint32 grid_gv = (N + 255) / 256
+
+    // Warmup
+    err = hipModuleLaunchKernel(fh_gemv, grid_gv, 1, 1, 256, 1, 1, 0, 0, kp_gv, 0)
+    if err != 0 { die("L gemv warm", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync warm", err) }
+
+    // Bench: 1000 cached-weight gemv calls (decode hot path).
+    uint64 iters = 1000
+    uint64 t0 = time_now()
+    uint64 it = 0
+    while it < iters {
+        err = hipModuleLaunchKernel(fh_gemv, grid_gv, 1, 1, 256, 1, 1, 0, 0, kp_gv, 0)
+        if err != 0 { die("L gemv bench", err) }
+        it = it + 1
+    }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync bench", err) }
+    uint64 t1 = time_now()
+    uint64 elapsed_ns  = t1 - t0
+    uint64 per_call_ns = elapsed_ns / iters
+    uint64 flops_per_call = 2 * N * K
+    uint64 gflops_x100 = (flops_per_call * 100) / per_call_ns
+
+    // Correctness proof for gemv at this shape lives in
+    // examples/llm/gemv_f32_launch.mlr (Phase A milestone, task #68
+    // GREEN at M=N=K=1024 and arbitrary GEMV_M / GEMV_K).  This launcher
+    // focuses on timing — the bench's only success signal is "1000
+    // dispatches without hanging the queue".
+    print_label_val("N",            1, N)
+    print_label_val("K",            1, K)
+    print_label_val("flops_per_call",14, 2 * N * K)
+    print_label_val("bench_iters", 11, iters)
+    print_label_val("per_call_us", 11, per_call_ns / 1000)
+    print_label_val("gflops_x100", 11, gflops_x100)
+
+    hipFree(d_b); hipFree(d_W_bf16); hipFree(d_W_f32); hipFree(d_c)
+    exit(0)
+}
