@@ -520,6 +520,150 @@ fn gpu_pipeline_flush() -> u64 {
     return 0
 }
 
+// gpu_matmul_to_dev: out_dev[N] = w_bf16[N,K] @ x_dev[K], M=1.
+// Caller supplies pre-allocated device buffers for x and out; the
+// weight goes through the same dequant cache as matmul_bf16_weights_
+// f32_gpu.  No H2D, no D2H, no sync — meant to be chained.
+//
+// Returns 0 on success (kernel queued).  Returns 1 if the GPU path is
+// unavailable or if N < 4096 (small-N kernel doesn't make sense in
+// the chained path; caller should avoid those shapes here).
+fn gpu_matmul_to_dev(u64 d_out, u64 d_x, u64 w_bf16, u64 N, u64 K) -> u64 {
+    if gpu_matmul_enabled() == 0 { return 1 }
+    if _gpu_mm_fh_gemv_coop == 0 { return 1 }
+    u64 d_W_f32 = _gpu_mm_get_or_dequant(w_bf16, K, N)
+    if d_W_f32 == 0 { return 1 }
+
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_W_f32 }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_x }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = d_out }
+    u64 a3 = alloc(8); unsafe { *(a3 as u64) = N }
+    u64 a4 = alloc(8); unsafe { *(a4 as u64) = K }
+    u64 kp = alloc(5 * 8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+    unsafe { *((kp + 24) as u64) = a3 }
+    unsafe { *((kp + 32) as u64) = a4 }
+
+    u32 cgrid = N
+    u32 err = hipModuleLaunchKernel(_gpu_mm_fh_gemv_coop, cgrid, 1, 1, 32, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
+// Allocate (or reuse) a GTT-backed device buffer of `bytes` size.
+// Shared static buffer pool; wraps around at 16 slots.  For small,
+// frequently-reused intermediates in the layer chain.
+static u64 _gpu_buf_pool_va  = 0
+static u64 _gpu_buf_pool_h   = 0
+static u64 _gpu_buf_pool_cap = 0
+static u64 _GPU_BUF_POOL_SIZE = 64
+static u64[64] _gpu_buf_pool_va_arr
+static u64[64] _gpu_buf_pool_h_arr
+static u64[64] _gpu_buf_pool_size_arr
+static u64 _gpu_buf_pool_n = 0
+
+// Reserve a fresh device buffer (GTT-backed).  Returns the device VA
+// and stores the host-mapped pointer in *out_h_slot.  The buffer is
+// not freed for the process lifetime — pool grows up to 64 slots.
+fn gpu_buf_reserve(u64 bytes, u64 out_h_slot) -> u64 {
+    if _gpu_buf_pool_n >= _GPU_BUF_POOL_SIZE { return 0 }
+    u64 va = dev_try_alloc_host_visible(bytes)
+    if va == 0 { return 0 }
+    u64 h = dev_host_ptr(va)
+    u64 idx = _gpu_buf_pool_n
+    unsafe { *((_gpu_buf_pool_va_arr   + idx * 8) as u64) = va }
+    unsafe { *((_gpu_buf_pool_h_arr    + idx * 8) as u64) = h }
+    unsafe { *((_gpu_buf_pool_size_arr + idx * 8) as u64) = bytes }
+    _gpu_buf_pool_n = idx + 1
+    if out_h_slot != 0 { unsafe { *(out_h_slot as u64) = h } }
+    return va
+}
+
+// Parallel cache for 1D bf16 arrays (rmsnorm gamma).  Maps host bf16
+// ptr → device f32 ptr.  One-shot dequant at first lookup, cached
+// thereafter.  Uses a separate table from the matmul weight cache.
+static u64 _gpu_gamma_keys = 0
+static u64 _gpu_gamma_vals = 0
+static u64 _gpu_gamma_n    = 0
+
+fn _gpu_gamma_init() {
+    if _gpu_gamma_keys != 0 { return }
+    _gpu_gamma_keys = alloc(_gpu_mm_cache_cap * 8)
+    _gpu_gamma_vals = alloc(_gpu_mm_cache_cap * 8)
+    _gpu_gamma_n = 0
+}
+
+fn _gpu_gamma_lookup(u64 w_bf16) -> u64 {
+    u64 i = 0
+    while i < _gpu_gamma_n {
+        u64 kp = _gpu_gamma_keys + i * 8
+        u64 k = 0; unsafe { *(kp as u64) -> k }
+        if k == w_bf16 {
+            u64 vp = _gpu_gamma_vals + i * 8
+            u64 v = 0; unsafe { *(vp as u64) -> v }
+            return v
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Cache a 1D bf16 array as a device f32 buffer (one-shot dequant).
+// For rmsnorm gamma weights.  Returns the device VA of the f32 copy,
+// or 0 on failure.  Subsequent calls with the same host ptr hit
+// the cache.
+fn gpu_cache_bf16_as_f32(u64 w_bf16_host, u64 N) -> u64 {
+    if gpu_matmul_enabled() == 0 { return 0 }
+    if _gpu_mm_fh_dq == 0 { return 0 }
+    _gpu_gamma_init()
+
+    u64 cached = _gpu_gamma_lookup(w_bf16_host)
+    if cached != 0 { return cached }
+
+    // Alloc device bf16 source + f32 dest.
+    u64 d_bf16 = 0
+    u64 slot = alloc(8)
+    u32 err = hipMalloc(slot, N * 2)
+    if err != 0 { return 0 }
+    unsafe { *(slot as u64) -> d_bf16 }
+    err = hipMemcpy(d_bf16, w_bf16_host, N * 2, 1)
+    if err != 0 { return 0 }
+
+    u64 d_f32 = 0
+    slot = alloc(8)
+    err = hipMalloc(slot, N * 4)
+    if err != 0 { return 0 }
+    unsafe { *(slot as u64) -> d_f32 }
+
+    // Launch dequant.
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_bf16 }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_f32 }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = N }
+    u64 kp = alloc(3 * 8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+    u64 grid_u = (N + 255) / 256
+    u32 grid32 = grid_u
+    err = hipModuleLaunchKernel(_gpu_mm_fh_dq, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 0 }
+    err = hipDeviceSynchronize()
+    if err != 0 { return 0 }
+    hipFree(d_bf16)
+
+    // Insert into cache.
+    if _gpu_gamma_n < _gpu_mm_cache_cap {
+        u64 kp_g = _gpu_gamma_keys + _gpu_gamma_n * 8
+        u64 vp_g = _gpu_gamma_vals + _gpu_gamma_n * 8
+        unsafe { *(kp_g as u64) = w_bf16_host }
+        unsafe { *(vp_g as u64) = d_f32 }
+        _gpu_gamma_n = _gpu_gamma_n + 1
+    }
+    return d_f32
+}
+
 // Probe whether the full-GPU pipeline kernels loaded successfully.
 fn gpu_pipeline_ready() -> u64 {
     if _gpu_fh_resid_add == 0 { return 0 }
