@@ -179,42 +179,15 @@ fn main() {
     eout("[qwen3_generate] 28 layers indexed; load_ms=")
     eu64(load_elapsed_ns / 1000000); eout("\n")
 
-    // Detect MLRIFT_GPU_FULL_FORWARD early so we can decide whether to
-    // allocate the kv_cache as GTT (device-visible).  The actual
-    // pipeline-readiness check happens later when we try to allocate
-    // the residual ping-pong buffers.
-    u64 want_gpu_full = 0
-    u64 ev_full_early = getenv("MLRIFT_GPU_FULL_FORWARD")
-    if ev_full_early != 0 {
-        u8 cf_e = 0; unsafe { *(ev_full_early as u8) -> cf_e }
-        if cf_e != 48 { want_gpu_full = 1 }
-    }
-
     // KV cache — one big slab each for K and V, with per-layer stride.
     //   shape per layer: [max_seq, n_kv_heads, head_dim] f32
     //   bytes per layer: max_seq * kv_dim * 4 = max_seq * 4096 at Qwen3-0.6B
     u64 kv_row_bytes   = kv_dim * 4
     u64 layer_stride   = max_seq * kv_row_bytes
     u64 total_cache    = n_layers * layer_stride
-    u64 k_cache = 0
-    u64 v_cache = 0
-    u64 k_cache_dev = 0
-    u64 v_cache_dev = 0
-    if want_gpu_full != 0 {
-        k_cache_dev = dev_try_alloc_host_visible(total_cache)
-        v_cache_dev = dev_try_alloc_host_visible(total_cache)
-        if k_cache_dev != 0 && v_cache_dev != 0 {
-            k_cache = dev_host_ptr(k_cache_dev)
-            v_cache = dev_host_ptr(v_cache_dev)
-            eout("[qwen3_generate] KV cache allocated as GTT (device-visible, ")
-            eu64(total_cache * 2); eout(" bytes total)\n")
-        }
-    }
-    if k_cache == 0 {
-        k_cache = alloc(total_cache)
-        v_cache = alloc(total_cache)
-        eout("[qwen3_generate] KV cache allocated on host ("); eu64(total_cache * 2); eout(" bytes total)\n")
-    }
+    u64 k_cache = alloc(total_cache)
+    u64 v_cache = alloc(total_cache)
+    eout("[qwen3_generate] KV cache allocated ("); eu64(total_cache * 2); eout(" bytes total)\n")
 
     // Per-step working buffers. Allocated once, reused every step.
     u64 x_cur    = alloc(hidden * 4)
