@@ -4745,6 +4745,18 @@ fn main() {
                 write(1, kvb_path, kvbl)
                 write(1, " (amdgpu kv-broadcast-f32 code object)\n", 40)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-embedding-lookup-f32=", 35) != 0 {
+                uint64 emb_path = arg + 35
+                uint64 emb_rc = emit_amdgpu_embedding_lookup_f32_blob(emb_path)
+                if emb_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-embedding-lookup-f32 failed\n", 49)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 embl = str_len(emb_path)
+                write(1, emb_path, embl)
+                write(1, " (amdgpu embedding-lookup-f32 code object)\n", 44)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-softmax-causal-f32=", 33) != 0 {
                 uint64 sc_path = arg + 33
                 uint64 sc_rc = emit_amdgpu_softmax_causal_f32_blob(sc_path)

@@ -8750,6 +8750,78 @@ fn _emit_kv_broadcast_f32_body(uint64 args_desc) {
     uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
 }
 
+// LLM Phase 2 — embedding_lookup_f32: out[seq, d] = embed[token_ids[seq], d].
+// One workgroup per sequence position; one lane per dim.  block = D
+// (embed_dim), grid = seq_len.  D must be in [32, 1024] and a multiple
+// of 32.  For D > 1024 we'd need thread-coarsening (each lane covers
+// K = D/1024 dims) — open follow-up; covers Qwen3-0.6B (D=1024) but
+// not Qwen3-1.5B (D=1536) or larger.
+//
+// Kernarg layout (32 bytes, 4 args):
+//   [0x00] uint64 token_ids_ptr  (uint32[seq])  → s4,s5
+//   [0x08] uint64 embed_ptr      (f32[V, D])    → s6,s7
+//   [0x10] uint64 out_ptr        (f32[seq, D])  → s8,s9
+//   [0x18] uint64 D              (low 32 used)  → s10
+fn _emit_embedding_lookup_f32_body(uint64 args_desc) {
+    asm_init()
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)        // s_load_b256 s[4:11], 0x00
+    asm_u32(0xBF89FC07)                             // s_waitcnt lgkmcnt(0)
+    asm_u32(0x840C820F)                             // s_lshl_b32 s12, s15, 2
+    asm_u32(0x80020C04)                             // s_add_u32 s2, s4, s12
+    asm_u32(0x82038005)                             // s_addc_u32 s3, s5, 0
+    asm_u32(0xF4000301); asm_u32(0xF8000000)        // s_load_b32 s12, s[2:3], 0
+    asm_u32(0xBF89FC07)                             // s_waitcnt lgkmcnt(0)
+    asm_u32(0x840D8208)                             // s_lshl_b32 s13, s8, 2  (unused; harmless)
+    asm_u32(0x840E820A)                             // s_lshl_b32 s14, s10, 2 (D*4)
+    asm_u32(0x96100E0F)                             // s_mul_i32 s16, s15, s14   (out row offset)
+    asm_u32(0x96110E0C)                             // s_mul_i32 s17, s12, s14   (in row offset = tok_id*D*4)
+    asm_u32(0x30020082)                             // v_lshlrev_b32 v1, 2, v0
+    asm_u32(0x7E060280)                             // v_mov_b32 v3, 0
+    asm_u32(0xD7006A02); asm_u32(0x00020211)        // v_add_co_u32 v2, vcc_lo, s17, v1
+    asm_u32(0xD5207C03); asm_u32(0x01AA0680)        // v_add_co_ci_u32 v3, null, 0, v3, vcc_lo
+    asm_u32(0xD7006A02); asm_u32(0x00020406)        // v_add_co_u32 v2, vcc_lo, s6, v2
+    asm_u32(0xD5207C03); asm_u32(0x01AA0607)        // v_add_co_ci_u32 v3, null, s7, v3, vcc_lo
+    asm_u32(0x7E0A0280)                             // v_mov_b32 v5, 0
+    asm_u32(0xD7006A04); asm_u32(0x00020210)        // v_add_co_u32 v4, vcc_lo, s16, v1
+    asm_u32(0xD5207C05); asm_u32(0x01AA0A80)        // v_add_co_ci_u32 v5, null, 0, v5, vcc_lo
+    asm_u32(0xD7006A04); asm_u32(0x00020808)        // v_add_co_u32 v4, vcc_lo, s8, v4
+    asm_u32(0xD5207C05); asm_u32(0x01AA0A09)        // v_add_co_ci_u32 v5, null, s9, v5, vcc_lo
+    asm_u32(0xDC520000); asm_u32(0x067C0002)        // global_load_b32 v6, v[2:3], off
+    asm_u32(0xBF8903F7)                             // s_waitcnt vmcnt(0)
+    asm_u32(0xDC6A0000); asm_u32(0x007C0604)        // global_store_b32 v[4:5], v6, off
+    asm_u32(0xBC7C0000)                             // s_waitcnt_vscnt null, 0
+    asm_u32(0xBFB00000)                             // s_endpgm
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+@export
+fn emit_amdgpu_embedding_lookup_f32_blob(uint64 out_path) -> uint64 {
+    uint64[8] args_desc
+    _emit_embedding_lookup_f32_body(args_desc)
+    uint64 size = emit_amdgpu_code_object_lds("embedding_lookup_f32", 20,
+                                               asm_text_buf, asm_text_len,
+                                               32, 8, 18, 7,
+                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 4,
+                                               0)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_embedding_lookup_f32_blob: cannot open output\n", 58)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 @export
 fn emit_amdgpu_kv_broadcast_f32_blob(uint64 out_path) -> uint64 {
     uint64[4] args_desc
