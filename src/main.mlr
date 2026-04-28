@@ -4745,6 +4745,18 @@ fn main() {
                 write(1, kvb_path, kvbl)
                 write(1, " (amdgpu kv-broadcast-f32 code object)\n", 40)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-bf16-to-f32=", 26) != 0 {
+                uint64 bf_path = arg + 26
+                uint64 bf_rc = emit_amdgpu_bf16_to_f32_blob(bf_path)
+                if bf_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-bf16-to-f32 failed\n", 40)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 bfl = str_len(bf_path)
+                write(1, bf_path, bfl)
+                write(1, " (amdgpu bf16-to-f32 code object)\n", 35)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-head-extract-f32=", 31) != 0 {
                 uint64 he_path = arg + 31
                 uint64 he_rc = emit_amdgpu_head_extract_f32_blob(he_path)

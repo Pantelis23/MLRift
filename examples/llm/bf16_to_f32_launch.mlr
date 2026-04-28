@@ -1,0 +1,115 @@
+// bf16_to_f32: dequant a bf16[N] buffer to f32[N].  out[i] = u32(in[i]) << 16.
+// Verifier: bit-exact comparison against a host reference (also a left
+// shift), since the conversion is a literal bit-pattern reinterpretation.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-bf16-to-f32=/tmp/bf16_to_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/bf16_to_f32_launch.mlr -o /tmp/bf16_to_f32_kfd
+// Run:
+//   /tmp/bf16_to_f32_kfd
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 { i = i - 1; uint64 d = tmp - (tmp / 10) * 10; uint64 p = buf + i; uint8 c = d + 48; unsafe { *(p as uint8) = c }; tmp = tmp / 10 }
+    return n
+}
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128); uint64 i = 0
+    while i < label_len { uint64 sp = label + i; uint64 c = 0; unsafe { *(sp as uint8) -> c }; uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }; i = i + 1 }
+    uint64 cp = buf + label_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1; uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+fn die(uint64 msg, uint64 code) { puts(msg); print_label_val("e", 1, code); exit(1) }
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 fd = file_open("/tmp/bf16_to_f32.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { puts("missing /tmp/bf16_to_f32.co"); exit(1) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "bf16_to_f32"); if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    uint64 N = 65536
+    uint64 in_bytes  = N * 2
+    uint64 out_bytes = N * 4
+
+    uint64 d_in = 0; uint64 d_out = 0
+    uint64 slot
+    slot = alloc(8); err = hipMalloc(slot, in_bytes);  if err != 0 { die("mIn",  err) }; unsafe { *(slot as uint64) -> d_in }
+    slot = alloc(8); err = hipMalloc(slot, out_bytes); if err != 0 { die("mOut", err) }; unsafe { *(slot as uint64) -> d_out }
+
+    // Fill with assorted bf16 patterns: positive small, positive large,
+    // negative, denormal-ish, zero — sweep the bit space.
+    uint64 h_in = alloc(in_bytes)
+    uint64 i = 0
+    while i < N {
+        uint64 p = h_in + i * 2
+        uint16 v = i        // every 16-bit pattern in [0, 65536) at least once
+        unsafe { *(p as uint16) = v }
+        i = i + 1
+    }
+    err = hipMemcpy(d_in, h_in, in_bytes, 1); if err != 0 { die("H2D", err) }
+
+    uint64 k_in  = alloc(8); unsafe { *(k_in  as uint64) = d_in }
+    uint64 k_out = alloc(8); unsafe { *(k_out as uint64) = d_out }
+    uint64 k_n   = alloc(8); unsafe { *(k_n   as uint64) = N }
+    uint64 kp = alloc(3 * 8)
+    unsafe { *(kp        as uint64) = k_in }
+    unsafe { *((kp +  8) as uint64) = k_out }
+    unsafe { *((kp + 16) as uint64) = k_n }
+
+    uint32 grid  = (N + 255) / 256
+    uint32 block = 256
+    err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 h_out = alloc(out_bytes)
+    err = hipMemcpy(h_out, d_out, out_bytes, 2); if err != 0 { die("D2H", err) }
+
+    // Bit-exact: out[i] (u32) should equal (u32)in[i] << 16.
+    uint64 mismatch = 0
+    uint64 first_bad = 0xFFFFFFFFFFFFFFFF
+    i = 0
+    while i < N {
+        uint64 ip = h_in  + i * 2
+        uint64 op = h_out + i * 4
+        uint16 ib = 0; uint32 ob = 0
+        unsafe { *(ip as uint16) -> ib }
+        unsafe { *(op as uint32) -> ob }
+        uint64 ib64 = ib
+        uint32 ref = ib64 << 16
+        if ob != ref {
+            mismatch = mismatch + 1
+            if first_bad == 0xFFFFFFFFFFFFFFFF { first_bad = i }
+        }
+        i = i + 1
+    }
+
+    print_label_val("N",        1, N)
+    print_label_val("mismatch", 8, mismatch)
+    if mismatch > 0 { print_label_val("first_bad", 9, first_bad) }
+
+    hipFree(d_in); hipFree(d_out)
+    exit(0)
+}

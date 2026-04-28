@@ -8803,6 +8803,77 @@ fn _emit_embedding_lookup_f32_body(uint64 args_desc) {
 }
 
 
+// LLM Phase 2 — bf16_to_f32: dequant a bf16[N] buffer to f32[N].
+// bf16 == high 16 bits of f32, so dequant is `out[i] = u32(in[i]) << 16` —
+// no arithmetic conversion needed.  Pointwise; block = 256, grid =
+// ceil(N/256).  Used by the safetensors weight loader: model checkpoints
+// ship in bf16, but our gemm operates on f32.
+//
+// Kernarg layout (24 bytes, 3 args):
+//   [0x00] uint64 in_ptr   (bf16[N])  → s4,s5
+//   [0x08] uint64 out_ptr  (f32[N])   → s6,s7
+//   [0x10] uint64 N                   → s8 (low 32 used)
+fn _emit_bf16_to_f32_body(uint64 args_desc) {
+    asm_init()
+    asm_u32(0xF4080100)
+    asm_u32(0xF8000000)
+    asm_u32(0xF4000200)
+    asm_u32(0xF8000010)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x840A880F)
+    asm_u32(0x4A02000A)
+    asm_u32(0xBE82007E)
+    asm_u32(0xD4C9007E)
+    asm_u32(0x00001101)
+    asm_u32(0xBFA50012)
+    asm_u32(0x30080281)
+    asm_u32(0x7E0A0280)
+    asm_u32(0xD7006A02)
+    asm_u32(0x00020804)
+    asm_u32(0xD5207C03)
+    asm_u32(0x01AA0A05)
+    asm_u32(0xDC4A0000)
+    asm_u32(0x067C0002)
+    asm_u32(0xBF8903F7)
+    asm_u32(0x300C0C90)
+    asm_u32(0x30080282)
+    asm_u32(0xD7006A02)
+    asm_u32(0x00020806)
+    asm_u32(0xD5207C03)
+    asm_u32(0x01AA0A07)
+    asm_u32(0xDC6A0000)
+    asm_u32(0x007C0602)
+    asm_u32(0xBC7C0000)
+    asm_u32(0xBFB00000)
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+@export
+fn emit_amdgpu_bf16_to_f32_blob(uint64 out_path) -> uint64 {
+    uint64[6] args_desc
+    _emit_bf16_to_f32_body(args_desc)
+    uint64 size = emit_amdgpu_code_object_lds("bf16_to_f32", 11,
+                                               asm_text_buf, asm_text_len,
+                                               24, 8, 16, 7,
+                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 3,
+                                               0)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_bf16_to_f32_blob: cannot open output\n", 49)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 // LLM Phase 2 — head_extract_f32: extract one head's slice from a
 // multi-head [SEQ, HEADS*HD] activation into a contiguous [SEQ, HD]
 // buffer.  out[s, d] = in[s, head_idx*HD + d].  block = HD, grid = SEQ.
