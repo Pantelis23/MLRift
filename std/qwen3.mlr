@@ -31,6 +31,7 @@
 //   down_proj:           [hidden, intermediate_size]              = [1024, 3072]
 
 import "inference.mlr"
+import "inference_gpu.mlr"
 import "safetensors.mlr"
 import "math_float.mlr"
 import "thread.mlr"
@@ -276,6 +277,11 @@ fn qwen3_main_matmul(u64 out_ptr, u64 x_ptr, u64 w_ptr,
                      u64 M, u64 N, u64 K,
                      u64 num_workers, u64 use_kahan) {
     if qwen3_matmul_kind == 0 {
+        // GPU dispatch (env-gated by MLRIFT_GPU_MATMUL).  Returns 0 on
+        // success, 1 to signal "fall through to CPU" — the dispatcher
+        // currently lights up the M=1 decode shape and returns 1 for
+        // M≥2 (prefill), keeping the CPU path for those.
+        if matmul_bf16_weights_f32_gpu(out_ptr, x_ptr, w_ptr, M, N, K) == 0 { return }
         matmul_bf16_weights_f32(out_ptr, x_ptr, w_ptr, M, N, K, num_workers, use_kahan)
     } else {
         matmul_q8_0_weights_f32(out_ptr, x_ptr, w_ptr, M, N, K, num_workers)

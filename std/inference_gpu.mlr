@@ -29,6 +29,8 @@ import "kfd.mlr"
 import "io.mlr"
 import "string.mlr"
 
+@dynamic extern fn getenv(uint64 name) -> uint64
+
 // === Static state ===
 
 // 0 = uninitialised, 1 = ready, 2 = unavailable (env not set or
