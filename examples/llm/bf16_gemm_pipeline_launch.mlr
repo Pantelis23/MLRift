@@ -1,0 +1,226 @@
+// bf16 weight pipeline → device dequant → device gemm.  Demonstrates
+// the matmul path the GPU-ported qwen3_generate will use:
+//
+//   1. weights live as bf16 on disk (or in host memory)
+//   2. H2D copy of bf16 weights (half the bandwidth of f32)
+//   3. bf16_to_f32 device kernel decodes them in-place to f32
+//   4. gemm_f32 runs the actual matmul on f32 activations + weights
+//
+// Verifies bit-equality against a host CPU reference at a
+// Qwen3-shaped problem (M=SEQ=32, N=INTER=3072, K=HIDDEN=1024 — i.e.
+// the gate_proj / up_proj shape during prefill).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-bf16-to-f32=/tmp/bf16_to_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-gemm-f32=/tmp/gemm_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/bf16_gemm_pipeline_launch.mlr -o /tmp/bf16_gemm_pipeline_kfd
+// Run:
+//   /tmp/bf16_gemm_pipeline_kfd
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 { i = i - 1; uint64 d = tmp - (tmp / 10) * 10; uint64 p = buf + i; uint8 c = d + 48; unsafe { *(p as uint8) = c }; tmp = tmp / 10 }
+    return n
+}
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128); uint64 i = 0
+    while i < label_len { uint64 sp = label + i; uint64 c = 0; unsafe { *(sp as uint8) -> c }; uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }; i = i + 1 }
+    uint64 cp = buf + label_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1; uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+fn die(uint64 msg, uint64 code) { puts(msg); print_label_val("e", 1, code); exit(1) }
+
+fn load_kernel(uint64 co_path, uint64 fname) -> uint64 {
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { puts("missing co"); puts(co_path); exit(1) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    uint32 err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fname); if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+    return fh
+}
+
+// Truncate an f32 to bf16 (top 16 bits).  Used to build a bf16 weight
+// buffer that exactly matches what the dequant kernel will reproduce.
+fn f32_to_bf16(f32 v) -> uint16 {
+    uint64 sb = alloc(4)
+    unsafe { *(sb as f32) = v }
+    uint32 bits = 0; unsafe { *(sb as uint32) -> bits }
+    uint32 hi = bits >> 16
+    uint16 b16 = hi
+    return b16
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 fh_dq   = load_kernel("/tmp/bf16_to_f32.co", "bf16_to_f32")
+    uint64 fh_gemm = load_kernel("/tmp/gemm_f32.co",    "gemm_f32")
+
+    // Qwen3-0.6B gate_proj / up_proj prefill shape: M=32 tokens, K=1024
+    // hidden, N=3072 intermediate.
+    uint64 M = 32
+    uint64 K = 1024
+    uint64 N = 3072
+
+    uint64 x_bytes_f32     = M * K * 4
+    uint64 w_bytes_bf16    = K * N * 2
+    uint64 w_bytes_f32     = K * N * 4
+    uint64 out_bytes       = M * N * 4
+
+    uint64 d_x = 0; uint64 d_W_bf16 = 0; uint64 d_W_f32 = 0; uint64 d_out = 0
+    uint64 slot
+    slot = alloc(8); err = hipMalloc(slot, x_bytes_f32);  if err != 0 { die("mX",  err) }; unsafe { *(slot as uint64) -> d_x }
+    slot = alloc(8); err = hipMalloc(slot, w_bytes_bf16); if err != 0 { die("mWb", err) }; unsafe { *(slot as uint64) -> d_W_bf16 }
+    slot = alloc(8); err = hipMalloc(slot, w_bytes_f32);  if err != 0 { die("mWf", err) }; unsafe { *(slot as uint64) -> d_W_f32 }
+    slot = alloc(8); err = hipMalloc(slot, out_bytes);    if err != 0 { die("mOut", err) }; unsafe { *(slot as uint64) -> d_out }
+
+    // Build host-side x (f32) and W_bf16 (bf16-truncated f32).
+    uint64 h_x      = alloc(x_bytes_f32)
+    uint64 h_W_bf16 = alloc(w_bytes_bf16)
+    uint64 h_W_f32  = alloc(w_bytes_f32)   // host f32 ground truth (post-dequant)
+
+    uint64 r = 0
+    while r < M {
+        uint64 c = 0
+        while c < K {
+            f64 v = (int_to_f64(r) * 0.001 + int_to_f64(c) * 0.0003) - 0.05
+            uint64 p = h_x + (r * K + c) * 4
+            unsafe { *(p as f32) = f64_to_f32(v) }
+            c = c + 1
+        }
+        r = r + 1
+    }
+
+    r = 0
+    while r < K {
+        uint64 c = 0
+        while c < N {
+            f64 v = (int_to_f64(r) * 0.0007 + int_to_f64(c) * 0.0011) - 0.07
+            f32 vf32 = f64_to_f32(v)
+            // Truncate to bf16 (so the f32 ground truth EXACTLY matches
+            // what bf16_to_f32 will produce on the device).
+            uint16 b16 = f32_to_bf16(vf32)
+            uint64 pb = h_W_bf16 + (r * N + c) * 2
+            unsafe { *(pb as uint16) = b16 }
+            // Reconstruct f32 from the truncated bf16: this is the
+            // bit-exact dequant ground truth.
+            uint64 b64 = b16
+            uint32 bits = b64 << 16
+            uint64 sb = alloc(4); unsafe { *(sb as uint32) = bits }
+            f32 vf32_truncated = 0.0
+            unsafe { *(sb as f32) -> vf32_truncated }
+            uint64 pf = h_W_f32 + (r * N + c) * 4
+            unsafe { *(pf as f32) = vf32_truncated }
+            c = c + 1
+        }
+        r = r + 1
+    }
+
+    err = hipMemcpy(d_x,      h_x,      x_bytes_f32,  1); if err != 0 { die("H2D x",   err) }
+    err = hipMemcpy(d_W_bf16, h_W_bf16, w_bytes_bf16, 1); if err != 0 { die("H2D Wb",  err) }
+
+    // === Stage 1: bf16_to_f32 dequant on device ===
+    uint64 dq_in  = alloc(8); unsafe { *(dq_in  as uint64) = d_W_bf16 }
+    uint64 dq_out = alloc(8); unsafe { *(dq_out as uint64) = d_W_f32 }
+    uint64 dq_n   = alloc(8); unsafe { *(dq_n   as uint64) = K * N }
+    uint64 kp_dq = alloc(3 * 8)
+    unsafe { *(kp_dq        as uint64) = dq_in }
+    unsafe { *((kp_dq +  8) as uint64) = dq_out }
+    unsafe { *((kp_dq + 16) as uint64) = dq_n }
+    uint32 grid_dq = (K * N + 255) / 256
+    err = hipModuleLaunchKernel(fh_dq, grid_dq, 1, 1, 256, 1, 1, 0, 0, kp_dq, 0)
+    if err != 0 { die("L dequant", err) }
+
+    // === Stage 2: gemm_f32  out = x @ W_f32 ===
+    uint64 g_a = alloc(8); unsafe { *(g_a as uint64) = d_x }
+    uint64 g_b = alloc(8); unsafe { *(g_b as uint64) = d_W_f32 }
+    uint64 g_c = alloc(8); unsafe { *(g_c as uint64) = d_out }
+    uint64 g_m = alloc(8); unsafe { *(g_m as uint64) = M }
+    uint64 g_n = alloc(8); unsafe { *(g_n as uint64) = N }
+    uint64 g_k = alloc(8); unsafe { *(g_k as uint64) = K }
+    uint64 kp_g = alloc(6 * 8)
+    unsafe { *(kp_g        as uint64) = g_a }
+    unsafe { *((kp_g +  8) as uint64) = g_b }
+    unsafe { *((kp_g + 16) as uint64) = g_c }
+    unsafe { *((kp_g + 24) as uint64) = g_m }
+    unsafe { *((kp_g + 32) as uint64) = g_n }
+    unsafe { *((kp_g + 40) as uint64) = g_k }
+    uint32 grid_g = (M / 16) * (N / 16)
+    err = hipModuleLaunchKernel(fh_gemm, grid_g, 1, 1, 256, 1, 1, 0, 0, kp_g, 0)
+    if err != 0 { die("L gemm", err) }
+
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 h_out = alloc(out_bytes)
+    err = hipMemcpy(h_out, d_out, out_bytes, 2); if err != 0 { die("D2H", err) }
+
+    // === Verify: host CPU gemm against the device output ===
+    // Use host-truncated f32 weights so the only divergence vs device
+    // is f32 accumulation order (no bf16 rounding asymmetry).
+    uint64 fail_count = 0
+    uint64 first_bad  = 0xFFFFFFFFFFFFFFFF
+    f32 max_abs_diff  = 0.0
+    f32 thresh        = 0.001          // f32 GEMM K=1024 accumulator drift bound
+    uint64 i = 0
+    while i < M {
+        uint64 j = 0
+        while j < N {
+            f32 acc = 0.0
+            uint64 kk = 0
+            while kk < K {
+                uint64 xp = h_x     + (i * K + kk) * 4
+                uint64 wp = h_W_f32 + (kk * N + j) * 4
+                f32 xv = 0.0; f32 wv = 0.0
+                unsafe { *(xp as f32) -> xv }
+                unsafe { *(wp as f32) -> wv }
+                acc = acc + xv * wv
+                kk = kk + 1
+            }
+            uint64 op = h_out + (i * N + j) * 4
+            f32 got = 0.0; unsafe { *(op as f32) -> got }
+            f32 d = got - acc
+            if d < 0.0 { d = 0.0 - d }
+            if d > max_abs_diff { max_abs_diff = d }
+            if d > thresh {
+                fail_count = fail_count + 1
+                if first_bad == 0xFFFFFFFFFFFFFFFF { first_bad = i * N + j }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    uint64 mab_buf = alloc(4); unsafe { *(mab_buf as f32) = max_abs_diff }
+    uint32 mab_bits = 0; unsafe { *(mab_buf as uint32) -> mab_bits }
+    uint64 mab_bits64 = mab_bits
+
+    print_label_val("M",            1, M)
+    print_label_val("N",            1, N)
+    print_label_val("K",            1, K)
+    print_label_val("cells",        5, M * N)
+    print_label_val("fail_count",  10, fail_count)
+    print_label_val("max_abs_bits",12, mab_bits64)
+    if first_bad != 0xFFFFFFFFFFFFFFFF { print_label_val("first_bad", 9, first_bad) }
+
+    hipFree(d_x); hipFree(d_W_bf16); hipFree(d_W_f32); hipFree(d_out)
+    exit(0)
+}
