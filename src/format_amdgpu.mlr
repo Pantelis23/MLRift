@@ -5942,13 +5942,13 @@ fn _emit_gemv_coop_f32_body(uint64 args_desc) {
     asm_v_mov_b32(7, 0x100 | 6)                    // v7 = v6
     asm_v_mov_b32(5, 0x80)                         // v5 = inline 0
     asm_u32(0xBE920080)                            // s_mov_b32  s18, 0
-    asm_u32(0x8513870C)                            // s_lshr_b32 s19, s12, 7  (K/128)
+    asm_u32(0x8513880C)                            // s_lshr_b32 s19, s12, 8  (K/256)
 
-    // .Lloop:  unrolled 4×.  Issue 8 VMEM loads back-to-back at
-    // offsets 0/128/256/384, drain once with vmcnt(0), then 4 fmac.
-    // K=1024 ⇒ 8 loop iters total.  (Tried 8× unroll: produces wrong
-    // results — likely a register-allocator boundary at v16 in this
-    // KD config; needs deeper bisection. 4× is the verified peak.)
+    // .Lloop:  unrolled 8×.  16 VMEM loads at offsets 0..896 step 128,
+    // drain once with vmcnt(0), then 8 fmac.  K=1024 ⇒ 4 loop iters.
+    // Earlier 8× attempt produced wrong output because rsrc1=0xE0AF0001
+    // only allocated 16 vgprs but we used v16+ — silent overrun.  Fixed
+    // by bumping rsrc1 to 0xE0AF0003 (32 vgprs) at the KD level below.
     uint64 loop_idx = asm_text_len / 4
     asm_u32(0xDC520000); asm_u32(0x08100007)       // global_load_b32 v8,  v7, s[16:17]
     asm_u32(0xDC520000); asm_u32(0x09060007)       // global_load_b32 v9,  v7, s[6:7]
@@ -5958,12 +5958,24 @@ fn _emit_gemv_coop_f32_body(uint64 args_desc) {
     asm_u32(0xDC520100); asm_u32(0x0D060007)       // global_load_b32 v13, v7, s[6:7]   offset:256
     asm_u32(0xDC520180); asm_u32(0x0E100007)       // global_load_b32 v14, v7, s[16:17] offset:384
     asm_u32(0xDC520180); asm_u32(0x0F060007)       // global_load_b32 v15, v7, s[6:7]   offset:384
+    asm_u32(0xDC520200); asm_u32(0x10100007)       // global_load_b32 v16, v7, s[16:17] offset:512
+    asm_u32(0xDC520200); asm_u32(0x11060007)       // global_load_b32 v17, v7, s[6:7]   offset:512
+    asm_u32(0xDC520280); asm_u32(0x12100007)       // global_load_b32 v18, v7, s[16:17] offset:640
+    asm_u32(0xDC520280); asm_u32(0x13060007)       // global_load_b32 v19, v7, s[6:7]   offset:640
+    asm_u32(0xDC520300); asm_u32(0x14100007)       // global_load_b32 v20, v7, s[16:17] offset:768
+    asm_u32(0xDC520300); asm_u32(0x15060007)       // global_load_b32 v21, v7, s[6:7]   offset:768
+    asm_u32(0xDC520380); asm_u32(0x16100007)       // global_load_b32 v22, v7, s[16:17] offset:896
+    asm_u32(0xDC520380); asm_u32(0x17060007)       // global_load_b32 v23, v7, s[6:7]   offset:896
     asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)
     asm_u32(0x560A1308)                            // v_fmac_f32 v5, v8,  v9
     asm_u32(0x560A170A)                            // v_fmac_f32 v5, v10, v11
     asm_u32(0x560A1B0C)                            // v_fmac_f32 v5, v12, v13
     asm_u32(0x560A1F0E)                            // v_fmac_f32 v5, v14, v15
-    asm_u32(0x4A0E0EFF); asm_u32(0x00000200)       // v_add_nc_u32_e32 v7, 512, v7
+    asm_u32(0x560A2310)                            // v_fmac_f32 v5, v16, v17
+    asm_u32(0x560A2712)                            // v_fmac_f32 v5, v18, v19
+    asm_u32(0x560A2B14)                            // v_fmac_f32 v5, v20, v21
+    asm_u32(0x560A2F16)                            // v_fmac_f32 v5, v22, v23
+    asm_u32(0x4A0E0EFF); asm_u32(0x00000400)       // v_add_nc_u32_e32 v7, 1024, v7
     asm_u32(0x80128112)                            // s_add_u32 s18, s18, 1
     asm_u32(0xBF0A1312)                            // s_cmp_lt_u32 s18, s19
     uint64 loop_branch_idx = asm_text_len / 4
@@ -6009,12 +6021,12 @@ fn emit_amdgpu_gemv_coop_f32_blob(uint64 out_path) -> uint64 {
     uint64[10] args_desc
     _emit_gemv_coop_f32_body(args_desc)
 
-    // KD: num_user_sgprs=18, num_vgprs=16 with unroll 4× (v0..v15
-    // active).  LDS = 128 B.
+    // KD: num_user_sgprs=18, num_vgprs=32 with unroll 8× (v0..v23 used).
+    // rsrc1=0xE0AF0003 sets VGPR granules=3 → 32 vgprs allocated.
     uint64 size = emit_amdgpu_code_object_lds("gemv_coop_f32", 13,
                                                asm_text_buf, asm_text_len,
-                                               40, 8, 18, 16,
-                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               40, 8, 18, 32,
+                                               0xE0AF0003, 0x0000009E, 0x00000010, 0x0408,
                                                args_desc, 5,
                                                128)
     uint64 fd = file_open(out_path, 1)
@@ -6069,27 +6081,37 @@ fn _emit_gemv_coop_bf16_f32_body(uint64 args_desc) {
     asm_u32(0x30100082)                            // v_lshlrev_b32 v8, 2, v0    (b_off = lane*4)
     asm_v_mov_b32(5, 0x80)                         // v5 = 0   (sum)
     asm_u32(0xBE920080)                            // s_mov_b32  s18, 0
-    asm_u32(0x8513860C)                            // s_lshr_b32 s19, s12, 6     (K/64)
+    asm_u32(0x8513870C)                            // s_lshr_b32 s19, s12, 7     (K/128)
 
-    // .Lloop: 2× unroll.  Per iter: 2 u16 A + 2 b32 B + 2 fmac.
-    // Each lane covers 2 bf16 elements per iter.  K=1024 ⇒ 16 iters.
-    // (4× unroll attempted but produced wrong output — root cause TBD.)
+    // .Lloop: 4× unroll, converted values written to SEPARATE vgprs
+    // (v21..v24) — earlier in-place v_lshlrev v9,16,v9 attempt produced
+    // wrong output, suspected RAW hazard between consecutive in-place
+    // VALU writes and immediate fmac reads.
     uint64 loop_idx = asm_text_len / 4
 
     asm_u32(0xDC4A0000); asm_u32(0x09100007)       // global_load_u16 v9,  v7, s[16:17]
     asm_u32(0xDC4A0040); asm_u32(0x0A100007)       // global_load_u16 v10, v7, s[16:17] offset:64
+    asm_u32(0xDC4A0080); asm_u32(0x0B100007)       // global_load_u16 v11, v7, s[16:17] offset:128
+    asm_u32(0xDC4A00C0); asm_u32(0x0C100007)       // global_load_u16 v12, v7, s[16:17] offset:192
     asm_u32(0xDC520000); asm_u32(0x0D060008)       // global_load_b32 v13, v8, s[6:7]
     asm_u32(0xDC520080); asm_u32(0x0E060008)       // global_load_b32 v14, v8, s[6:7] offset:128
+    asm_u32(0xDC520100); asm_u32(0x0F060008)       // global_load_b32 v15, v8, s[6:7] offset:256
+    asm_u32(0xDC520180); asm_u32(0x10060008)       // global_load_b32 v16, v8, s[6:7] offset:384
     asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)
 
-    asm_u32(0x30121290)                            // v_lshlrev_b32 v9,  16, v9
-    asm_u32(0x30141490)                            // v_lshlrev_b32 v10, 16, v10
+    // v21..v24 = (loaded v9..v12) << 16  → f32 conversion
+    asm_u32(0x302A1290)                            // v_lshlrev_b32 v21, 16, v9
+    asm_u32(0x302C1490)                            // v_lshlrev_b32 v22, 16, v10
+    asm_u32(0x302E1690)                            // v_lshlrev_b32 v23, 16, v11
+    asm_u32(0x30301890)                            // v_lshlrev_b32 v24, 16, v12
 
-    asm_u32(0x560A1B09)                            // v_fmac_f32 v5, v9,  v13
-    asm_u32(0x560A1D0A)                            // v_fmac_f32 v5, v10, v14
+    asm_u32(0x560A1B15)                            // v_fmac_f32 v5, v21, v13
+    asm_u32(0x560A1D16)                            // v_fmac_f32 v5, v22, v14
+    asm_u32(0x560A1F17)                            // v_fmac_f32 v5, v23, v15
+    asm_u32(0x560A2118)                            // v_fmac_f32 v5, v24, v16
 
-    asm_u32(0x4A0E0EFF); asm_u32(0x00000080)       // v_add_nc_u32 v7, 128, v7
-    asm_u32(0x4A1010FF); asm_u32(0x00000100)       // v_add_nc_u32 v8, 256, v8
+    asm_u32(0x4A0E0EFF); asm_u32(0x00000100)       // v_add_nc_u32 v7, 256, v7
+    asm_u32(0x4A1010FF); asm_u32(0x00000200)       // v_add_nc_u32 v8, 512, v8
 
     asm_u32(0x80128112)                            // s_add_u32 s18, s18, 1
     asm_u32(0xBF0A1312)                            // s_cmp_lt_u32 s18, s19
@@ -6136,11 +6158,14 @@ fn emit_amdgpu_gemv_coop_bf16_f32_blob(uint64 out_path) -> uint64 {
     uint64[10] args_desc
     _emit_gemv_coop_bf16_f32_body(args_desc)
 
-    // num_user_sgprs=18, num_vgprs=24 (v0..v22 used; granularity 8).
+    // num_user_sgprs=18, num_vgprs=32 (v0..v24 used; granularity 8 → 32).
+    // rsrc1=0xE0AF0003 sets VGPR granules=3 → 32 vgprs allocated per
+    // wave.  0xE0AF0001 (16 vgprs) was the silent-corruption root for
+    // earlier 4× attempts that wrote v16+.
     uint64 size = emit_amdgpu_code_object_lds("gemv_coop_bf16_f32", 18,
                                                asm_text_buf, asm_text_len,
-                                               40, 8, 18, 24,
-                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               40, 8, 18, 32,
+                                               0xE0AF0003, 0x0000009E, 0x00000010, 0x0408,
                                                args_desc, 5,
                                                128)
     uint64 fd = file_open(out_path, 1)
