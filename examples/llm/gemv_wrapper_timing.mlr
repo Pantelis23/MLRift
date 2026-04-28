@@ -212,6 +212,33 @@ fn main() {
     u64 total3 = g_h2d + g_lnch + g_sync + g_d2h
     dump_us("  avg total:       ", total3 / 100)
 
+    // Sync amortization probe: launch K kernels, then sync once.
+    print_str("=== sync amortization (GTT output, K launches → 1 sync) ===\n")
+    u64 K_BATCH = 1
+    while K_BATCH <= 16 {
+        u64 a_lnch = 0; u64 a_sync = 0
+        u64 trials = 0
+        while trials < 50 {
+            u64 a = time_now()
+            u64 b_idx = 0
+            while b_idx < K_BATCH {
+                err = hipModuleLaunchKernel(fh_gemv, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+                b_idx = b_idx + 1
+            }
+            u64 b = time_now()
+            err = hipDeviceSynchronize()
+            u64 c = time_now()
+            a_lnch = a_lnch + (b - a)
+            a_sync = a_sync + (c - b)
+            trials = trials + 1
+        }
+        print_str("  K="); u64 sk = fmt_dec(K_BATCH); print_str(sk); dealloc(sk)
+        print_str("  avg launches: "); u64 sl = fmt_dec(a_lnch / 50 / 1000); print_str(sl); dealloc(sl); print_str(" us")
+        print_str("  avg sync: ");     u64 ss = fmt_dec(a_sync / 50 / 1000); print_str(ss); dealloc(ss); print_str(" us")
+        print_str("  per-launch eff: "); u64 sp = fmt_dec((a_lnch + a_sync) / 50 / K_BATCH / 1000); print_str(sp); dealloc(sp); print_str(" us\n")
+        K_BATCH = K_BATCH * 2
+    }
+
     print_str("=== average over 100 hot iters (direct memcpy path) ===\n")
     u64 a_h2d = 0; u64 a_lnch = 0; u64 a_sync = 0; u64 a_d2h = 0
     iter = 0
