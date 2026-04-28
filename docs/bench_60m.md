@@ -91,17 +91,34 @@ four kernels. No external toolchain in the build OR runtime path.
 | **MLRift** (GPU, KFD shim + hipcc kernels)\* | — | 1.69 s | 0.18 s | **26.59 s** | **13 ms** | **29.50 s** | 1,985,575,928 |
 | **MLRift** (GPU, KFD shim + native gfx1100 ISA + spike_reduce fallback)\* | — | 1.68 s | 0.22 s | **26.63 s** | **13 ms** | **29.28 s** | 1,985,575,926 |
 | **MLRift** (GPU, KFD shim + native gfx1100 ISA, no spike_reduce)\*† | — | 1.64 s | 0.15 s | **26.45 s** | **13 ms** | **28.59 s** | 1,985,575,926 |
+| **MLRift** (GPU, KFD shim + native ISA *including* spike_reduce)\*‡ | — | 1.65 s | 0.15 s | **26.69 s** | **13 ms** | **28.54 s** | 1,985,575,926 |
 
 \* zero-ROCm linkage in the launcher binary — `ldd` shows only
 `libc + ld-linux + vdso`. No `libamdhip64`, `libhsa-runtime64`,
 `libdrm`, `libdrm_amdgpu`. Built with `--target=amdgpu-native` on
 the launcher source.
 
-† Reproduced 2026-04-28 with all four kernels native (csr_build now
-bit-encoded via Barrett-reduction modulo, no hipcc dependency anywhere
-in the runtime path).  `NOESIS_CSR_CO_PATH` unset, so the optional
-`spike_reduce` device path is bypassed; host-side spike total still
-matches `1,985,575,926`.
+† Reproduced 2026-04-28 with all four sim kernels native (csr_build via
+Barrett-reduction modulo, no hipcc anywhere in the runtime path).
+`NOESIS_CSR_CO_PATH` unset, so the device-side `spike_reduce` path is
+bypassed; the launcher D2H-copies 480 MB and tallies on CPU. Host-side
+spike total matches `1,985,575,926`.
+
+‡ Reproduced 2026-04-28 with **all FIVE kernels native** — spike_reduce
+joined the natively-emitted set (24-byte kernarg, two
+`global_atomic_add_u64` ops on a 16-byte result buffer). The launcher
+finds it in the native .co, takes the device-reduce path, and skips
+the 480 MB D2H + 60M-iter CPU tally. 5×5 head-to-head median:
+**28.54 s** native vs **28.33 s** HIP-built kernels (KFD shim, same
+launcher binary). The remaining ~210 ms gap is in the per-step kernel
+ISA (lif_step ~+90 µs/launch, delivery_step ~+50 µs/launch vs hipcc) —
+both kernels are issuing the same algorithmic work and produce
+bit-identical f64 outputs, but hipcc's instruction scheduler interleaves
+VMEM and VALU more aggressively than the current native emitter. That
+gap is the open follow-up; closing it requires a real instruction-level
+investment (s_clause batching, FMA-chain dependency reordering),
+not a one-shot edit. The structural milestones (zero-toolchain build,
+zero-ROCm linkage, sub-millisecond .co regeneration) are already shipped.
 
 \* numpy was run on the original flat-`RI` workload (1.86 B spikes).
 All other variants use the per-neuron `RI` variance (1.99 B spikes,
