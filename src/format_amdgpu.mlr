@@ -8803,6 +8803,177 @@ fn _emit_embedding_lookup_f32_body(uint64 args_desc) {
 }
 
 
+// LLM Phase 2 — head_extract_f32: extract one head's slice from a
+// multi-head [SEQ, HEADS*HD] activation into a contiguous [SEQ, HD]
+// buffer.  out[s, d] = in[s, head_idx*HD + d].  block = HD, grid = SEQ.
+//
+// Used by per-head attention dispatch: peel each head's Q, K, V off
+// the post-projection activation so per-head gemm operands are
+// contiguous (no strided gemm support yet).
+//
+// Kernarg layout (40 bytes, 5 args):
+//   [0x00] uint64 in_ptr     (f32[SEQ, HEADS*HD])  → s4,s5
+//   [0x08] uint64 out_ptr    (f32[SEQ, HD])         → s6,s7
+//   [0x10] uint64 HD                                → s8 (low 32)
+//   [0x18] uint64 HEADS                             → s10 (low 32)
+//   [0x20] uint64 head_idx                          → s12 (low 32)
+fn _emit_head_extract_f32_body(uint64 args_desc) {
+    asm_init()
+    asm_u32(0xF40C0100)
+    asm_u32(0xF8000000)
+    asm_u32(0xF4000300)
+    asm_u32(0xF8000020)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x960D080A)
+    asm_u32(0x960E0D0F)
+    asm_u32(0x9610080C)
+    asm_u32(0x800E100E)
+    asm_u32(0x840E820E)
+    asm_u32(0x9611080F)
+    asm_u32(0x84118211)
+    asm_u32(0x30020082)
+    asm_u32(0x7E060280)
+    asm_u32(0xD7006A02)
+    asm_u32(0x0002020E)
+    asm_u32(0xD5207C03)
+    asm_u32(0x01AA0680)
+    asm_u32(0xD7006A02)
+    asm_u32(0x00020404)
+    asm_u32(0xD5207C03)
+    asm_u32(0x01AA0605)
+    asm_u32(0x7E0A0280)
+    asm_u32(0xD7006A04)
+    asm_u32(0x00020211)
+    asm_u32(0xD5207C05)
+    asm_u32(0x01AA0A80)
+    asm_u32(0xD7006A04)
+    asm_u32(0x00020806)
+    asm_u32(0xD5207C05)
+    asm_u32(0x01AA0A07)
+    asm_u32(0xDC520000)
+    asm_u32(0x067C0002)
+    asm_u32(0xBF8903F7)
+    asm_u32(0xDC6A0000)
+    asm_u32(0x007C0604)
+    asm_u32(0xBC7C0000)
+    asm_u32(0xBFB00000)
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a8 = args_desc + 64;  unsafe { *(a8 as uint64) = 8 }
+    uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+@export
+fn emit_amdgpu_head_extract_f32_blob(uint64 out_path) -> uint64 {
+    uint64[10] args_desc
+    _emit_head_extract_f32_body(args_desc)
+    uint64 size = emit_amdgpu_code_object_lds("head_extract_f32", 16,
+                                               asm_text_buf, asm_text_len,
+                                               40, 8, 18, 7,
+                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 5,
+                                               0)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_head_extract_f32_blob: cannot open output\n", 54)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// LLM Phase 2 — head_insert_f32: write one head's slice INTO a
+// multi-head [SEQ, HEADS*HD] activation from a contiguous [SEQ, HD]
+// buffer.  out[s, head_idx*HD + d] = in[s, d].  Inverse of
+// head_extract.  block = HD, grid = SEQ.
+//
+// Kernarg layout (40 bytes, 5 args):
+//   [0x00] uint64 in_ptr     (f32[SEQ, HD])
+//   [0x08] uint64 out_ptr    (f32[SEQ, HEADS*HD])
+//   [0x10] uint64 HD
+//   [0x18] uint64 HEADS
+//   [0x20] uint64 head_idx
+fn _emit_head_insert_f32_body(uint64 args_desc) {
+    asm_init()
+    asm_u32(0xF40C0100)
+    asm_u32(0xF8000000)
+    asm_u32(0xF4000300)
+    asm_u32(0xF8000020)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x960E080F)
+    asm_u32(0x840E820E)
+    asm_u32(0x960D080A)
+    asm_u32(0x96100D0F)
+    asm_u32(0x9611080C)
+    asm_u32(0x80101110)
+    asm_u32(0x84108210)
+    asm_u32(0x30020082)
+    asm_u32(0x7E060280)
+    asm_u32(0xD7006A02)
+    asm_u32(0x0002020E)
+    asm_u32(0xD5207C03)
+    asm_u32(0x01AA0680)
+    asm_u32(0xD7006A02)
+    asm_u32(0x00020404)
+    asm_u32(0xD5207C03)
+    asm_u32(0x01AA0605)
+    asm_u32(0x7E0A0280)
+    asm_u32(0xD7006A04)
+    asm_u32(0x00020210)
+    asm_u32(0xD5207C05)
+    asm_u32(0x01AA0A80)
+    asm_u32(0xD7006A04)
+    asm_u32(0x00020806)
+    asm_u32(0xD5207C05)
+    asm_u32(0x01AA0A07)
+    asm_u32(0xDC520000)
+    asm_u32(0x067C0002)
+    asm_u32(0xBF8903F7)
+    asm_u32(0xDC6A0000)
+    asm_u32(0x007C0604)
+    asm_u32(0xBC7C0000)
+    asm_u32(0xBFB00000)
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a8 = args_desc + 64;  unsafe { *(a8 as uint64) = 8 }
+    uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+@export
+fn emit_amdgpu_head_insert_f32_blob(uint64 out_path) -> uint64 {
+    uint64[10] args_desc
+    _emit_head_insert_f32_body(args_desc)
+    uint64 size = emit_amdgpu_code_object_lds("head_insert_f32", 15,
+                                               asm_text_buf, asm_text_len,
+                                               40, 8, 18, 7,
+                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 5,
+                                               0)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_head_insert_f32_blob: cannot open output\n", 53)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 // LLM Phase 2 — transpose_f32: out[N, M] = transpose(in[M, N]).
 // 16×16 LDS-tile transpose to keep VMEM coalesced in both directions.
 // One workgroup per (tile_m, tile_n); 256 lanes per WG, 1 f32 per lane.

@@ -4745,6 +4745,30 @@ fn main() {
                 write(1, kvb_path, kvbl)
                 write(1, " (amdgpu kv-broadcast-f32 code object)\n", 40)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-head-extract-f32=", 31) != 0 {
+                uint64 he_path = arg + 31
+                uint64 he_rc = emit_amdgpu_head_extract_f32_blob(he_path)
+                if he_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-head-extract-f32 failed\n", 45)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 hel = str_len(he_path)
+                write(1, he_path, hel)
+                write(1, " (amdgpu head-extract-f32 code object)\n", 40)
+                exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-head-insert-f32=", 30) != 0 {
+                uint64 hi_path = arg + 30
+                uint64 hi_rc = emit_amdgpu_head_insert_f32_blob(hi_path)
+                if hi_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-head-insert-f32 failed\n", 44)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 hil = str_len(hi_path)
+                write(1, hi_path, hil)
+                write(1, " (amdgpu head-insert-f32 code object)\n", 39)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-transpose-f32=", 28) != 0 {
                 uint64 tr_path = arg + 28
                 uint64 tr_rc = emit_amdgpu_transpose_f32_blob(tr_path)
