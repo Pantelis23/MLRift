@@ -250,13 +250,11 @@ fn main() {
         sum_norm_ns = sum_norm_ns + time_elapsed(norm_start_ns)
         // lm_head: tied embedding matmul. Not on a residual — Kahan off.
         u64 lmhead_start_ns = time_now()
-        // Direct CPU path — at N=151936 the row-per-thread gemv is
-        // memory-access-pattern bound (non-coalesced 32 rows per wave →
-        // poor L1 hit rate) and lands ~13× slower than 16-thread AVX2.
-        // Routing through qwen3_main_matmul would invoke the GPU
-        // wrapper unnecessarily.  Bring back via the dispatcher when a
-        // cooperative-row gemv kernel (multi-thread-per-row) lands.
-        matmul_bf16_weights_f32(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
+        // qwen3_main_matmul routes to the GPU dispatcher under env-gate.
+        // For lm_head (N=151936, K=1024) the wrapper picks the
+        // cooperative-row gemv_coop_f32 kernel — bandwidth-bound at ~6 ms
+        // vs 9 ms 16-thread AVX2.  Falls through to CPU when MLRIFT_GPU_MATMUL is unset.
+        qwen3_main_matmul(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
         sum_lmhead_ns = sum_lmhead_ns + time_elapsed(lmhead_start_ns)
 
         u64 argmax_start_ns = time_now()

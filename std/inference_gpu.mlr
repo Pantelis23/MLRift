@@ -36,10 +36,11 @@ import "string.mlr"
 
 // 0 = uninitialised, 1 = ready, 2 = unavailable (env not set or
 // kernel-load failure — caller falls back to CPU on every call).
-static u64 _gpu_mm_init       = 0
-static u64 _gpu_mm_fh_dq      = 0
-static u64 _gpu_mm_fh_gemv    = 0
-static u64 _gpu_mm_fh_gemm    = 0
+static u64 _gpu_mm_init        = 0
+static u64 _gpu_mm_fh_dq       = 0
+static u64 _gpu_mm_fh_gemv     = 0
+static u64 _gpu_mm_fh_gemv_coop = 0    // cooperative-row variant
+static u64 _gpu_mm_fh_gemm     = 0
 
 // Weight-size threshold (bytes of bf16 weight) below which GPU is
 // not worth dispatching — for decode-shape M=1, the per-call sync
@@ -106,9 +107,10 @@ fn _gpu_mm_init_once() {
     u64 c0 = 0; unsafe { *(ev as u8) -> c0 }
     if c0 == 48 { return }   // '0' → off
 
-    _gpu_mm_fh_dq   = _gpu_mm_load_co("/tmp/bf16_to_f32.co", "bf16_to_f32")
-    _gpu_mm_fh_gemv = _gpu_mm_load_co("/tmp/gemv_f32.co",    "gemv_f32")
-    _gpu_mm_fh_gemm = _gpu_mm_load_co("/tmp/gemm_f32.co",    "gemm_f32")
+    _gpu_mm_fh_dq        = _gpu_mm_load_co("/tmp/bf16_to_f32.co",   "bf16_to_f32")
+    _gpu_mm_fh_gemv      = _gpu_mm_load_co("/tmp/gemv_f32.co",      "gemv_f32")
+    _gpu_mm_fh_gemv_coop = _gpu_mm_load_co("/tmp/gemv_coop_f32.co", "gemv_coop_f32")
+    _gpu_mm_fh_gemm      = _gpu_mm_load_co("/tmp/gemm_f32.co",      "gemm_f32")
     if _gpu_mm_fh_dq == 0 || _gpu_mm_fh_gemv == 0 { return }
 
     _gpu_mm_cache_keys = alloc(_gpu_mm_cache_cap * 8)
@@ -298,7 +300,26 @@ fn matmul_bf16_weights_f32_gpu(u64 out_ptr, u64 x_ptr, u64 w_bf16,
     unsafe { *((kp + 32) as u64) = a4 }
     u64 grid_u = N_padded / 256
     u32 grid32 = grid_u
-    err = hipModuleLaunchKernel(_gpu_mm_fh_gemv, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+    // Pick the kernel based on N.  Cooperative-row gemv (block=32,
+    // grid=N) wins big at large N due to coalesced reads, but pays a
+    // grid-launch tax that's ~256× higher than the row-per-LANE
+    // gemv_f32 (block=256, grid=N/256).  Crossover empirically lands
+    // around N=4096.  Use the new kernel above 4096; original below.
+    u64 use_coop = 0
+    if _gpu_mm_fh_gemv_coop != 0 {
+        if N >= 4096 { use_coop = 1 }
+    }
+
+    if use_coop != 0 {
+        // gemv_coop_f32: block=32 (1 wave), grid=N (1 row per WG).
+        // Pass actual N (not padded); coop kernel has correct WG-level
+        // bounds and no partial-wave pathology.
+        unsafe { *(a3 as u64) = N }
+        u32 cgrid = N
+        err = hipModuleLaunchKernel(_gpu_mm_fh_gemv_coop, cgrid, 1, 1, 32, 1, 1, 0, 0, kp, 0)
+    } else {
+        err = hipModuleLaunchKernel(_gpu_mm_fh_gemv, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+    }
     if err != 0 { return 1 }
     err = hipDeviceSynchronize()
     if err != 0 { return 1 }

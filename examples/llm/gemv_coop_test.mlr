@@ -1,0 +1,178 @@
+// Verify and benchmark gemv_coop_f32 against gemv_f32 / CPU reference.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-gemv-coop-f32=/tmp/gemv_coop_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/gemv_coop_test.mlr -o /tmp/gemv_coop_test
+// Run:
+//   N=2048 /tmp/gemv_coop_test    (default)
+//   N=151936 /tmp/gemv_coop_test  (lm_head shape)
+
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn die(uint64 msg, uint64 code) {
+    print_str(msg); print_str(" e="); u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n"); exit(1)
+}
+
+fn load_kernel(uint64 co_path, uint64 fname) -> uint64 {
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    uint32 err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fname); if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+    return fh
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+    uint64 fh = load_kernel("/tmp/gemv_coop_f32.co", "gemv_coop_f32")
+
+    u64 n_env = getenv("N")
+    u64 N = 2048
+    if n_env != 0 {
+        u64 parsed = 0
+        u64 i = 0
+        u8 c = 0
+        unsafe { *(n_env as u8) -> c }
+        while c >= 48 && c <= 57 {
+            parsed = parsed * 10 + (c - 48)
+            i = i + 1
+            unsafe { *((n_env + i) as u8) -> c }
+        }
+        if parsed > 0 { N = parsed }
+    }
+    u64 K = 1024
+    print_str("N="); u64 sn = fmt_dec(N); print_str(sn); dealloc(sn)
+    print_str(" K="); u64 sk = fmt_dec(K); print_str(sk); dealloc(sk)
+    print_str(" grid="); u64 sg = fmt_dec(N); print_str(sg); dealloc(sg); print_str("\n")
+
+    // Allocate device buffers.
+    u64 d_a = 0; u64 d_b = 0; u64 d_c = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, N*K*4); if err != 0 { die("mA", err) }; unsafe { *(slot as u64) -> d_a }
+    slot = alloc(8); err = hipMalloc(slot, K*4);   if err != 0 { die("mB", err) }; unsafe { *(slot as u64) -> d_b }
+    slot = alloc(8); err = hipMalloc(slot, N*4);   if err != 0 { die("mC", err) }; unsafe { *(slot as u64) -> d_c }
+
+    // Synthetic A and b: deterministic but covering positive/negative.
+    u64 h_a = alloc(N*K*4); u64 h_b = alloc(K*4); u64 h_c = alloc(N*4); u64 h_ref = alloc(N*4)
+    u64 i = 0
+    while i < N*K {
+        f64 v = (int_to_f64(i % 997) * 0.001) - 0.5
+        u64 p = h_a + i*4
+        unsafe { *(p as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+    i = 0
+    while i < K {
+        f64 v = (int_to_f64(i) * 0.0003) - 0.05
+        u64 p = h_b + i*4
+        unsafe { *(p as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+
+    err = hipMemcpy(d_a, h_a, N*K*4, 1); if err != 0 { die("H2D a", err) }
+    err = hipMemcpy(d_b, h_b, K*4,   1); if err != 0 { die("H2D b", err) }
+
+    // Build kernarg.
+    u64 g0 = alloc(8); unsafe { *(g0 as u64) = d_a }
+    u64 g1 = alloc(8); unsafe { *(g1 as u64) = d_b }
+    u64 g2 = alloc(8); unsafe { *(g2 as u64) = d_c }
+    u64 g3 = alloc(8); unsafe { *(g3 as u64) = N }
+    u64 g4 = alloc(8); unsafe { *(g4 as u64) = K }
+    u64 kp = alloc(5*8)
+    unsafe { *(kp        as u64) = g0 }
+    unsafe { *((kp +  8) as u64) = g1 }
+    unsafe { *((kp + 16) as u64) = g2 }
+    unsafe { *((kp + 24) as u64) = g3 }
+    unsafe { *((kp + 32) as u64) = g4 }
+
+    // Coop kernel: block=32, grid=N (1 row per WG).
+    u32 grid32 = N
+    print_str("launch...\n")
+    u64 t0 = time_now()
+    err = hipModuleLaunchKernel(fh, grid32, 1, 1, 32, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("L", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+    u64 t1 = time_now()
+    err = hipMemcpy(h_c, d_c, N*4, 2); if err != 0 { die("D2H", err) }
+    print_str("kernel_us="); u64 sa = fmt_dec((t1-t0)/1000); print_str(sa); dealloc(sa); print_str("\n")
+
+    // CPU reference.
+    u64 r = 0
+    while r < N {
+        f64 acc = 0.0
+        u64 k = 0
+        while k < K {
+            f32 av = 0.0f; unsafe { *((h_a + (r*K + k)*4) as f32) -> av }
+            f32 bv = 0.0f; unsafe { *((h_b + k*4)        as f32) -> bv }
+            acc = acc + f32_to_f64(av) * f32_to_f64(bv)
+            k = k + 1
+        }
+        unsafe { *((h_ref + r*4) as f32) = f64_to_f32(acc) }
+        r = r + 1
+    }
+
+    // Verify.
+    u64 fail_001 = 0; u64 fail_01 = 0
+    u64 nan_gpu = 0; u64 nan_cpu = 0
+    u32 max_diff_bits = 0
+    u64 j = 0
+    while j < N {
+        u32 cb = 0; u32 gb = 0
+        unsafe { *((h_ref + j*4) as u32) -> cb }
+        unsafe { *((h_c   + j*4) as u32) -> gb }
+        u32 c_exp = (cb >> 23) & 0xFF; u32 c_man = cb & 0x7FFFFF
+        u32 g_exp = (gb >> 23) & 0xFF; u32 g_man = gb & 0x7FFFFF
+        if c_exp == 0xFF && c_man != 0 { nan_cpu = nan_cpu + 1 }
+        if g_exp == 0xFF && g_man != 0 { nan_gpu = nan_gpu + 1 }
+        f32 cv = 0.0f; f32 gv = 0.0f
+        unsafe { *((h_ref + j*4) as f32) -> cv }
+        unsafe { *((h_c   + j*4) as f32) -> gv }
+        f32 d = gv - cv
+        if d < 0.0f { d = 0.0f - d }
+        if d > 0.001f { fail_001 = fail_001 + 1 }
+        if d > 0.01f  { fail_01  = fail_01  + 1 }
+        u64 dbuf = alloc(4); unsafe { *(dbuf as f32) = d }
+        u32 dbits = 0; unsafe { *(dbuf as u32) -> dbits }
+        u32 d_exp = (dbits >> 23) & 0xFF
+        if d_exp != 0xFF {
+            if dbits > max_diff_bits { max_diff_bits = dbits }
+        }
+        dealloc(dbuf)
+        j = j + 1
+    }
+    print_str("fail>0.001:    "); u64 sf1 = fmt_dec(fail_001); print_str(sf1); dealloc(sf1); print_str("\n")
+    print_str("fail>0.01:     "); u64 sf2 = fmt_dec(fail_01);  print_str(sf2); dealloc(sf2); print_str("\n")
+    print_str("nan_gpu:       "); u64 sn1 = fmt_dec(nan_gpu);  print_str(sn1); dealloc(sn1); print_str("\n")
+    print_str("nan_cpu:       "); u64 sn2 = fmt_dec(nan_cpu);  print_str(sn2); dealloc(sn2); print_str("\n")
+    u64 mb64 = max_diff_bits
+    print_str("max_diff_bits: "); u64 sm = fmt_dec(mb64); print_str(sm); dealloc(sm); print_str("\n")
+
+    print_str("first 4 cells (cpu / gpu):\n")
+    u64 di = 0
+    while di < 4 {
+        u32 cb = 0; u32 gb = 0
+        unsafe { *((h_ref + di*4) as u32) -> cb }
+        unsafe { *((h_c   + di*4) as u32) -> gb }
+        u64 cb64 = cb; u64 gb64 = gb
+        print_str("  ["); u64 sx = fmt_dec(di); print_str(sx); dealloc(sx)
+        print_str("] cpu="); u64 sy = fmt_dec(cb64); print_str(sy); dealloc(sy)
+        print_str(" gpu=");  u64 sz = fmt_dec(gb64); print_str(sz); dealloc(sz)
+        print_str("\n")
+        di = di + 1
+    }
+
+    exit(0)
+}

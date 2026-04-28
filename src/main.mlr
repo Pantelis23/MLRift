@@ -4607,6 +4607,22 @@ fn main() {
                 write(1, gv_path, gvl)
                 write(1, " (amdgpu gemv-f32 code object)\n", 31)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-gemv-coop-f32=", 28) != 0 {
+                // Cooperative-row gemv_coop_f32 (task #75).  32-thread
+                // workgroups, 1 row per WG, LDS reduce.  Kernarg layout
+                // identical to gemv_f32 — drop-in replacement at
+                // dispatch time but launches with block=32, grid=M.
+                uint64 gc_path = arg + 28
+                uint64 gc_rc = emit_amdgpu_gemv_coop_f32_blob(gc_path)
+                if gc_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-gemv-coop-f32 failed\n", 41)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 gcl = str_len(gc_path)
+                write(1, gc_path, gcl)
+                write(1, " (amdgpu gemv-coop-f32 code object)\n", 36)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-gemm-f32=", 23) != 0 {
                 uint64 gm_path = arg + 23
                 uint64 gm_rc = emit_amdgpu_gemm_f32_blob(gm_path)
