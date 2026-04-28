@@ -1024,6 +1024,13 @@ fn asm_s_waitcnt_lgkmcnt_zero() { asm_sopp(0x09, 0xFC07) }
 // exactly 0x03F7 for that.
 fn asm_s_waitcnt_vmcnt_zero() { asm_sopp(0x09, 0x03F7) }
 
+// s_waitcnt vmcnt(N) for N in {1, 2} — partial drain: wait until at
+// most N outstanding VMEM ops remain. Lets the compiler interleave
+// VALU/SALU computation with later VMEM loads in flight (mirrors
+// hipcc's lif_step / delivery_step inner loops).
+fn asm_s_waitcnt_vmcnt_1() { asm_sopp(0x09, 0x07F7) }
+fn asm_s_waitcnt_vmcnt_2() { asm_sopp(0x09, 0x0BF7) }
+
 // s_delay_alu <simm16> — SOPP op 0x07 (gfx11+). The simm16 encodes
 // how far back the current instruction should wait for a VALU
 // dependency. simm16 values this helper takes directly:
@@ -10969,6 +10976,12 @@ fn amdgpu_lower_noesis_delivery(uint64 kname_ptr, uint64 nl) -> uint64 {
     //   tgt = col_tgt[slot]   → v[12:13]   saddr=s4
     //   w   = col_w[slot]     → v[14:15]   saddr=s6
     //   inh = col_is_inh[slot] → v[16:17]  saddr=s8
+    // Tried interleaving via vmcnt(2)/vmcnt(1) partial waits with the
+    // inh→cndmask chain pipelined behind the tgt+w loads — bit-exact
+    // but +35 ms wall vs the simple s_clause/vmcnt(0) shape on this
+    // kernel. The 3 loads share the same v_addr and saddr base style
+    // and are already issued back-to-back; the partial waits added
+    // observable s_waitcnt overhead that exceeded the latency hiding.
     asm_s_clause(2)
     asm_global_load_b64(12, 4, 4)               // v[12:13] = tgt
     asm_global_load_b64(14, 4, 6)               // v[14:15] = w
