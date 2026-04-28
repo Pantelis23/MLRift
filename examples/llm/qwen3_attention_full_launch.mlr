@@ -1,0 +1,256 @@
+// Attention forward FULL chain: gemm_f32 → softmax_causal_f32 → gemm_f32.
+//
+//   scores  = Q @ K^T                  [SEQ, SEQ]   (gemm_f32)
+//   attn    = softmax_causal(scores)   [SEQ, SEQ]   (softmax_causal_f32)
+//   context = attn @ V                 [SEQ, HD]    (gemm_f32, second use)
+//
+// Closes the attention forward path; only missing piece is the
+// 1/sqrt(head_dim) attention scale, which we still skip (would just
+// pre-multiply K or fuse into softmax exp; demo shows plumbing only).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-gemm-f32=/tmp/gemm_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-softmax-causal-f32-N=256:/tmp/softmax_causal_n256.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/qwen3_attention_full_launch.mlr -o /tmp/qwen3_attention_full_kfd
+// Run:
+//   /tmp/qwen3_attention_full_kfd
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 { i = i - 1; uint64 d = tmp - (tmp / 10) * 10; uint64 p = buf + i; uint8 c = d + 48; unsafe { *(p as uint8) = c }; tmp = tmp / 10 }
+    return n
+}
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128); uint64 i = 0
+    while i < label_len { uint64 sp = label + i; uint64 c = 0; unsafe { *(sp as uint8) -> c }; uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }; i = i + 1 }
+    uint64 cp = buf + label_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1; uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+fn die(uint64 msg, uint64 code) { puts(msg); print_label_val("e", 1, code); exit(1) }
+
+fn load_kernel(uint64 co_path, uint64 fname) -> uint64 {
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { puts("missing co"); puts(co_path); exit(1) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    uint32 err = hipModuleLoadData(mod_slot, blob)
+    if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fname)
+    if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+    return fh
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 SEQ = 256
+    uint64 HD  = 128
+
+    uint64 fh_gemm = load_kernel("/tmp/gemm_f32.co",            "gemm_f32")
+    uint64 fh_smc  = load_kernel("/tmp/softmax_causal_n256.co", "softmax_causal_f32")
+
+    uint64 q_bytes  = SEQ * HD  * 4        // [SEQ, HD]
+    uint64 kt_bytes = HD  * SEQ * 4        // [HD,  SEQ] = transpose(K)
+    uint64 v_bytes  = SEQ * HD  * 4        // [SEQ, HD]
+    uint64 sc_bytes = SEQ * SEQ * 4        // [SEQ, SEQ]
+    uint64 ctx_bytes= SEQ * HD  * 4        // [SEQ, HD]
+
+    uint64 d_Q = 0; uint64 d_Kt = 0; uint64 d_V = 0
+    uint64 d_scores = 0; uint64 d_attn = 0; uint64 d_ctx = 0
+    uint64 slot
+    slot = alloc(8); err = hipMalloc(slot, q_bytes);   if err != 0 { die("mQ",  err) }; unsafe { *(slot as uint64) -> d_Q }
+    slot = alloc(8); err = hipMalloc(slot, kt_bytes);  if err != 0 { die("mKt", err) }; unsafe { *(slot as uint64) -> d_Kt }
+    slot = alloc(8); err = hipMalloc(slot, v_bytes);   if err != 0 { die("mV",  err) }; unsafe { *(slot as uint64) -> d_V }
+    slot = alloc(8); err = hipMalloc(slot, sc_bytes);  if err != 0 { die("mSc", err) }; unsafe { *(slot as uint64) -> d_scores }
+    slot = alloc(8); err = hipMalloc(slot, sc_bytes);  if err != 0 { die("mAt", err) }; unsafe { *(slot as uint64) -> d_attn }
+    slot = alloc(8); err = hipMalloc(slot, ctx_bytes); if err != 0 { die("mCx", err) }; unsafe { *(slot as uint64) -> d_ctx }
+
+    // Fill Q [SEQ, HD], K [SEQ, HD], V [SEQ, HD] deterministically.
+    uint64 h_Q = alloc(q_bytes)
+    uint64 h_K = alloc(q_bytes)
+    uint64 h_V = alloc(v_bytes)
+    uint64 r = 0
+    while r < SEQ {
+        uint64 c = 0
+        while c < HD {
+            f64 qv = (int_to_f64(r) * 0.001  + int_to_f64(c) * 0.0005) - 0.05
+            f64 kv = (int_to_f64(r) * 0.0007 + int_to_f64(c) * 0.0011) - 0.07
+            f64 vv = (int_to_f64(r) * 0.0009 + int_to_f64(c) * 0.0013) - 0.06
+            uint64 pq = h_Q + (r * HD + c) * 4
+            uint64 pk = h_K + (r * HD + c) * 4
+            uint64 pv = h_V + (r * HD + c) * 4
+            unsafe { *(pq as f32) = f64_to_f32(qv) }
+            unsafe { *(pk as f32) = f64_to_f32(kv) }
+            unsafe { *(pv as f32) = f64_to_f32(vv) }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    // K^T [HD, SEQ]
+    uint64 h_Kt = alloc(kt_bytes)
+    uint64 ki = 0
+    while ki < HD {
+        uint64 ks = 0
+        while ks < SEQ {
+            uint64 src = h_K  + (ks * HD + ki) * 4
+            uint64 dst = h_Kt + (ki * SEQ + ks) * 4
+            f32 v = 0.0; unsafe { *(src as f32) -> v }
+            unsafe { *(dst as f32) = v }
+            ks = ks + 1
+        }
+        ki = ki + 1
+    }
+
+    err = hipMemcpy(d_Q,  h_Q,  q_bytes,  1); if err != 0 { die("H2D Q",  err) }
+    err = hipMemcpy(d_Kt, h_Kt, kt_bytes, 1); if err != 0 { die("H2D Kt", err) }
+    err = hipMemcpy(d_V,  h_V,  v_bytes,  1); if err != 0 { die("H2D V",  err) }
+
+    // Stage 1: scores = Q @ K^T  (M=SEQ, N=SEQ, K=HD)
+    uint64 k1_a = alloc(8); unsafe { *(k1_a as uint64) = d_Q }
+    uint64 k1_b = alloc(8); unsafe { *(k1_b as uint64) = d_Kt }
+    uint64 k1_c = alloc(8); unsafe { *(k1_c as uint64) = d_scores }
+    uint64 k1_m = alloc(8); unsafe { *(k1_m as uint64) = SEQ }
+    uint64 k1_n = alloc(8); unsafe { *(k1_n as uint64) = SEQ }
+    uint64 k1_k = alloc(8); unsafe { *(k1_k as uint64) = HD }
+    uint64 kp1 = alloc(6 * 8)
+    unsafe { *(kp1        as uint64) = k1_a }
+    unsafe { *((kp1 +  8) as uint64) = k1_b }
+    unsafe { *((kp1 + 16) as uint64) = k1_c }
+    unsafe { *((kp1 + 24) as uint64) = k1_m }
+    unsafe { *((kp1 + 32) as uint64) = k1_n }
+    unsafe { *((kp1 + 40) as uint64) = k1_k }
+    uint32 grid1  = (SEQ / 16) * (SEQ / 16)
+    err = hipModuleLaunchKernel(fh_gemm, grid1, 1, 1, 256, 1, 1, 0, 0, kp1, 0)
+    if err != 0 { die("launch QKt", err) }
+
+    // Stage 2: attn = softmax_causal(scores)
+    uint64 k2_in  = alloc(8); unsafe { *(k2_in  as uint64) = d_scores }
+    uint64 k2_out = alloc(8); unsafe { *(k2_out as uint64) = d_attn }
+    uint64 k2_m   = alloc(8); unsafe { *(k2_m   as uint64) = SEQ }
+    uint64 k2_n   = alloc(8); unsafe { *(k2_n   as uint64) = SEQ }
+    uint64 kp2 = alloc(4 * 8)
+    unsafe { *(kp2        as uint64) = k2_in }
+    unsafe { *((kp2 +  8) as uint64) = k2_out }
+    unsafe { *((kp2 + 16) as uint64) = k2_m }
+    unsafe { *((kp2 + 24) as uint64) = k2_n }
+    err = hipModuleLaunchKernel(fh_smc, SEQ, 1, 1, 256, 1, 1, 0, 0, kp2, 0)
+    if err != 0 { die("launch smc", err) }
+
+    // Stage 3: context = attn @ V   (M=SEQ, N=HD, K=SEQ)
+    uint64 k3_a = alloc(8); unsafe { *(k3_a as uint64) = d_attn }
+    uint64 k3_b = alloc(8); unsafe { *(k3_b as uint64) = d_V }
+    uint64 k3_c = alloc(8); unsafe { *(k3_c as uint64) = d_ctx }
+    uint64 k3_m = alloc(8); unsafe { *(k3_m as uint64) = SEQ }
+    uint64 k3_n = alloc(8); unsafe { *(k3_n as uint64) = HD }
+    uint64 k3_k = alloc(8); unsafe { *(k3_k as uint64) = SEQ }
+    uint64 kp3 = alloc(6 * 8)
+    unsafe { *(kp3        as uint64) = k3_a }
+    unsafe { *((kp3 +  8) as uint64) = k3_b }
+    unsafe { *((kp3 + 16) as uint64) = k3_c }
+    unsafe { *((kp3 + 24) as uint64) = k3_m }
+    unsafe { *((kp3 + 32) as uint64) = k3_n }
+    unsafe { *((kp3 + 40) as uint64) = k3_k }
+    uint32 grid3 = (SEQ / 16) * (HD / 16)
+    err = hipModuleLaunchKernel(fh_gemm, grid3, 1, 1, 256, 1, 1, 0, 0, kp3, 0)
+    if err != 0 { die("launch attnV", err) }
+
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 h_attn = alloc(sc_bytes)
+    uint64 h_ctx  = alloc(ctx_bytes)
+    err = hipMemcpy(h_attn, d_attn, sc_bytes,  2); if err != 0 { die("D2H attn", err) }
+    err = hipMemcpy(h_ctx,  d_ctx,  ctx_bytes, 2); if err != 0 { die("D2H ctx",  err) }
+
+    // Verifier:
+    //   (a) softmax row-sum invariant on attn (sum over c ≤ r ≈ 1).
+    //   (b) Mask invariant on attn (c > r → bit-zero).
+    //   (c) context = attn @ V cross-check: for each (r, c), recompute
+    //       sum_{k ≤ r} attn[r, k] * V[k, c] in f64 and compare to h_ctx.
+    //
+    // Because attn is row-stochastic with mask, |context[r,c]| ≤ max|V|.
+    // With V in roughly [-0.06, 0.40] this gives generous abs-thresh.
+    uint64 fail_sum  = 0
+    uint64 fail_mask = 0
+    uint64 fail_ctx  = 0
+    f32 thresh_sum = 0.001
+    f64 thresh_ctx = 0.001
+    r = 0
+    while r < SEQ {
+        f32 row_sum = 0.0
+        uint64 c = 0
+        while c <= r {
+            uint64 ap = h_attn + (r * SEQ + c) * 4
+            f32 v = 0.0; unsafe { *(ap as f32) -> v }
+            row_sum = row_sum + v
+            c = c + 1
+        }
+        f32 d = row_sum - 1.0
+        if d < 0.0 { d = 0.0 - d }
+        if d > thresh_sum { fail_sum = fail_sum + 1 }
+
+        c = r + 1
+        uint64 row_mask_fail = 0
+        while c < SEQ {
+            uint64 ap = h_attn + (r * SEQ + c) * 4
+            uint64 vp = alloc(4); f32 v = 0.0; unsafe { *(ap as f32) -> v }
+            unsafe { *(vp as f32) = v }
+            uint32 vbits = 0; unsafe { *(vp as uint32) -> vbits }
+            if vbits != 0 { row_mask_fail = 1 }
+            c = c + 1
+        }
+        if row_mask_fail != 0 { fail_mask = fail_mask + 1 }
+
+        // Context cross-check on this row.
+        uint64 col = 0
+        while col < HD {
+            f64 acc = 0.0
+            uint64 kk = 0
+            while kk <= r {
+                uint64 ap = h_attn + (r * SEQ + kk) * 4
+                uint64 vp = h_V    + (kk * HD + col) * 4
+                f32 a = 0.0; unsafe { *(ap as f32) -> a }
+                f32 vf = 0.0; unsafe { *(vp as f32) -> vf }
+                acc = acc + f32_to_f64(a) * f32_to_f64(vf)
+                kk = kk + 1
+            }
+            uint64 cp = h_ctx + (r * HD + col) * 4
+            f32 got = 0.0; unsafe { *(cp as f32) -> got }
+            f64 dd = f32_to_f64(got) - acc
+            if dd < 0.0 { dd = 0.0 - dd }
+            if dd > thresh_ctx { fail_ctx = fail_ctx + 1 }
+            col = col + 1
+        }
+
+        r = r + 1
+    }
+
+    print_label_val("seq_len",         7, SEQ)
+    print_label_val("head_dim",        8, HD)
+    print_label_val("kernels_chained",15, 3)
+    print_label_val("rows_failed_sum",15, fail_sum)
+    print_label_val("rows_failed_mask",16, fail_mask)
+    print_label_val("ctx_cells_failed",16, fail_ctx)
+    print_label_val("ctx_cells_total", 15, SEQ * HD)
+
+    hipFree(d_Q); hipFree(d_Kt); hipFree(d_V)
+    hipFree(d_scores); hipFree(d_attn); hipFree(d_ctx)
+    exit(0)
+}

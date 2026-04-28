@@ -5924,6 +5924,9 @@ fn amdgpu_lower_llm_gemv_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
 @export
 fn _emit_gemm_f32_body(uint64 args_desc) {
     asm_init()
+    // Stash WG_ID_X (s15 under rsrc2=0x9E) into s3 BEFORE the kernarg
+    // load — s_load_b64 s[14:15], 0x28 clobbers s15 with high(k_dim).
+    asm_u32(0xBE83000F)         // s_mov_b32 s3, s15
     asm_u32(0xF40C0100); asm_u32(0xF8000000)
     asm_u32(0xF4040300); asm_u32(0xF8000020)
     asm_u32(0xF4040380); asm_u32(0xF8000028)
@@ -5932,7 +5935,7 @@ fn _emit_gemm_f32_body(uint64 args_desc) {
     asm_u32(0x3604008F)
     asm_u32(0x80108F0C)
     asm_u32(0x85108410)
-    asm_u32(0xBE910002)
+    asm_u32(0xBE910003)         // s_mov_b32 s17, s3   (saved WG_ID_X)
     asm_u32(0xBE920080)
     asm_u32(0xBF0A1011)
     asm_u32(0xBFA20003)
