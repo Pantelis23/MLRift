@@ -1,14 +1,16 @@
-// Attention forward FULL chain: gemm_f32 → softmax_causal_f32 → gemm_f32.
+// Attention forward FULL chain (with 1/sqrt(head_dim) scale):
+//   Q       *= 1/sqrt(HD)              [SEQ, HD]    (scale_f32, in-place)
+//   scores   = Q @ K^T                 [SEQ, SEQ]   (gemm_f32)
+//   attn     = softmax_causal(scores)  [SEQ, SEQ]   (softmax_causal_f32)
+//   context  = attn @ V                [SEQ, HD]    (gemm_f32, second use)
 //
-//   scores  = Q @ K^T                  [SEQ, SEQ]   (gemm_f32)
-//   attn    = softmax_causal(scores)   [SEQ, SEQ]   (softmax_causal_f32)
-//   context = attn @ V                 [SEQ, HD]    (gemm_f32, second use)
-//
-// Closes the attention forward path; only missing piece is the
-// 1/sqrt(head_dim) attention scale, which we still skip (would just
-// pre-multiply K or fuse into softmax exp; demo shows plumbing only).
+// Closes the attention forward path: scale → matmul → softmax → matmul.
+// Folding the 1/sqrt(HD) into Q before Q@K^T is the standard trick —
+// both Q@K^T and softmax-of-scores then operate on bounded magnitudes
+// regardless of HD, which improves f32 stability.
 //
 // Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/scale_f32.mlr -o /tmp/scale_f32
 //   ./build/mlrc --arch=x86_64 --emit-amdgpu-gemm-f32=/tmp/gemm_f32.co dummy
 //   ./build/mlrc --arch=x86_64 --emit-amdgpu-softmax-causal-f32-N=256:/tmp/softmax_causal_n256.co dummy
 //   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/qwen3_attention_full_launch.mlr -o /tmp/qwen3_attention_full_kfd
@@ -64,8 +66,9 @@ fn main() {
     uint64 SEQ = 256
     uint64 HD  = 128
 
-    uint64 fh_gemm = load_kernel("/tmp/gemm_f32.co",            "gemm_f32")
-    uint64 fh_smc  = load_kernel("/tmp/softmax_causal_n256.co", "softmax_causal_f32")
+    uint64 fh_gemm  = load_kernel("/tmp/gemm_f32.co",            "gemm_f32")
+    uint64 fh_smc   = load_kernel("/tmp/softmax_causal_n256.co", "softmax_causal_f32")
+    uint64 fh_scale = load_kernel("/tmp/scale_f32.co",           "scale_f32")
 
     uint64 q_bytes  = SEQ * HD  * 4        // [SEQ, HD]
     uint64 kt_bytes = HD  * SEQ * 4        // [HD,  SEQ] = transpose(K)
@@ -123,7 +126,24 @@ fn main() {
     err = hipMemcpy(d_Kt, h_Kt, kt_bytes, 1); if err != 0 { die("H2D Kt", err) }
     err = hipMemcpy(d_V,  h_V,  v_bytes,  1); if err != 0 { die("H2D V",  err) }
 
-    // Stage 1: scores = Q @ K^T  (M=SEQ, N=SEQ, K=HD)
+    // Stage 0: Q *= 1/sqrt(HD).  In-place pointwise scale on Q.
+    // 1/sqrt(128) = 0x3DB504F3 in f32.
+    f32 inv_sqrt_hd = 0.08838834764831845
+    uint64 isb = alloc(4); unsafe { *(isb as f32) = inv_sqrt_hd }
+    uint32 inv_sqrt_hd_bits = 0; unsafe { *(isb as uint32) -> inv_sqrt_hd_bits }
+    uint64 k0_buf = alloc(8); unsafe { *(k0_buf as uint64) = d_Q }
+    uint64 k0_n   = alloc(8); unsafe { *(k0_n   as uint64) = SEQ * HD }
+    uint64 k0_f   = alloc(8); uint64 fb64_0 = inv_sqrt_hd_bits; unsafe { *(k0_f as uint64) = fb64_0 }
+    uint64 kp0 = alloc(3 * 8)
+    unsafe { *(kp0        as uint64) = k0_buf }
+    unsafe { *((kp0 +  8) as uint64) = k0_n   }
+    unsafe { *((kp0 + 16) as uint64) = k0_f   }
+    uint32 grid_scale = (SEQ * HD + 255) / 256
+    err = hipModuleLaunchKernel(fh_scale, grid_scale, 1, 1, 256, 1, 1, 0, 0, kp0, 0)
+    if err != 0 { die("launch scale", err) }
+
+    // Stage 1: scores = Q @ K^T  (M=SEQ, N=SEQ, K=HD).  Q has been
+    // pre-multiplied by 1/sqrt(HD), so scores already carry the scale.
     uint64 k1_a = alloc(8); unsafe { *(k1_a as uint64) = d_Q }
     uint64 k1_b = alloc(8); unsafe { *(k1_b as uint64) = d_Kt }
     uint64 k1_c = alloc(8); unsafe { *(k1_c as uint64) = d_scores }
@@ -244,7 +264,7 @@ fn main() {
 
     print_label_val("seq_len",         7, SEQ)
     print_label_val("head_dim",        8, HD)
-    print_label_val("kernels_chained",15, 3)
+    print_label_val("kernels_chained",15, 4)
     print_label_val("rows_failed_sum",15, fail_sum)
     print_label_val("rows_failed_mask",16, fail_mask)
     print_label_val("ctx_cells_failed",16, fail_ctx)
