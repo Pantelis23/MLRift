@@ -18,6 +18,7 @@
 //   /tmp/bf16_gemm_pipeline_kfd
 
 import "../../std/hip.mlr"
+import "../../std/time.mlr"
 
 @dynamic extern fn puts(uint64 s) -> uint32
 @dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
@@ -170,6 +171,28 @@ fn main() {
 
     err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
 
+    // === Bench: time 100 cached-weight gemm calls ===
+    // Models the hot path of qwen3_generate after weights are dequant'd
+    // once at startup: per call, only the gemm_f32 dispatch happens.
+    uint64 iters = 100
+    uint64 t0 = time_now()
+    uint64 it = 0
+    while it < iters {
+        err = hipModuleLaunchKernel(fh_gemm, grid_g, 1, 1, 256, 1, 1, 0, 0, kp_g, 0)
+        if err != 0 { die("L gemm bench", err) }
+        it = it + 1
+    }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync bench", err) }
+    uint64 t1 = time_now()
+    uint64 elapsed_ns  = t1 - t0
+    uint64 per_call_ns = elapsed_ns / iters
+    // FLOPs per gemm = 2 * M * N * K (one MUL + one ADD per output × inner sum).
+    uint64 flops_per_call = 2 * M * N * K
+    // Avoid f64 division noise: report in giga-FLOPS as integer:
+    //   GFLOPS_x100 = (flops_per_call / per_call_ns) * 100
+    //              ≈ flops/sec / 1e9 * 100 = GFLOPS × 100
+    uint64 gflops_x100 = (flops_per_call * 100) / per_call_ns
+
     uint64 h_out = alloc(out_bytes)
     err = hipMemcpy(h_out, d_out, out_bytes, 2); if err != 0 { die("D2H", err) }
 
@@ -213,13 +236,16 @@ fn main() {
     uint32 mab_bits = 0; unsafe { *(mab_buf as uint32) -> mab_bits }
     uint64 mab_bits64 = mab_bits
 
-    print_label_val("M",            1, M)
-    print_label_val("N",            1, N)
-    print_label_val("K",            1, K)
-    print_label_val("cells",        5, M * N)
-    print_label_val("fail_count",  10, fail_count)
-    print_label_val("max_abs_bits",12, mab_bits64)
+    print_label_val("M",             1, M)
+    print_label_val("N",             1, N)
+    print_label_val("K",             1, K)
+    print_label_val("cells",         5, M * N)
+    print_label_val("fail_count",   10, fail_count)
+    print_label_val("max_abs_bits", 12, mab_bits64)
     if first_bad != 0xFFFFFFFFFFFFFFFF { print_label_val("first_bad", 9, first_bad) }
+    print_label_val("bench_iters",  11, iters)
+    print_label_val("per_call_us",  11, per_call_ns / 1000)
+    print_label_val("gflops_x100",  11, gflops_x100)
 
     hipFree(d_x); hipFree(d_W_bf16); hipFree(d_W_f32); hipFree(d_out)
     exit(0)
