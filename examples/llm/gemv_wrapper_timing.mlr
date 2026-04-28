@@ -1,0 +1,242 @@
+// Per-stage timing of the matmul_bf16_weights_f32_gpu hot path.
+// Builds the same shape as the wrapper but instruments each step:
+//   H2D x, kernel launch, sync, D2H out.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/gemv_wrapper_timing.mlr -o /tmp/gemv_wrapper_timing
+// Run:
+//   /tmp/gemv_wrapper_timing
+
+import "../../std/hip.mlr"
+import "../../std/kfd.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn die(uint64 msg, uint64 code) {
+    print_str(msg); print_str(" e="); u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n"); exit(1)
+}
+
+fn load_kernel(uint64 co_path, uint64 fname) -> uint64 {
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    uint32 err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fname); if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+    return fh
+}
+
+fn dump_us(uint64 label, uint64 ns) {
+    print_str(label); u64 s = fmt_dec(ns / 1000); print_str(s); dealloc(s); print_str(" us\n")
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 fh_dq   = load_kernel("/tmp/bf16_to_f32.co", "bf16_to_f32")
+    uint64 fh_gemv = load_kernel("/tmp/gemv_f32.co",    "gemv_f32")
+
+    u64 N = 2048
+    u64 K = 1024
+
+    // Allocate all device buffers up-front (mirrors wrapper steady state).
+    u64 d_W_bf16 = 0; u64 d_W_f32 = 0; u64 d_x = 0; u64 d_out = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, N*K*2); if err != 0 { die("mWb", err) }; unsafe { *(slot as u64) -> d_W_bf16 }
+    slot = alloc(8); err = hipMalloc(slot, N*K*4); if err != 0 { die("mWf", err) }; unsafe { *(slot as u64) -> d_W_f32 }
+    slot = alloc(8); err = hipMalloc(slot, K*4);   if err != 0 { die("mx",  err) }; unsafe { *(slot as u64) -> d_x }
+    slot = alloc(8); err = hipMalloc(slot, N*4);   if err != 0 { die("mo",  err) }; unsafe { *(slot as u64) -> d_out }
+
+    // Synthetic host buffers.
+    u64 h_W = alloc(N*K*2); u64 h_x = alloc(K*4); u64 h_out = alloc(N*4)
+    u64 i = 0
+    while i < N*K { u64 p = h_W + i*2; unsafe { *(p as u16) = 0x3F00 }; i = i + 1 }
+    i = 0
+    while i < K { u64 p = h_x + i*4; unsafe { *(p as f32) = 0.5 }; i = i + 1 }
+
+    // Pre-warm: H2D weight and dequant once.
+    err = hipMemcpy(d_W_bf16, h_W, N*K*2, 1); if err != 0 { die("H2D W", err) }
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_W_bf16 }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_W_f32 }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = N*K }
+    u64 kp_dq = alloc(3*8)
+    unsafe { *(kp_dq        as u64) = a0 }
+    unsafe { *((kp_dq +  8) as u64) = a1 }
+    unsafe { *((kp_dq + 16) as u64) = a2 }
+    u64 grid_dq_u = (N*K + 255) / 256; u32 grid_dq32 = grid_dq_u
+    err = hipModuleLaunchKernel(fh_dq, grid_dq32, 1, 1, 256, 1, 1, 0, 0, kp_dq, 0); if err != 0 { die("L dq", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync dq", err) }
+
+    // Build gemv kernarg ptr table once.
+    u64 g0 = alloc(8); unsafe { *(g0 as u64) = d_W_f32 }
+    u64 g1 = alloc(8); unsafe { *(g1 as u64) = d_x }
+    u64 g2 = alloc(8); unsafe { *(g2 as u64) = d_out }
+    u64 g3 = alloc(8); unsafe { *(g3 as u64) = N }
+    u64 g4 = alloc(8); unsafe { *(g4 as u64) = K }
+    u64 kp = alloc(5*8)
+    unsafe { *(kp        as u64) = g0 }
+    unsafe { *((kp +  8) as u64) = g1 }
+    unsafe { *((kp + 16) as u64) = g2 }
+    unsafe { *((kp + 24) as u64) = g3 }
+    unsafe { *((kp + 32) as u64) = g4 }
+    u64 grid_u = (N + 255) / 256; u32 grid32 = grid_u
+
+    // Warmup iter (let any first-call lazy paths settle).
+    err = hipMemcpy(d_x, h_x, K*4, 1)
+    err = hipModuleLaunchKernel(fh_gemv, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+    err = hipDeviceSynchronize()
+    err = hipMemcpy(h_out, d_out, N*4, 2)
+
+    print_str("=== single hot iter, per-stage ===\n")
+    u64 t0 = time_now()
+    err = hipMemcpy(d_x, h_x, K*4, 1)
+    u64 t1 = time_now()
+    err = hipModuleLaunchKernel(fh_gemv, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+    u64 t2 = time_now()
+    err = hipDeviceSynchronize()
+    u64 t3 = time_now()
+    err = hipMemcpy(h_out, d_out, N*4, 2)
+    u64 t4 = time_now()
+
+    dump_us("  H2D x  (4 KB):    ", t1 - t0)
+    dump_us("  launch:           ", t2 - t1)
+    dump_us("  sync (drain):     ", t3 - t2)
+    dump_us("  D2H out (8 KB):   ", t4 - t3)
+    dump_us("  total wallclock:  ", t4 - t0)
+
+    // Cache the host-visible pointer once; bypass hipMemcpy entirely.
+    u64 d_x_h   = dev_host_ptr(d_x)
+    u64 d_out_h = dev_host_ptr(d_out)
+    print_str("=== single hot iter, direct host-mapped path ===\n")
+    u64 t0d = time_now()
+    memcpy(d_x_h, h_x, K*4)
+    u64 t1d = time_now()
+    err = hipModuleLaunchKernel(fh_gemv, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+    u64 t2d = time_now()
+    err = hipDeviceSynchronize()
+    u64 t3d = time_now()
+    memcpy(h_out, d_out_h, N*4)
+    u64 t4d = time_now()
+    dump_us("  H2D (memcpy):     ", t1d - t0d)
+    dump_us("  launch:           ", t2d - t1d)
+    dump_us("  sync (drain):     ", t3d - t2d)
+    dump_us("  D2H (memcpy):     ", t4d - t3d)
+    dump_us("  total wallclock:  ", t4d - t0d)
+
+    // Average over 100 hot iters to filter spike noise.
+    print_str("=== average over 100 hot iters (hipMemcpy path) ===\n")
+    u64 acc_h2d = 0; u64 acc_lnch = 0; u64 acc_sync = 0; u64 acc_d2h = 0
+    u64 iter = 0
+    while iter < 100 {
+        u64 a = time_now()
+        err = hipMemcpy(d_x, h_x, K*4, 1)
+        u64 b = time_now()
+        err = hipModuleLaunchKernel(fh_gemv, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+        u64 c = time_now()
+        err = hipDeviceSynchronize()
+        u64 d = time_now()
+        err = hipMemcpy(h_out, d_out, N*4, 2)
+        u64 e = time_now()
+        acc_h2d  = acc_h2d  + (b - a)
+        acc_lnch = acc_lnch + (c - b)
+        acc_sync = acc_sync + (d - c)
+        acc_d2h  = acc_d2h  + (e - d)
+        iter = iter + 1
+    }
+    dump_us("  avg H2D x:   ", acc_h2d  / 100)
+    dump_us("  avg launch:  ", acc_lnch / 100)
+    dump_us("  avg sync:    ", acc_sync / 100)
+    dump_us("  avg D2H:     ", acc_d2h  / 100)
+    u64 total = acc_h2d + acc_lnch + acc_sync + acc_d2h
+    dump_us("  avg total:   ", total / 100)
+
+    // GTT path — output buffer in system RAM, GPU writes via PCIe,
+    // CPU reads at native DRAM rate.
+    u64 d_out_gtt = dev_try_alloc_host_visible(N*4)
+    if d_out_gtt == 0 { die("gtt alloc failed", 0) }
+    u64 d_out_gtt_h = dev_host_ptr(d_out_gtt)
+    // Re-point gemv kernarg c to the GTT buffer.
+    unsafe { *(g2 as u64) = d_out_gtt }
+    // Warmup
+    err = hipModuleLaunchKernel(fh_gemv, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+    err = hipDeviceSynchronize()
+    print_str("=== single hot iter, GTT output ===\n")
+    u64 t0g = time_now()
+    memcpy(d_x_h, h_x, K*4)
+    u64 t1g = time_now()
+    err = hipModuleLaunchKernel(fh_gemv, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+    u64 t2g = time_now()
+    err = hipDeviceSynchronize()
+    u64 t3g = time_now()
+    memcpy(h_out, d_out_gtt_h, N*4)
+    u64 t4g = time_now()
+    dump_us("  H2D (memcpy):     ", t1g - t0g)
+    dump_us("  launch:           ", t2g - t1g)
+    dump_us("  sync (drain):     ", t3g - t2g)
+    dump_us("  D2H (memcpy GTT): ", t4g - t3g)
+    dump_us("  total wallclock:  ", t4g - t0g)
+
+    print_str("=== average over 100 hot iters (GTT output) ===\n")
+    u64 g_h2d = 0; u64 g_lnch = 0; u64 g_sync = 0; u64 g_d2h = 0
+    iter = 0
+    while iter < 100 {
+        u64 a = time_now()
+        memcpy(d_x_h, h_x, K*4)
+        u64 b = time_now()
+        err = hipModuleLaunchKernel(fh_gemv, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+        u64 c = time_now()
+        err = hipDeviceSynchronize()
+        u64 d = time_now()
+        memcpy(h_out, d_out_gtt_h, N*4)
+        u64 e = time_now()
+        g_h2d  = g_h2d  + (b - a)
+        g_lnch = g_lnch + (c - b)
+        g_sync = g_sync + (d - c)
+        g_d2h  = g_d2h  + (e - d)
+        iter = iter + 1
+    }
+    dump_us("  avg H2D memcpy:  ", g_h2d  / 100)
+    dump_us("  avg launch:      ", g_lnch / 100)
+    dump_us("  avg sync:        ", g_sync / 100)
+    dump_us("  avg D2H GTT:     ", g_d2h  / 100)
+    u64 total3 = g_h2d + g_lnch + g_sync + g_d2h
+    dump_us("  avg total:       ", total3 / 100)
+
+    print_str("=== average over 100 hot iters (direct memcpy path) ===\n")
+    u64 a_h2d = 0; u64 a_lnch = 0; u64 a_sync = 0; u64 a_d2h = 0
+    iter = 0
+    while iter < 100 {
+        u64 a = time_now()
+        memcpy(d_x_h, h_x, K*4)
+        u64 b = time_now()
+        err = hipModuleLaunchKernel(fh_gemv, grid32, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+        u64 c = time_now()
+        err = hipDeviceSynchronize()
+        u64 d = time_now()
+        memcpy(h_out, d_out_h, N*4)
+        u64 e = time_now()
+        a_h2d  = a_h2d  + (b - a)
+        a_lnch = a_lnch + (c - b)
+        a_sync = a_sync + (d - c)
+        a_d2h  = a_d2h  + (e - d)
+        iter = iter + 1
+    }
+    dump_us("  avg H2D memcpy:  ", a_h2d  / 100)
+    dump_us("  avg launch:      ", a_lnch / 100)
+    dump_us("  avg sync:        ", a_sync / 100)
+    dump_us("  avg D2H memcpy:  ", a_d2h  / 100)
+    u64 total2 = a_h2d + a_lnch + a_sync + a_d2h
+    dump_us("  avg total:       ", total2 / 100)
+
+    exit(0)
+}

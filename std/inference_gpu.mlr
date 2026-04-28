@@ -25,6 +25,7 @@
 // shim; under HIP runtime they go to libamdhip64.
 
 import "hip.mlr"
+import "kfd.mlr"
 import "io.mlr"
 import "string.mlr"
 
@@ -47,9 +48,20 @@ static u64 _gpu_mm_cache_vals = 0    // u64[cap]   device f32 ptrs
 
 // Per-call activation/output device buffer pool.  Re-allocate when
 // the requested size exceeds capacity; free at module shutdown.
+//
+// Both x and out are allocated as **GTT** (system RAM mapped to GPU)
+// so the CPU read of the result avoids BAR1 latency — on this card
+// CPU-reading 8 KB of host-visible VRAM costs ~11 ms (cacheline-bound
+// PCIe round-trips), but reading the same bytes from GTT is ~6 µs.
+// GPU writes to GTT cost the equivalent of one PCIe transaction
+// (microseconds for the small activations) — net wins are 80×+ on
+// per-call wallclock for the decode shape.  Cached host pointers
+// for both buffers are set at alloc time.
 static u64 _gpu_mm_d_x_buf    = 0
+static u64 _gpu_mm_d_x_h      = 0
 static u64 _gpu_mm_d_x_cap    = 0
 static u64 _gpu_mm_d_out_buf  = 0
+static u64 _gpu_mm_d_out_h    = 0
 static u64 _gpu_mm_d_out_cap  = 0
 
 // === Helpers ===
@@ -175,26 +187,24 @@ fn _gpu_mm_get_or_dequant(u64 w_bf16, u64 K, u64 N) -> u64 {
 
 fn _gpu_mm_ensure_x_buf(u64 want_bytes) -> u64 {
     if _gpu_mm_d_x_cap >= want_bytes { return _gpu_mm_d_x_buf }
-    if _gpu_mm_d_x_buf != 0 { hipFree(_gpu_mm_d_x_buf) }
-    u64 slot = alloc(8)
-    u32 err = hipMalloc(slot, want_bytes)
-    if err != 0 { return 0 }
-    u64 p = 0; unsafe { *(slot as u64) -> p }
-    _gpu_mm_d_x_buf = p
+    if _gpu_mm_d_x_buf != 0 { dev_free(_gpu_mm_d_x_buf) }
+    u64 va = dev_try_alloc_host_visible(want_bytes)
+    if va == 0 { return 0 }
+    _gpu_mm_d_x_buf = va
+    _gpu_mm_d_x_h   = dev_host_ptr(va)
     _gpu_mm_d_x_cap = want_bytes
-    return p
+    return va
 }
 
 fn _gpu_mm_ensure_out_buf(u64 want_bytes) -> u64 {
     if _gpu_mm_d_out_cap >= want_bytes { return _gpu_mm_d_out_buf }
-    if _gpu_mm_d_out_buf != 0 { hipFree(_gpu_mm_d_out_buf) }
-    u64 slot = alloc(8)
-    u32 err = hipMalloc(slot, want_bytes)
-    if err != 0 { return 0 }
-    u64 p = 0; unsafe { *(slot as u64) -> p }
-    _gpu_mm_d_out_buf = p
+    if _gpu_mm_d_out_buf != 0 { dev_free(_gpu_mm_d_out_buf) }
+    u64 va = dev_try_alloc_host_visible(want_bytes)
+    if va == 0 { return 0 }
+    _gpu_mm_d_out_buf = va
+    _gpu_mm_d_out_h   = dev_host_ptr(va)
     _gpu_mm_d_out_cap = want_bytes
-    return p
+    return va
 }
 
 // === Public dispatch ===
@@ -216,11 +226,14 @@ fn matmul_bf16_weights_f32_gpu(u64 out_ptr, u64 x_ptr, u64 w_bf16,
 
     u64 d_x = _gpu_mm_ensure_x_buf(K * 4)
     if d_x == 0 { return 1 }
-    u32 err = hipMemcpy(d_x, x_ptr, K * 4, 1)
-    if err != 0 { return 1 }
+    // Direct memcpy via the cached host-mapped GTT pointer; skips the
+    // kind=1 dispatch in hipMemcpy (parallel-WC for ≥1 MB chunks) which
+    // is wrong for the few-KB activation case.
+    memcpy(_gpu_mm_d_x_h, x_ptr, K * 4)
 
     u64 d_out = _gpu_mm_ensure_out_buf(N * 4)
     if d_out == 0 { return 1 }
+    u32 err = 0
 
     // gemv_f32: c[m] = A[m, k] @ b[k]
     //   args: A_ptr, b_ptr, c_ptr, M (rows), K (cols)
@@ -244,8 +257,8 @@ fn matmul_bf16_weights_f32_gpu(u64 out_ptr, u64 x_ptr, u64 w_bf16,
     err = hipDeviceSynchronize()
     if err != 0 { return 1 }
 
-    err = hipMemcpy(out_ptr, d_out, N * 4, 2)
-    if err != 0 { return 1 }
+    // Direct memcpy from GTT — system RAM read, native DRAM rate.
+    memcpy(out_ptr, _gpu_mm_d_out_h, N * 4)
     return 0
 }
 
