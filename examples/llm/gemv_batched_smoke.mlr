@@ -27,7 +27,10 @@ fn die(uint64 msg, uint64 code) {
 fn main() {
     uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
 
-    // Load the batched kernel.
+    // Load the batched kernel directly (smoke targets the kernel; the
+    // gpu_matmul_to_dev_batched launcher lives in inference_gpu.mlr
+    // and is exercised end-to-end via the qwen3 forward path once
+    // slice 1.3.2's chain reshape lands).
     u64 fd = file_open("/tmp/gemv_coop_f32_batched.co", 0)
     if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
     u64 sz = file_size(fd); u64 blob = alloc(sz)
