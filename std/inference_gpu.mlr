@@ -543,17 +543,18 @@ fn gpu_matmul_to_dev(u64 d_out, u64 d_x, u64 w_bf16, u64 N, u64 K) -> u64 {
     if gpu_matmul_enabled() == 0 { return 1 }
     if _gpu_mm_fh_gemv_coop == 0 { return 1 }
 
-    // bf16-direct is default when the kernel loaded — halves A bandwidth
-    // by reading the weights directly as bf16 instead of going through
-    // the f32 dequant cache.  Bit-exact vs the f32 path on Qwen3.
-    // Opt out via MLRIFT_GPU_MATMUL_BF16=0.
+    // Decode shapes on the chained path (N = 1024..6144) are
+    // compute-bound, not memory-bound, so the bf16-direct kernel's
+    // per-fmac lshl16 makes it ~1-2 % slower than the f32 path
+    // empirically.  bf16-direct stays on the legacy lm_head path
+    // (N ≈ 152 k, memory-bound).  Set MLRIFT_GPU_MATMUL_BF16=1 to
+    // opt in here for benchmarking.
     u64 use_bf16 = 0
     if _gpu_mm_fh_gemv_coop_bf16 != 0 {
-        use_bf16 = 1
         u64 bf16_env = getenv("MLRIFT_GPU_MATMUL_BF16")
         if bf16_env != 0 {
             u8 bc = 0; unsafe { *(bf16_env as u8) -> bc }
-            if bc == 48 { use_bf16 = 0 }   // explicit '0' = opt-out
+            if bc != 48 { use_bf16 = 1 }
         }
     }
 
