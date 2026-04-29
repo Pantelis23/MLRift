@@ -380,21 +380,28 @@ fn main() {
                         u64 d_out_b = 0; unsafe { *((d_out_arr + b_attn_phase * 8) as u64) -> d_out_b }
                         u64 kc = k_cache + layer * batch_stride + b_attn_phase * layer_stride
                         u64 vc = v_cache + layer * batch_stride + b_attn_phase * layer_stride
-                        // 0x02 = attn region only
-                        if qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, kc, vc, num_workers, b_attn_phase, 0x02) != 0 { exit(1) }
+                        // 0x02 = attn region; 0x200 = skip Q-rope (batched below).
+                        if qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, kc, vc, num_workers, b_attn_phase, 0x202) != 0 { exit(1) }
                         b_attn_phase = b_attn_phase + 1
                     }
+                    // ONE batched Q-rope across all streams (n_heads = batch * nh).
+                    if gpu_rope_f32_to_dev(_gpuq_d_q_attn, _gpuq_d_rope_cos, _gpuq_d_rope_sin,
+                                            batch_size * QWEN3_N_HEADS) != 0 { exit(1) }
                     // Batched o_proj: _gpuq_d_o = w.o_proj_w @ _gpuq_d_attn
                     if gpu_matmul_to_dev_batched(_gpuq_d_o, _gpuq_d_attn, w.o_proj_w,
                                                   hidden, q_dim, batch_size) != 0 { exit(1) }
-                    // Per-stream resid + post_norm (0x08).
+                    // Per-stream resid (0x08); 0x100 = skip post_norm (batched below).
                     u64 b_resid = 0
                     while b_resid < batch_size {
                         u64 d_in_b  = 0; unsafe { *((d_in_arr  + b_resid * 8) as u64) -> d_in_b }
                         u64 d_out_b = 0; unsafe { *((d_out_arr + b_resid * 8) as u64) -> d_out_b }
-                        if qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, 0, 0, num_workers, b_resid, 0x08) != 0 { exit(1) }
+                        if qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, 0, 0, num_workers, b_resid, 0x108) != 0 { exit(1) }
                         b_resid = b_resid + 1
                     }
+                    // ONE batched post_norm across all streams (M = batch).
+                    u64 d_post_gamma_b = gpu_cache_bf16_as_f32(w.post_norm_w, hidden)
+                    if d_post_gamma_b == 0 { exit(1) }
+                    if gpu_rmsnorm_1024_to_dev(_gpuq_d_mid_norm, _gpuq_d_mid, d_post_gamma_b, batch_size) != 0 { exit(1) }
                     // Batched gate_up.
                     if gpu_matmul_to_dev_batched(_gpuq_d_gu, _gpuq_d_mid_norm, w.gate_proj_w,
                                                   2 * ff, hidden, batch_size) != 0 { exit(1) }

@@ -1254,10 +1254,12 @@ fn qwen3_forward_layer_qkv_batched_gpu(u64 d_x_in_arr_ptr,
 //   0x20  silu_mul                       (step 13)
 //   0x40  down matmul                    (step 14)
 //   0x80  final resid                    (step 15)
-// Legacy path uses 0xFF (all phases).  Batched path uses 0xAA (per-stream
-// phases only — 0x02|0x08|0x20|0x80) and dispatches the 3 BATCHED matmuls
-// (0x04, 0x10, 0x40) via gpu_matmul_to_dev_batched separately, plus the
-// initial 0x01 via qwen3_forward_layer_qkv_batched_gpu.
+// Sub-bits (set in addition to a phase bit to *skip* a sub-step):
+//   0x100  inside 0x08, skip post_norm   (caller batches it)
+//   0x200  inside 0x02, skip Q-rope      (caller batches it)
+// Legacy path uses 0xFF (no skip bits) — every sub-step runs inline.
+// Batched path uses 0x02|0x200, 0x08|0x100 plus the batched matmul +
+// post_norm + Q-rope calls dispatched separately by qwen3_generate.
 fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
                             Qwen3LayerWeights w, u64 pos,
                             u64 k_cache_layer, u64 v_cache_layer,
@@ -1358,8 +1360,12 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
         if gpu_qknorm_f32_to_dev(b_q_attn, b_qkv, d_q_gamma, nh) != 0 { return 1 }
         if gpu_qknorm_f32_to_dev(d_k_slot, d_k_slot, d_k_gamma, nkv) != 0 { return 1 }
 
-        // 4c. RoPE: in-place per-head rotation.
-        if gpu_rope_f32_to_dev(b_q_attn, _gpuq_d_rope_cos, _gpuq_d_rope_sin, nh) != 0 { return 1 }
+        // 4c. RoPE: in-place per-head rotation.  Q-rope is skippable
+        //     when the batched-decode caller has dispatched it once
+        //     across all M streams (mask 0x200).
+        if (phase_mask & 0x200) == 0 {
+            if gpu_rope_f32_to_dev(b_q_attn, _gpuq_d_rope_cos, _gpuq_d_rope_sin, nh) != 0 { return 1 }
+        }
         if gpu_rope_f32_to_dev(d_k_slot,  _gpuq_d_rope_cos, _gpuq_d_rope_sin, nkv) != 0 { return 1 }
 
         // 4d. Fused attention.
@@ -1427,12 +1433,16 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
     if (phase_mask & 0x04) != 0 {
         if gpu_matmul_to_dev(b_o, b_attn, w.o_proj_w, hidden, q_dim) != 0 { return 1 }
     }
-    // Steps 10-11: resid + post_norm (0x08).
+    // Steps 10-11: resid + post_norm (0x08).  post_norm is skippable
+    // when the batched-decode caller has dispatched it once across
+    // all M streams (mask 0x100).
     if (phase_mask & 0x08) != 0 {
         if gpu_resid_add_to_dev(b_mid, d_x_in, b_o, hidden) != 0 { return 1 }
-        u64 d_post_gamma = gpu_cache_bf16_as_f32(w.post_norm_w, hidden)
-        if d_post_gamma == 0 { return 1 }
-        if gpu_rmsnorm_1024_to_dev(b_mid_norm, b_mid, d_post_gamma, 1) != 0 { return 1 }
+        if (phase_mask & 0x100) == 0 {
+            u64 d_post_gamma = gpu_cache_bf16_as_f32(w.post_norm_w, hidden)
+            if d_post_gamma == 0 { return 1 }
+            if gpu_rmsnorm_1024_to_dev(b_mid_norm, b_mid, d_post_gamma, 1) != 0 { return 1 }
+        }
     }
     // Step 12: gate_up matmul (0x10).
     if (phase_mask & 0x10) != 0 {
