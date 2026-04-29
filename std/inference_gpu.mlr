@@ -46,6 +46,7 @@ static u64 _gpu_mm_fh_gemm     = 0
 static u64 _gpu_fh_resid_add   = 0
 static u64 _gpu_fh_silu_mul    = 0
 static u64 _gpu_fh_rmsnorm_1024 = 0       // hidden-dim rmsnorm (N=1024)
+static u64 _gpu_fh_attn_decode  = 0       // fused decode-attn (Q·K → softmax → ·V)
 
 // Parallel cache for bf16-direct path: maps host w_bf16 ptr → device
 // bf16 ptr (one-shot H2D, no dequant).
@@ -134,6 +135,7 @@ fn _gpu_mm_init_once() {
     _gpu_fh_resid_add         = _gpu_mm_load_co("/tmp/residual_add_f32.co",   "residual_add_f32")
     _gpu_fh_silu_mul          = _gpu_mm_load_co("/tmp/silu_mul_f32.co",       "silu_mul_f32")
     _gpu_fh_rmsnorm_1024      = _gpu_mm_load_co("/tmp/rmsnorm_f32_1024.co",   "rmsnorm_f32")
+    _gpu_fh_attn_decode       = _gpu_mm_load_co("/tmp/attn_decode_f32.co",    "attn_decode_f32")
     if _gpu_mm_fh_dq == 0 || _gpu_mm_fh_gemv == 0 { return }
 
     _gpu_mm_cache_keys = alloc(_gpu_mm_cache_cap * 8)
@@ -551,6 +553,39 @@ fn gpu_matmul_to_dev(u64 d_out, u64 d_x, u64 w_bf16, u64 N, u64 K) -> u64 {
 
     u32 cgrid = N
     u32 err = hipModuleLaunchKernel(_gpu_mm_fh_gemv_coop, cgrid, 1, 1, 32, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
+// gpu_attn_decode_to_dev: fused decode-attention for Qwen3-0.6B shape
+// (nh=16, nkv=8, hd=128).  Computes
+//   out[h, j] = Σ_p softmax_p ((1/√128) Σ_k q[h,k] * K[p, h>>1, k])
+//             * V[p, h>>1, j]
+// where the softmax runs over positions 0..pos_plus_1.
+//
+// All four buffers are device VAs (kernel does the loads/stores via
+// global_load/store).  Caller has placed the freshly-rope'd q at
+// d_q (16*128 f32 = 8 KB) and the up-to-date kv-cache slots at d_kc /
+// d_vc (max_seq=64; 64*8*128 f32 = 256 KB each).  Output lands in
+// d_out (8 KB).
+//
+// Returns 0 on success (kernel queued, no implicit sync).
+fn gpu_attn_decode_to_dev(u64 d_q, u64 d_kc, u64 d_vc, u64 d_out,
+                           u64 pos_plus_1) -> u64 {
+    if _gpu_fh_attn_decode == 0 { return 1 }
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_q }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_kc }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = d_vc }
+    u64 a3 = alloc(8); unsafe { *(a3 as u64) = d_out }
+    u64 a4 = alloc(8); unsafe { *(a4 as u64) = pos_plus_1 }
+    u64 kp = alloc(5 * 8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+    unsafe { *((kp + 24) as u64) = a3 }
+    unsafe { *((kp + 32) as u64) = a4 }
+    // grid = nh = 16 (one WG per query head); block = 32 (one wave).
+    u32 err = hipModuleLaunchKernel(_gpu_fh_attn_decode, 16, 1, 1, 32, 1, 1, 0, 0, kp, 0)
     if err != 0 { return 1 }
     return 0
 }
