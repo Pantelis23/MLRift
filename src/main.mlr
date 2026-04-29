@@ -4623,6 +4623,18 @@ fn main() {
                 write(1, gc_path, gcl)
                 write(1, " (amdgpu gemv-coop-f32 code object)\n", 36)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-gemv-coop-f32-batched=", 36) != 0 {
+                uint64 gvb_path = arg + 36
+                uint64 gvb_rc = emit_amdgpu_gemv_coop_f32_batched_blob(gvb_path)
+                if gvb_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-gemv-coop-f32-batched failed\n", 49)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 gvbl = str_len(gvb_path)
+                write(1, gvb_path, gvbl)
+                write(1, " (amdgpu gemv-coop-f32-batched code object, grid=(N,batch))\n", 61)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-gemv-coop-bf16-f32=", 33) != 0 {
                 // bf16-direct cooperative gemv (task #76).  Reads bf16
                 // weights directly, halves A bandwidth + skips dequant.

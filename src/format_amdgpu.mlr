@@ -6017,6 +6017,141 @@ fn _emit_gemv_coop_f32_body(uint64 args_desc) {
     uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
 }
 
+// Batched-gemv: same as _emit_gemv_coop_f32_body but per-WG also reads
+// a wg_id_y batch index from s16 (rsrc2 = 0x19E enables both X and Y
+// workgroup IDs).  Shifts b_ptr by wg_id_y * K * 4 and c_ptr by
+// wg_id_y * N * 4 so each (wg_x, wg_y) WG produces out[wg_y, wg_x].
+// Caller dispatches grid = (N, batch_size, 1).
+//
+// At wg_id_y = 0 the math collapses to the base kernel — Phase 1.3
+// uses this kernel for both batch=1 and batch>1, single binary.
+fn _emit_gemv_coop_f32_batched_body(uint64 args_desc) {
+    asm_init()
+
+    // Prologue: kernarg load (a_ptr, b_ptr, c_ptr, m, k_dim).
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)       // s_load_b256 s[4:11], s[0:1], 0x0
+    asm_u32(0xF4040300); asm_u32(0xF8000020)       // s_load_b64  s[12:13], s[0:1], 0x20
+    asm_u32(0xBF89FC07)                            // s_waitcnt   lgkmcnt(0)
+
+    // wg_id_y is in s16 (USER_SGPR_COUNT=15 → s15=wg_x, s16=wg_y).
+    // b_ptr (= s[6:7]) += wg_y * K * 4
+    asm_u32(0x960E0C10)                            // s_mul_i32  s14, s16, s12   (wg_y * K)
+    asm_u32(0x840E820E)                            // s_lshl_b32 s14, s14, 2     (* 4 bytes)
+    asm_u32(0x80060E06)                            // s_add_u32  s6, s6, s14
+    asm_u32(0x82078007)                            // s_addc_u32 s7, s7, 0
+    // c_ptr (= s[8:9]) += wg_y * N * 4   (N is s10)
+    asm_u32(0x960E0A10)                            // s_mul_i32  s14, s16, s10
+    asm_u32(0x840E820E)                            // s_lshl_b32 s14, s14, 2
+    asm_u32(0x80080E08)                            // s_add_u32  s8, s8, s14
+    asm_u32(0x82098009)                            // s_addc_u32 s9, s9, 0
+
+    // WG-level bounds check on x dim (output row).
+    asm_u32(0xBF090A0F)                            // s_cmp_ge_u32 s15, s10
+    uint64 cbranch_end_idx = asm_text_len / 4
+    asm_u32(0xBFA20000)                            // s_cbranch_scc1 .Lend (patched)
+
+    // a_row_base = a_ptr + row*K*4   (per-WG; a is shared across batch).
+    asm_u32(0x96100C0F)                            // s_mul_i32  s16, s15, s12
+    asm_u32(0x84108210)                            // s_lshl_b32 s16, s16, 2
+    asm_u32(0x80101004)                            // s_add_u32  s16, s4, s16
+    asm_u32(0x82118005)                            // s_addc_u32 s17, s5, 0
+
+    // Per-lane init.
+    asm_u32(0x300C0082)                            // v_lshlrev_b32 v6, 2, v0
+    asm_v_mov_b32(7, 0x100 | 6)                    // v7 = v6
+    asm_v_mov_b32(5, 0x80)                         // v5 = inline 0
+    asm_u32(0xBE920080)                            // s_mov_b32  s18, 0
+    asm_u32(0x8513880C)                            // s_lshr_b32 s19, s12, 8
+
+    // .Lloop: identical to single-stream — a from s[16:17], b from
+    // s[6:7] (now batch-shifted).
+    uint64 loop_idx = asm_text_len / 4
+    asm_u32(0xDC520000); asm_u32(0x08100007)
+    asm_u32(0xDC520000); asm_u32(0x09060007)
+    asm_u32(0xDC520080); asm_u32(0x0A100007)
+    asm_u32(0xDC520080); asm_u32(0x0B060007)
+    asm_u32(0xDC520100); asm_u32(0x0C100007)
+    asm_u32(0xDC520100); asm_u32(0x0D060007)
+    asm_u32(0xDC520180); asm_u32(0x0E100007)
+    asm_u32(0xDC520180); asm_u32(0x0F060007)
+    asm_u32(0xDC520200); asm_u32(0x10100007)
+    asm_u32(0xDC520200); asm_u32(0x11060007)
+    asm_u32(0xDC520280); asm_u32(0x12100007)
+    asm_u32(0xDC520280); asm_u32(0x13060007)
+    asm_u32(0xDC520300); asm_u32(0x14100007)
+    asm_u32(0xDC520300); asm_u32(0x15060007)
+    asm_u32(0xDC520380); asm_u32(0x16100007)
+    asm_u32(0xDC520380); asm_u32(0x17060007)
+    asm_u32(0xBF8903F7)
+    asm_u32(0x560A1308)
+    asm_u32(0x560A170A)
+    asm_u32(0x560A1B0C)
+    asm_u32(0x560A1F0E)
+    asm_u32(0x560A2310)
+    asm_u32(0x560A2712)
+    asm_u32(0x560A2B14)
+    asm_u32(0x560A2F16)
+    asm_u32(0x4A0E0EFF); asm_u32(0x00000400)
+    asm_u32(0x80128112)
+    asm_u32(0xBF0A1312)
+    uint64 loop_branch_idx = asm_text_len / 4
+    uint64 back_simm = loop_idx - (loop_branch_idx + 1)
+    asm_u32(0xBFA20000 | (back_simm & 0xFFFF))
+
+    // Reduce + lane-0 store (c[wg_y, wg_x] = total_sum).
+    asm_u32(0xD8340000); asm_u32(0x00000506)
+    asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)
+    _emit_lds_reduce_pow2(32, 0x060A0F05, 14)
+    asm_v_cmp_eq_u32_imm_vgpr(0, 0)
+    asm_u32(0xBE82206A)
+    asm_v_mov_b32(3, 15)
+    asm_u32(0x30060682)
+    asm_u32(0xDC6A0000); asm_u32(0x00080503)
+    asm_u32(0xBC7C0000)
+    asm_u32(0xBEFE0002)
+
+    asm_u32(0xBFB00000)
+
+    uint64 total_dwords = asm_text_len / 4
+    uint64 fwd_simm = total_dwords - cbranch_end_idx - 2
+    asm_patch_u32(cbranch_end_idx, 0xBFA20000 | (fwd_simm & 0xFFFF))
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a8 = args_desc + 64;  unsafe { *(a8 as uint64) = 8 }
+    uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+@export
+fn emit_amdgpu_gemv_coop_f32_batched_blob(uint64 out_path) -> uint64 {
+    uint64[10] args_desc
+    _emit_gemv_coop_f32_batched_body(args_desc)
+    // rsrc2 = 0x19E enables BOTH workgroup_id_x (s15) AND
+    // workgroup_id_y (s16).  Other fields identical to the
+    // single-stream variant.
+    uint64 size = emit_amdgpu_code_object_lds("gemv_coop_f32_batched", 21,
+                                               asm_text_buf, asm_text_len,
+                                               40, 8, 18, 32,
+                                               0xE0AF0003, 0x0000019E, 0x00000010, 0x0408,
+                                               args_desc, 5,
+                                               128)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_gemv_coop_f32_batched_blob: cannot open output\n", 60)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 fn emit_amdgpu_gemv_coop_f32_blob(uint64 out_path) -> uint64 {
     uint64[10] args_desc
     _emit_gemv_coop_f32_body(args_desc)
