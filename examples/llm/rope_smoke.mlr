@@ -1,0 +1,92 @@
+// Step-D part 2 smoke: validates gpu_rope_f32_to_dev (per-head RoPE
+// with shared cos/sin) against the CPU qwen3_rope_apply reference at
+// Qwen3-0.6B head shape (n_heads=16, head_dim=128, half=64).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-rope-qwen3=/tmp/rope_qwen3_f32.co dummy
+//   MLRIFT_GPU_MATMUL=1 ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/rope_smoke.mlr -o /tmp/rope_smoke
+// Run:
+//   MLRIFT_GPU_MATMUL=1 /tmp/rope_smoke
+
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/math_float.mlr"
+import "../../std/inference_gpu.mlr"
+import "../../std/qwen3.mlr"
+
+@dynamic extern fn exit(uint64 code)
+
+fn die(uint64 msg, uint64 code) {
+    print_str(msg); print_str(" e="); u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n"); exit(1)
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+    if gpu_matmul_enabled() == 0 { print_str("MLRIFT_GPU_MATMUL not set\n"); exit(1) }
+
+    u64 n_heads = 16
+    u64 head_dim = 128
+    u64 half = head_dim / 2
+    u64 bytes_x  = n_heads * head_dim * 4
+    u64 bytes_cs = half * 4
+
+    u64 h_x_cpu = alloc(bytes_x)
+    u64 h_x_gpu = alloc(bytes_x)
+    u64 h_cos   = alloc(bytes_cs)
+    u64 h_sin   = alloc(bytes_cs)
+
+    u64 i = 0
+    while i < n_heads * head_dim {
+        f64 vd = int_to_f64(i * 7 + 11) * 0.013 - 1.0
+        while vd > 1.0 { vd = vd - 2.0 }
+        while vd < -1.0 { vd = vd + 2.0 }
+        unsafe { *((h_x_cpu + i * 4) as f32) = f64_to_f32(vd) }
+        unsafe { *((h_x_gpu + i * 4) as f32) = f64_to_f32(vd) }
+        i = i + 1
+    }
+    // Use real RoPE cos/sin for position 5 so we exercise non-trivial values.
+    f64 theta = 1000000.0
+    qwen3_rope_compute(h_cos, h_sin, 5, head_dim, theta)
+
+    // CPU reference.
+    qwen3_rope_apply(h_x_cpu, h_cos, h_sin, n_heads, head_dim)
+
+    // GPU run.
+    u64 d_x = 0; u64 d_cos = 0; u64 d_sin = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, bytes_x);  if err != 0 { die("mx",   err) }; unsafe { *(slot as u64) -> d_x }
+    slot = alloc(8); err = hipMalloc(slot, bytes_cs); if err != 0 { die("mcos", err) }; unsafe { *(slot as u64) -> d_cos }
+    slot = alloc(8); err = hipMalloc(slot, bytes_cs); if err != 0 { die("msin", err) }; unsafe { *(slot as u64) -> d_sin }
+    err = hipMemcpy(d_x,   h_x_gpu, bytes_x,  1); if err != 0 { die("H2D x",   err) }
+    err = hipMemcpy(d_cos, h_cos,   bytes_cs, 1); if err != 0 { die("H2D cos", err) }
+    err = hipMemcpy(d_sin, h_sin,   bytes_cs, 1); if err != 0 { die("H2D sin", err) }
+
+    if gpu_rope_f32_to_dev(d_x, d_cos, d_sin, n_heads) != 0 { die("launch", 0) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+    err = hipMemcpy(h_x_gpu, d_x, bytes_x, 2); if err != 0 { die("D2H", err) }
+
+    u64 fail = 0
+    f32 max_abs = 0.0f
+    u64 k = 0
+    while k < n_heads * head_dim {
+        f32 cv = 0.0f; unsafe { *((h_x_cpu + k * 4) as f32) -> cv }
+        f32 gv = 0.0f; unsafe { *((h_x_gpu + k * 4) as f32) -> gv }
+        f32 d = cv - gv; if d < 0.0f { d = 0.0f - d }
+        if d > max_abs { max_abs = d }
+        if d > 0.00001f { fail = fail + 1 }
+        k = k + 1
+    }
+    print_str("rope fail count: "); u64 sf = fmt_dec(fail); print_str(sf); dealloc(sf)
+    print_str(" / "); u64 stot = fmt_dec(n_heads * head_dim); print_str(stot); dealloc(stot); print_str("\n")
+    u64 mb = alloc(4); unsafe { *(mb as f32) = max_abs }
+    u32 mb_b = 0; unsafe { *(mb as u32) -> mb_b }
+    u64 mb64 = mb_b
+    print_str("max abs diff bits="); u64 smb = fmt_dec(mb64); print_str(smb); dealloc(smb); print_str("\n"); dealloc(mb)
+    if fail == 0 {
+        print_str("OK — gpu_rope_f32_to_dev matches CPU qwen3_rope_apply.\n"); exit(0)
+    } else {
+        print_str("FAIL\n"); exit(1)
+    }
+}

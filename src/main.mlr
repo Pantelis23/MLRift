@@ -4957,6 +4957,19 @@ fn main() {
                 write(1, qkn_path, qknl)
                 write(1, " (amdgpu qknorm-f32 code object, N=128, eps=1e-6)\n", 51)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-rope-qwen3=", 25) != 0 {
+                // Per-head RoPE for Qwen3 decode (shared cos/sin, head_dim=128).
+                uint64 rp_path = arg + 25
+                uint64 rp_rc = emit_amdgpu_rope_qwen3_f32_blob(rp_path)
+                if rp_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-rope-qwen3 failed\n", 38)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 rpl = str_len(rp_path)
+                write(1, rp_path, rpl)
+                write(1, " (amdgpu rope-qwen3 code object, head_dim=128)\n", 48)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-layernorm-f32-N=", 30) != 0 {
                 // Format: --emit-amdgpu-layernorm-f32-N=<N>:<path>
                 uint64 lnn_arg = arg + 30

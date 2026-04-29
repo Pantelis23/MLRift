@@ -6515,6 +6515,93 @@ fn emit_amdgpu_attn_decode_f32_blob(uint64 out_path) -> uint64 {
     return 0
 }
 
+// Per-head RoPE for Qwen3 decode: head_dim = 128 hardcoded, half = 64.
+// Each WG handles one head's 128-element slice; block = 64 lanes,
+// one lane per (i, i+half) pair.  In-place rotation:
+//   x[..i..]      = x[..i..] * cos[i]      - x[..i+half..] * sin[i]
+//   x[..i+half..] = x[..i..] * sin[i]      + x[..i+half..] * cos[i]
+//
+// Kernarg layout (32 bytes, 4 args):
+//   [0x00] x_ptr   → s[4:5]
+//   [0x08] cos_ptr → s[6:7]   (half = 64 f32s)
+//   [0x10] sin_ptr → s[8:9]   (half = 64 f32s)
+//   [0x18] n_heads → s[10:11] (used only as the s_cmp_ge_u32 bound)
+//
+// VGPR layout: v0 = lane id; v1 = lane*4; v2 = x1; v3 = x2; v4 = c;
+// v5 = s; v8 = x1*c; v6 = y1; v9 = y2.
+// Per-head RoPE for Qwen3 decode (shared cos/sin tables across heads,
+// in-place rotation).  Differs from the existing _emit_rope_f32_body
+// which assumes per-row cos/sin tables of length M*64.
+fn _emit_rope_qwen3_f32_body(uint64 args_desc) {
+    asm_init()
+
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)       // s_load_b256 s[4:11], s[0:1], 0x0
+    asm_u32(0xBF89FC07)                            // s_waitcnt   lgkmcnt(0)
+
+    asm_u32(0xBF090A0F)                            // s_cmp_ge_u32 s15, s10
+    uint64 cbranch_idx = asm_text_len / 4
+    asm_u32(0xBFA20000)                            // s_cbranch_scc1 .Lend (patched)
+
+    asm_u32(0x840C890F)                            // s_lshl_b32 s12, s15, 9
+    asm_u32(0x80100C04)                            // s_add_u32  s16, s4, s12
+    asm_u32(0x82118005)                            // s_addc_u32 s17, s5, 0
+
+    asm_u32(0x30020082)                            // v_lshlrev_b32 v1, 2, v0
+    asm_s_delay_alu(0x01)
+
+    asm_u32(0xDC520000); asm_u32(0x02100001)       // global_load_b32 v2, v1, s[16:17]
+    asm_u32(0xDC520100); asm_u32(0x03100001)       // global_load_b32 v3, v1, s[16:17] offset:256
+    asm_u32(0xDC520000); asm_u32(0x04060001)       // global_load_b32 v4, v1, s[6:7]
+    asm_u32(0xDC520000); asm_u32(0x05080001)       // global_load_b32 v5, v1, s[8:9]
+    asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)
+
+    asm_u32(0x10100902)                            // v_mul_f32  v8, v2, v4
+    asm_u32(0x100C0B03)                            // v_mul_f32  v6, v3, v5
+    asm_u32(0x080C0D08)                            // v_sub_f32  v6, v8, v6   (op 0x04; 0x05 = subrev)
+    asm_u32(0x10120B02)                            // v_mul_f32  v9, v2, v5
+    asm_u32(0x56120903)                            // v_fmac_f32 v9, v3, v4
+    asm_s_delay_alu(0x01)
+
+    asm_u32(0xDC6A0000); asm_u32(0x00100601)       // global_store_b32 v1, v6, s[16:17]
+    asm_u32(0xDC6A0100); asm_u32(0x00100901)       // global_store_b32 v1, v9, s[16:17] offset:256
+    asm_u32(0xBC7C0000)                            // s_waitcnt_vscnt null, 0
+
+    asm_u32(0xBFB00000)                            // s_endpgm
+
+    uint64 total_dwords = asm_text_len / 4
+    uint64 simm16 = total_dwords - cbranch_idx - 2
+    asm_patch_u32(cbranch_idx, 0xBFA20000 | (simm16 & 0xFFFF))
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+@export
+fn emit_amdgpu_rope_qwen3_f32_blob(uint64 out_path) -> uint64 {
+    uint64[8] args_desc
+    _emit_rope_qwen3_f32_body(args_desc)
+    uint64 size = emit_amdgpu_code_object_lds("rope_qwen3_f32", 14,
+                                               asm_text_buf, asm_text_len,
+                                               32, 8, 18, 16,
+                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 4,
+                                               0)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_rope_qwen3_f32_blob: cannot open output\n", 53)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 // Phase 2 routing: lower a name-matched @kernel `gemv_f32` into the
 // kernel table. Snapshots the ISA so a subsequent kernel's asm_init
 // can't clobber it before emit_amdgpu_multi_code_object runs.
