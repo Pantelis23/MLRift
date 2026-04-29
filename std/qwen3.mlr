@@ -1121,6 +1121,25 @@ static u64 _gpuq_d_gu        = 0
 static u64 _gpuq_d_ff        = 0
 static u64 _gpuq_d_ff_out    = 0
 
+// Device-resident Q (post-rope) staged for the fused attn kernel, plus
+// host-mapped pointer for the CPU-side qknorm/rope writeback.
+static u64 _gpuq_d_q_attn    = 0
+static u64 _gpuq_d_q_attn_h  = 0
+
+// KV cache device VAs (Step C of attn wiring).  Set once via
+// qwen3_gpu_set_kv_cache_dev() before the layer sweep; used by the
+// fused attention launcher to address each layer's KV slab.
+static u64 _gpuq_kv_k_dev_base = 0
+static u64 _gpuq_kv_v_dev_base = 0
+static u64 _gpuq_kv_layer_stride = 0
+
+@export
+fn qwen3_gpu_set_kv_cache_dev(u64 k_dev_base, u64 v_dev_base, u64 layer_stride) {
+    _gpuq_kv_k_dev_base   = k_dev_base
+    _gpuq_kv_v_dev_base   = v_dev_base
+    _gpuq_kv_layer_stride = layer_stride
+}
+
 fn _qwen3_gpu_pipeline_init() -> u64 {
     if _gpuq_init != 0 { return _gpuq_init }
     if gpu_pipeline_ready() == 0 { return 0 }
@@ -1143,6 +1162,8 @@ fn _qwen3_gpu_pipeline_init() -> u64 {
     _gpuq_d_gu       = gpu_buf_reserve(2 * ff * 4, 0)
     _gpuq_d_ff       = gpu_buf_reserve(ff * 4, 0)
     _gpuq_d_ff_out   = gpu_buf_reserve(hidden * 4, 0)
+    _gpuq_d_q_attn   = gpu_buf_reserve(q_dim * 4, hslot)
+    unsafe { *(hslot as u64) -> _gpuq_d_q_attn_h }
 
     if _gpuq_d_x_norm == 0 { return 0 }
     if _gpuq_d_qkv == 0 { return 0 }
@@ -1153,6 +1174,7 @@ fn _qwen3_gpu_pipeline_init() -> u64 {
     if _gpuq_d_gu == 0 { return 0 }
     if _gpuq_d_ff == 0 { return 0 }
     if _gpuq_d_ff_out == 0 { return 0 }
+    if _gpuq_d_q_attn == 0 { return 0 }
 
     _gpuq_init = 1
     return 1
@@ -1237,14 +1259,38 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
     qwen3_rope_apply(q_buf, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nh, hd)
     qwen3_rope_apply(k_row, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nkv, hd)
 
-    u64 attn_out = alloc(q_dim * 4)
-    qwen3_attn_cached(attn_out, q_buf, k_cache_layer, v_cache_layer,
-                      pos + 1, nh, nkv, hd)
+    // 5.  Attention.  When KV cache is GTT-resident AND the fused
+    //     attn kernel is loaded, dispatch on GPU (Step E of attn
+    //     wiring); otherwise fall back to the CPU AVX2 path.
+    u64 use_gpu_attn = 0
+    if _gpuq_kv_k_dev_base != 0 {
+        if _gpuq_kv_v_dev_base != 0 {
+            use_gpu_attn = 1
+        }
+    }
+    if use_gpu_attn != 0 {
+        // Stage post-rope Q into the device-resident Q buffer.  The
+        // KV cache is already GTT (host writes from qknorm+rope are
+        // visible to the GPU via the same physical pages).
+        memcpy(_gpuq_d_q_attn_h, q_buf, q_dim * 4)
 
-    // 5.  H2D attn_out → d_attn (direct GTT memcpy).
-    memcpy(_gpuq_d_attn_h, attn_out, q_dim * 4)
-    dealloc(q_buf)
-    dealloc(attn_out)
+        u64 layer_idx = (k_cache_layer - dev_host_ptr(_gpuq_kv_k_dev_base)) / _gpuq_kv_layer_stride
+        u64 d_kc_layer = _gpuq_kv_k_dev_base + layer_idx * _gpuq_kv_layer_stride
+        u64 d_vc_layer = _gpuq_kv_v_dev_base + layer_idx * _gpuq_kv_layer_stride
+
+        if gpu_attn_decode_to_dev(_gpuq_d_q_attn, d_kc_layer, d_vc_layer,
+                                   _gpuq_d_attn, pos + 1) != 0 { return 1 }
+        // _gpuq_d_attn now holds the per-head attention output; the
+        // chained o_proj call below consumes it directly without sync.
+        dealloc(q_buf)
+    } else {
+        u64 attn_out = alloc(q_dim * 4)
+        qwen3_attn_cached(attn_out, q_buf, k_cache_layer, v_cache_layer,
+                          pos + 1, nh, nkv, hd)
+        memcpy(_gpuq_d_attn_h, attn_out, q_dim * 4)
+        dealloc(q_buf)
+        dealloc(attn_out)
+    }
 
     // 6.  Chained GPU section — 6 ops, no intermediate sync:
     //     o_proj → resid → post_norm → gate_up → silu → down → resid
