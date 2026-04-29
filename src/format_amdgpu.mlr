@@ -6402,13 +6402,80 @@ fn _emit_attn_decode_f32_body(uint64 args_desc) {
     asm_u32(0x100A0B0B)                            // v_mul_f32 v5, v11, v5
 
     // Recompute active mask, then lane < pos_plus_1 stores the weight
-    // back to LDS scores buffer AND to global out (for verification).
+    // back to LDS scores buffer (consumed by the accum loop below).
     asm_u32(0x7C98000C)                            // v_cmp_gt_u32 vcc_lo, s12, v0
     asm_u32(0xBE82206A)                            // s_and_saveexec_b32 s2, vcc_lo
     asm_u32(0xD8340080); asm_u32(0x00000506)       // ds_store_b32 v6, v5 offset:128
-    asm_u32(0xDC6A0000); asm_u32(0x00180506)       // global_store_b32 v6, v5, s[24:25]
-    asm_u32(0xBC7C0000)                            // s_waitcnt_vscnt null, 0
     asm_u32(0xBEFE0002)                            // s_mov_b32 exec_lo, s2
+    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
+    asm_u32(0xBFBD0000)                            // s_barrier  (all lanes see weights)
+
+    // ---------------------------------------------------------------
+    // MILESTONE 4: Accum loop  acc[lane*4..+3] = Σᵢ w[i] · V[i, kvh, lane*4..+3]
+    // ---------------------------------------------------------------
+    // Each lane owns 4 elements of the head's output row.  Per-pos:
+    //   1. broadcast w[pos] from LDS scores[pos] → v22 (scalar across all lanes).
+    //   2. b128-load V[pos, kvh, lane*4..+3] → v[16:19].
+    //   3. v_fmac_f32 v[acc], v[V], v22 (4 fmacs).
+    //
+    // VGPR layout for accum:
+    //   v[24:27] = per-lane accum (init 0)
+    //   v[16:19] = V loaded quad
+    //   v22      = current weight (scalar across lanes via v_mov_b32 vN, sN)
+    //
+    // SGPR loop state (re-init):
+    //   s28:29   = current V-slot base   (vc_ptr + kvh*512, advancing)
+    //   s30      = pos counter
+    //   s31      = K-slot stride 4096 (still set from score loop)
+    //   s27      = LDS scores byte offset (= pos*4 + 128, but we use LDS-load
+    //              with imm offset and increment-via-add separately).
+    //              We just use s30*4 computed each iter.
+
+    // Init accum to 0.  Inline 0 = 0x80, op v_mov_b32 = 0x01.
+    asm_v_mov_b32(24, 0x80)                        // v24 = 0
+    asm_v_mov_b32(25, 0x80)                        // v25 = 0
+    asm_v_mov_b32(26, 0x80)                        // v26 = 0
+    asm_v_mov_b32(27, 0x80)                        // v27 = 0
+
+    // V-slot base = vc_ptr + kvh*512 = s[8:9] + s19.
+    asm_u32(0x801C1308)                            // s_add_u32  s28, s8,  s19
+    asm_u32(0x821D8009)                            // s_addc_u32 s29, s9,  0
+    asm_u32(0xBE9E0080)                            // s_mov_b32  s30, 0   (pos counter)
+
+    // .Laccum_loop:
+    uint64 accum_loop_idx = asm_text_len / 4
+
+    // Load weight w[pos] from LDS scores[pos*4 + 128] using
+    // v9 = s30*4 (already lane-broadcasted vgpr).  Reuse v9 store-offset.
+    asm_v_mov_b32(10, 30)                          // v10 = s30
+    asm_u32(0x30121482)                            // v_lshlrev_b32 v9, 2, v10  (= pos*4)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xD8D80080); asm_u32(0x16000009)       // ds_load_b32 v22, v9 offset:128
+    // Load V[pos, kvh, lane*4..+3] into v[16:19].
+    asm_u32(0xDC5E0000); asm_u32(0x101C0008)       // global_load_b128 v[16:19], v8, s[28:29]
+    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)   (for LDS w)
+    asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)     (for V load)
+
+    // acc[j] += w * V[j].  v22 is per-lane scalar (same value).
+    asm_u32(0x56302D10)                            // v_fmac_f32 v24, v16, v22
+    asm_u32(0x56322D11)                            // v_fmac_f32 v25, v17, v22
+    asm_u32(0x56342D12)                            // v_fmac_f32 v26, v18, v22
+    asm_u32(0x56362D13)                            // v_fmac_f32 v27, v19, v22
+
+    // Advance: pos += 1, V-base += 4096.
+    asm_u32(0x801E811E)                            // s_add_u32  s30, s30, 1
+    asm_u32(0x801C1F1C)                            // s_add_u32  s28, s28, s31
+    asm_u32(0x821D801D)                            // s_addc_u32 s29, s29, 0
+    asm_u32(0xBF0A0C1E)                            // s_cmp_lt_u32 s30, s12
+    uint64 accum_branch_idx = asm_text_len / 4
+    uint64 accum_back_simm = accum_loop_idx - (accum_branch_idx + 1)
+    asm_u32(0xBFA20000 | (accum_back_simm & 0xFFFF))  // s_cbranch_scc1 .Laccum_loop
+
+    // Final write: global_store_b128 v8, v[24:27], s[24:25] (overwrites
+    // the per-pos scores we wrote earlier — that's OK, we're done with them).
+    asm_s_delay_alu(0x01)                          // VALU→VMEM wait state for v[24:27]
+    asm_u32(0xDC760000); asm_u32(0x00181808)       // global_store_b128 v8, v[24:27], s[24:25]
+    asm_u32(0xBC7C0000)                            // s_waitcnt_vscnt null, 0
 
     asm_u32(0xBFB00000)                            // s_endpgm
 
