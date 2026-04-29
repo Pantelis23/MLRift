@@ -6264,15 +6264,37 @@ fn _emit_attn_decode_f32_body(uint64 args_desc) {
     asm_u32(0x80141306)                            // s_add_u32  s20, s6, s19
     asm_u32(0x82158007)                            // s_addc_u32 s21, s7, 0
 
-    // MILESTONE 2 PHASE 2a: K-passthrough from pos=0.  Each lane
-    // copies K[pos=0, kv_h, lane*4..+3] to out[head, lane*4..+3].
-    // Validates kv_h derivation + K-slot addressing.  Per-pos loop
-    // + dot + reduce + softmax + accum land in the next phases.
-    asm_u32(0x30100084)                            // v_lshlrev_b32 v8, 4, v0
-    asm_s_delay_alu(0x01)                          // VALU→VMEM wait state
-    asm_u32(0xDC5E0000); asm_u32(0x04140008)       // global_load_b128 v[4:7], v8, s[20:21]
+    // MILESTONE 2 PHASE 2c: Load Q and K[pos=0], compute per-lane
+    // partial dot product (4 fmacs), write the partial to
+    // out[head*128 + lane*4] for verification.  No reduce yet.
+    //
+    // VGPR layout (avoids the milestone-1 aliasing trap):
+    //   v[4:7]   = K loaded quad            (b128 needs 4-aligned)
+    //   v[12:15] = Q loaded quad            (b128, also 4-aligned)
+    //   v8       = lane*16  (byte offset for both load and store)
+    //   v9       = partial dot (per lane)
+    asm_u32(0x30100084)                            // v_lshlrev_b32 v8, 4, v0   (lane*16 byte offset, used for both load AND store)
+    asm_s_delay_alu(0x01)                          // VALU→VMEM wait state for v8
+
+    // Load Q[head, lane*4..+3] into v[12:15]   (head base in s[16:17])
+    asm_u32(0xDC5E0000); asm_u32(0x0C100008)       // global_load_b128 v[12:15], v8, s[16:17]
+    // Load K[pos=0, kv_h, lane*4..+3] into v[4:7]   (KV base in s[20:21])
+    asm_u32(0xDC5E0000); asm_u32(0x04140008)       // global_load_b128 v[4:7],  v8, s[20:21]
     asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)
-    asm_u32(0xDC760000); asm_u32(0x00180408)       // global_store_b128 v8, v[4:7], s[24:25]
+
+    // Per-lane dot:  v9 = q[0]*k[0] + q[1]*k[1] + q[2]*k[2] + q[3]*k[3]
+    //
+    // Encoding gotcha (caught with llvm-objdump): VOP2 src0 has bit 8 =
+    // "vgpr-vs-sgpr" indicator.  Hand-summing fields (5<<9)|(0x100|13)
+    // gives 0xA00 + 0x10D = 0xB0D — DON'T forget the carry from bit 7→8
+    // or the operand silently becomes an SGPR (e.g. 0xA0D → s13).
+    asm_u32(0x1012090C)                            // v_mul_f32  v9, v12, v4
+    asm_u32(0x56120B0D)                            // v_fmac_f32 v9, v13, v5
+    asm_u32(0x56120D0E)                            // v_fmac_f32 v9, v14, v6
+    asm_u32(0x56120F0F)                            // v_fmac_f32 v9, v15, v7
+    asm_s_delay_alu(0x01)                          // VALU→VMEM wait state for v9
+
+    asm_u32(0xDC6A0000); asm_u32(0x00180908)       // global_store_b32 v8, v9, s[24:25]   (out byte offset = lane*16)
     asm_u32(0xBC7C0000)                            // s_waitcnt_vscnt null, 0
 
     asm_u32(0xBFB00000)                            // s_endpgm
