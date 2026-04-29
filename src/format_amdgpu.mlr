@@ -6335,6 +6335,7 @@ fn _emit_attn_decode_f32_body(uint64 args_desc) {
     asm_v_cmp_eq_u32_imm_vgpr(0, 0)                // v_cmp_eq_u32 vcc_lo, 0, v0
     asm_u32(0xBE82206A)                            // s_and_saveexec_b32 s2, vcc_lo
     asm_u32(0xDC6A0000); asm_u32(0x00180509)       // global_store_b32 v9, v5, s[24:25]
+    asm_u32(0xD8340080); asm_u32(0x00000509)       // ds_store_b32 v9, v5 offset:128  (LDS scores[pos])
     asm_u32(0xBC7C0000)                            // s_waitcnt_vscnt null, 0
     asm_u32(0xBEFE0002)                            // s_mov_b32 exec_lo, s2
 
@@ -6346,6 +6347,68 @@ fn _emit_attn_decode_f32_body(uint64 args_desc) {
     uint64 score_branch_idx = asm_text_len / 4
     uint64 score_back_simm = score_loop_idx - (score_branch_idx + 1)
     asm_u32(0xBFA20000 | (score_back_simm & 0xFFFF))   // s_cbranch_scc1 .Lloop
+
+    // ---------------------------------------------------------------
+    // MILESTONE 3: Softmax over scores[0..pos_plus_1) in LDS @ off 128.
+    // ---------------------------------------------------------------
+    // Each lane handles one position (assumes pos_plus_1 ≤ 32).  Lanes
+    // outside that range get the identity element for each reduce
+    // (-inf for max, 0 for sum) so they don't pollute the result.
+    //
+    // VGPR usage in this section:
+    //   v0   lane id
+    //   v5   reduce accumulator (helper-mandated)
+    //   v6   lane*4 LDS slot (unchanged)
+    //   v7   reduce scratch / literal holder
+    //   v11  per-lane post-exp value (saved across the sum-reduce)
+    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
+    asm_u32(0xBFBD0000)                            // s_barrier  (all WG sees scores)
+
+    // Active-lane mask: vcc_lo[lane] = (lane < s12).
+    asm_u32(0x7C98000C)                            // v_cmp_gt_u32 vcc_lo, s12, v0
+
+    // Load this lane's score from LDS scores buffer (offset 128).
+    asm_u32(0xD8D80080); asm_u32(0x05000006)       // ds_load_b32 v5, v6 offset:128
+    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
+
+    // Pad inactive lanes with -inf for the max reduce.
+    asm_v_mov_b32_lit32(7, 0xFF800000)             // v7 = -inf
+    asm_u32(0x020A0B07)                            // v_cndmask_b32 v5, v7, v5, vcc_lo
+
+    // Save the padded score for later (centered, then exp).
+    asm_u32(0x7E160305)                            // v_mov_b32 v11, v5
+
+    // LDS broadcast + 32 → 1 max reduce.
+    asm_u32(0xD8340000); asm_u32(0x00000506)       // ds_store_b32 v6, v5
+    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
+    asm_u32(0xBFBD0000)                            // s_barrier
+    _emit_lds_reduce_pow2(32, 0x200A0F05, 2)       // v_max_f32 v5,v5,v7
+
+    // Centred score = v11 − v5, then * log2(e), then v_exp_f32 (= 2^x).
+    asm_u32(0x0A160B0B)                            // v_sub_f32  v11, v11, v5
+    asm_v_mov_b32_lit32(7, 0x3FB8AA3B)             // v7 = log2(e)
+    asm_u32(0x10160F0B)                            // v_mul_f32  v11, v11, v7
+    asm_u32(0x7E164B0B)                            // v_exp_f32  v11, v11
+
+    // Copy e to v5 for the sum reduce.
+    asm_u32(0x7E0A030B)                            // v_mov_b32 v5, v11
+    asm_u32(0xD8340000); asm_u32(0x00000506)       // ds_store_b32 v6, v5
+    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
+    asm_u32(0xBFBD0000)                            // s_barrier
+    _emit_lds_reduce_pow2(32, 0x060A0F05, 2)       // v_add_f32 v5,v5,v7
+
+    // weight = e * (1/sum).
+    asm_u32(0x7E0A5505)                            // v_rcp_f32 v5, v5
+    asm_u32(0x100A0B0B)                            // v_mul_f32 v5, v11, v5
+
+    // Recompute active mask, then lane < pos_plus_1 stores the weight
+    // back to LDS scores buffer AND to global out (for verification).
+    asm_u32(0x7C98000C)                            // v_cmp_gt_u32 vcc_lo, s12, v0
+    asm_u32(0xBE82206A)                            // s_and_saveexec_b32 s2, vcc_lo
+    asm_u32(0xD8340080); asm_u32(0x00000506)       // ds_store_b32 v6, v5 offset:128
+    asm_u32(0xDC6A0000); asm_u32(0x00180506)       // global_store_b32 v6, v5, s[24:25]
+    asm_u32(0xBC7C0000)                            // s_waitcnt_vscnt null, 0
+    asm_u32(0xBEFE0002)                            // s_mov_b32 exec_lo, s2
 
     asm_u32(0xBFB00000)                            // s_endpgm
 
