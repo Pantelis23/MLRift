@@ -337,39 +337,100 @@ fn main() {
         u64 step_start_ns = time_now()
         eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
 
-        // For each stream: full forward + lm_head + argmax + embed.
-        u64 b_step = 0
-        while b_step < batch_size {
-            u64 x_cur = 0; unsafe { *((x_cur_arr + b_step * 8) as u64) -> x_cur }
-            u64 x_nxt = 0; unsafe { *((x_nxt_arr + b_step * 8) as u64) -> x_nxt }
-            u64 sids  = 0; unsafe { *((seq_ids_arr + b_step * 8) as u64) -> sids }
+        u64 layer_start_ns = time_now()
+        if use_gpu_full != 0 {
+            // GPU path: per-stream H2D into d_x_a, layer-major outer loop
+            // with ONE batched qkv matmul per layer for all M streams.
+            u64 b_init = 0
+            while b_init < batch_size {
+                u64 xc_b   = 0; unsafe { *((x_cur_arr   + b_init * 8) as u64) -> xc_b }
+                u64 dxah_b = 0; unsafe { *((d_x_a_h_arr + b_init * 8) as u64) -> dxah_b }
+                memcpy(dxah_b, xc_b, hidden * 4)
+                b_init = b_init + 1
+            }
+            // Per-stream d_in/d_out pointer arrays (ping-pong across layers).
+            u64 d_in_arr   = alloc(batch_size * 8)
+            u64 d_out_arr  = alloc(batch_size * 8)
+            u64 d_in_h_arr = alloc(batch_size * 8)
+            u64 b_set = 0
+            while b_set < batch_size {
+                u64 da   = 0; unsafe { *((d_x_a_arr   + b_set * 8) as u64) -> da }
+                u64 db   = 0; unsafe { *((d_x_b_arr   + b_set * 8) as u64) -> db }
+                u64 dah  = 0; unsafe { *((d_x_a_h_arr + b_set * 8) as u64) -> dah }
+                unsafe { *((d_in_arr   + b_set * 8) as u64) = da }
+                unsafe { *((d_out_arr  + b_set * 8) as u64) = db }
+                unsafe { *((d_in_h_arr + b_set * 8) as u64) = dah }
+                b_set = b_set + 1
+            }
 
-            // Sweep 28 layers at this position for stream b_step.
-            u64 layer_start_ns = time_now()
             u64 layer = 0
-            if use_gpu_full != 0 {
-                u64 d_x_a   = 0; unsafe { *((d_x_a_arr   + b_step * 8) as u64) -> d_x_a }
-                u64 d_x_b   = 0; unsafe { *((d_x_b_arr   + b_step * 8) as u64) -> d_x_b }
-                u64 d_x_a_h = 0; unsafe { *((d_x_a_h_arr + b_step * 8) as u64) -> d_x_a_h }
-                u64 d_x_b_h = 0; unsafe { *((d_x_b_h_arr + b_step * 8) as u64) -> d_x_b_h }
-                memcpy(d_x_a_h, x_cur, hidden * 4)
-                u64 d_in = d_x_a; u64 d_out = d_x_b
-                u64 d_in_h = d_x_a_h; u64 d_out_h = d_x_b_h
-                while layer < n_layers {
-                    Qwen3LayerWeights w = layers_arr + layer * 88
-                    u64 kc = k_cache + layer * batch_stride + b_step * layer_stride
-                    u64 vc = v_cache + layer * batch_stride + b_step * layer_stride
-                    u64 rc = qwen3_forward_layer_gpu(d_in, d_out, w, pos, kc, vc, num_workers, b_step)
+            while layer < n_layers {
+                Qwen3LayerWeights w = layers_arr + layer * 88
+                // Pre-phase: per-stream input_norm + ONE batched qkv matmul.
+                if qwen3_forward_layer_qkv_batched_gpu(d_in_arr, w, batch_size) != 0 {
+                    eout("[qwen3_generate] qkv batched failed at layer "); eu64(layer); eout("\n")
+                    exit(1)
+                }
+                // Per-stream remainder of layer (qkv_split → ... → resid).
+                u64 b_lf = 0
+                while b_lf < batch_size {
+                    u64 d_in_b  = 0; unsafe { *((d_in_arr  + b_lf * 8) as u64) -> d_in_b }
+                    u64 d_out_b = 0; unsafe { *((d_out_arr + b_lf * 8) as u64) -> d_out_b }
+                    u64 kc = k_cache + layer * batch_stride + b_lf * layer_stride
+                    u64 vc = v_cache + layer * batch_stride + b_lf * layer_stride
+                    u64 rc = qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, kc, vc, num_workers, b_lf, 1)
                     if rc != 0 {
                         eout("[qwen3_generate] GPU forward failed at layer "); eu64(layer); eout("\n")
                         exit(1)
                     }
-                    u64 tmp = d_in; d_in = d_out; d_out = tmp
-                    u64 tmp_h = d_in_h; d_in_h = d_out_h; d_out_h = tmp_h
-                    layer = layer + 1
+                    b_lf = b_lf + 1
                 }
-                memcpy(x_cur, d_in_h, hidden * 4)
-            } else {
+                // Swap ping-pong pointers per stream.
+                u64 b_sw = 0
+                while b_sw < batch_size {
+                    u64 di = 0; unsafe { *((d_in_arr   + b_sw * 8) as u64) -> di }
+                    u64 do_ = 0; unsafe { *((d_out_arr  + b_sw * 8) as u64) -> do_ }
+                    u64 dih = 0; unsafe { *((d_in_h_arr + b_sw * 8) as u64) -> dih }
+                    // Find the matching host pointer for d_out by index lookup.
+                    u64 doh = 0
+                    if do_ == 0 { } else {
+                        u64 b_lk = 0
+                        while b_lk < batch_size {
+                            u64 dxa  = 0; unsafe { *((d_x_a_arr   + b_lk * 8) as u64) -> dxa }
+                            u64 dxah = 0; unsafe { *((d_x_a_h_arr + b_lk * 8) as u64) -> dxah }
+                            u64 dxb  = 0; unsafe { *((d_x_b_arr   + b_lk * 8) as u64) -> dxb }
+                            u64 dxbh = 0; unsafe { *((d_x_b_h_arr + b_lk * 8) as u64) -> dxbh }
+                            if b_lk == b_sw {
+                                if do_ == dxa { doh = dxah }
+                                if do_ == dxb { doh = dxbh }
+                            }
+                            b_lk = b_lk + 1
+                        }
+                    }
+                    unsafe { *((d_in_arr   + b_sw * 8) as u64) = do_ }
+                    unsafe { *((d_out_arr  + b_sw * 8) as u64) = di }
+                    unsafe { *((d_in_h_arr + b_sw * 8) as u64) = doh }
+                    b_sw = b_sw + 1
+                }
+                layer = layer + 1
+            }
+            // After the layer sweep, d_in_arr[b] holds the final residual
+            // device VA for stream b; D2H back to that stream's x_cur.
+            u64 b_d2h = 0
+            while b_d2h < batch_size {
+                u64 dih_f = 0; unsafe { *((d_in_h_arr + b_d2h * 8) as u64) -> dih_f }
+                u64 xc_f  = 0; unsafe { *((x_cur_arr  + b_d2h * 8) as u64) -> xc_f }
+                memcpy(xc_f, dih_f, hidden * 4)
+                b_d2h = b_d2h + 1
+            }
+            dealloc(d_in_arr); dealloc(d_out_arr); dealloc(d_in_h_arr)
+        } else {
+            // CPU path stays per-stream sequential.
+            u64 b_step = 0
+            while b_step < batch_size {
+                u64 x_cur = 0; unsafe { *((x_cur_arr + b_step * 8) as u64) -> x_cur }
+                u64 x_nxt = 0; unsafe { *((x_nxt_arr + b_step * 8) as u64) -> x_nxt }
+                u64 layer = 0
                 while layer < n_layers {
                     Qwen3LayerWeights w = layers_arr + layer * 88
                     u64 kc = k_cache + layer * batch_stride + b_step * layer_stride
@@ -378,11 +439,19 @@ fn main() {
                     u64 tmp = x_cur; x_cur = x_nxt; x_nxt = tmp
                     layer = layer + 1
                 }
-                // Persist the swap back into the array (CPU path swaps ptrs in-place).
                 unsafe { *((x_cur_arr + b_step * 8) as u64) = x_cur }
                 unsafe { *((x_nxt_arr + b_step * 8) as u64) = x_nxt }
+                b_step = b_step + 1
             }
-            sum_layer_ns = sum_layer_ns + time_elapsed(layer_start_ns)
+        }
+        sum_layer_ns = sum_layer_ns + time_elapsed(layer_start_ns)
+
+        // Per-stream lm_head + argmax + embed (still sequential — slice 1.5
+        // batches lm_head later).
+        u64 b_step = 0
+        while b_step < batch_size {
+            u64 x_cur = 0; unsafe { *((x_cur_arr + b_step * 8) as u64) -> x_cur }
+            u64 sids  = 0; unsafe { *((seq_ids_arr + b_step * 8) as u64) -> sids }
 
             u64 norm_start_ns = time_now()
             qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)

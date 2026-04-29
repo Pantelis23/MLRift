@@ -1215,10 +1215,41 @@ fn _qwen3_gpu_pipeline_init() -> u64 {
 
 // Returns 0 on success.  Returns 1 if the GPU pipeline failed to
 // initialise (caller should fall back to qwen3_forward_layer).
+// Pre-phase used by the batched-decode path: runs input_norm per-stream
+// (writing into b_x_norm sub-slabs of _gpuq_d_x_norm) and a SINGLE
+// batched qkv matmul (writing into b_qkv sub-slabs of _gpuq_d_qkv) for
+// all `batch_size` streams.  d_x_in_arr_ptr is a host array of u64
+// device pointers, one per stream.  qwen3_forward_layer_gpu's tail is
+// then invoked with skip_input_qkv = 1 to consume those pre-populated
+// sub-slabs without redoing the matmul.
+@export
+fn qwen3_forward_layer_qkv_batched_gpu(u64 d_x_in_arr_ptr,
+                                        Qwen3LayerWeights w,
+                                        u64 batch_size) -> u64 {
+    if _qwen3_gpu_pipeline_init() == 0 { return 1 }
+    u64 hidden  = QWEN3_HIDDEN
+    u64 qkv_dim = QWEN3_Q_DIM + 2 * QWEN3_KV_DIM
+
+    u64 d_in_gamma = gpu_cache_bf16_as_f32(w.input_norm_w, hidden)
+    if d_in_gamma == 0 { return 1 }
+    u64 b = 0
+    while b < batch_size {
+        u64 d_x_in_b = 0; unsafe { *((d_x_in_arr_ptr + b * 8) as u64) -> d_x_in_b }
+        u64 b_x_norm = _gpuq_d_x_norm + b * hidden * 4
+        if gpu_rmsnorm_1024_to_dev(b_x_norm, d_x_in_b, d_in_gamma, 1) != 0 { return 1 }
+        b = b + 1
+    }
+    // ONE batched qkv matmul for all M streams.
+    if gpu_matmul_to_dev_batched(_gpuq_d_qkv, _gpuq_d_x_norm, w.q_proj_w,
+                                  qkv_dim, hidden, batch_size) != 0 { return 1 }
+    return 0
+}
+
 fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
                             Qwen3LayerWeights w, u64 pos,
                             u64 k_cache_layer, u64 v_cache_layer,
-                            u64 num_workers, u64 batch_idx) -> u64 {
+                            u64 num_workers, u64 batch_idx,
+                            u64 skip_input_qkv) -> u64 {
     if _qwen3_gpu_pipeline_init() == 0 { return 1 }
 
     u64 hidden  = QWEN3_HIDDEN
@@ -1248,13 +1279,15 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
     u64 b_ff       = _gpuq_d_ff       + batch_idx * ff      * 4
     u64 b_ff_out   = _gpuq_d_ff_out   + batch_idx * hidden  * 4
 
-    // 1.  input_norm: x_norm = rmsnorm(x_in) * gamma_in
-    u64 d_in_gamma = gpu_cache_bf16_as_f32(w.input_norm_w, hidden)
-    if d_in_gamma == 0 { return 1 }
-    if gpu_rmsnorm_1024_to_dev(b_x_norm, d_x_in, d_in_gamma, 1) != 0 { return 1 }
-
-    // 2.  qkv (fused) = w.q_proj_w @ x_norm
-    if gpu_matmul_to_dev(b_qkv, b_x_norm, w.q_proj_w, qkv_dim, hidden) != 0 { return 1 }
+    // 1+2.  input_norm + qkv matmul.  When skip_input_qkv != 0 the
+    //       caller has already populated b_x_norm and b_qkv via the
+    //       batched pre-phase; we jump straight to step 3.
+    if skip_input_qkv == 0 {
+        u64 d_in_gamma = gpu_cache_bf16_as_f32(w.input_norm_w, hidden)
+        if d_in_gamma == 0 { return 1 }
+        if gpu_rmsnorm_1024_to_dev(b_x_norm, d_x_in, d_in_gamma, 1) != 0 { return 1 }
+        if gpu_matmul_to_dev(b_qkv, b_x_norm, w.q_proj_w, qkv_dim, hidden) != 0 { return 1 }
+    }
 
     // 3.  Sync 1 — only required when CPU has to read qkv (legacy attn
     //     path).  GPU-attn path keeps the qkv buffer device-resident
