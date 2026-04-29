@@ -4944,6 +4944,19 @@ fn main() {
                 write(1, rnn_path, rnnl)
                 write(1, " (amdgpu rmsnorm-f32 code object, N-parametric)\n", 49)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-qknorm-f32=", 25) != 0 {
+                // Per-head N=128 RMSNorm with eps=1e-6 (Qwen3 spec).
+                uint64 qkn_path = arg + 25
+                uint64 qkn_rc = emit_amdgpu_rmsnorm_f32_N_eps_blob(qkn_path, 128, 0x358637BD)
+                if qkn_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-qknorm-f32 failed\n", 38)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 qknl = str_len(qkn_path)
+                write(1, qkn_path, qknl)
+                write(1, " (amdgpu qknorm-f32 code object, N=128, eps=1e-6)\n", 51)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-layernorm-f32-N=", 30) != 0 {
                 // Format: --emit-amdgpu-layernorm-f32-N=<N>:<path>
                 uint64 lnn_arg = arg + 30
