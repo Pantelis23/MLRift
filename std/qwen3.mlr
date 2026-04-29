@@ -1219,8 +1219,18 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
     // 2.  qkv (fused) = w.q_proj_w @ x_norm
     if gpu_matmul_to_dev(_gpuq_d_qkv, _gpuq_d_x_norm, w.q_proj_w, qkv_dim, hidden) != 0 { return 1 }
 
-    // 3.  Sync 1 — drain so CPU can read qkv from its GTT host pointer.
-    gpu_pipeline_flush()
+    // 3.  Sync 1 — only required when CPU has to read qkv (legacy attn
+    //     path).  GPU-attn path keeps the qkv buffer device-resident
+    //     and slices K/V via gpu_qkv_split_f32_to_dev below; no sync.
+    u64 use_gpu_attn = 0
+    if _gpuq_kv_k_dev_base != 0 {
+        if _gpuq_kv_v_dev_base != 0 {
+            use_gpu_attn = 1
+        }
+    }
+    if use_gpu_attn == 0 {
+        gpu_pipeline_flush()
+    }
 
     // 4.  CPU side: split qkv → q,k,v into the kv-cache slot, qknorm,
     //     rope, attention.  Reads directly from _gpuq_d_qkv_h (GTT,
@@ -1229,32 +1239,16 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
     u64 k_row = k_cache_layer + pos * kv_row_bytes
     u64 v_row = v_cache_layer + pos * kv_row_bytes
 
-    // 5.  Attention.  When KV cache is GTT-resident AND the fused
-    //     attn kernel is loaded, dispatch the entire chain
-    //     (qknorm Q/K + rope Q/K + attn) on GPU (Step E of attn
-    //     wiring); otherwise fall back to the CPU AVX2 path.
-    u64 use_gpu_attn = 0
-    if _gpuq_kv_k_dev_base != 0 {
-        if _gpuq_kv_v_dev_base != 0 {
-            use_gpu_attn = 1
-        }
-    }
     if use_gpu_attn != 0 {
-        // V doesn't need qknorm/rope — copy through GTT (CPU memcpy
-        // because the qkv buffer is on GPU but GTT-host-mapped).
-        memcpy(v_row, _gpuq_d_qkv_h + (q_dim + kv_dim) * 4, kv_dim * 4)
-        // Stage Q + K into device buffers (Q to _gpuq_d_q_attn; K
-        // straight into the head's KV cache slot via its GTT host ptr).
-        memcpy(_gpuq_d_q_attn_h, _gpuq_d_qkv_h, q_dim * 4)
-        memcpy(k_row, _gpuq_d_qkv_h + q_dim * 4, kv_dim * 4)
-
         // Cache q_norm_w / k_norm_w as device f32 (one-shot per layer).
         u64 d_q_gamma = gpu_cache_bf16_as_f32(w.q_norm_w, hd)
         u64 d_k_gamma = gpu_cache_bf16_as_f32(w.k_norm_w, hd)
         if d_q_gamma == 0 { return 1 }
         if d_k_gamma == 0 { return 1 }
 
-        // Refresh device cos/sin tables when pos has advanced.
+        // Refresh device cos/sin tables when pos has advanced.  Safe:
+        // _gpuq_d_rope_cos/sin are GTT, so the host write is visible
+        // to the GPU once the next dispatch reads it.
         if _gpuq_rope_cache_pos != pos {
             f64 theta = 1000000.0
             qwen3_rope_compute(_gpuq_d_rope_cos_h, _gpuq_d_rope_sin_h, pos, hd, theta)
@@ -1266,14 +1260,24 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
         u64 d_kc_layer = _gpuq_kv_k_dev_base + layer_idx * _gpuq_kv_layer_stride
         u64 d_vc_layer = _gpuq_kv_v_dev_base + layer_idx * _gpuq_kv_layer_stride
         u64 d_k_slot   = d_kc_layer + pos * kv_row_bytes
+        u64 d_v_slot   = d_vc_layer + pos * kv_row_bytes
 
-        // qknorm: in-place RMSNorm on each Q head and each K head.
-        if gpu_qknorm_f32_to_dev(_gpuq_d_q_attn, _gpuq_d_q_attn, d_q_gamma, nh) != 0 { return 1 }
+        // 4a. Slice qkv → K/V cache slots on-device (no sync).  Q is
+        //     the first q_dim elements of d_qkv and stays there until
+        //     qknorm reads it via _gpuq_d_q_attn (we use d_qkv directly
+        //     as the Q source by passing its base).
+        if gpu_qkv_split_f32_to_dev(_gpuq_d_qkv, d_k_slot, d_v_slot) != 0 { return 1 }
+
+        // 4b. qknorm: in-place RMSNorm on each Q head + each K head.
+        //     Q reads/writes _gpuq_d_qkv (first q_dim elements).
+        if gpu_qknorm_f32_to_dev(_gpuq_d_q_attn, _gpuq_d_qkv, d_q_gamma, nh) != 0 { return 1 }
         if gpu_qknorm_f32_to_dev(d_k_slot, d_k_slot, d_k_gamma, nkv) != 0 { return 1 }
-        // RoPE: in-place per-head rotation.
+
+        // 4c. RoPE: in-place per-head rotation.
         if gpu_rope_f32_to_dev(_gpuq_d_q_attn, _gpuq_d_rope_cos, _gpuq_d_rope_sin, nh) != 0 { return 1 }
         if gpu_rope_f32_to_dev(d_k_slot,        _gpuq_d_rope_cos, _gpuq_d_rope_sin, nkv) != 0 { return 1 }
 
+        // 4d. Fused attention.
         if gpu_attn_decode_to_dev(_gpuq_d_q_attn, d_kc_layer, d_vc_layer,
                                    _gpuq_d_attn, pos + 1) != 0 { return 1 }
         // _gpuq_d_attn now holds the per-head attention output; the

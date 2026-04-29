@@ -6602,6 +6602,88 @@ fn emit_amdgpu_rope_qwen3_f32_blob(uint64 out_path) -> uint64 {
     return 0
 }
 
+// Qwen3-0.6B QKV-split helper: copy K (1024 f32) + V (1024 f32) out of
+// the fused d_qkv buffer into the per-step KV cache slots.  Hardcoded
+// shape: q_dim = 2048 → q_byte_offset = 8192; kv_dim = 1024.  Block =
+// 128 lanes, grid = 8 (8 * 128 = 1024 elements per slot).  Used to
+// keep the qkv matmul → split → qknorm → rope → attn chain entirely
+// on-device, dropping the CPU memcpy that previously required sync 1.
+//
+// Kernarg layout (24 bytes, 3 args):
+//   [0x00] uint64 src_qkv → s[4:5]
+//   [0x08] uint64 dst_k   → s[6:7]
+//   [0x10] uint64 dst_v   → s[8:9]
+fn _emit_qkv_split_f32_body(uint64 args_desc) {
+    asm_init()
+
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)       // s_load_b256 s[4:11], s[0:1], 0x0
+    asm_u32(0xBF89FC07)                            // s_waitcnt   lgkmcnt(0)
+
+    // s14 = wg_id * 512  (each WG covers 128 elements = 512 bytes).
+    asm_u32(0x840E890F)                            // s_lshl_b32 s14, s15, 9
+
+    // K source: s4:5 + 0x2000 + s14.
+    asm_u32(0xBE8C00FF); asm_u32(0x00002000)       // s_mov_b32 s12, 0x2000   (q_dim_bytes)
+    asm_u32(0x800C0E0C)                            // s_add_u32 s12, s12, s14
+    asm_u32(0x80100C04)                            // s_add_u32 s16, s4, s12
+    asm_u32(0x82118005)                            // s_addc_u32 s17, s5, 0
+    // V source: s4:5 + 0x3000 + s14  (= K source + 0x1000 since K=V_size_bytes).
+    asm_u32(0xBE8D00FF); asm_u32(0x00001000)       // s_mov_b32 s13, 0x1000
+    asm_u32(0x800C0D0C)                            // s_add_u32 s12, s12, s13
+    asm_u32(0x80120C04)                            // s_add_u32 s18, s4, s12
+    asm_u32(0x82138005)                            // s_addc_u32 s19, s5, 0
+
+    // dst_K = s[6:7] + s14 (wg*512 byte offset).
+    asm_u32(0x80140E06)                            // s_add_u32 s20, s6, s14
+    asm_u32(0x82158007)                            // s_addc_u32 s21, s7, 0
+    // dst_V = s[8:9] + s14.
+    asm_u32(0x80160E08)                            // s_add_u32 s22, s8, s14
+    asm_u32(0x82178009)                            // s_addc_u32 s23, s9, 0
+
+    // v1 = lane*4 byte offset within the 128-element WG slice.
+    asm_u32(0x30020082)                            // v_lshlrev_b32 v1, 2, v0
+    asm_s_delay_alu(0x01)                          // VALU→VMEM wait state for v1
+
+    // Loads.
+    asm_u32(0xDC520000); asm_u32(0x02100001)       // global_load_b32 v2, v1, s[16:17]   ; K
+    asm_u32(0xDC520000); asm_u32(0x03120001)       // global_load_b32 v3, v1, s[18:19]   ; V
+    asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)
+
+    // Stores.
+    asm_u32(0xDC6A0000); asm_u32(0x00140201)       // global_store_b32 v1, v2, s[20:21]  ; dst_K
+    asm_u32(0xDC6A0000); asm_u32(0x00160301)       // global_store_b32 v1, v3, s[22:23]  ; dst_V
+    asm_u32(0xBC7C0000)                            // s_waitcnt_vscnt null, 0
+
+    asm_u32(0xBFB00000)                            // s_endpgm
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+}
+
+@export
+fn emit_amdgpu_qkv_split_f32_blob(uint64 out_path) -> uint64 {
+    uint64[6] args_desc
+    _emit_qkv_split_f32_body(args_desc)
+    uint64 size = emit_amdgpu_code_object_lds("qkv_split_f32", 13,
+                                               asm_text_buf, asm_text_len,
+                                               24, 8, 16, 24,
+                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 3,
+                                               0)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_qkv_split_f32_blob: cannot open output\n", 52)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 // Phase 2 routing: lower a name-matched @kernel `gemv_f32` into the
 // kernel table. Snapshots the ISA so a subsequent kernel's asm_init
 // can't clobber it before emit_amdgpu_multi_code_object runs.
