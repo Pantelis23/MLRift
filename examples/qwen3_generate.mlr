@@ -247,51 +247,74 @@ fn main() {
         eout("[qwen3_generate] KV cache allocated on host ("); eu64(total_cache * 2); eout(" bytes total)\n")
     }
 
-    // Per-step working buffers. Allocated once, reused every step.
-    u64 x_cur    = alloc(hidden * 4)
-    u64 x_nxt    = alloc(hidden * 4)
+    // Per-stream working buffers (Phase 1 batched-decode plumbing).
+    // At batch_size = 1 this keeps the original single-stream layout
+    // bit-identical; at batch_size > 1 each stream gets its own
+    // hidden-vector buffers + token sequence + seed.
     u64 final_out = alloc(hidden * 4)
-    u64 logits   = alloc(vocab * 4)
+    u64 logits    = alloc(vocab * 4)
 
-    // Sequence of generated token ids — u64 one per step. Includes the seed
-    // token so we have a full self-contained record.
     u64 seq_cap = max_new + 1
-    u64 seq_ids = alloc(seq_cap * 8)
+    u64 x_cur_arr   = alloc(batch_size * 8)        // batch_size pointers
+    u64 x_nxt_arr   = alloc(batch_size * 8)
+    u64 seq_ids_arr = alloc(batch_size * 8)
+    u64 tok_arr     = alloc(batch_size * 8)
+    u64 seq_len     = 1
 
-    u64 tok = 14990
-    unsafe { *((seq_ids + 0 * 8) as u64) = tok }
-    u64 seq_len = 1
-
-    eout("[qwen3_generate] seed token = "); eu64(tok); eout("\n")
-
-    // Embed seed token into x_cur
-    u64 row = embed_ptr + tok * hidden * 2
-    u64 i0 = 0
-    while i0 < hidden {
-        f32 v = bf16_to_f32(row + i0 * 2)
-        unsafe { *((x_cur + i0 * 4) as f32) = v }
-        i0 = i0 + 1
+    // Same seed for all streams initially — verifies cross-batch
+    // isolation by producing N copies of the canonical decode.
+    u64 seed_tok = 14990
+    eout("[qwen3_generate] batch_size="); eu64(batch_size); eout(" seed_tok="); eu64(seed_tok); eout("\n")
+    u64 b_init = 0
+    while b_init < batch_size {
+        u64 xc_b   = alloc(hidden * 4)
+        u64 xn_b   = alloc(hidden * 4)
+        u64 sids_b = alloc(seq_cap * 8)
+        unsafe { *((sids_b + 0 * 8) as u64) = seed_tok }
+        u64 row_b = embed_ptr + seed_tok * hidden * 2
+        u64 i0 = 0
+        while i0 < hidden {
+            f32 v = bf16_to_f32(row_b + i0 * 2)
+            unsafe { *((xc_b + i0 * 4) as f32) = v }
+            i0 = i0 + 1
+        }
+        unsafe { *((x_cur_arr   + b_init * 8) as u64) = xc_b }
+        unsafe { *((x_nxt_arr   + b_init * 8) as u64) = xn_b }
+        unsafe { *((seq_ids_arr + b_init * 8) as u64) = sids_b }
+        unsafe { *((tok_arr     + b_init * 8) as u64) = seed_tok }
+        b_init = b_init + 1
     }
 
     // Optional full-GPU forward path: keep the residual carry device-
     // resident throughout the 28-layer sweep, sync only at the layer-
-    // half boundaries.  Gated by MLRIFT_GPU_FULL_FORWARD=1.
+    // half boundaries.  Gated by MLRIFT_GPU_FULL_FORWARD=1.  At
+    // batch_size > 1 each stream gets its own ping-pong pair.
     u64 use_gpu_full = 0
-    u64 d_x_a = 0; u64 d_x_a_h = 0
-    u64 d_x_b = 0; u64 d_x_b_h = 0
+    u64 d_x_a_arr   = alloc(batch_size * 8)
+    u64 d_x_b_arr   = alloc(batch_size * 8)
+    u64 d_x_a_h_arr = alloc(batch_size * 8)
+    u64 d_x_b_h_arr = alloc(batch_size * 8)
     u64 ev_full = getenv("MLRIFT_GPU_FULL_FORWARD")
     if ev_full != 0 {
         u8 cf = 0; unsafe { *(ev_full as u8) -> cf }
         if cf != 48 {
-            // Need MLRIFT_GPU_MATMUL=1 too — gpu_pipeline_ready depends on it.
             if gpu_pipeline_ready() == 1 {
-                d_x_a = dev_try_alloc_host_visible(hidden * 4)
-                d_x_b = dev_try_alloc_host_visible(hidden * 4)
-                if d_x_a != 0 && d_x_b != 0 {
-                    d_x_a_h = dev_host_ptr(d_x_a)
-                    d_x_b_h = dev_host_ptr(d_x_b)
+                u64 all_ok = 1
+                u64 b_dx = 0
+                while b_dx < batch_size {
+                    u64 da = dev_try_alloc_host_visible(hidden * 4)
+                    u64 db = dev_try_alloc_host_visible(hidden * 4)
+                    if da == 0 { all_ok = 0; break }
+                    if db == 0 { all_ok = 0; break }
+                    unsafe { *((d_x_a_arr   + b_dx * 8) as u64) = da }
+                    unsafe { *((d_x_b_arr   + b_dx * 8) as u64) = db }
+                    unsafe { *((d_x_a_h_arr + b_dx * 8) as u64) = dev_host_ptr(da) }
+                    unsafe { *((d_x_b_h_arr + b_dx * 8) as u64) = dev_host_ptr(db) }
+                    b_dx = b_dx + 1
+                }
+                if all_ok == 1 {
                     use_gpu_full = 1
-                    eout("[qwen3_generate] full-GPU forward ENABLED\n")
+                    eout("[qwen3_generate] full-GPU forward ENABLED for "); eu64(batch_size); eout(" stream(s)\n")
                 }
             } else {
                 eout("[qwen3_generate] MLRIFT_GPU_FULL_FORWARD set but pipeline NOT ready\n")
@@ -313,94 +336,90 @@ fn main() {
         u64 step_start_ns = time_now()
         eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
 
-        // Sweep 28 layers at this position; each writes K/V into cache[layer][pos].
-        u64 layer_start_ns = time_now()
-        u64 layer = 0
-        if use_gpu_full != 0 {
-            // Full-GPU forward path.  Initial H2D into d_x_a; ping-pong
-            // through 28 layers; final D2H back to x_cur.
-            memcpy(d_x_a_h, x_cur, hidden * 4)
-            u64 d_in = d_x_a; u64 d_out = d_x_b
-            u64 d_in_h = d_x_a_h; u64 d_out_h = d_x_b_h
-            while layer < n_layers {
-                Qwen3LayerWeights w = layers_arr + layer * 88
-                // 4D KV-cache addressing: batch_idx = 0 (single-stream
-                // path; Phase 1 expansion to batch>1 uses batch_idx=0..M-1).
-                u64 batch_idx = 0
-                u64 kc = k_cache + layer * batch_stride + batch_idx * layer_stride
-                u64 vc = v_cache + layer * batch_stride + batch_idx * layer_stride
-                u64 rc = qwen3_forward_layer_gpu(d_in, d_out, w, pos, kc, vc, num_workers, batch_idx)
-                if rc != 0 {
-                    eout("[qwen3_generate] GPU forward failed at layer "); eu64(layer); eout("\n")
-                    exit(1)
+        // For each stream: full forward + lm_head + argmax + embed.
+        u64 b_step = 0
+        while b_step < batch_size {
+            u64 x_cur = 0; unsafe { *((x_cur_arr + b_step * 8) as u64) -> x_cur }
+            u64 x_nxt = 0; unsafe { *((x_nxt_arr + b_step * 8) as u64) -> x_nxt }
+            u64 sids  = 0; unsafe { *((seq_ids_arr + b_step * 8) as u64) -> sids }
+
+            // Sweep 28 layers at this position for stream b_step.
+            u64 layer_start_ns = time_now()
+            u64 layer = 0
+            if use_gpu_full != 0 {
+                u64 d_x_a   = 0; unsafe { *((d_x_a_arr   + b_step * 8) as u64) -> d_x_a }
+                u64 d_x_b   = 0; unsafe { *((d_x_b_arr   + b_step * 8) as u64) -> d_x_b }
+                u64 d_x_a_h = 0; unsafe { *((d_x_a_h_arr + b_step * 8) as u64) -> d_x_a_h }
+                u64 d_x_b_h = 0; unsafe { *((d_x_b_h_arr + b_step * 8) as u64) -> d_x_b_h }
+                memcpy(d_x_a_h, x_cur, hidden * 4)
+                u64 d_in = d_x_a; u64 d_out = d_x_b
+                u64 d_in_h = d_x_a_h; u64 d_out_h = d_x_b_h
+                while layer < n_layers {
+                    Qwen3LayerWeights w = layers_arr + layer * 88
+                    u64 kc = k_cache + layer * batch_stride + b_step * layer_stride
+                    u64 vc = v_cache + layer * batch_stride + b_step * layer_stride
+                    u64 rc = qwen3_forward_layer_gpu(d_in, d_out, w, pos, kc, vc, num_workers, b_step)
+                    if rc != 0 {
+                        eout("[qwen3_generate] GPU forward failed at layer "); eu64(layer); eout("\n")
+                        exit(1)
+                    }
+                    u64 tmp = d_in; d_in = d_out; d_out = tmp
+                    u64 tmp_h = d_in_h; d_in_h = d_out_h; d_out_h = tmp_h
+                    layer = layer + 1
                 }
-                u64 tmp = d_in; d_in = d_out; d_out = tmp
-                u64 tmp_h = d_in_h; d_in_h = d_out_h; d_out_h = tmp_h
-                layer = layer + 1
-            }
-            // d_in now holds the final residual; D2H back to x_cur.
-            memcpy(x_cur, d_in_h, hidden * 4)
-        } else {
-            while layer < n_layers {
-                Qwen3LayerWeights w = layers_arr + layer * 88
-                // CPU forward stays on batch_idx = 0 of the 4D layout.
-                u64 kc = k_cache + layer * batch_stride
-                u64 vc = v_cache + layer * batch_stride
-                qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
-                u64 tmp = x_cur
-                x_cur = x_nxt
-                x_nxt = tmp
-                layer = layer + 1
-            }
-        }
-        sum_layer_ns = sum_layer_ns + time_elapsed(layer_start_ns)
-
-        // Final RMSNorm → lm_head (tied to embed_tokens) → greedy argmax.
-        u64 norm_start_ns = time_now()
-        qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
-        sum_norm_ns = sum_norm_ns + time_elapsed(norm_start_ns)
-        // lm_head: tied embedding matmul. Not on a residual — Kahan off.
-        u64 lmhead_start_ns = time_now()
-        // qwen3_main_matmul routes to the GPU dispatcher under env-gate.
-        // For lm_head (N=151936, K=1024) the wrapper picks the
-        // cooperative-row gemv_coop_f32 kernel — bandwidth-bound at ~6 ms
-        // vs 9 ms 16-thread AVX2.  Falls through to CPU when MLRIFT_GPU_MATMUL is unset.
-        qwen3_main_matmul(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
-        sum_lmhead_ns = sum_lmhead_ns + time_elapsed(lmhead_start_ns)
-
-        u64 argmax_start_ns = time_now()
-        u64 best_id = 0
-        f32 best_val = 0.0f
-        u64 first = 1
-        u64 j = 0
-        while j < vocab {
-            f32 v = 0.0f
-            unsafe { *((logits + j * 4) as f32) -> v }
-            if first == 1 {
-                best_val = v; best_id = j; first = 0
+                memcpy(x_cur, d_in_h, hidden * 4)
             } else {
-                if v > best_val { best_val = v; best_id = j }
+                while layer < n_layers {
+                    Qwen3LayerWeights w = layers_arr + layer * 88
+                    u64 kc = k_cache + layer * batch_stride + b_step * layer_stride
+                    u64 vc = v_cache + layer * batch_stride + b_step * layer_stride
+                    qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+                    u64 tmp = x_cur; x_cur = x_nxt; x_nxt = tmp
+                    layer = layer + 1
+                }
+                // Persist the swap back into the array (CPU path swaps ptrs in-place).
+                unsafe { *((x_cur_arr + b_step * 8) as u64) = x_cur }
+                unsafe { *((x_nxt_arr + b_step * 8) as u64) = x_nxt }
             }
-            j = j + 1
-        }
-        sum_argmax_ns = sum_argmax_ns + time_elapsed(argmax_start_ns)
-        eout("  -> next_id = "); eu64(best_id); eout(" logit=")
-        u64 lvs = fmt_f32(best_val, 4); eout(lvs); dealloc(lvs); eout("\n")
+            sum_layer_ns = sum_layer_ns + time_elapsed(layer_start_ns)
 
-        unsafe { *((seq_ids + seq_len * 8) as u64) = best_id }
+            u64 norm_start_ns = time_now()
+            qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
+            sum_norm_ns = sum_norm_ns + time_elapsed(norm_start_ns)
+            u64 lmhead_start_ns = time_now()
+            qwen3_main_matmul(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
+            sum_lmhead_ns = sum_lmhead_ns + time_elapsed(lmhead_start_ns)
+
+            u64 argmax_start_ns = time_now()
+            u64 best_id = 0
+            f32 best_val = 0.0f
+            u64 first = 1
+            u64 j = 0
+            while j < vocab {
+                f32 v = 0.0f
+                unsafe { *((logits + j * 4) as f32) -> v }
+                if first == 1 { best_val = v; best_id = j; first = 0 }
+                else          { if v > best_val { best_val = v; best_id = j } }
+                j = j + 1
+            }
+            sum_argmax_ns = sum_argmax_ns + time_elapsed(argmax_start_ns)
+
+            unsafe { *((sids + seq_len * 8) as u64) = best_id }
+
+            u64 embed_start_ns = time_now()
+            row = embed_ptr + best_id * hidden * 2
+            u64 i1 = 0
+            while i1 < hidden {
+                f32 v = bf16_to_f32(row + i1 * 2)
+                unsafe { *((x_cur + i1 * 4) as f32) = v }
+                i1 = i1 + 1
+            }
+            sum_embed_ns = sum_embed_ns + time_elapsed(embed_start_ns)
+            unsafe { *((tok_arr + b_step * 8) as u64) = best_id }
+            b_step = b_step + 1
+        }
+
         seq_len = seq_len + 1
-
-        // Embed the new token into x_cur for the next iteration.
-        u64 embed_start_ns = time_now()
-        row = embed_ptr + best_id * hidden * 2
-        u64 i1 = 0
-        while i1 < hidden {
-            f32 v = bf16_to_f32(row + i1 * 2)
-            unsafe { *((x_cur + i1 * 4) as f32) = v }
-            i1 = i1 + 1
-        }
-        sum_embed_ns = sum_embed_ns + time_elapsed(embed_start_ns)
-        tok = best_id
         pos = pos + 1
         u64 step_elapsed_ns = time_elapsed(step_start_ns)
         sum_decode_ns = sum_decode_ns + step_elapsed_ns
@@ -414,12 +433,19 @@ fn main() {
     eout("total_decode_ms=");  eu64(total_ms); eout("\n")
     eout("sum_per_step_ms=");  eu64(sum_decode_ns / 1000000); eout("\n")
     eout("mean_step_ms=");     eu64(total_decode_ns / max_new / 1000000); eout("\n")
-    // tokens/sec * 1000 (fixed-point, integer math only)
+    // tokens/sec * 1000 (fixed-point, integer math only).  Reports
+    // aggregate tokens/sec across all batch_size streams.
+    u64 total_tokens = max_new * batch_size
     u64 tokps_milli = 0
     if total_decode_ns != 0 {
-        tokps_milli = (max_new * 1000 * 1000000000) / total_decode_ns
+        tokps_milli = (total_tokens * 1000 * 1000000000) / total_decode_ns
     }
-    eout("tokens_per_sec_x1000="); eu64(tokps_milli); eout("\n")
+    eout("tokens_per_sec_x1000="); eu64(tokps_milli)
+    if batch_size > 1 {
+        u64 perstream_milli = tokps_milli / batch_size
+        eout(" (per_stream="); eu64(perstream_milli); eout(")")
+    }
+    eout("\n")
     eout("\n=== BREAKDOWN (ms) ===\n")
     eout("layer_sweep_ms=");     eu64(sum_layer_ns  / 1000000); eout("\n")
     eout("final_norm_ms=");      eu64(sum_norm_ns   / 1000000); eout("\n")
@@ -428,22 +454,27 @@ fn main() {
     eout("embed_ms=");           eu64(sum_embed_ns  / 1000000); eout("\n")
     qwen3_profile_dump()
 
-    // Print final sequence
+    // Print final sequences (one per stream).
     eout("\n=== GENERATED SEQUENCE ===\n")
-    u64 si = 0
-    while si < seq_len {
-        if si != 0 { eout(", ") }
-        u64 id = 0
-        unsafe { *((seq_ids + si * 8) as u64) -> id }
-        eu64(id)
-        si = si + 1
+    u64 b_print = 0
+    while b_print < batch_size {
+        if batch_size > 1 { eout("[stream "); eu64(b_print); eout("] ") }
+        u64 sids_p = 0; unsafe { *((seq_ids_arr + b_print * 8) as u64) -> sids_p }
+        u64 si = 0
+        while si < seq_len {
+            if si != 0 { eout(", ") }
+            u64 id = 0
+            unsafe { *((sids_p + si * 8) as u64) -> id }
+            eu64(id)
+            si = si + 1
+        }
+        eout("\n")
+        b_print = b_print + 1
     }
-    eout("\n")
     eout("=== PYTORCH REF (for eyeball diff) ===\n")
     eout("14990, 14582, 284, 330, 9707, 11, 4337, 17199, 1350, 3203, 4791, 14582, 692, 2, 1173, 279, 1156, 3409, 198, 1350, 3203\n")
 
-    dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits)
-    dealloc(seq_ids); dealloc(layers_arr)
+    dealloc(final_out); dealloc(logits); dealloc(layers_arr)
     dealloc(k_cache); dealloc(v_cache)
     safetensors_free(st)
     thread_pool_shutdown()
