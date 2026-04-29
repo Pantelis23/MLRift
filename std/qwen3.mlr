@@ -1245,11 +1245,24 @@ fn qwen3_forward_layer_qkv_batched_gpu(u64 d_x_in_arr_ptr,
     return 0
 }
 
+// phase_mask bits:
+//   0x01  input_norm + qkv matmul       (steps 1-2)
+//   0x02  qkv_split + qknorm + rope + attn  (steps 3-8)
+//   0x04  o_proj matmul                  (step 9)
+//   0x08  resid + post_norm              (steps 10-11)
+//   0x10  gate_up matmul                 (step 12)
+//   0x20  silu_mul                       (step 13)
+//   0x40  down matmul                    (step 14)
+//   0x80  final resid                    (step 15)
+// Legacy path uses 0xFF (all phases).  Batched path uses 0xAA (per-stream
+// phases only — 0x02|0x08|0x20|0x80) and dispatches the 3 BATCHED matmuls
+// (0x04, 0x10, 0x40) via gpu_matmul_to_dev_batched separately, plus the
+// initial 0x01 via qwen3_forward_layer_qkv_batched_gpu.
 fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
                             Qwen3LayerWeights w, u64 pos,
                             u64 k_cache_layer, u64 v_cache_layer,
                             u64 num_workers, u64 batch_idx,
-                            u64 skip_input_qkv) -> u64 {
+                            u64 phase_mask) -> u64 {
     if _qwen3_gpu_pipeline_init() == 0 { return 1 }
 
     u64 hidden  = QWEN3_HIDDEN
@@ -1279,10 +1292,8 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
     u64 b_ff       = _gpuq_d_ff       + batch_idx * ff      * 4
     u64 b_ff_out   = _gpuq_d_ff_out   + batch_idx * hidden  * 4
 
-    // 1+2.  input_norm + qkv matmul.  When skip_input_qkv != 0 the
-    //       caller has already populated b_x_norm and b_qkv via the
-    //       batched pre-phase; we jump straight to step 3.
-    if skip_input_qkv == 0 {
+    // 1+2.  input_norm + qkv matmul (gated by 0x01).
+    if (phase_mask & 0x01) != 0 {
         u64 d_in_gamma = gpu_cache_bf16_as_f32(w.input_norm_w, hidden)
         if d_in_gamma == 0 { return 1 }
         if gpu_rmsnorm_1024_to_dev(b_x_norm, d_x_in, d_in_gamma, 1) != 0 { return 1 }
@@ -1302,13 +1313,12 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
         gpu_pipeline_flush()
     }
 
-    // 4.  CPU side: split qkv → q,k,v into the kv-cache slot, qknorm,
-    //     rope, attention.  Reads directly from _gpuq_d_qkv_h (GTT,
-    //     no D2H copy needed).
+    // Steps 3-8: attn region (gated by 0x02).
     u64 kv_row_bytes = nkv * hd * 4
     u64 k_row = k_cache_layer + pos * kv_row_bytes
     u64 v_row = v_cache_layer + pos * kv_row_bytes
 
+    if (phase_mask & 0x02) != 0 {
     if use_gpu_attn != 0 {
         // Cache q_norm_w / k_norm_w as device f32 (one-shot per layer).
         u64 d_q_gamma = gpu_cache_bf16_as_f32(w.q_norm_w, hd)
@@ -1410,22 +1420,40 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
         dealloc(q_buf)
         dealloc(attn_out)
     }
+    } // end of phase_mask & 0x02 (attn region)
 
-    // 6.  Chained GPU section — 6 ops, no intermediate sync:
-    //     o_proj → resid → post_norm → gate_up → silu → down → resid
-    if gpu_matmul_to_dev(b_o, b_attn, w.o_proj_w, hidden, q_dim) != 0 { return 1 }
-    if gpu_resid_add_to_dev(b_mid, d_x_in, b_o, hidden) != 0 { return 1 }
+    // Step 9: o_proj matmul (0x04). batched-decode caller passes 0
+    //         here and dispatches gpu_matmul_to_dev_batched separately.
+    if (phase_mask & 0x04) != 0 {
+        if gpu_matmul_to_dev(b_o, b_attn, w.o_proj_w, hidden, q_dim) != 0 { return 1 }
+    }
+    // Steps 10-11: resid + post_norm (0x08).
+    if (phase_mask & 0x08) != 0 {
+        if gpu_resid_add_to_dev(b_mid, d_x_in, b_o, hidden) != 0 { return 1 }
+        u64 d_post_gamma = gpu_cache_bf16_as_f32(w.post_norm_w, hidden)
+        if d_post_gamma == 0 { return 1 }
+        if gpu_rmsnorm_1024_to_dev(b_mid_norm, b_mid, d_post_gamma, 1) != 0 { return 1 }
+    }
+    // Step 12: gate_up matmul (0x10).
+    if (phase_mask & 0x10) != 0 {
+        if gpu_matmul_to_dev(b_gu, b_mid_norm, w.gate_proj_w, 2 * ff, hidden) != 0 { return 1 }
+    }
+    // Step 13: silu_mul (0x20).
+    if (phase_mask & 0x20) != 0 {
+        if gpu_silu_mul_to_dev(b_ff, b_gu, b_gu + ff * 4, ff) != 0 { return 1 }
+    }
+    // Step 14: down matmul (0x40).
+    if (phase_mask & 0x40) != 0 {
+        if gpu_matmul_to_dev(b_ff_out, b_ff, w.down_proj_w, hidden, ff) != 0 { return 1 }
+    }
+    // Step 15: final resid (0x80).
+    if (phase_mask & 0x80) != 0 {
+        if gpu_resid_add_to_dev(d_x_out, b_mid, b_ff_out, hidden) != 0 { return 1 }
+    }
 
-    u64 d_post_gamma = gpu_cache_bf16_as_f32(w.post_norm_w, hidden)
-    if d_post_gamma == 0 { return 1 }
-    if gpu_rmsnorm_1024_to_dev(b_mid_norm, b_mid, d_post_gamma, 1) != 0 { return 1 }
-
-    if gpu_matmul_to_dev(b_gu, b_mid_norm, w.gate_proj_w, 2 * ff, hidden) != 0 { return 1 }
-    if gpu_silu_mul_to_dev(b_ff, b_gu, b_gu + ff * 4, ff) != 0 { return 1 }
-    if gpu_matmul_to_dev(b_ff_out, b_ff, w.down_proj_w, hidden, ff) != 0 { return 1 }
-    if gpu_resid_add_to_dev(d_x_out, b_mid, b_ff_out, hidden) != 0 { return 1 }
-
-    // 7.  Sync 2 — drain before next layer reads d_x_out.
+    // Sync 2 — drain before next layer reads d_x_out.  Skip when we
+    // know more phases will run on the same chain (saves sync cost).
+    // For simplicity, always flush at the end of any partial chain:
     gpu_pipeline_flush()
     return 0
 }

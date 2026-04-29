@@ -54,6 +54,8 @@ fn main() {
 
     u64 hidden = QWEN3_HIDDEN
     u64 kv_dim = QWEN3_KV_DIM
+    u64 q_dim  = QWEN3_Q_DIM
+    u64 ff     = QWEN3_INTERMEDIATE
     u64 n_layers = 28
     u64 vocab = 151936
     u64 max_seq = 64
@@ -366,24 +368,59 @@ fn main() {
             u64 layer = 0
             while layer < n_layers {
                 Qwen3LayerWeights w = layers_arr + layer * 88
-                // Pre-phase: per-stream input_norm + ONE batched qkv matmul.
-                if qwen3_forward_layer_qkv_batched_gpu(d_in_arr, w, batch_size) != 0 {
-                    eout("[qwen3_generate] qkv batched failed at layer "); eu64(layer); eout("\n")
-                    exit(1)
-                }
-                // Per-stream remainder of layer (qkv_split → ... → resid).
-                u64 b_lf = 0
-                while b_lf < batch_size {
-                    u64 d_in_b  = 0; unsafe { *((d_in_arr  + b_lf * 8) as u64) -> d_in_b }
-                    u64 d_out_b = 0; unsafe { *((d_out_arr + b_lf * 8) as u64) -> d_out_b }
-                    u64 kc = k_cache + layer * batch_stride + b_lf * layer_stride
-                    u64 vc = v_cache + layer * batch_stride + b_lf * layer_stride
-                    u64 rc = qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, kc, vc, num_workers, b_lf, 1)
-                    if rc != 0 {
-                        eout("[qwen3_generate] GPU forward failed at layer "); eu64(layer); eout("\n")
-                        exit(1)
+                if batch_size > 1 {
+                    // Fully batched chain: qkv_batched + per-stream attn +
+                    // batched o_proj + per-stream resid/postnorm + batched
+                    // gate_up + per-stream silu + batched down + per-stream
+                    // final_resid.
+                    if qwen3_forward_layer_qkv_batched_gpu(d_in_arr, w, batch_size) != 0 { exit(1) }
+                    u64 b_attn_phase = 0
+                    while b_attn_phase < batch_size {
+                        u64 d_in_b  = 0; unsafe { *((d_in_arr  + b_attn_phase * 8) as u64) -> d_in_b }
+                        u64 d_out_b = 0; unsafe { *((d_out_arr + b_attn_phase * 8) as u64) -> d_out_b }
+                        u64 kc = k_cache + layer * batch_stride + b_attn_phase * layer_stride
+                        u64 vc = v_cache + layer * batch_stride + b_attn_phase * layer_stride
+                        // 0x02 = attn region only
+                        if qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, kc, vc, num_workers, b_attn_phase, 0x02) != 0 { exit(1) }
+                        b_attn_phase = b_attn_phase + 1
                     }
-                    b_lf = b_lf + 1
+                    // Batched o_proj: _gpuq_d_o = w.o_proj_w @ _gpuq_d_attn
+                    if gpu_matmul_to_dev_batched(_gpuq_d_o, _gpuq_d_attn, w.o_proj_w,
+                                                  hidden, q_dim, batch_size) != 0 { exit(1) }
+                    // Per-stream resid + post_norm (0x08).
+                    u64 b_resid = 0
+                    while b_resid < batch_size {
+                        u64 d_in_b  = 0; unsafe { *((d_in_arr  + b_resid * 8) as u64) -> d_in_b }
+                        u64 d_out_b = 0; unsafe { *((d_out_arr + b_resid * 8) as u64) -> d_out_b }
+                        if qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, 0, 0, num_workers, b_resid, 0x08) != 0 { exit(1) }
+                        b_resid = b_resid + 1
+                    }
+                    // Batched gate_up.
+                    if gpu_matmul_to_dev_batched(_gpuq_d_gu, _gpuq_d_mid_norm, w.gate_proj_w,
+                                                  2 * ff, hidden, batch_size) != 0 { exit(1) }
+                    // Per-stream silu_mul (0x20).
+                    u64 b_silu = 0
+                    while b_silu < batch_size {
+                        if qwen3_forward_layer_gpu(0, 0, w, pos, 0, 0, num_workers, b_silu, 0x20) != 0 { exit(1) }
+                        b_silu = b_silu + 1
+                    }
+                    // Batched down.
+                    if gpu_matmul_to_dev_batched(_gpuq_d_ff_out, _gpuq_d_ff, w.down_proj_w,
+                                                  hidden, ff, batch_size) != 0 { exit(1) }
+                    // Per-stream final resid (0x80) — writes d_x_out_b.
+                    u64 b_fin = 0
+                    while b_fin < batch_size {
+                        u64 d_out_b = 0; unsafe { *((d_out_arr + b_fin * 8) as u64) -> d_out_b }
+                        if qwen3_forward_layer_gpu(0, d_out_b, w, pos, 0, 0, num_workers, b_fin, 0x80) != 0 { exit(1) }
+                        b_fin = b_fin + 1
+                    }
+                } else {
+                    // batch=1: legacy single-stream path with full mask.
+                    u64 d_in_b  = 0; unsafe { *((d_in_arr  + 0) as u64) -> d_in_b }
+                    u64 d_out_b = 0; unsafe { *((d_out_arr + 0) as u64) -> d_out_b }
+                    u64 kc = k_cache + layer * batch_stride
+                    u64 vc = v_cache + layer * batch_stride
+                    if qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, kc, vc, num_workers, 0, 0xFF) != 0 { exit(1) }
                 }
                 // Swap ping-pong pointers per stream.
                 u64 b_sw = 0
