@@ -236,6 +236,7 @@ fn main() {
                 k_cache = dev_host_ptr(k_cache_dev)
                 v_cache = dev_host_ptr(v_cache_dev)
                 qwen3_gpu_set_kv_cache_dev(k_cache_dev, v_cache_dev, layer_stride, batch_size)
+                qwen3_gpu_set_batch_size(batch_size)
                 eout("[qwen3_generate] KV cache allocated as GTT (")
                 eu64(total_cache * 2); eout(" bytes total)\n")
             }
