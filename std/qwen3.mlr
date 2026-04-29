@@ -1134,18 +1134,25 @@ static u64 _gpuq_d_rope_sin    = 0
 static u64 _gpuq_d_rope_sin_h  = 0
 static u64 _gpuq_rope_cache_pos = 0xFFFFFFFFFFFFFFFF
 
-// KV cache device VAs (Step C of attn wiring).  Set once via
-// qwen3_gpu_set_kv_cache_dev() before the layer sweep; used by the
-// fused attention launcher to address each layer's KV slab.
-static u64 _gpuq_kv_k_dev_base = 0
-static u64 _gpuq_kv_v_dev_base = 0
-static u64 _gpuq_kv_layer_stride = 0
+// KV cache device VAs (Step C of attn wiring; extended to 4D for
+// Phase 1 batched-decode work).  Layout is layer-major-of-batch-major:
+//   addr = base + layer*batch_stride + batch_idx*layer_stride + ...
+// At batch_size = 1, batch_stride == layer_stride and batch_idx == 0,
+// so the math collapses to the original 3D form bit-for-bit.
+static u64 _gpuq_kv_k_dev_base    = 0
+static u64 _gpuq_kv_v_dev_base    = 0
+static u64 _gpuq_kv_layer_stride  = 0     // bytes per (batch, layer) slab
+static u64 _gpuq_kv_batch_stride  = 0     // bytes per layer = batch_size * layer_stride
+static u64 _gpuq_kv_batch_size    = 1
 
 @export
-fn qwen3_gpu_set_kv_cache_dev(u64 k_dev_base, u64 v_dev_base, u64 layer_stride) {
+fn qwen3_gpu_set_kv_cache_dev(u64 k_dev_base, u64 v_dev_base,
+                               u64 layer_stride, u64 batch_size) {
     _gpuq_kv_k_dev_base   = k_dev_base
     _gpuq_kv_v_dev_base   = v_dev_base
     _gpuq_kv_layer_stride = layer_stride
+    _gpuq_kv_batch_size   = batch_size
+    _gpuq_kv_batch_stride = batch_size * layer_stride
 }
 
 fn _qwen3_gpu_pipeline_init() -> u64 {
@@ -1199,7 +1206,7 @@ fn _qwen3_gpu_pipeline_init() -> u64 {
 fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
                             Qwen3LayerWeights w, u64 pos,
                             u64 k_cache_layer, u64 v_cache_layer,
-                            u64 num_workers) -> u64 {
+                            u64 num_workers, u64 batch_idx) -> u64 {
     if _qwen3_gpu_pipeline_init() == 0 { return 1 }
 
     u64 hidden  = QWEN3_HIDDEN
@@ -1255,10 +1262,15 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
             _gpuq_rope_cache_pos = pos
         }
 
-        // Layer-relative device VAs for KV cache.
-        u64 layer_idx = (k_cache_layer - dev_host_ptr(_gpuq_kv_k_dev_base)) / _gpuq_kv_layer_stride
-        u64 d_kc_layer = _gpuq_kv_k_dev_base + layer_idx * _gpuq_kv_layer_stride
-        u64 d_vc_layer = _gpuq_kv_v_dev_base + layer_idx * _gpuq_kv_layer_stride
+        // 4D layout: addr = base + layer*batch_stride + batch_idx*layer_stride.
+        // Reconstruct layer_idx from the host pointer the caller supplied
+        // (which is itself batch_idx-relative — see qwen3_generate's loop).
+        u64 host_base = dev_host_ptr(_gpuq_kv_k_dev_base) + batch_idx * _gpuq_kv_layer_stride
+        u64 layer_idx = (k_cache_layer - host_base) / _gpuq_kv_batch_stride
+        u64 d_kc_layer = _gpuq_kv_k_dev_base + layer_idx * _gpuq_kv_batch_stride
+                                              + batch_idx * _gpuq_kv_layer_stride
+        u64 d_vc_layer = _gpuq_kv_v_dev_base + layer_idx * _gpuq_kv_batch_stride
+                                              + batch_idx * _gpuq_kv_layer_stride
         u64 d_k_slot   = d_kc_layer + pos * kv_row_bytes
         u64 d_v_slot   = d_vc_layer + pos * kv_row_bytes
 

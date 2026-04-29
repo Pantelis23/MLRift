@@ -189,12 +189,30 @@ fn main() {
         if cf_e != 48 { want_gpu_full = 1 }
     }
 
-    // KV cache — one big slab each for K and V, with per-layer stride.
-    //   shape per layer: [max_seq, n_kv_heads, head_dim] f32
-    //   bytes per layer: max_seq * kv_dim * 4 = max_seq * 4096 at Qwen3-0.6B
+    // KV cache — 4D slab [batch, layer, max_seq, n_kv_heads, head_dim].
+    //   bytes per (batch, layer): max_seq * kv_dim * 4 = max_seq * 4096
+    //   layout is layer-major: addr = layer*batch*layer_stride + batch_idx*layer_stride
+    //   Phase 1 starts with batch_size = 1 (env-overridable later); the
+    //   layout is bit-identical to the prior 3D form when batch=1.
+    u64 batch_size     = 1
+    u64 ev_batch       = getenv("MLRIFT_BATCH")
+    if ev_batch != 0 {
+        u64 ofs = 0
+        while ofs < 4 {
+            u8 cb = 0; unsafe { *((ev_batch + ofs) as u8) -> cb }
+            if cb == 0 { break }
+            if cb >= 48 && cb <= 57 {
+                if ofs == 0 { batch_size = cb - 48 }
+                else        { batch_size = batch_size * 10 + (cb - 48) }
+            }
+            ofs = ofs + 1
+        }
+        if batch_size == 0 { batch_size = 1 }
+    }
     u64 kv_row_bytes   = kv_dim * 4
     u64 layer_stride   = max_seq * kv_row_bytes
-    u64 total_cache    = n_layers * layer_stride
+    u64 batch_stride   = batch_size * layer_stride
+    u64 total_cache    = n_layers * batch_stride
     u64 k_cache = 0
     u64 v_cache = 0
     u64 k_cache_dev = 0
@@ -217,7 +235,7 @@ fn main() {
             if k_cache_dev != 0 && v_cache_dev != 0 {
                 k_cache = dev_host_ptr(k_cache_dev)
                 v_cache = dev_host_ptr(v_cache_dev)
-                qwen3_gpu_set_kv_cache_dev(k_cache_dev, v_cache_dev, layer_stride)
+                qwen3_gpu_set_kv_cache_dev(k_cache_dev, v_cache_dev, layer_stride, batch_size)
                 eout("[qwen3_generate] KV cache allocated as GTT (")
                 eu64(total_cache * 2); eout(" bytes total)\n")
             }
@@ -306,9 +324,12 @@ fn main() {
             u64 d_in_h = d_x_a_h; u64 d_out_h = d_x_b_h
             while layer < n_layers {
                 Qwen3LayerWeights w = layers_arr + layer * 88
-                u64 kc = k_cache + layer * layer_stride
-                u64 vc = v_cache + layer * layer_stride
-                u64 rc = qwen3_forward_layer_gpu(d_in, d_out, w, pos, kc, vc, num_workers)
+                // 4D KV-cache addressing: batch_idx = 0 (single-stream
+                // path; Phase 1 expansion to batch>1 uses batch_idx=0..M-1).
+                u64 batch_idx = 0
+                u64 kc = k_cache + layer * batch_stride + batch_idx * layer_stride
+                u64 vc = v_cache + layer * batch_stride + batch_idx * layer_stride
+                u64 rc = qwen3_forward_layer_gpu(d_in, d_out, w, pos, kc, vc, num_workers, batch_idx)
                 if rc != 0 {
                     eout("[qwen3_generate] GPU forward failed at layer "); eu64(layer); eout("\n")
                     exit(1)
@@ -322,8 +343,9 @@ fn main() {
         } else {
             while layer < n_layers {
                 Qwen3LayerWeights w = layers_arr + layer * 88
-                u64 kc = k_cache + layer * layer_stride
-                u64 vc = v_cache + layer * layer_stride
+                // CPU forward stays on batch_idx = 0 of the 4D layout.
+                u64 kc = k_cache + layer * batch_stride
+                u64 vc = v_cache + layer * batch_stride
                 qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
                 u64 tmp = x_cur
                 x_cur = x_nxt
