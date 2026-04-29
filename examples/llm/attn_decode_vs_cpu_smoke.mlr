@@ -1,0 +1,143 @@
+// Step-B correctness gate: compare GPU fused attn_decode_f32 against
+// the CPU qwen3_attn_cached path on the same Q/K/V at Qwen3-0.6B
+// shape (nh=16, nkv=8, hd=128).  Uses pseudo-random fp data scaled
+// to the magnitudes a real layer sees post-rope, so we exercise the
+// kernel with realistic dynamic range (vs the synthetic patterns of
+// attn_decode_smoke).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-attn-decode-f32=/tmp/attn_decode_f32.co dummy
+//   MLRIFT_GPU_MATMUL=1 ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/attn_decode_vs_cpu_smoke.mlr -o /tmp/attn_decode_vs_cpu
+// Run:
+//   MLRIFT_GPU_MATMUL=1 /tmp/attn_decode_vs_cpu
+
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/time.mlr"
+import "../../std/math_float.mlr"
+import "../../std/inference_gpu.mlr"
+import "../../std/qwen3.mlr"
+
+@dynamic extern fn exit(uint64 code)
+
+fn die(uint64 msg, uint64 code) {
+    print_str(msg); print_str(" e="); u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n"); exit(1)
+}
+
+// xorshift32 → f32 in [-1, 1).
+fn rand_step(u64 state_ptr) -> f32 {
+    u32 s = 0; unsafe { *(state_ptr as u32) -> s }
+    s = s ^ (s << 13)
+    s = s ^ (s >> 17)
+    s = s ^ (s << 5)
+    unsafe { *(state_ptr as u32) = s }
+    u32 hi32 = s >> 8                       // 24-bit
+    u64 hi = hi32
+    f32 v = int_to_f32(hi) / 8388608.0f - 1.0f
+    return v
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+    if gpu_matmul_enabled() == 0 {
+        print_str("MLRIFT_GPU_MATMUL not set — exiting\n"); exit(1)
+    }
+
+    u64 nh = 16
+    u64 nkv = 8
+    u64 hd = 128
+    u64 max_seq = 64
+    u64 pos_plus_1 = 8
+
+    u64 q_bytes  = nh * hd * 4
+    u64 kv_bytes = max_seq * nkv * hd * 4
+
+    // Host buffers + xorshift seed.
+    u64 h_q   = alloc(q_bytes)
+    u64 h_kc  = alloc(kv_bytes)
+    u64 h_vc  = alloc(kv_bytes)
+    u64 h_cpu = alloc(q_bytes)
+    u64 h_gpu = alloc(q_bytes)
+    u64 seed_slot = alloc(4); unsafe { *(seed_slot as u32) = 0x1234ABCD }
+
+    u64 i = 0
+    while i < nh * hd {
+        f32 v = rand_step(seed_slot)
+        unsafe { *((h_q + i * 4) as f32) = v }
+        i = i + 1
+    }
+    i = 0
+    while i < max_seq * nkv * hd {
+        f32 vk = rand_step(seed_slot)
+        f32 vv = rand_step(seed_slot)
+        unsafe { *((h_kc + i * 4) as f32) = vk }
+        unsafe { *((h_vc + i * 4) as f32) = vv }
+        i = i + 1
+    }
+    dealloc(seed_slot)
+
+    // CPU reference.
+    qwen3_attn_cached(h_cpu, h_q, h_kc, h_vc, pos_plus_1, nh, nkv, hd)
+
+    // GPU run.
+    u64 d_q = 0; u64 d_kc = 0; u64 d_vc = 0; u64 d_out = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, q_bytes);  if err != 0 { die("mq",  err) }; unsafe { *(slot as u64) -> d_q }
+    slot = alloc(8); err = hipMalloc(slot, kv_bytes); if err != 0 { die("mkc", err) }; unsafe { *(slot as u64) -> d_kc }
+    slot = alloc(8); err = hipMalloc(slot, kv_bytes); if err != 0 { die("mvc", err) }; unsafe { *(slot as u64) -> d_vc }
+    slot = alloc(8); err = hipMalloc(slot, q_bytes);  if err != 0 { die("mo",  err) }; unsafe { *(slot as u64) -> d_out }
+    err = hipMemcpy(d_q,  h_q,  q_bytes,  1); if err != 0 { die("H2D q",  err) }
+    err = hipMemcpy(d_kc, h_kc, kv_bytes, 1); if err != 0 { die("H2D kc", err) }
+    err = hipMemcpy(d_vc, h_vc, kv_bytes, 1); if err != 0 { die("H2D vc", err) }
+
+    u64 t0 = time_now()
+    if gpu_attn_decode_to_dev(d_q, d_kc, d_vc, d_out, pos_plus_1) != 0 { die("launch", 0) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+    u64 t1 = time_now()
+    err = hipMemcpy(h_gpu, d_out, q_bytes, 2); if err != 0 { die("D2H", err) }
+    print_str("gpu kernel_us="); u64 s = fmt_dec((t1 - t0) / 1000); print_str(s); dealloc(s); print_str("\n")
+
+    // Compare CPU vs GPU element-wise.  qwen3_attn_cached uses
+    // exp_f32_fast (≈3-bit ulp at extreme inputs) so we use a
+    // generous absolute threshold.
+    u64 fail = 0
+    f32 max_abs = 0.0f
+    f32 max_rel = 0.0f
+    u64 k = 0
+    while k < nh * hd {
+        f32 cv = 0.0f; unsafe { *((h_cpu + k * 4) as f32) -> cv }
+        f32 gv = 0.0f; unsafe { *((h_gpu + k * 4) as f32) -> gv }
+        f32 d = cv - gv; if d < 0.0f { d = 0.0f - d }
+        if d > max_abs { max_abs = d }
+        f32 ac = cv; if ac < 0.0f { ac = 0.0f - ac }
+        f32 rel = d / (ac + 1.0e-6f)
+        if rel > max_rel { max_rel = rel }
+        if d > 0.005f { fail = fail + 1 }
+        k = k + 1
+    }
+    print_str("CPU vs GPU mismatch (tol=5e-3): "); u64 sf = fmt_dec(fail); print_str(sf); dealloc(sf)
+    print_str(" / "); u64 stot = fmt_dec(nh * hd); print_str(stot); dealloc(stot); print_str("\n")
+    u64 mab = alloc(4); unsafe { *(mab as f32) = max_abs }
+    u32 mab_b = 0; unsafe { *(mab as u32) -> mab_b }
+    u64 mab64 = mab_b
+    print_str("max abs diff bits="); u64 smb = fmt_dec(mab64); print_str(smb); dealloc(smb); print_str("\n"); dealloc(mab)
+    if fail == 0 {
+        print_str("OK — GPU fused attn matches CPU qwen3_attn_cached.\n"); exit(0)
+    } else {
+        print_str("FAIL — first 8 cells of head 0 (cpu / gpu f32 bits):\n")
+        u64 jj = 0
+        while jj < 8 {
+            u32 cb = 0; unsafe { *((h_cpu + jj * 4) as u32) -> cb }
+            u32 gb = 0; unsafe { *((h_gpu + jj * 4) as u32) -> gb }
+            print_str("  ["); u64 sj = fmt_dec(jj); print_str(sj); dealloc(sj)
+            u64 cb64 = cb; u64 gb64 = gb
+            print_str("] cpu="); u64 sc = fmt_dec(cb64); print_str(sc); dealloc(sc)
+            print_str(" gpu="); u64 sg = fmt_dec(gb64); print_str(sg); dealloc(sg)
+            print_str("\n")
+            jj = jj + 1
+        }
+        exit(1)
+    }
+}
