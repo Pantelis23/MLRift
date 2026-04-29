@@ -1,0 +1,120 @@
+// Microbench the attn-region dispatch chain.  Runs each kernel
+// independently 10000 times with a single sync at the end, divides by
+// 10000 to get per-dispatch average launch overhead + per-launch GPU
+// work.  Then runs the full chain (qkv_split + 2× qknorm + 2× rope +
+// attn) to compare against the sum.  Tells us how much room a fused
+// mega-kernel actually has.
+
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/time.mlr"
+import "../../std/inference_gpu.mlr"
+
+@dynamic extern fn exit(uint64 code)
+fn die(uint64 msg, uint64 code) { print_str(msg); print_str(" e="); u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n"); exit(1) }
+
+fn report(uint64 label, u64 wall_ns, u64 iters) {
+    print_str(label); print_str(": total_us=")
+    u64 a = fmt_dec(wall_ns / 1000); print_str(a); dealloc(a)
+    print_str(" per_dispatch_us=")
+    u64 per = wall_ns / iters / 1000
+    u64 b = fmt_dec(per); print_str(b); dealloc(b)
+    print_str("\n")
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+    if gpu_matmul_enabled() == 0 { print_str("MLRIFT_GPU_MATMUL not set\n"); exit(1) }
+
+    u64 q_bytes  = 16 * 128 * 4
+    u64 kv_bytes = 64 * 8 * 128 * 4
+    u64 hd_half_bytes = 64 * 4
+    u64 gamma_bytes = 128 * 4
+
+    // Allocate buffers (zero-initialised; correctness not required).
+    u64 d_q   = 0; u64 d_kc  = 0; u64 d_vc  = 0; u64 d_out = 0
+    u64 d_qkv = 0; u64 d_k_slot = 0; u64 d_v_slot = 0
+    u64 d_qg  = 0; u64 d_kg  = 0; u64 d_cos = 0; u64 d_sin = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, q_bytes);   if err != 0 { die("mq",  err) }; unsafe { *(slot as u64) -> d_q }
+    slot = alloc(8); err = hipMalloc(slot, kv_bytes);  if err != 0 { die("mkc", err) }; unsafe { *(slot as u64) -> d_kc }
+    slot = alloc(8); err = hipMalloc(slot, kv_bytes);  if err != 0 { die("mvc", err) }; unsafe { *(slot as u64) -> d_vc }
+    slot = alloc(8); err = hipMalloc(slot, q_bytes);   if err != 0 { die("mo",  err) }; unsafe { *(slot as u64) -> d_out }
+    slot = alloc(8); err = hipMalloc(slot, 4096 * 4);  if err != 0 { die("mqkv", err) }; unsafe { *(slot as u64) -> d_qkv }
+    slot = alloc(8); err = hipMalloc(slot, 1024 * 4);  if err != 0 { die("mks",  err) }; unsafe { *(slot as u64) -> d_k_slot }
+    slot = alloc(8); err = hipMalloc(slot, 1024 * 4);  if err != 0 { die("mvs",  err) }; unsafe { *(slot as u64) -> d_v_slot }
+    slot = alloc(8); err = hipMalloc(slot, gamma_bytes); if err != 0 { die("mqg", err) }; unsafe { *(slot as u64) -> d_qg }
+    slot = alloc(8); err = hipMalloc(slot, gamma_bytes); if err != 0 { die("mkg", err) }; unsafe { *(slot as u64) -> d_kg }
+    slot = alloc(8); err = hipMalloc(slot, hd_half_bytes); if err != 0 { die("mc", err) }; unsafe { *(slot as u64) -> d_cos }
+    slot = alloc(8); err = hipMalloc(slot, hd_half_bytes); if err != 0 { die("ms", err) }; unsafe { *(slot as u64) -> d_sin }
+
+    u64 iters = 10000
+    u64 i = 0
+    u64 t0 = 0
+    u64 t1 = 0
+
+    // Warm-up.
+    if gpu_qkv_split_f32_to_dev(d_qkv, d_k_slot, d_v_slot) != 0 { die("warm split", 0) }
+    err = hipDeviceSynchronize()
+
+    // qkv_split
+    t0 = time_now(); i = 0
+    while i < iters { gpu_qkv_split_f32_to_dev(d_qkv, d_k_slot, d_v_slot); i = i + 1 }
+    err = hipDeviceSynchronize(); t1 = time_now()
+    report("qkv_split", t1 - t0, iters)
+
+    // qknorm Q (M=16)
+    t0 = time_now(); i = 0
+    while i < iters { gpu_qknorm_f32_to_dev(d_q, d_q, d_qg, 16); i = i + 1 }
+    err = hipDeviceSynchronize(); t1 = time_now()
+    report("qknorm Q (M=16)", t1 - t0, iters)
+
+    // qknorm K (M=8)
+    t0 = time_now(); i = 0
+    while i < iters { gpu_qknorm_f32_to_dev(d_k_slot, d_k_slot, d_kg, 8); i = i + 1 }
+    err = hipDeviceSynchronize(); t1 = time_now()
+    report("qknorm K (M=8)", t1 - t0, iters)
+
+    // rope Q (n_heads=16)
+    t0 = time_now(); i = 0
+    while i < iters { gpu_rope_f32_to_dev(d_q, d_cos, d_sin, 16); i = i + 1 }
+    err = hipDeviceSynchronize(); t1 = time_now()
+    report("rope Q (16)", t1 - t0, iters)
+
+    // rope K (n_heads=8)
+    t0 = time_now(); i = 0
+    while i < iters { gpu_rope_f32_to_dev(d_k_slot, d_cos, d_sin, 8); i = i + 1 }
+    err = hipDeviceSynchronize(); t1 = time_now()
+    report("rope K (8)", t1 - t0, iters)
+
+    // attn (pos_plus_1=20)
+    t0 = time_now(); i = 0
+    while i < iters { gpu_attn_decode_to_dev(d_q, d_kc, d_vc, d_out, 20); i = i + 1 }
+    err = hipDeviceSynchronize(); t1 = time_now()
+    report("attn_decode (pos=20)", t1 - t0, iters)
+
+    print_str("---\n")
+
+    // Full chain (no sync between, single sync at end of each iter loop).
+    iters = 5000
+    t0 = time_now(); i = 0
+    while i < iters {
+        gpu_qkv_split_f32_to_dev(d_qkv, d_k_slot, d_v_slot)
+        gpu_qknorm_f32_to_dev(d_q, d_q, d_qg, 16)
+        gpu_qknorm_f32_to_dev(d_k_slot, d_k_slot, d_kg, 8)
+        gpu_rope_f32_to_dev(d_q, d_cos, d_sin, 16)
+        gpu_rope_f32_to_dev(d_k_slot, d_cos, d_sin, 8)
+        gpu_attn_decode_to_dev(d_q, d_kc, d_vc, d_out, 20)
+        i = i + 1
+    }
+    err = hipDeviceSynchronize(); t1 = time_now()
+    print_str("full chain: total_us=")
+    u64 a = fmt_dec((t1 - t0) / 1000); print_str(a); dealloc(a)
+    print_str(" per_chain_us=")
+    u64 b = fmt_dec((t1 - t0) / iters / 1000); print_str(b); dealloc(b)
+    print_str("\n")
+
+    exit(0)
+}
