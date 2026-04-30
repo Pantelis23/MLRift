@@ -1255,10 +1255,11 @@ fn qwen3_forward_layer_qkv_batched_gpu(u64 d_x_in_arr_ptr,
 //   0x40  down matmul                    (step 14)
 //   0x80  final resid                    (step 15)
 // Sub-bits (set in addition to a phase bit to *skip* a sub-step):
-//   0x100  inside 0x08, skip post_norm   (caller batches it)
-//   0x200  inside 0x02, skip Q-rope      (caller batches it)
-//   0x400  inside 0x02, skip attn_decode (caller batches it)
-//   0x800  inside 0x02, skip qknorm Q    (caller batches it via extract_q)
+//   0x100   inside 0x08, skip post_norm   (caller batches it)
+//   0x200   inside 0x02, skip Q-rope      (caller batches it)
+//   0x400   inside 0x02, skip attn_decode (caller batches it)
+//   0x800   inside 0x02, skip qknorm Q    (caller batches it via extract_q)
+//   0x1000  inside 0x02, skip qkv_split   (caller batches it)
 // Legacy path uses 0xFF (no skip bits) — every sub-step runs inline.
 // Batched path uses 0x02|0x200, 0x08|0x100 plus the batched matmul +
 // post_norm + Q-rope calls dispatched separately by qwen3_generate.
@@ -1351,11 +1352,11 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
         u64 d_k_slot   = d_kc_layer + pos * kv_row_bytes
         u64 d_v_slot   = d_vc_layer + pos * kv_row_bytes
 
-        // 4a. Slice qkv → K/V cache slots on-device (no sync).  Q is
-        //     the first q_dim elements of d_qkv and stays there until
-        //     qknorm reads it via _gpuq_d_q_attn (we use d_qkv directly
-        //     as the Q source by passing its base).
-        if gpu_qkv_split_f32_to_dev(b_qkv, d_k_slot, d_v_slot) != 0 { return 1 }
+        // 4a. Slice qkv → K/V cache slots on-device (skippable by 0x1000
+        //     when caller batches via gpu_qkv_split_f32_batched_to_dev).
+        if (phase_mask & 0x1000) == 0 {
+            if gpu_qkv_split_f32_to_dev(b_qkv, d_k_slot, d_v_slot) != 0 { return 1 }
+        }
 
         // 4b. qknorm: in-place RMSNorm on each Q head + each K head.
         //     Q-side skippable by 0x800 (caller batches via extract_q +

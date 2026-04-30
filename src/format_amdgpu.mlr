@@ -6965,6 +6965,82 @@ fn emit_amdgpu_qkv_split_f32_blob(uint64 out_path) -> uint64 {
     return 0
 }
 
+// Batched qkv_split: grid (8, batch_size, 1).  Same body as the single-
+// stream variant but with an 8-instruction prologue that shifts the
+// three pointers in s[4..9] by per-batch strides:
+//   src_qkv += wg_y * 16384   (qkv_dim*4)
+//   dst_k   += wg_y * 262144  (kv_layer_stride = max_seq*nkv*hd*4)
+//   dst_v   += wg_y * 262144
+// Both strides are powers of 2 so each batch shift is one s_lshl_b32.
+fn _emit_qkv_split_f32_batched_body(uint64 args_desc) {
+    asm_init()
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)       // s_load_b256 s[4:11], s[0:1], 0x0
+    asm_u32(0xBF89FC07)                            // s_waitcnt   lgkmcnt(0)
+
+    // Per-batch pointer shifts.
+    asm_u32(0x84168E10)                            // s_lshl_b32 s22, s16, 14   (wg_y * 16384)
+    asm_u32(0x80041604)                            // s_add_u32  s4,  s4,  s22  (src += wg_y*16384)
+    asm_u32(0x82058005)                            // s_addc_u32 s5,  s5,  0
+    asm_u32(0x84179210)                            // s_lshl_b32 s23, s16, 18   (wg_y * 262144)
+    asm_u32(0x80061706)                            // s_add_u32  s6,  s6,  s23  (dst_k += wg_y*262144)
+    asm_u32(0x82078007)                            // s_addc_u32 s7,  s7,  0
+    asm_u32(0x80081708)                            // s_add_u32  s8,  s8,  s23  (dst_v += wg_y*262144)
+    asm_u32(0x82098009)                            // s_addc_u32 s9,  s9,  0
+
+    // Body identical to single-stream _emit_qkv_split_f32_body from here on.
+    asm_u32(0x840E890F)                            // s_lshl_b32 s14, s15, 9
+    asm_u32(0xBE8C00FF); asm_u32(0x00002000)       // s_mov_b32 s12, 0x2000
+    asm_u32(0x800C0E0C)                            // s_add_u32 s12, s12, s14
+    asm_u32(0x80100C04)                            // s_add_u32 s16, s4, s12
+    asm_u32(0x82118005)                            // s_addc_u32 s17, s5, 0
+    asm_u32(0xBE8D00FF); asm_u32(0x00001000)       // s_mov_b32 s13, 0x1000
+    asm_u32(0x800C0D0C)                            // s_add_u32 s12, s12, s13
+    asm_u32(0x80120C04)                            // s_add_u32 s18, s4, s12
+    asm_u32(0x82138005)                            // s_addc_u32 s19, s5, 0
+    asm_u32(0x80140E06)                            // s_add_u32  s20, s6, s14
+    asm_u32(0x82158007)                            // s_addc_u32 s21, s7, 0
+    // dst_V row-base in s[24:25] — but s22/s23 are already used for
+    // the per-batch strides above; rename via fresh sgprs s26/s27.
+    asm_u32(0x801A0E08)                            // s_add_u32  s26, s8, s14
+    asm_u32(0x821B8009)                            // s_addc_u32 s27, s9, 0
+    asm_u32(0x30020082)                            // v_lshlrev_b32 v1, 2, v0
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC520000); asm_u32(0x02100001)       // global_load_b32 v2, v1, s[16:17]   ; K
+    asm_u32(0xDC520000); asm_u32(0x03120001)       // global_load_b32 v3, v1, s[18:19]   ; V
+    asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)
+    asm_u32(0xDC6A0000); asm_u32(0x00140201)       // global_store_b32 v1, v2, s[20:21]
+    asm_u32(0xDC6A0000); asm_u32(0x001A0301)       // global_store_b32 v1, v3, s[26:27]
+    asm_u32(0xBC7C0000)                            // s_waitcnt_vscnt null, 0
+    asm_u32(0xBFB00000)                            // s_endpgm
+
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+}
+
+@export
+fn emit_amdgpu_qkv_split_f32_batched_blob(uint64 out_path) -> uint64 {
+    uint64[6] args_desc
+    _emit_qkv_split_f32_batched_body(args_desc)
+    uint64 size = emit_amdgpu_code_object_lds("qkv_split_f32_batched", 21,
+                                               asm_text_buf, asm_text_len,
+                                               24, 8, 16, 28,
+                                               0xE0AF0001, 0x0000019E, 0x00000010, 0x0408,
+                                               args_desc, 3,
+                                               0)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_qkv_split_f32_batched_blob: cannot open output\n", 60)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 // Qwen3-0.6B Q-extract kernel (Phase 1 Slice 1.7): copies the Q part
 // (q_dim = 2048 f32) out of the fused [batch, qkv_dim] _gpuq_d_qkv
 // buffer into the contiguous [batch, q_dim] _gpuq_d_q_attn buffer, so

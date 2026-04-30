@@ -50,6 +50,7 @@ static u64 _gpu_fh_rmsnorm_1024 = 0       // hidden-dim rmsnorm (N=1024)
 static u64 _gpu_fh_rmsnorm_128  = 0       // per-head rmsnorm (N=128, used by qknorm)
 static u64 _gpu_fh_rope_f32     = 0       // per-head RoPE (head_dim=128)
 static u64 _gpu_fh_qkv_split    = 0       // Qwen3 KV-slice copy (q=2048, kv=1024)
+static u64 _gpu_fh_qkv_split_batched = 0  // batched qkv_split (grid (8, batch))
 static u64 _gpu_fh_extract_q    = 0       // Qwen3 Q-extract for batched qknorm
 static u64 _gpu_fh_attn_decode  = 0       // fused decode-attn (Q·K → softmax → ·V)
 static u64 _gpu_fh_attn_decode_batched = 0  // batched decode-attn (grid (nh, batch))
@@ -145,6 +146,7 @@ fn _gpu_mm_init_once() {
     _gpu_fh_rmsnorm_128       = _gpu_mm_load_co("/tmp/qknorm_f32.co",         "rmsnorm_f32")
     _gpu_fh_rope_f32          = _gpu_mm_load_co("/tmp/rope_qwen3_f32.co",     "rope_qwen3_f32")
     _gpu_fh_qkv_split         = _gpu_mm_load_co("/tmp/qkv_split_f32.co",      "qkv_split_f32")
+    _gpu_fh_qkv_split_batched = _gpu_mm_load_co("/tmp/qkv_split_f32_batched.co", "qkv_split_f32_batched")
     _gpu_fh_extract_q         = _gpu_mm_load_co("/tmp/extract_q_qwen3_f32.co", "extract_q_qwen3_f32")
     _gpu_fh_attn_decode       = _gpu_mm_load_co("/tmp/attn_decode_f32.co",    "attn_decode_f32")
     _gpu_fh_attn_decode_batched = _gpu_mm_load_co("/tmp/attn_decode_f32_batched.co", "attn_decode_f32_batched")
@@ -682,6 +684,28 @@ fn gpu_matmul_to_dev_batched(u64 d_out, u64 d_x, u64 w_bf16,
     u32 cgrid_y = batch_size
     u32 err = hipModuleLaunchKernel(_gpu_mm_fh_gemv_coop_batched,
                                      cgrid_x, cgrid_y, 1, 32, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
+// gpu_qkv_split_f32_batched_to_dev: ONE batched dispatch covers M
+// streams' qkv → K-slot/V-slot extraction.  Grid (8, batch_size, 1).
+// Caller passes layer-base K/V pointers (= kv_layer_base + pos *
+// kv_row_bytes for batch=0); the kernel adds wg_id_y * 262144 to
+// reach the per-batch slot.  Returns 0 on success.
+fn gpu_qkv_split_f32_batched_to_dev(u64 d_qkv, u64 d_k_slot_base, u64 d_v_slot_base,
+                                     u64 batch_size) -> u64 {
+    if _gpu_fh_qkv_split_batched == 0 { return 1 }
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_qkv }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_k_slot_base }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = d_v_slot_base }
+    u64 kp = alloc(3 * 8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+    u32 cgrid_x = 8
+    u32 cgrid_y = batch_size
+    u32 err = hipModuleLaunchKernel(_gpu_fh_qkv_split_batched, cgrid_x, cgrid_y, 1, 128, 1, 1, 0, 0, kp, 0)
     if err != 0 { return 1 }
     return 0
 }
