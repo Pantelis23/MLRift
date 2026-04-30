@@ -1,0 +1,145 @@
+// Smoke test for the speculative-layout qkv_split kernel
+// (Phase 2 Slice 2.2a).  K=4 contiguous QKV-proj outputs split into
+// K consecutive K/V cache positions of a single sequence's slab.
+//
+// Layout match with Qwen3-0.6B + Phase 1 4D KV cache:
+//   q_dim   = 2048 f32 (16 heads * 128)
+//   kv_dim  = 1024 f32 ( 8 kv-heads * 128)
+//   qkv_dim = 4096 f32  → 16384 bytes/slot
+//   max_seq = 64 (per smoke test; prod uses 1024+)
+//   nkv*hd*4 = 4096 bytes/position  →  per-pos stride for SPECK4
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-qkv-split-f32-speck4=/tmp/qkv_split_f32_speck4.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/qkv_split_speck4_smoke.mlr -o /tmp/qkv_split_speck4_smoke
+// Run:
+//   /tmp/qkv_split_speck4_smoke
+
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/inference_gpu.mlr"
+
+@dynamic extern fn exit(uint64 code)
+fn die(uint64 m, uint64 c) { print_str(m); print_str(" e="); u64 s = fmt_dec(c); print_str(s); dealloc(s); print_str("\n"); exit(1) }
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    u64 fd = file_open("/tmp/qkv_split_f32_speck4.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
+    u64 sz = file_size(fd); u64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    u64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    u64 mod = 0; unsafe { *(mod_slot as u64) -> mod }
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "qkv_split_f32_speck4"); if err != 0 { die("getFn", err) }
+    u64 fh = 0; unsafe { *(fh_slot as u64) -> fh }
+    print_str("qkv_split_f32_speck4 loaded\n")
+
+    u64 K = 4
+    u64 q_dim   = 2048
+    u64 kv_dim  = 1024
+    u64 qkv_dim = q_dim + 2 * kv_dim    // = 4096
+    u64 max_seq = 64
+    u64 pos     = 5                      // history length; speculation writes pos..pos+K-1
+
+    u64 qkv_bytes = K * qkv_dim * 4      // [K, qkv_dim]
+    u64 kv_bytes  = max_seq * kv_dim * 4 // single-sequence slab
+
+    u64 d_qkv = 0; u64 d_k = 0; u64 d_v = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, qkv_bytes); if err != 0 { die("m_qkv", err) }; unsafe { *(slot as u64) -> d_qkv }
+    slot = alloc(8); err = hipMalloc(slot, kv_bytes);  if err != 0 { die("m_k",   err) }; unsafe { *(slot as u64) -> d_k }
+    slot = alloc(8); err = hipMalloc(slot, kv_bytes);  if err != 0 { die("m_v",   err) }; unsafe { *(slot as u64) -> d_v }
+
+    // QKV input pattern: qkv[m, j] = m*100000 + j  (each f32 unique).
+    // q_dim=2048 → K elements [0..2048),  K=2048..3072,  V=3072..4096.
+    u64 h_qkv = alloc(qkv_bytes)
+    u64 i = 0
+    while i < K * qkv_dim {
+        u64 m = i / qkv_dim
+        u64 j = i % qkv_dim
+        f64 v = int_to_f64(m * 100000 + j)
+        unsafe { *((h_qkv + i * 4) as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+    err = hipMemcpy(d_qkv, h_qkv, qkv_bytes, 1); if err != 0 { die("H2D qkv", err) }
+
+    // Pre-fill K/V cache with sentinel -1.0 to detect any out-of-bounds writes.
+    u64 h_seed = alloc(kv_bytes)
+    i = 0
+    while i < max_seq * kv_dim {
+        unsafe { *((h_seed + i * 4) as f32) = (0.0f - 1.0f) }
+        i = i + 1
+    }
+    err = hipMemcpy(d_k, h_seed, kv_bytes, 1); if err != 0 { die("H2D K seed", err) }
+    err = hipMemcpy(d_v, h_seed, kv_bytes, 1); if err != 0 { die("H2D V seed", err) }
+
+    // Caller-supplied K/V dst pointers are pre-shifted to position pos.
+    // Per-position stride = kv_dim * 4 = 4096 bytes.
+    u64 d_k_pos = d_k + pos * kv_dim * 4
+    u64 d_v_pos = d_v + pos * kv_dim * 4
+
+    // Build kernarg & launch directly (smoke bypasses the lazy-init launcher).
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_qkv }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_k_pos }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = d_v_pos }
+    u64 kp = alloc(3 * 8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+    err = hipModuleLaunchKernel(fh, 8, K, 1, 128, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    u64 h_k_out = alloc(kv_bytes)
+    u64 h_v_out = alloc(kv_bytes)
+    err = hipMemcpy(h_k_out, d_k, kv_bytes, 2); if err != 0 { die("D2H K", err) }
+    err = hipMemcpy(h_v_out, d_v, kv_bytes, 2); if err != 0 { die("D2H V", err) }
+
+    // Verify:
+    //   K-cache positions pos..pos+K-1 hold qkv[m, q_dim..q_dim+kv_dim)
+    //   V-cache positions pos..pos+K-1 hold qkv[m, q_dim+kv_dim..qkv_dim)
+    //   All other positions remain -1.0
+    u64 fail = 0
+    u64 t = 0
+    while t < max_seq {
+        u64 in_window = 0
+        u64 m_idx = 0
+        if t >= pos {
+            u64 d = t - pos
+            if d < K { in_window = 1; m_idx = d }
+        }
+        u64 j = 0
+        while j < kv_dim {
+            f32 k_act = 0.0f
+            f32 v_act = 0.0f
+            unsafe { *((h_k_out + (t * kv_dim + j) * 4) as f32) -> k_act }
+            unsafe { *((h_v_out + (t * kv_dim + j) * 4) as f32) -> v_act }
+            f32 k_exp = 0.0f - 1.0f
+            f32 v_exp = 0.0f - 1.0f
+            if in_window == 1 {
+                f64 ke = int_to_f64(m_idx * 100000 + q_dim + j)
+                f64 ve = int_to_f64(m_idx * 100000 + q_dim + kv_dim + j)
+                k_exp = f64_to_f32(ke)
+                v_exp = f64_to_f32(ve)
+            }
+            if k_act != k_exp { fail = fail + 1 }
+            if v_act != v_exp { fail = fail + 1 }
+            j = j + 1
+        }
+        t = t + 1
+    }
+
+    u64 total = 2 * max_seq * kv_dim
+    print_str("speck4 qkv_split fail count: "); u64 sf = fmt_dec(fail); print_str(sf); dealloc(sf)
+    print_str(" / "); u64 stot = fmt_dec(total); print_str(stot); dealloc(stot); print_str("\n")
+    if fail == 0 {
+        print_str("OK — qkv_split_speck4 writes K K/V vectors to consecutive positions.\n"); exit(0)
+    } else {
+        print_str("FAIL\n"); exit(1)
+    }
+}

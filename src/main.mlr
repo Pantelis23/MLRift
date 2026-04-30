@@ -4986,6 +4986,14 @@ fn main() {
                 if emit_amdgpu_attn_decode_f32_speck4_blob(sk_path) != 0 { exit(1) }
                 write(1, "mlrc: wrote ", 12); write(1, sk_path, str_len(sk_path))
                 write(1, " (attn-decode-f32-speck4)\n", 26); exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-qkv-split-f32-speck4=", 35) != 0 {
+                uint64 qsk_path = arg + 35
+                if emit_amdgpu_qkv_split_f32_speck4_blob(qsk_path) != 0 {
+                    write(2, "mlrc: --emit-amdgpu-qkv-split-f32-speck4 failed\n", 48)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12); write(1, qsk_path, str_len(qsk_path))
+                write(1, " (qkv-split-f32-speck4, grid=(8,K) per-pos stride 4096)\n", 56); exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-silu-mul-f32-batched=", 35) != 0 {
                 uint64 sm_path = arg + 35
                 if emit_amdgpu_silu_mul_f32_batched_blob(sm_path) != 0 { exit(1) }
