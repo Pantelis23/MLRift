@@ -7107,6 +7107,92 @@ fn emit_amdgpu_extract_q_qwen3_f32_blob(uint64 out_path) -> uint64 {
     return 0
 }
 
+// extract_k_qwen3_f32: copies K from per-batch K-cache slots into a
+// contiguous [batch, kv_dim] stage buffer.  Grid (8, batch); per WG
+// copies 128 f32 elements.
+//   src per-batch stride = max_seq * nkv * hd * 4 = 262144 = 1 << 18
+//   dst per-batch stride = nkv * hd * 4 = 4096 = 1 << 12
+fn _emit_extract_k_qwen3_f32_body(uint64 args_desc) {
+    asm_init()
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x840E9210)                            // s_lshl_b32 s14, s16, 18  (src batch off)
+    asm_u32(0x8411890F)                            // s_lshl_b32 s17, s15, 9   (wg_x * 512)
+    asm_u32(0x800E110E)                            // s_add_u32  s14, s14, s17
+    asm_u32(0x80120E04)                            // s_add_u32  s18, s4, s14
+    asm_u32(0x82138005)                            // s_addc_u32 s19, s5, 0
+    asm_u32(0x84168C10)                            // s_lshl_b32 s22, s16, 12  (dst batch off)
+    asm_u32(0x80161116)                            // s_add_u32  s22, s22, s17
+    asm_u32(0x80141606)                            // s_add_u32  s20, s6, s22
+    asm_u32(0x82158007)                            // s_addc_u32 s21, s7, 0
+    asm_u32(0x30020082)                            // v_lshlrev_b32 v1, 2, v0
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC520000); asm_u32(0x02120001)       // global_load_b32 v2, v1, s[18:19]
+    asm_u32(0xBF8903F7)
+    asm_u32(0xDC6A0000); asm_u32(0x00140201)       // global_store_b32 v1, v2, s[20:21]
+    asm_u32(0xBC7C0000)
+    asm_u32(0xBFB00000)
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+}
+
+@export
+fn emit_amdgpu_extract_k_qwen3_f32_blob(uint64 out_path) -> uint64 {
+    uint64[4] args_desc
+    _emit_extract_k_qwen3_f32_body(args_desc)
+    uint64 size = emit_amdgpu_code_object_lds("extract_k_qwen3_f32", 19,
+                                               asm_text_buf, asm_text_len,
+                                               16, 8, 16, 16,
+                                               0xE0AF0001, 0x0000019E, 0x00000010, 0x0408,
+                                               args_desc, 2, 0)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 { write(2, "extract_k blob fail\n", 20); return 1 }
+    file_write(fd, amd_buf, size); file_close(fd); return 0
+}
+
+// insert_k_qwen3_f32: inverse of extract_k.
+fn _emit_insert_k_qwen3_f32_body(uint64 args_desc) {
+    asm_init()
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x840E8C10)                            // s_lshl_b32 s14, s16, 12  (src batch off, contig)
+    asm_u32(0x8411890F)
+    asm_u32(0x800E110E)
+    asm_u32(0x80120E04)
+    asm_u32(0x82138005)
+    asm_u32(0x84169210)                            // s_lshl_b32 s22, s16, 18  (dst batch off, K-slot)
+    asm_u32(0x80161116)
+    asm_u32(0x80141606)
+    asm_u32(0x82158007)
+    asm_u32(0x30020082)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC520000); asm_u32(0x02120001)
+    asm_u32(0xBF8903F7)
+    asm_u32(0xDC6A0000); asm_u32(0x00140201)
+    asm_u32(0xBC7C0000)
+    asm_u32(0xBFB00000)
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+}
+
+@export
+fn emit_amdgpu_insert_k_qwen3_f32_blob(uint64 out_path) -> uint64 {
+    uint64[4] args_desc
+    _emit_insert_k_qwen3_f32_body(args_desc)
+    uint64 size = emit_amdgpu_code_object_lds("insert_k_qwen3_f32", 18,
+                                               asm_text_buf, asm_text_len,
+                                               16, 8, 16, 16,
+                                               0xE0AF0001, 0x0000019E, 0x00000010, 0x0408,
+                                               args_desc, 2, 0)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 { write(2, "insert_k blob fail\n", 19); return 1 }
+    file_write(fd, amd_buf, size); file_close(fd); return 0
+}
+
 // Phase 2 routing: lower a name-matched @kernel `gemv_f32` into the
 // kernel table. Snapshots the ISA so a subsequent kernel's asm_init
 // can't clobber it before emit_amdgpu_multi_code_object runs.

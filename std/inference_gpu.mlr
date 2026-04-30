@@ -52,6 +52,8 @@ static u64 _gpu_fh_rope_f32     = 0       // per-head RoPE (head_dim=128)
 static u64 _gpu_fh_qkv_split    = 0       // Qwen3 KV-slice copy (q=2048, kv=1024)
 static u64 _gpu_fh_qkv_split_batched = 0  // batched qkv_split (grid (8, batch))
 static u64 _gpu_fh_extract_q    = 0       // Qwen3 Q-extract for batched qknorm
+static u64 _gpu_fh_extract_k    = 0       // Qwen3 K-extract: K-slots → contig stage
+static u64 _gpu_fh_insert_k     = 0       // Qwen3 K-insert: contig stage → K-slots
 static u64 _gpu_fh_attn_decode  = 0       // fused decode-attn (Q·K → softmax → ·V)
 static u64 _gpu_fh_attn_decode_batched = 0  // batched decode-attn (grid (nh, batch))
 
@@ -148,6 +150,8 @@ fn _gpu_mm_init_once() {
     _gpu_fh_qkv_split         = _gpu_mm_load_co("/tmp/qkv_split_f32.co",      "qkv_split_f32")
     _gpu_fh_qkv_split_batched = _gpu_mm_load_co("/tmp/qkv_split_f32_batched.co", "qkv_split_f32_batched")
     _gpu_fh_extract_q         = _gpu_mm_load_co("/tmp/extract_q_qwen3_f32.co", "extract_q_qwen3_f32")
+    _gpu_fh_extract_k         = _gpu_mm_load_co("/tmp/extract_k_qwen3_f32.co", "extract_k_qwen3_f32")
+    _gpu_fh_insert_k          = _gpu_mm_load_co("/tmp/insert_k_qwen3_f32.co",  "insert_k_qwen3_f32")
     _gpu_fh_attn_decode       = _gpu_mm_load_co("/tmp/attn_decode_f32.co",    "attn_decode_f32")
     _gpu_fh_attn_decode_batched = _gpu_mm_load_co("/tmp/attn_decode_f32_batched.co", "attn_decode_f32_batched")
     if _gpu_mm_fh_dq == 0 || _gpu_mm_fh_gemv == 0 { return }
@@ -706,6 +710,35 @@ fn gpu_qkv_split_f32_batched_to_dev(u64 d_qkv, u64 d_k_slot_base, u64 d_v_slot_b
     u32 cgrid_x = 8
     u32 cgrid_y = batch_size
     u32 err = hipModuleLaunchKernel(_gpu_fh_qkv_split_batched, cgrid_x, cgrid_y, 1, 128, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
+// gpu_extract_k_qwen3_f32_to_dev: K-slots → contiguous stage buffer.
+// Caller passes layer/pos K-slot base for batch=0; kernel adds wg_y *
+// 262144 to reach each batch's slot.  Returns 0 on success.
+fn gpu_extract_k_qwen3_f32_to_dev(u64 d_k_slot_base, u64 d_stage, u64 batch_size) -> u64 {
+    if _gpu_fh_extract_k == 0 { return 1 }
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_k_slot_base }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_stage }
+    u64 kp = alloc(2 * 8)
+    unsafe { *(kp as u64) = a0 }
+    unsafe { *((kp + 8) as u64) = a1 }
+    u32 err = hipModuleLaunchKernel(_gpu_fh_extract_k, 8, batch_size, 1, 128, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
+// gpu_insert_k_qwen3_f32_to_dev: contiguous stage → K-slots.  Inverse
+// of extract_k.  Returns 0 on success.
+fn gpu_insert_k_qwen3_f32_to_dev(u64 d_stage, u64 d_k_slot_base, u64 batch_size) -> u64 {
+    if _gpu_fh_insert_k == 0 { return 1 }
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_stage }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_k_slot_base }
+    u64 kp = alloc(2 * 8)
+    unsafe { *(kp as u64) = a0 }
+    unsafe { *((kp + 8) as u64) = a1 }
+    u32 err = hipModuleLaunchKernel(_gpu_fh_insert_k, 8, batch_size, 1, 128, 1, 1, 0, 0, kp, 0)
     if err != 0 { return 1 }
     return 0
 }

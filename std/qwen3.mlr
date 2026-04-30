@@ -1145,6 +1145,12 @@ static u64 _gpuq_d_rope_sin    = 0
 static u64 _gpuq_d_rope_sin_h  = 0
 static u64 _gpuq_rope_cache_pos = 0xFFFFFFFFFFFFFFFF
 
+// Phase 1 Slice 1.7c: contiguous [batch, kv_dim] K-stage buffer.
+// extract_k → qknorm K → K-rope → insert_k pipeline copies the K row
+// from per-batch K-slots into here, processes it, and writes back.
+// Allocated lazily in _qwen3_gpu_pipeline_init.
+static u64 _gpuq_d_k_stage      = 0
+
 // KV cache device VAs (Step C of attn wiring; extended to 4D for
 // Phase 1 batched-decode work).  Layout is layer-major-of-batch-major:
 //   addr = base + layer*batch_stride + batch_idx*layer_stride + ...
@@ -1195,6 +1201,9 @@ fn _qwen3_gpu_pipeline_init() -> u64 {
     unsafe { *(hslot as u64) -> _gpuq_d_rope_cos_h }
     _gpuq_d_rope_sin = gpu_buf_reserve((QWEN3_HEAD_DIM / 2) * 4, hslot)
     unsafe { *(hslot as u64) -> _gpuq_d_rope_sin_h }
+    // K-stage buffer: [batch, kv_dim] f32 for the extract-k → qknorm K
+    // → K-rope → insert-k pipeline.  At batch=1 the buffer is unused.
+    _gpuq_d_k_stage = gpu_buf_reserve(B * kv_dim * 4, 0)
 
     if _gpuq_d_x_norm == 0 { return 0 }
     if _gpuq_d_qkv == 0 { return 0 }
@@ -1260,6 +1269,8 @@ fn qwen3_forward_layer_qkv_batched_gpu(u64 d_x_in_arr_ptr,
 //   0x400   inside 0x02, skip attn_decode (caller batches it)
 //   0x800   inside 0x02, skip qknorm Q    (caller batches it via extract_q)
 //   0x1000  inside 0x02, skip qkv_split   (caller batches it)
+//   0x2000  inside 0x02, skip qknorm K    (caller batches it via stage buffer)
+//   0x4000  inside 0x02, skip K-rope      (caller batches it via stage buffer)
 // Legacy path uses 0xFF (no skip bits) — every sub-step runs inline.
 // Batched path uses 0x02|0x200, 0x08|0x100 plus the batched matmul +
 // post_norm + Q-rope calls dispatched separately by qwen3_generate.
@@ -1365,15 +1376,18 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
         if (phase_mask & 0x800) == 0 {
             if gpu_qknorm_f32_to_dev(b_q_attn, b_qkv, d_q_gamma, nh) != 0 { return 1 }
         }
-        if gpu_qknorm_f32_to_dev(d_k_slot, d_k_slot, d_k_gamma, nkv) != 0 { return 1 }
+        if (phase_mask & 0x2000) == 0 {
+            if gpu_qknorm_f32_to_dev(d_k_slot, d_k_slot, d_k_gamma, nkv) != 0 { return 1 }
+        }
 
-        // 4c. RoPE: in-place per-head rotation.  Q-rope is skippable
-        //     when the batched-decode caller has dispatched it once
-        //     across all M streams (mask 0x200).
+        // 4c. RoPE: in-place per-head rotation.  Q-rope skippable by
+        //     0x200, K-rope by 0x4000.
         if (phase_mask & 0x200) == 0 {
             if gpu_rope_f32_to_dev(b_q_attn, _gpuq_d_rope_cos, _gpuq_d_rope_sin, nh) != 0 { return 1 }
         }
-        if gpu_rope_f32_to_dev(d_k_slot,  _gpuq_d_rope_cos, _gpuq_d_rope_sin, nkv) != 0 { return 1 }
+        if (phase_mask & 0x4000) == 0 {
+            if gpu_rope_f32_to_dev(d_k_slot, _gpuq_d_rope_cos, _gpuq_d_rope_sin, nkv) != 0 { return 1 }
+        }
 
         // 4d. Fused attention (skippable by 0x400 when caller batches).
         if (phase_mask & 0x400) == 0 {
