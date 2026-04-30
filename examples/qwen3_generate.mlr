@@ -343,15 +343,17 @@ fn main() {
     if ev_full != 0 {
         u8 cf = 0; unsafe { *(ev_full as u8) -> cf }
         if cf != 48 {
-            // Note: gpu_pipeline_ready below returns 0 unless someone
-            // already triggered _gpu_mm_init_once.  Historically use_gpu_full
-            // remained 0 here for both batch=1 and batch>1 — the layer
-            // loop's CPU-fallback path internally fast-paths via
-            // qwen3_main_matmul (which fires lazy init on its first
-            // matmul) and that's the path that's been delivering the
-            // numbers in earlier slices.  We don't disturb that here.
-            // Spec mode does need the GTT residual buffers, so it forces
-            // init explicitly when entering the verify block.
+            // Slice 2.4-pre finding: gpu_pipeline_ready returns 0 here
+            // because _gpu_mm_init_once hasn't fired yet (no GPU op has
+            // run).  Earlier batched slices ran the CPU fallback path,
+            // not the use_gpu_full=1 path — qwen3_main_matmul fires the
+            // lazy init internally on its first call, but by then this
+            // block has already left use_gpu_full at 0.  Forcing init
+            // here (gpu_matmul_enabled()) reveals that the M>1 path
+            // hangs at the very first qwen3_forward_layer_qkv_batched_gpu
+            // call, even at M=2.  Root cause not yet found — tracked as
+            // task #102.  For now leave use_gpu_full=0 in batched mode
+            // so the CPU-fallback-with-GPU-matmul path keeps working.
             if gpu_pipeline_ready() == 1 {
                 d_x_A = dev_try_alloc_host_visible(M_eff * hidden * 4)
                 d_x_B = dev_try_alloc_host_visible(M_eff * hidden * 4)
