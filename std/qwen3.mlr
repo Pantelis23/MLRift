@@ -1257,6 +1257,7 @@ fn qwen3_forward_layer_qkv_batched_gpu(u64 d_x_in_arr_ptr,
 // Sub-bits (set in addition to a phase bit to *skip* a sub-step):
 //   0x100  inside 0x08, skip post_norm   (caller batches it)
 //   0x200  inside 0x02, skip Q-rope      (caller batches it)
+//   0x400  inside 0x02, skip attn_decode (caller batches it)
 // Legacy path uses 0xFF (no skip bits) — every sub-step runs inline.
 // Batched path uses 0x02|0x200, 0x08|0x100 plus the batched matmul +
 // post_norm + Q-rope calls dispatched separately by qwen3_generate.
@@ -1368,9 +1369,11 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
         }
         if gpu_rope_f32_to_dev(d_k_slot,  _gpuq_d_rope_cos, _gpuq_d_rope_sin, nkv) != 0 { return 1 }
 
-        // 4d. Fused attention.
-        if gpu_attn_decode_to_dev(b_q_attn, d_kc_layer, d_vc_layer,
-                                   b_attn, pos + 1) != 0 { return 1 }
+        // 4d. Fused attention (skippable by 0x400 when caller batches).
+        if (phase_mask & 0x400) == 0 {
+            if gpu_attn_decode_to_dev(b_q_attn, d_kc_layer, d_vc_layer,
+                                       b_attn, pos + 1) != 0 { return 1 }
+        }
         // _gpuq_d_attn now holds the per-head attention output; the
         // chained o_proj call below consumes it directly without sync.
     } else {

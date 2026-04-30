@@ -4969,6 +4969,18 @@ fn main() {
                 write(1, qkn_path, qknl)
                 write(1, " (amdgpu qknorm-f32 code object, N=128, eps=1e-6)\n", 51)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-attn-decode-f32-batched=", 38) != 0 {
+                uint64 adb_path = arg + 38
+                uint64 adb_rc = emit_amdgpu_attn_decode_f32_batched_blob(adb_path)
+                if adb_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-attn-decode-f32-batched failed\n", 51)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 adbl = str_len(adb_path)
+                write(1, adb_path, adbl)
+                write(1, " (amdgpu attn-decode-f32-batched code object, grid=(nh,batch))\n", 64)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-qkv-split-f32=", 28) != 0 {
                 uint64 qsp_path = arg + 28
                 uint64 qsp_rc = emit_amdgpu_qkv_split_f32_blob(qsp_path)
