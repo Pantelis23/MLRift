@@ -343,6 +343,15 @@ fn main() {
     if ev_full != 0 {
         u8 cf = 0; unsafe { *(ev_full as u8) -> cf }
         if cf != 48 {
+            // Note: gpu_pipeline_ready below returns 0 unless someone
+            // already triggered _gpu_mm_init_once.  Historically use_gpu_full
+            // remained 0 here for both batch=1 and batch>1 — the layer
+            // loop's CPU-fallback path internally fast-paths via
+            // qwen3_main_matmul (which fires lazy init on its first
+            // matmul) and that's the path that's been delivering the
+            // numbers in earlier slices.  We don't disturb that here.
+            // Spec mode does need the GTT residual buffers, so it forces
+            // init explicitly when entering the verify block.
             if gpu_pipeline_ready() == 1 {
                 d_x_A = dev_try_alloc_host_visible(M_eff * hidden * 4)
                 d_x_B = dev_try_alloc_host_visible(M_eff * hidden * 4)
@@ -404,6 +413,47 @@ fn main() {
         u64 step_start_ns = time_now()
         eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
 
+        // Slice 2.3: PLD draft proposal (computed once per step, used
+        // both to fill input rows 1..K-1 and to verify after lmhead).
+        u64 draft_arr = 0
+        u64 K_minus_1 = 0
+        if is_spec != 0 {
+            K_minus_1 = M_eff - 1
+            draft_arr = alloc(K_minus_1 * 8)
+            u64 di = 0
+            while di < K_minus_1 {
+                unsafe { *((draft_arr + di * 8) as u64) = 0 }
+                di = di + 1
+            }
+            u64 sids0 = 0; unsafe { *((seq_ids_arr + 0) as u64) -> sids0 }
+            if seq_len >= 3 {
+                u64 last_a = 0; unsafe { *((sids0 + (seq_len - 2) * 8) as u64) -> last_a }
+                u64 last_b = 0; unsafe { *((sids0 + (seq_len - 1) * 8) as u64) -> last_b }
+                u64 ii = 1
+                u64 limit = seq_len - 1
+                while ii < limit {
+                    u64 a = 0; unsafe { *((sids0 + (ii - 1) * 8) as u64) -> a }
+                    u64 b = 0; unsafe { *((sids0 + ii * 8) as u64) -> b }
+                    if a == last_a {
+                        if b == last_b {
+                            u64 m = 0
+                            while m < K_minus_1 {
+                                u64 src = ii + 1 + m
+                                u64 tk  = 0
+                                if src < seq_len {
+                                    unsafe { *((sids0 + src * 8) as u64) -> tk }
+                                }
+                                unsafe { *((draft_arr + m * 8) as u64) = tk }
+                                m = m + 1
+                            }
+                            ii = limit
+                        }
+                    }
+                    ii = ii + 1
+                }
+            }
+        }
+
         u64 layer_start_ns = time_now()
         if use_gpu_full != 0 {
             // GPU path: per-stream H2D into d_x_a, layer-major outer loop
@@ -415,15 +465,23 @@ fn main() {
                 memcpy(dxah_b, xc_b, hidden * 4)
                 b_init = b_init + 1
             }
-            // Spec mode: replicate row 0's x_cur into rows 1..M_eff-1 so all
-            // K input rows hold the verified token's embedding (no draft yet,
-            // slice 2.3 will produce real K candidate embeddings).
+            // Fill rows 1..K-1 with embeddings of the step-scoped draft
+            // tokens (computed via PLD at step start).
             if is_spec != 0 {
                 u64 row0_dst = 0
                 unsafe { *((d_x_a_h_arr + 0) as u64) -> row0_dst }
                 u64 r = 1
                 while r < M_eff {
-                    memcpy(row0_dst + r * hidden * 4, row0_dst, hidden * 4)
+                    u64 dtk = 0
+                    unsafe { *((draft_arr + (r - 1) * 8) as u64) -> dtk }
+                    u64 d_row = row0_dst + r * hidden * 4
+                    u64 e_row = embed_ptr + dtk * hidden * 2
+                    u64 ie = 0
+                    while ie < hidden {
+                        f32 ev = bf16_to_f32(e_row + ie * 2)
+                        unsafe { *((d_row + ie * 4) as f32) = ev }
+                        ie = ie + 1
+                    }
                     r = r + 1
                 }
             }
@@ -446,10 +504,6 @@ fn main() {
             while layer < n_layers {
                 Qwen3LayerWeights w = layers_arr + layer * 88
                 if M_eff > 1 {
-                    // Fully batched chain at M = M_eff (= batch_size or
-                    // spec_K).  qkv_batched + per-stream attn + batched
-                    // o_proj + batched resid/postnorm + batched gate_up
-                    // + batched silu + batched down + batched final_resid.
                     if qwen3_forward_layer_qkv_batched_gpu(d_in_arr, w, M_eff) != 0 { exit(1) }
                     // Pre-compute layer's K/V slab base.  In spec mode
                     // batch_size=1 so this is also the single-sequence
@@ -459,7 +513,6 @@ fn main() {
                     u64 d_k_pos_b = d_kc_layer_b + pos * (kv_dim * 4)
                     u64 d_v_pos_b = d_vc_layer_b + pos * (kv_dim * 4)
                     if is_spec != 0 {
-                        // SPECK qkv_split: K consecutive positions of single seq.
                         if gpu_qkv_split_f32_speck4_to_dev(_gpuq_d_qkv, d_k_pos_b, d_v_pos_b, M_eff) != 0 { exit(1) }
                     } else {
                         if gpu_qkv_split_f32_batched_to_dev(_gpuq_d_qkv, d_k_pos_b, d_v_pos_b, batch_size) != 0 { exit(1) }
@@ -478,7 +531,6 @@ fn main() {
                             b_attn_phase = b_attn_phase + 1
                         }
                     }
-                    // Q extract + batched qknorm Q + batched Q-rope.
                     if gpu_extract_q_qwen3_f32_to_dev(_gpuq_d_qkv, _gpuq_d_q_attn, M_eff) != 0 { exit(1) }
                     u64 d_q_gamma_b = gpu_cache_bf16_as_f32(w.q_norm_w, QWEN3_HEAD_DIM)
                     if d_q_gamma_b == 0 { exit(1) }
@@ -601,76 +653,123 @@ fn main() {
         // allocated, run final_norm × M into the batched final_out buffer,
         // then ONE batched lm_head matmul for all streams, then per-stream
         // argmax + embed.
-        u64 use_batched_lmhead = 0
-        if batch_size > 1 {
-            if d_logits_batched != 0 { use_batched_lmhead = 1 }
-        }
-        if use_batched_lmhead != 0 {
-            u64 norm_start_ns = time_now()
-            u64 b_n = 0
-            while b_n < batch_size {
-                u64 x_cur_n = 0; unsafe { *((x_cur_arr + b_n * 8) as u64) -> x_cur_n }
-                qwen3_rmsnorm_bf16(d_final_out_batched_h + b_n * hidden * 4, x_cur_n, norm_ptr, hidden)
-                b_n = b_n + 1
-            }
-            sum_norm_ns = sum_norm_ns + time_elapsed(norm_start_ns)
-            u64 lmhead_start_ns = time_now()
-            if gpu_matmul_to_dev_batched(d_logits_batched, d_final_out_batched, embed_ptr,
-                                          vocab, hidden, batch_size) != 0 { exit(1) }
-            gpu_pipeline_flush()
-            sum_lmhead_ns = sum_lmhead_ns + time_elapsed(lmhead_start_ns)
-        }
-
-        // Per-stream argmax + embed (and per-stream final_norm + lm_head
-        // when use_batched_lmhead == 0).
-        u64 b_step = 0
-        while b_step < batch_size {
-            u64 x_cur = 0; unsafe { *((x_cur_arr + b_step * 8) as u64) -> x_cur }
-            u64 sids  = 0; unsafe { *((seq_ids_arr + b_step * 8) as u64) -> sids }
-
-            u64 logits_for_b = logits
-            if use_batched_lmhead != 0 {
-                logits_for_b = d_logits_batched_h + b_step * vocab * 4
-            } else {
+        if is_spec != 0 {
+            // Slice 2.4 verify block lives here in a future iteration.
+            // For now: consume row 0 only (single-stream-equivalent
+            // semantics) and free draft_arr.
+            dealloc(draft_arr)
+            // Fall through to the existing per-stream path which
+            // operates on x_cur (already updated by D2H from row 0).
+            u64 b_step = 0
+            while b_step < batch_size {
+                u64 x_cur = 0; unsafe { *((x_cur_arr + b_step * 8) as u64) -> x_cur }
+                u64 sids  = 0; unsafe { *((seq_ids_arr + b_step * 8) as u64) -> sids }
                 u64 norm_start_ns = time_now()
                 qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
                 sum_norm_ns = sum_norm_ns + time_elapsed(norm_start_ns)
                 u64 lmhead_start_ns = time_now()
                 qwen3_main_matmul(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
                 sum_lmhead_ns = sum_lmhead_ns + time_elapsed(lmhead_start_ns)
+                u64 argmax_start_ns = time_now()
+                u64 best_id = 0
+                f32 best_val = 0.0f
+                u64 first = 1
+                u64 j = 0
+                while j < vocab {
+                    f32 v = 0.0f
+                    unsafe { *((logits + j * 4) as f32) -> v }
+                    if first == 1 { best_val = v; best_id = j; first = 0 }
+                    else          { if v > best_val { best_val = v; best_id = j } }
+                    j = j + 1
+                }
+                sum_argmax_ns = sum_argmax_ns + time_elapsed(argmax_start_ns)
+                unsafe { *((sids + seq_len * 8) as u64) = best_id }
+                u64 embed_start_ns = time_now()
+                u64 row_e = embed_ptr + best_id * hidden * 2
+                u64 i1 = 0
+                while i1 < hidden {
+                    f32 v = bf16_to_f32(row_e + i1 * 2)
+                    unsafe { *((x_cur + i1 * 4) as f32) = v }
+                    i1 = i1 + 1
+                }
+                sum_embed_ns = sum_embed_ns + time_elapsed(embed_start_ns)
+                unsafe { *((tok_arr + b_step * 8) as u64) = best_id }
+                b_step = b_step + 1
+            }
+            seq_len = seq_len + 1
+            pos    = pos    + 1
+        } else {
+            u64 use_batched_lmhead = 0
+            if batch_size > 1 {
+                if d_logits_batched != 0 { use_batched_lmhead = 1 }
+            }
+            if use_batched_lmhead != 0 {
+                u64 norm_start_ns = time_now()
+                u64 b_n = 0
+                while b_n < batch_size {
+                    u64 x_cur_n = 0; unsafe { *((x_cur_arr + b_n * 8) as u64) -> x_cur_n }
+                    qwen3_rmsnorm_bf16(d_final_out_batched_h + b_n * hidden * 4, x_cur_n, norm_ptr, hidden)
+                    b_n = b_n + 1
+                }
+                sum_norm_ns = sum_norm_ns + time_elapsed(norm_start_ns)
+                u64 lmhead_start_ns = time_now()
+                if gpu_matmul_to_dev_batched(d_logits_batched, d_final_out_batched, embed_ptr,
+                                              vocab, hidden, batch_size) != 0 { exit(1) }
+                gpu_pipeline_flush()
+                sum_lmhead_ns = sum_lmhead_ns + time_elapsed(lmhead_start_ns)
             }
 
-            u64 argmax_start_ns = time_now()
-            u64 best_id = 0
-            f32 best_val = 0.0f
-            u64 first = 1
-            u64 j = 0
-            while j < vocab {
-                f32 v = 0.0f
-                unsafe { *((logits_for_b + j * 4) as f32) -> v }
-                if first == 1 { best_val = v; best_id = j; first = 0 }
-                else          { if v > best_val { best_val = v; best_id = j } }
-                j = j + 1
-            }
-            sum_argmax_ns = sum_argmax_ns + time_elapsed(argmax_start_ns)
+            // Per-stream argmax + embed (and per-stream final_norm + lm_head
+            // when use_batched_lmhead == 0).
+            u64 b_step = 0
+            while b_step < batch_size {
+                u64 x_cur = 0; unsafe { *((x_cur_arr + b_step * 8) as u64) -> x_cur }
+                u64 sids  = 0; unsafe { *((seq_ids_arr + b_step * 8) as u64) -> sids }
 
-            unsafe { *((sids + seq_len * 8) as u64) = best_id }
+                u64 logits_for_b = logits
+                if use_batched_lmhead != 0 {
+                    logits_for_b = d_logits_batched_h + b_step * vocab * 4
+                } else {
+                    u64 norm_start_ns = time_now()
+                    qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
+                    sum_norm_ns = sum_norm_ns + time_elapsed(norm_start_ns)
+                    u64 lmhead_start_ns = time_now()
+                    qwen3_main_matmul(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
+                    sum_lmhead_ns = sum_lmhead_ns + time_elapsed(lmhead_start_ns)
+                }
 
-            u64 embed_start_ns = time_now()
-            row = embed_ptr + best_id * hidden * 2
-            u64 i1 = 0
-            while i1 < hidden {
-                f32 v = bf16_to_f32(row + i1 * 2)
-                unsafe { *((x_cur + i1 * 4) as f32) = v }
-                i1 = i1 + 1
+                u64 argmax_start_ns = time_now()
+                u64 best_id = 0
+                f32 best_val = 0.0f
+                u64 first = 1
+                u64 j = 0
+                while j < vocab {
+                    f32 v = 0.0f
+                    unsafe { *((logits_for_b + j * 4) as f32) -> v }
+                    if first == 1 { best_val = v; best_id = j; first = 0 }
+                    else          { if v > best_val { best_val = v; best_id = j } }
+                    j = j + 1
+                }
+                sum_argmax_ns = sum_argmax_ns + time_elapsed(argmax_start_ns)
+
+                unsafe { *((sids + seq_len * 8) as u64) = best_id }
+
+                u64 embed_start_ns = time_now()
+                row = embed_ptr + best_id * hidden * 2
+                u64 i1 = 0
+                while i1 < hidden {
+                    f32 v = bf16_to_f32(row + i1 * 2)
+                    unsafe { *((x_cur + i1 * 4) as f32) = v }
+                    i1 = i1 + 1
+                }
+                sum_embed_ns = sum_embed_ns + time_elapsed(embed_start_ns)
+                unsafe { *((tok_arr + b_step * 8) as u64) = best_id }
+                b_step = b_step + 1
             }
-            sum_embed_ns = sum_embed_ns + time_elapsed(embed_start_ns)
-            unsafe { *((tok_arr + b_step * 8) as u64) = best_id }
-            b_step = b_step + 1
+
+            seq_len = seq_len + 1
+            pos = pos + 1
         }
-
-        seq_len = seq_len + 1
-        pos = pos + 1
         u64 step_elapsed_ns = time_elapsed(step_start_ns)
         sum_decode_ns = sum_decode_ns + step_elapsed_ns
         u64 step_ms = step_elapsed_ns / 1000000

@@ -153,25 +153,25 @@ static uint32 KFD_MMAP_FLAGS = 0x1       // MAP_SHARED
 static uint32 KFD_VA_PROT     = 0x0      // PROT_NONE
 static uint32 KFD_VA_FLAGS    = 0x4022   // MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE
 
-// --- Allocation tracking (small static table; max 256 outstanding allocs) ---
+// --- Allocation tracking (small static table; max 1024 outstanding allocs) ---
 // Kind values for _kfd_alloc_kind (so the HIP shim's hipMemcpy(D2H)
 // fast-path can tell what backing won):
 //   0 = VRAM-only (no host pointer)
 //   1 = host-visible VRAM (PUBLIC flag, mmap'd via DRM render fd)
 //   2 = GTT  (host-visible system RAM mapped to GPU)
 static uint64 _kfd_alloc_tab_n = 0
-static uint64[256] _kfd_alloc_va
-static uint64[256] _kfd_alloc_handle
-static uint64[256] _kfd_alloc_size
-static uint64[256] _kfd_alloc_host
-static uint64[256] _kfd_alloc_kind
+static uint64[1024] _kfd_alloc_va
+static uint64[1024] _kfd_alloc_handle
+static uint64[1024] _kfd_alloc_size
+static uint64[1024] _kfd_alloc_host
+static uint64[1024] _kfd_alloc_kind
 
 fn _kfd_alloc_track(uint64 va, uint64 handle, uint64 size, uint64 host_ptr) {
     _kfd_alloc_track_kind(va, handle, size, host_ptr, 0)
 }
 
 fn _kfd_alloc_track_kind(uint64 va, uint64 handle, uint64 size, uint64 host_ptr, uint64 kind) {
-    if _kfd_alloc_tab_n >= 256 { kfd_die("kfd: alloc table full (max 256)", _kfd_alloc_tab_n) }
+    if _kfd_alloc_tab_n >= 1024 { kfd_die("kfd: alloc table full (max 1024)", _kfd_alloc_tab_n) }
     uint64 i = _kfd_alloc_tab_n
     uint64 p_va  = _kfd_alloc_va     + i * 8; unsafe { *(p_va as uint64) = va }
     uint64 p_h   = _kfd_alloc_handle + i * 8; unsafe { *(p_h as uint64) = handle }
@@ -292,7 +292,7 @@ fn dev_alloc_host_visible(uint64 nbytes) -> uint64 {
 // mmap's the result on the DRM render-node fd. Works on systems with
 // resizable BAR (ReBar / Smart Access Memory) where the GPU's full
 // VRAM is exposed via PCI BAR1 to the host. On non-ReBar systems
-// only ~256 MiB of VRAM is host-mappable; this allocator returns 0
+// only ~1024 MiB of VRAM is host-mappable; this allocator returns 0
 // for larger requests, in which case dev_alloc_smart_hostvis falls
 // back to GTT.
 //
@@ -620,7 +620,7 @@ fn kfd_create_queue(uint32 wait_mode) -> uint64 {
     uint64 qdesc_host = dev_host_ptr(qdesc_va)
     // Zero the whole struct.
     uint64 zi = 0
-    while zi < 256 { uint64 zp = qdesc_host + zi; unsafe { *(zp as uint64) = 0 }; zi = zi + 8 }
+    while zi < 1024 { uint64 zp = qdesc_host + zi; unsafe { *(zp as uint64) = 0 }; zi = zi + 8 }
     // hsa_queue.type = MULTI(0), features = KERNEL_DISPATCH(1)
     uint32 qtype = 0; unsafe { *((qdesc_host + 0x00) as uint32) = qtype }
     uint32 qfeat = 1; unsafe { *((qdesc_host + 0x04) as uint32) = qfeat }
