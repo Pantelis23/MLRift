@@ -1,0 +1,202 @@
+// Smoke test for the multi-Q attention kernel (Phase 2 Slice 2.1).
+// K = 4 speculative queries against shared KV history of length pos.
+// Causal mask: Q[m] attends to t in [0, pos+m+1).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-attn-decode-f32-speck4=/tmp/attn_decode_f32_speck4.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/attn_speck4_smoke.mlr -o /tmp/attn_speck4_smoke
+// Run:
+//   /tmp/attn_speck4_smoke
+
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/time.mlr"
+import "../../std/math_float.mlr"
+import "../../std/inference_gpu.mlr"
+
+@dynamic extern fn exit(uint64 code)
+fn die(uint64 m, uint64 c) { print_str(m); print_str(" e="); u64 s = fmt_dec(c); print_str(s); dealloc(s); print_str("\n"); exit(1) }
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    u64 fd = file_open("/tmp/attn_decode_f32_speck4.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
+    u64 sz = file_size(fd); u64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    u64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    u64 mod = 0; unsafe { *(mod_slot as u64) -> mod }
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "attn_decode_f32_speck4"); if err != 0 { die("getFn", err) }
+    u64 fh = 0; unsafe { *(fh_slot as u64) -> fh }
+    print_str("attn_decode_f32_speck4 loaded\n")
+
+    u64 K = 4
+    u64 nh = 16; u64 nkv = 8; u64 hd = 128
+    u64 max_seq = 64
+    u64 pos = 5     // verified history length
+    u64 pos_plus_1 = pos + K   // = 9 (total valid K-cache positions)
+
+    u64 q_bytes  = K * nh * hd * 4    // [K, nh, hd]
+    u64 out_bytes = q_bytes
+    u64 kv_bytes = max_seq * nkv * hd * 4
+
+    u64 d_q  = 0; u64 d_kc = 0; u64 d_vc = 0; u64 d_out = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, q_bytes);  if err != 0 { die("mq",  err) }; unsafe { *(slot as u64) -> d_q }
+    slot = alloc(8); err = hipMalloc(slot, kv_bytes); if err != 0 { die("mkc", err) }; unsafe { *(slot as u64) -> d_kc }
+    slot = alloc(8); err = hipMalloc(slot, kv_bytes); if err != 0 { die("mvc", err) }; unsafe { *(slot as u64) -> d_vc }
+    slot = alloc(8); err = hipMalloc(slot, out_bytes); if err != 0 { die("mo", err) }; unsafe { *(slot as u64) -> d_out }
+
+    // Q[m, h, j] = (m+1)*0.001 * (h+1) + j * 0.0001
+    u64 h_q = alloc(q_bytes)
+    u64 i = 0
+    while i < K * nh * hd {
+        u64 m = i / (nh * hd)
+        u64 ih  = (i / hd) % nh
+        u64 ij  = i % hd
+        f64 v = (int_to_f64(m) + 1.0) * 0.001 * (int_to_f64(ih) + 1.0) + int_to_f64(ij) * 0.0001
+        unsafe { *((h_q + i * 4) as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+    err = hipMemcpy(d_q, h_q, q_bytes, 1); if err != 0 { die("H2D q", err) }
+
+    // K cache pattern: K[t, kvh, j] = (t+1) * 0.01 + kvh * 0.001 + j * 0.0001
+    u64 h_kc = alloc(kv_bytes)
+    i = 0
+    while i < max_seq * nkv * hd {
+        u64 ipos = i / (nkv * hd)
+        u64 ikv  = (i / hd) % nkv
+        u64 ij   = i % hd
+        f64 v = (int_to_f64(ipos) + 1.0) * 0.01 + int_to_f64(ikv) * 0.001 + int_to_f64(ij) * 0.0001
+        unsafe { *((h_kc + i * 4) as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+    err = hipMemcpy(d_kc, h_kc, kv_bytes, 1); if err != 0 { die("H2D kc", err) }
+
+    // V cache pattern: V[t, kvh, j] = (t+1) * 0.02 + kvh * 0.002 + j * 0.0002
+    u64 h_vc = alloc(kv_bytes)
+    i = 0
+    while i < max_seq * nkv * hd {
+        u64 ipos = i / (nkv * hd)
+        u64 ikv  = (i / hd) % nkv
+        u64 ij   = i % hd
+        f64 v = (int_to_f64(ipos) + 1.0) * 0.02 + int_to_f64(ikv) * 0.002 + int_to_f64(ij) * 0.0002
+        unsafe { *((h_vc + i * 4) as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+    err = hipMemcpy(d_vc, h_vc, kv_bytes, 1); if err != 0 { die("H2D vc", err) }
+
+    // Build kernarg.
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_q }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_kc }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = d_vc }
+    u64 a3 = alloc(8); unsafe { *(a3 as u64) = d_out }
+    u64 a4 = alloc(8); unsafe { *(a4 as u64) = pos_plus_1 }
+    u64 kp = alloc(5 * 8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+    unsafe { *((kp + 24) as u64) = a3 }
+    unsafe { *((kp + 32) as u64) = a4 }
+
+    // Grid (nh, K, 1).
+    err = hipModuleLaunchKernel(fh, nh, K, 1, 32, 1, 1, 0, 0, kp, 0); if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    u64 h_out = alloc(out_bytes)
+    err = hipMemcpy(h_out, d_out, out_bytes, 2); if err != 0 { die("D2H", err) }
+
+    // CPU reference: for each (m, head, j), compute
+    //   out[m, head, j] = Σ_t softmax(score)[t] * V[t, head>>1, j]
+    //   where score[t] = (1/√128) Σ_k Q[m, head, k] * K[t, head>>1, k]
+    //   for t in [0, pos+m+1)  (causal mask)
+    f64 inv_sqrt_dk = 1.0 / 11.31370849898476
+    u64 fail = 0
+    f32 max_abs = 0.0f
+    u64 m = 0
+    while m < K {
+        u64 head = 0
+        while head < nh {
+            u64 kvh = head / 2
+            u64 effective_pos = pos + m + 1
+            // 1) raw scores per t
+            u64 sb = alloc(effective_pos * 8)
+            f64 mx = -1.0e15
+            u64 t = 0
+            while t < effective_pos {
+                f64 sv = 0.0
+                u64 kk = 0
+                while kk < hd {
+                    u64 q_idx  = m * nh * hd + head * hd + kk
+                    u64 k_idx  = t * nkv * hd + kvh * hd + kk
+                    f64 qv = 0.0; unsafe { *((h_q  + q_idx * 4) as f32) -> qv }
+                    f64 kv = 0.0; unsafe { *((h_kc + k_idx * 4) as f32) -> kv }
+                    sv = sv + qv * kv
+                    kk = kk + 1
+                }
+                f64 sc = sv * inv_sqrt_dk
+                unsafe { *((sb + t * 8) as f64) = sc }
+                if sc > mx { mx = sc }
+                t = t + 1
+            }
+            // 2) softmax
+            f64 esum = 0.0
+            t = 0
+            while t < effective_pos {
+                f64 sc = 0.0; unsafe { *((sb + t * 8) as f64) -> sc }
+                f64 ev = exp_f64(sc - mx)
+                unsafe { *((sb + t * 8) as f64) = ev }
+                esum = esum + ev
+                t = t + 1
+            }
+            t = 0
+            while t < effective_pos {
+                f64 ev = 0.0; unsafe { *((sb + t * 8) as f64) -> ev }
+                unsafe { *((sb + t * 8) as f64) = ev / esum }
+                t = t + 1
+            }
+            // 3) Σ w_t · V[t, kvh, j]
+            u64 j = 0
+            while j < hd {
+                f64 acc = 0.0
+                t = 0
+                while t < effective_pos {
+                    f64 wv = 0.0; unsafe { *((sb + t * 8) as f64) -> wv }
+                    u64 v_idx = t * nkv * hd + kvh * hd + j
+                    f64 vv = 0.0; unsafe { *((h_vc + v_idx * 4) as f32) -> vv }
+                    acc = acc + wv * vv
+                    t = t + 1
+                }
+                f32 expected = f64_to_f32(acc)
+                f32 actual = 0.0f
+                u64 out_idx = m * nh * hd + head * hd + j
+                unsafe { *((h_out + out_idx * 4) as f32) -> actual }
+                f32 d = actual - expected
+                if d < 0.0f { d = 0.0f - d }
+                if d > max_abs { max_abs = d }
+                f32 abs_e = expected
+                if abs_e < 0.0f { abs_e = 0.0f - abs_e }
+                f32 thresh = abs_e * 0.01f
+                if thresh < 0.00001f { thresh = 0.00001f }
+                if d > thresh { fail = fail + 1 }
+                j = j + 1
+            }
+            dealloc(sb)
+            head = head + 1
+        }
+        m = m + 1
+    }
+
+    u64 total = K * nh * hd
+    print_str("speck4 fail count: "); u64 sf = fmt_dec(fail); print_str(sf); dealloc(sf)
+    print_str(" / "); u64 stot = fmt_dec(total); print_str(stot); dealloc(stot); print_str("\n")
+    if fail == 0 {
+        print_str("OK — multi-Q attn (K=4) bit-close per (m, head, j).\n"); exit(0)
+    } else {
+        print_str("FAIL\n"); exit(1)
+    }
+}
