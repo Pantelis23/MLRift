@@ -6801,11 +6801,12 @@ fn _emit_attn_decode_f32_speck4_body(uint64 args_desc) {
     asm_u32(0x80180E0A)                            // s_add_u32  s24, s10, s14
     asm_u32(0x8219800B)                            // s_addc_u32 s25, s11, 0
 
-    // Per-batch KV byte offset = kvh*512 + batch_idx*262144.
+    // KV byte offset = kvh*512  (NO per-batch shift — speculative shares
+    // a single-sequence KV cache across the K Q vectors; only Q/out
+    // get the wg_y stride.  Phase 1 batched used wg_y*262144 here for
+    // its independent-streams semantics.)
     asm_u32(0x8512810F)                            // s_lshr_b32 s18, s15, 1
     asm_u32(0x84138912)                            // s_lshl_b32 s19, s18, 9
-    asm_u32(0x84179210)                            // s_lshl_b32 s23, s16, 18
-    asm_u32(0x80131713)                            // s_add_u32  s19, s19, s23
     asm_u32(0x80141306)                            // s_add_u32  s20, s6, s19
     asm_u32(0x82158007)                            // s_addc_u32 s21, s7, 0
 
