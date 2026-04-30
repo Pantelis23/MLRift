@@ -319,8 +319,25 @@ fn main() {
                     use_gpu_full = 1
                     eout("[qwen3_generate] full-GPU forward ENABLED for "); eu64(batch_size); eout(" stream(s)\n")
                 }
-            } else {
-                eout("[qwen3_generate] MLRIFT_GPU_FULL_FORWARD set but pipeline NOT ready\n")
+            }
+        }
+    }
+
+    // Slice 1.5: batched lm_head buffers (allocated only when batch > 1).
+    u64 d_final_out_batched   = 0
+    u64 d_final_out_batched_h = 0
+    u64 d_logits_batched      = 0
+    u64 d_logits_batched_h    = 0
+    if batch_size > 1 {
+        if gpu_pipeline_ready() == 1 {
+            d_final_out_batched = dev_try_alloc_host_visible(batch_size * hidden * 4)
+            d_logits_batched    = dev_try_alloc_host_visible(batch_size * vocab * 4)
+            if d_final_out_batched != 0 {
+                if d_logits_batched != 0 {
+                    d_final_out_batched_h = dev_host_ptr(d_final_out_batched)
+                    d_logits_batched_h    = dev_host_ptr(d_logits_batched)
+                    eout("[qwen3_generate] batched lm_head buffers allocated\n")
+                }
             }
         }
     }
@@ -496,19 +513,48 @@ fn main() {
         }
         sum_layer_ns = sum_layer_ns + time_elapsed(layer_start_ns)
 
-        // Per-stream lm_head + argmax + embed (still sequential — slice 1.5
-        // batches lm_head later).
+        // Slice 1.5: when batch > 1 and the batched lm_head buffers are
+        // allocated, run final_norm × M into the batched final_out buffer,
+        // then ONE batched lm_head matmul for all streams, then per-stream
+        // argmax + embed.
+        u64 use_batched_lmhead = 0
+        if batch_size > 1 {
+            if d_logits_batched != 0 { use_batched_lmhead = 1 }
+        }
+        if use_batched_lmhead != 0 {
+            u64 norm_start_ns = time_now()
+            u64 b_n = 0
+            while b_n < batch_size {
+                u64 x_cur_n = 0; unsafe { *((x_cur_arr + b_n * 8) as u64) -> x_cur_n }
+                qwen3_rmsnorm_bf16(d_final_out_batched_h + b_n * hidden * 4, x_cur_n, norm_ptr, hidden)
+                b_n = b_n + 1
+            }
+            sum_norm_ns = sum_norm_ns + time_elapsed(norm_start_ns)
+            u64 lmhead_start_ns = time_now()
+            if gpu_matmul_to_dev_batched(d_logits_batched, d_final_out_batched, embed_ptr,
+                                          vocab, hidden, batch_size) != 0 { exit(1) }
+            gpu_pipeline_flush()
+            sum_lmhead_ns = sum_lmhead_ns + time_elapsed(lmhead_start_ns)
+        }
+
+        // Per-stream argmax + embed (and per-stream final_norm + lm_head
+        // when use_batched_lmhead == 0).
         u64 b_step = 0
         while b_step < batch_size {
             u64 x_cur = 0; unsafe { *((x_cur_arr + b_step * 8) as u64) -> x_cur }
             u64 sids  = 0; unsafe { *((seq_ids_arr + b_step * 8) as u64) -> sids }
 
-            u64 norm_start_ns = time_now()
-            qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
-            sum_norm_ns = sum_norm_ns + time_elapsed(norm_start_ns)
-            u64 lmhead_start_ns = time_now()
-            qwen3_main_matmul(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
-            sum_lmhead_ns = sum_lmhead_ns + time_elapsed(lmhead_start_ns)
+            u64 logits_for_b = logits
+            if use_batched_lmhead != 0 {
+                logits_for_b = d_logits_batched_h + b_step * vocab * 4
+            } else {
+                u64 norm_start_ns = time_now()
+                qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
+                sum_norm_ns = sum_norm_ns + time_elapsed(norm_start_ns)
+                u64 lmhead_start_ns = time_now()
+                qwen3_main_matmul(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
+                sum_lmhead_ns = sum_lmhead_ns + time_elapsed(lmhead_start_ns)
+            }
 
             u64 argmax_start_ns = time_now()
             u64 best_id = 0
@@ -517,7 +563,7 @@ fn main() {
             u64 j = 0
             while j < vocab {
                 f32 v = 0.0f
-                unsafe { *((logits + j * 4) as f32) -> v }
+                unsafe { *((logits_for_b + j * 4) as f32) -> v }
                 if first == 1 { best_val = v; best_id = j; first = 0 }
                 else          { if v > best_val { best_val = v; best_id = j } }
                 j = j + 1
