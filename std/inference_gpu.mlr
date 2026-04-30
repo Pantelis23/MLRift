@@ -46,6 +46,7 @@ static u64 _gpu_mm_fh_gemm     = 0
 // Pipeline kernels for the full-GPU forward path.
 static u64 _gpu_fh_resid_add   = 0
 static u64 _gpu_fh_silu_mul    = 0
+static u64 _gpu_fh_silu_mul_batched = 0   // batched silu_mul (grid (n/256, batch))
 static u64 _gpu_fh_rmsnorm_1024 = 0       // hidden-dim rmsnorm (N=1024)
 static u64 _gpu_fh_rmsnorm_128  = 0       // per-head rmsnorm (N=128, used by qknorm)
 static u64 _gpu_fh_rope_f32     = 0       // per-head RoPE (head_dim=128)
@@ -144,6 +145,7 @@ fn _gpu_mm_init_once() {
     // Pipeline kernels — best-effort load; unset = full-GPU path falls back.
     _gpu_fh_resid_add         = _gpu_mm_load_co("/tmp/residual_add_f32.co",   "residual_add_f32")
     _gpu_fh_silu_mul          = _gpu_mm_load_co("/tmp/silu_mul_f32.co",       "silu_mul_f32")
+    _gpu_fh_silu_mul_batched  = _gpu_mm_load_co("/tmp/silu_mul_f32_batched.co", "silu_mul_f32_batched")
     _gpu_fh_rmsnorm_1024      = _gpu_mm_load_co("/tmp/rmsnorm_f32_1024.co",   "rmsnorm_f32")
     _gpu_fh_rmsnorm_128       = _gpu_mm_load_co("/tmp/qknorm_f32.co",         "rmsnorm_f32")
     _gpu_fh_rope_f32          = _gpu_mm_load_co("/tmp/rope_qwen3_f32.co",     "rope_qwen3_f32")
@@ -710,6 +712,29 @@ fn gpu_qkv_split_f32_batched_to_dev(u64 d_qkv, u64 d_k_slot_base, u64 d_v_slot_b
     u32 cgrid_x = 8
     u32 cgrid_y = batch_size
     u32 err = hipModuleLaunchKernel(_gpu_fh_qkv_split_batched, cgrid_x, cgrid_y, 1, 128, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
+// gpu_silu_mul_f32_batched_to_dev: ONE batched silu_mul over M streams.
+// Caller passes [batch, 2*ff] gate||up base and [batch, ff] out base;
+// kernel adds wg_y * 24576 and wg_y * 12288 to the respective bases.
+// n_per_stream is the per-stream element count (= ff).  Returns 0 on success.
+fn gpu_silu_mul_f32_batched_to_dev(u64 d_out, u64 d_gate, u64 d_up,
+                                    u64 n_per_stream, u64 batch_size) -> u64 {
+    if _gpu_fh_silu_mul_batched == 0 { return 1 }
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_gate }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_up }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = d_out }
+    u64 a3 = alloc(8); unsafe { *(a3 as u64) = n_per_stream }
+    u64 kp = alloc(4 * 8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+    unsafe { *((kp + 24) as u64) = a3 }
+    u32 cgrid_x = (n_per_stream + 255) / 256
+    u32 cgrid_y = batch_size
+    u32 err = hipModuleLaunchKernel(_gpu_fh_silu_mul_batched, cgrid_x, cgrid_y, 1, 256, 1, 1, 0, 0, kp, 0)
     if err != 0 { return 1 }
     return 0
 }

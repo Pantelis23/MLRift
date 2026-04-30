@@ -4981,6 +4981,11 @@ fn main() {
                 write(1, qsb_path, qsbl)
                 write(1, " (amdgpu qkv-split-f32-batched code object, grid=(8,batch))\n", 61)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-silu-mul-f32-batched=", 35) != 0 {
+                uint64 sm_path = arg + 35
+                if emit_amdgpu_silu_mul_f32_batched_blob(sm_path) != 0 { exit(1) }
+                write(1, "mlrc: wrote ", 12); write(1, sm_path, str_len(sm_path))
+                write(1, " (silu-mul-f32-batched)\n", 24); exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-extract-k-qwen3-f32=", 34) != 0 {
                 uint64 ekp_path = arg + 34
                 if emit_amdgpu_extract_k_qwen3_f32_blob(ekp_path) != 0 { exit(1) }

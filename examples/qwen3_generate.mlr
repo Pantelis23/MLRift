@@ -458,12 +458,9 @@ fn main() {
                     // Batched gate_up.
                     if gpu_matmul_to_dev_batched(_gpuq_d_gu, _gpuq_d_mid_norm, w.gate_proj_w,
                                                   2 * ff, hidden, batch_size) != 0 { exit(1) }
-                    // Per-stream silu_mul (0x20).
-                    u64 b_silu = 0
-                    while b_silu < batch_size {
-                        if qwen3_forward_layer_gpu(0, 0, w, pos, 0, 0, num_workers, b_silu, 0x20) != 0 { exit(1) }
-                        b_silu = b_silu + 1
-                    }
+                    // ONE batched silu_mul across all streams.
+                    if gpu_silu_mul_f32_batched_to_dev(_gpuq_d_ff, _gpuq_d_gu, _gpuq_d_gu + ff * 4,
+                                                        ff, batch_size) != 0 { exit(1) }
                     // Batched down.
                     if gpu_matmul_to_dev_batched(_gpuq_d_ff_out, _gpuq_d_ff, w.down_proj_w,
                                                   hidden, ff, batch_size) != 0 { exit(1) }
