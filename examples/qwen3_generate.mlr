@@ -297,27 +297,36 @@ fn main() {
     u64 d_x_b_arr   = alloc(batch_size * 8)
     u64 d_x_a_h_arr = alloc(batch_size * 8)
     u64 d_x_b_h_arr = alloc(batch_size * 8)
+    // Slice 1.6: contiguous [batch, hidden] residual buffers (one A, one B
+    // for ping-pong).  Per-stream pointers in d_x_a_arr / d_x_b_arr now
+    // reference slots inside the single contiguous allocation, so the
+    // 2 resid_adds per layer can fire as ONE batched dispatch each.
+    u64 d_x_A = 0; u64 d_x_A_h = 0
+    u64 d_x_B = 0; u64 d_x_B_h = 0
     u64 ev_full = getenv("MLRIFT_GPU_FULL_FORWARD")
     if ev_full != 0 {
         u8 cf = 0; unsafe { *(ev_full as u8) -> cf }
         if cf != 48 {
             if gpu_pipeline_ready() == 1 {
-                u64 all_ok = 1
-                u64 b_dx = 0
-                while b_dx < batch_size {
-                    u64 da = dev_try_alloc_host_visible(hidden * 4)
-                    u64 db = dev_try_alloc_host_visible(hidden * 4)
-                    if da == 0 { all_ok = 0; break }
-                    if db == 0 { all_ok = 0; break }
-                    unsafe { *((d_x_a_arr   + b_dx * 8) as u64) = da }
-                    unsafe { *((d_x_b_arr   + b_dx * 8) as u64) = db }
-                    unsafe { *((d_x_a_h_arr + b_dx * 8) as u64) = dev_host_ptr(da) }
-                    unsafe { *((d_x_b_h_arr + b_dx * 8) as u64) = dev_host_ptr(db) }
-                    b_dx = b_dx + 1
-                }
-                if all_ok == 1 {
-                    use_gpu_full = 1
-                    eout("[qwen3_generate] full-GPU forward ENABLED for "); eu64(batch_size); eout(" stream(s)\n")
+                d_x_A = dev_try_alloc_host_visible(batch_size * hidden * 4)
+                d_x_B = dev_try_alloc_host_visible(batch_size * hidden * 4)
+                if d_x_A != 0 {
+                    if d_x_B != 0 {
+                        d_x_A_h = dev_host_ptr(d_x_A)
+                        d_x_B_h = dev_host_ptr(d_x_B)
+                        u64 b_dx = 0
+                        while b_dx < batch_size {
+                            u64 da = d_x_A + b_dx * hidden * 4
+                            u64 db = d_x_B + b_dx * hidden * 4
+                            unsafe { *((d_x_a_arr   + b_dx * 8) as u64) = da }
+                            unsafe { *((d_x_b_arr   + b_dx * 8) as u64) = db }
+                            unsafe { *((d_x_a_h_arr + b_dx * 8) as u64) = d_x_A_h + b_dx * hidden * 4 }
+                            unsafe { *((d_x_b_h_arr + b_dx * 8) as u64) = d_x_B_h + b_dx * hidden * 4 }
+                            b_dx = b_dx + 1
+                        }
+                        use_gpu_full = 1
+                        eout("[qwen3_generate] full-GPU forward ENABLED for "); eu64(batch_size); eout(" stream(s) (contiguous residuals)\n")
+                    }
                 }
             }
         }
@@ -413,14 +422,12 @@ fn main() {
                     // Batched o_proj: _gpuq_d_o = w.o_proj_w @ _gpuq_d_attn
                     if gpu_matmul_to_dev_batched(_gpuq_d_o, _gpuq_d_attn, w.o_proj_w,
                                                   hidden, q_dim, batch_size) != 0 { exit(1) }
-                    // Per-stream resid (0x08); 0x100 = skip post_norm (batched below).
-                    u64 b_resid = 0
-                    while b_resid < batch_size {
-                        u64 d_in_b  = 0; unsafe { *((d_in_arr  + b_resid * 8) as u64) -> d_in_b }
-                        u64 d_out_b = 0; unsafe { *((d_out_arr + b_resid * 8) as u64) -> d_out_b }
-                        if qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, 0, 0, num_workers, b_resid, 0x108) != 0 { exit(1) }
-                        b_resid = b_resid + 1
-                    }
+                    // ONE batched resid_add: _gpuq_d_mid = d_x_in_full + _gpuq_d_o
+                    // d_x_in_full is the contiguous A or B buffer (whichever
+                    // d_in_arr currently points into — both per-stream entries
+                    // reference offsets within the same contiguous slab).
+                    u64 d_in_full_pa = 0; unsafe { *((d_in_arr + 0) as u64) -> d_in_full_pa }
+                    if gpu_resid_add_to_dev(_gpuq_d_mid, d_in_full_pa, _gpuq_d_o, batch_size * hidden) != 0 { exit(1) }
                     // ONE batched post_norm across all streams (M = batch).
                     u64 d_post_gamma_b = gpu_cache_bf16_as_f32(w.post_norm_w, hidden)
                     if d_post_gamma_b == 0 { exit(1) }
@@ -437,13 +444,9 @@ fn main() {
                     // Batched down.
                     if gpu_matmul_to_dev_batched(_gpuq_d_ff_out, _gpuq_d_ff, w.down_proj_w,
                                                   hidden, ff, batch_size) != 0 { exit(1) }
-                    // Per-stream final resid (0x80) — writes d_x_out_b.
-                    u64 b_fin = 0
-                    while b_fin < batch_size {
-                        u64 d_out_b = 0; unsafe { *((d_out_arr + b_fin * 8) as u64) -> d_out_b }
-                        if qwen3_forward_layer_gpu(0, d_out_b, w, pos, 0, 0, num_workers, b_fin, 0x80) != 0 { exit(1) }
-                        b_fin = b_fin + 1
-                    }
+                    // ONE batched final resid_add: d_x_out_full = _gpuq_d_mid + _gpuq_d_ff_out
+                    u64 d_out_full_pa = 0; unsafe { *((d_out_arr + 0) as u64) -> d_out_full_pa }
+                    if gpu_resid_add_to_dev(d_out_full_pa, _gpuq_d_mid, _gpuq_d_ff_out, batch_size * hidden) != 0 { exit(1) }
                 } else {
                     // batch=1: legacy single-stream path with full mask.
                     u64 d_in_b  = 0; unsafe { *((d_in_arr  + 0) as u64) -> d_in_b }
