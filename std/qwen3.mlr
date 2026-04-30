@@ -1183,24 +1183,28 @@ fn _qwen3_gpu_pipeline_init() -> u64 {
     u64 qkv_dim = q_dim + 2 * kv_dim
     u64 B       = _gpuq_batch_size
 
-    u64 hslot = alloc(8)
+    // The earlier `unsafe { *(hslot) -> _gpuq_FOO_h }` pattern silently
+    // dropped writes to module-static targets — every *_h slot read 0
+    // at runtime, which hung qwen3_rope_compute (write to address 0)
+    // and made the entire use_gpu_full=1 batched path dormant.  Fixed
+    // 2026-04-30 by reading host pointers via dev_host_ptr directly.
     _gpuq_d_x_norm = gpu_buf_reserve(B * hidden * 4, 0)
-    _gpuq_d_qkv    = gpu_buf_reserve(B * qkv_dim * 4, hslot)
-    unsafe { *(hslot as u64) -> _gpuq_d_qkv_h }
-    _gpuq_d_attn   = gpu_buf_reserve(B * q_dim * 4, hslot)
-    unsafe { *(hslot as u64) -> _gpuq_d_attn_h }
+    _gpuq_d_qkv    = gpu_buf_reserve(B * qkv_dim * 4, 0)
+    _gpuq_d_qkv_h  = dev_host_ptr(_gpuq_d_qkv)
+    _gpuq_d_attn   = gpu_buf_reserve(B * q_dim * 4, 0)
+    _gpuq_d_attn_h = dev_host_ptr(_gpuq_d_attn)
     _gpuq_d_o        = gpu_buf_reserve(B * hidden * 4, 0)
     _gpuq_d_mid      = gpu_buf_reserve(B * hidden * 4, 0)
     _gpuq_d_mid_norm = gpu_buf_reserve(B * hidden * 4, 0)
     _gpuq_d_gu       = gpu_buf_reserve(B * 2 * ff * 4, 0)
     _gpuq_d_ff       = gpu_buf_reserve(B * ff * 4, 0)
     _gpuq_d_ff_out   = gpu_buf_reserve(B * hidden * 4, 0)
-    _gpuq_d_q_attn   = gpu_buf_reserve(B * q_dim * 4, hslot)
-    unsafe { *(hslot as u64) -> _gpuq_d_q_attn_h }
-    _gpuq_d_rope_cos = gpu_buf_reserve((QWEN3_HEAD_DIM / 2) * 4, hslot)
-    unsafe { *(hslot as u64) -> _gpuq_d_rope_cos_h }
-    _gpuq_d_rope_sin = gpu_buf_reserve((QWEN3_HEAD_DIM / 2) * 4, hslot)
-    unsafe { *(hslot as u64) -> _gpuq_d_rope_sin_h }
+    _gpuq_d_q_attn   = gpu_buf_reserve(B * q_dim * 4, 0)
+    _gpuq_d_q_attn_h = dev_host_ptr(_gpuq_d_q_attn)
+    _gpuq_d_rope_cos = gpu_buf_reserve((QWEN3_HEAD_DIM / 2) * 4, 0)
+    _gpuq_d_rope_cos_h = dev_host_ptr(_gpuq_d_rope_cos)
+    _gpuq_d_rope_sin = gpu_buf_reserve((QWEN3_HEAD_DIM / 2) * 4, 0)
+    _gpuq_d_rope_sin_h = dev_host_ptr(_gpuq_d_rope_sin)
     // K-stage buffer: [batch, kv_dim] f32 for the extract-k → qknorm K
     // → K-rope → insert-k pipeline.  At batch=1 the buffer is unused.
     _gpuq_d_k_stage = gpu_buf_reserve(B * kv_dim * 4, 0)

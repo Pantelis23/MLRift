@@ -343,17 +343,13 @@ fn main() {
     if ev_full != 0 {
         u8 cf = 0; unsafe { *(ev_full as u8) -> cf }
         if cf != 48 {
-            // Slice 2.4-pre finding: gpu_pipeline_ready returns 0 here
-            // because _gpu_mm_init_once hasn't fired yet (no GPU op has
-            // run).  Earlier batched slices ran the CPU fallback path,
-            // not the use_gpu_full=1 path — qwen3_main_matmul fires the
-            // lazy init internally on its first call, but by then this
-            // block has already left use_gpu_full at 0.  Forcing init
-            // here (gpu_matmul_enabled()) reveals that the M>1 path
-            // hangs at the very first qwen3_forward_layer_qkv_batched_gpu
-            // call, even at M=2.  Root cause not yet found — tracked as
-            // task #102.  For now leave use_gpu_full=0 in batched mode
-            // so the CPU-fallback-with-GPU-matmul path keeps working.
+            // Slice 2.4-pre bisection (in progress): host-pointer bug in
+            // qwen3.mlr's _qwen3_gpu_pipeline_init now FIXED — use_gpu_full
+            // path no longer hangs in qwen3_rope_compute on a NULL pointer.
+            // Chain still hangs at o_proj for unrelated reason (kernel
+            // queue / kernel-side bug at this shape).  Until that's fixed,
+            // leave use_gpu_full=0 in batched mode so existing CPU-fallback
+            // path keeps running.
             if gpu_pipeline_ready() == 1 {
                 d_x_A = dev_try_alloc_host_visible(M_eff * hidden * 4)
                 d_x_B = dev_try_alloc_host_visible(M_eff * hidden * 4)
@@ -558,15 +554,12 @@ fn main() {
                         if gpu_insert_k_qwen3_f32_to_dev(_gpuq_d_k_stage, d_k_pos_b, batch_size) != 0 { exit(1) }
                     }
                     if is_spec != 0 {
-                        // SPECK multi-Q attn: K queries vs single shared KV
-                        // history of length pos+K (causal-within-window).
                         if gpu_attn_decode_to_dev_speck4(_gpuq_d_q_attn, d_kc_layer_b, d_vc_layer_b,
                                                           _gpuq_d_attn, pos + M_eff) != 0 { exit(1) }
                     } else {
                         if gpu_attn_decode_to_dev_batched(_gpuq_d_q_attn, d_kc_layer_b, d_vc_layer_b,
                                                            _gpuq_d_attn, pos + 1, batch_size) != 0 { exit(1) }
                     }
-                    // Batched o_proj: _gpuq_d_o = w.o_proj_w @ _gpuq_d_attn
                     if gpu_matmul_to_dev_batched(_gpuq_d_o, _gpuq_d_attn, w.o_proj_w,
                                                   hidden, q_dim, M_eff) != 0 { exit(1) }
                     u64 d_in_full_pa = 0; unsafe { *((d_in_arr + 0) as u64) -> d_in_full_pa }
