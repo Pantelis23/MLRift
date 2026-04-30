@@ -4999,6 +4999,16 @@ fn main() {
                 if emit_amdgpu_silu_mul_f32_batched_blob(sm_path) != 0 { exit(1) }
                 write(1, "mlrc: wrote ", 12); write(1, sm_path, str_len(sm_path))
                 write(1, " (silu-mul-f32-batched)\n", 24); exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-extract-k-qwen3-f32-speck4=", 41) != 0 {
+                uint64 eks_path = arg + 41
+                if emit_amdgpu_extract_k_qwen3_f32_speck4_blob(eks_path) != 0 { exit(1) }
+                write(1, "mlrc: wrote ", 12); write(1, eks_path, str_len(eks_path))
+                write(1, " (extract-k-qwen3-f32-speck4)\n", 30); exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-insert-k-qwen3-f32-speck4=", 40) != 0 {
+                uint64 iks_path = arg + 40
+                if emit_amdgpu_insert_k_qwen3_f32_speck4_blob(iks_path) != 0 { exit(1) }
+                write(1, "mlrc: wrote ", 12); write(1, iks_path, str_len(iks_path))
+                write(1, " (insert-k-qwen3-f32-speck4)\n", 29); exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-extract-k-qwen3-f32=", 34) != 0 {
                 uint64 ekp_path = arg + 34
                 if emit_amdgpu_extract_k_qwen3_f32_blob(ekp_path) != 0 { exit(1) }

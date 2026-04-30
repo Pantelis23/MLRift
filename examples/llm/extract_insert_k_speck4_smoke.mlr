@@ -1,0 +1,166 @@
+// Smoke test for extract_k_qwen3_f32_speck4 + insert_k_qwen3_f32_speck4
+// (Phase 2 Slice 2.2b).  Verifies the K-cache stage shuffle for spec K=4:
+//
+//   1. Seed K-cache positions pos..pos+K-1 with a known pattern.
+//   2. extract_k_speck4 → contig stage [K, kv_dim].
+//   3. Modify the stage (multiply by 2) — simulates qknorm + K-rope.
+//   4. insert_k_speck4 → write modified vectors back to positions
+//      pos..pos+K-1.
+//   5. Verify K-cache positions are 2× original; positions outside the
+//      window are unchanged.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-extract-k-qwen3-f32-speck4=/tmp/extract_k_qwen3_f32_speck4.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-insert-k-qwen3-f32-speck4=/tmp/insert_k_qwen3_f32_speck4.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/extract_insert_k_speck4_smoke.mlr -o /tmp/extract_insert_k_speck4_smoke
+// Run:
+//   /tmp/extract_insert_k_speck4_smoke
+
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/inference_gpu.mlr"
+
+@dynamic extern fn exit(uint64 code)
+fn die(uint64 m, uint64 c) { print_str(m); print_str(" e="); u64 s = fmt_dec(c); print_str(s); dealloc(s); print_str("\n"); exit(1) }
+
+fn _load_co(u64 path, u64 fname) -> u64 {
+    u64 fd = file_open(path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
+    u64 sz = file_size(fd); u64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    u64 mod_slot = alloc(8)
+    u32 err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    u64 mod = 0; unsafe { *(mod_slot as u64) -> mod }
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fname); if err != 0 { die("getFn", err) }
+    u64 fh = 0; unsafe { *(fh_slot as u64) -> fh }
+    return fh
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    u64 fh_ex = _load_co("/tmp/extract_k_qwen3_f32_speck4.co", "extract_k_qwen3_f32_speck4")
+    u64 fh_in = _load_co("/tmp/insert_k_qwen3_f32_speck4.co",  "insert_k_qwen3_f32_speck4")
+    print_str("extract/insert k speck4 loaded\n")
+
+    u64 K       = 4
+    u64 kv_dim  = 1024            // Qwen3-0.6B
+    u64 max_seq = 64
+    u64 pos     = 5
+
+    u64 kv_bytes    = max_seq * kv_dim * 4
+    u64 stage_bytes = K * kv_dim * 4
+
+    u64 d_kc = 0; u64 d_stage = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, kv_bytes);    if err != 0 { die("m_kc",    err) }; unsafe { *(slot as u64) -> d_kc }
+    slot = alloc(8); err = hipMalloc(slot, stage_bytes); if err != 0 { die("m_stage", err) }; unsafe { *(slot as u64) -> d_stage }
+
+    // Seed K-cache: kc[t, j] = (t+1) * 1000 + j
+    u64 h_kc = alloc(kv_bytes)
+    u64 i = 0
+    while i < max_seq * kv_dim {
+        u64 t = i / kv_dim
+        u64 j = i % kv_dim
+        f64 v = int_to_f64((t + 1) * 1000 + j)
+        unsafe { *((h_kc + i * 4) as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+    err = hipMemcpy(d_kc, h_kc, kv_bytes, 1); if err != 0 { die("H2D kc", err) }
+
+    // Stage gets sentinel pattern -1.0 so we know extract overwrote it.
+    u64 h_stage_seed = alloc(stage_bytes)
+    i = 0
+    while i < K * kv_dim {
+        unsafe { *((h_stage_seed + i * 4) as f32) = (0.0f - 1.0f) }
+        i = i + 1
+    }
+    err = hipMemcpy(d_stage, h_stage_seed, stage_bytes, 1); if err != 0 { die("H2D stage", err) }
+
+    u64 d_k_pos = d_kc + pos * kv_dim * 4
+
+    // Step 2: extract.
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_k_pos }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_stage }
+    u64 kp = alloc(2 * 8)
+    unsafe { *(kp as u64) = a0 }; unsafe { *((kp + 8) as u64) = a1 }
+    err = hipModuleLaunchKernel(fh_ex, 8, K, 1, 128, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch ex", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync ex", err) }
+
+    // Verify stage contains the K-cache window.
+    u64 h_stage_after = alloc(stage_bytes)
+    err = hipMemcpy(h_stage_after, d_stage, stage_bytes, 2); if err != 0 { die("D2H stage", err) }
+
+    u64 fail_extract = 0
+    u64 m = 0
+    while m < K {
+        u64 t = pos + m
+        u64 j = 0
+        while j < kv_dim {
+            f32 a = 0.0f
+            unsafe { *((h_stage_after + (m * kv_dim + j) * 4) as f32) -> a }
+            f32 e = f64_to_f32(int_to_f64((t + 1) * 1000 + j))
+            if a != e { fail_extract = fail_extract + 1 }
+            j = j + 1
+        }
+        m = m + 1
+    }
+    print_str("extract fail: "); u64 sef = fmt_dec(fail_extract); print_str(sef); dealloc(sef); print_str("\n")
+    if fail_extract != 0 { print_str("EXTRACT FAIL\n"); exit(1) }
+
+    // Step 3: modify the stage (multiply by 2 — stand-in for qknorm/rope).
+    u64 h_stage_mod = alloc(stage_bytes)
+    i = 0
+    while i < K * kv_dim {
+        f32 v = 0.0f
+        unsafe { *((h_stage_after + i * 4) as f32) -> v }
+        unsafe { *((h_stage_mod + i * 4) as f32) = (v + v) }
+        i = i + 1
+    }
+    err = hipMemcpy(d_stage, h_stage_mod, stage_bytes, 1); if err != 0 { die("H2D stage_mod", err) }
+
+    // Step 4: insert.
+    u64 b0 = alloc(8); unsafe { *(b0 as u64) = d_stage }
+    u64 b1 = alloc(8); unsafe { *(b1 as u64) = d_k_pos }
+    u64 kp2 = alloc(2 * 8)
+    unsafe { *(kp2 as u64) = b0 }; unsafe { *((kp2 + 8) as u64) = b1 }
+    err = hipModuleLaunchKernel(fh_in, 8, K, 1, 128, 1, 1, 0, 0, kp2, 0)
+    if err != 0 { die("launch in", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync in", err) }
+
+    // Step 5: verify K-cache.
+    u64 h_kc_after = alloc(kv_bytes)
+    err = hipMemcpy(h_kc_after, d_kc, kv_bytes, 2); if err != 0 { die("D2H kc final", err) }
+    u64 fail_insert = 0
+    u64 t = 0
+    while t < max_seq {
+        u64 in_window = 0
+        if t >= pos {
+            u64 d = t - pos
+            if d < K { in_window = 1 }
+        }
+        u64 j = 0
+        while j < kv_dim {
+            f32 a = 0.0f
+            unsafe { *((h_kc_after + (t * kv_dim + j) * 4) as f32) -> a }
+            f32 orig = f64_to_f32(int_to_f64((t + 1) * 1000 + j))
+            f32 e = orig
+            if in_window == 1 { e = orig + orig }
+            if a != e { fail_insert = fail_insert + 1 }
+            j = j + 1
+        }
+        t = t + 1
+    }
+    u64 total = max_seq * kv_dim
+    print_str("insert+verify fail: "); u64 sif = fmt_dec(fail_insert); print_str(sif); dealloc(sif)
+    print_str(" / "); u64 stot = fmt_dec(total); print_str(stot); dealloc(stot); print_str("\n")
+    if fail_insert == 0 {
+        print_str("OK — extract/insert_k_speck4 round-trip + windowed update bit-exact.\n"); exit(0)
+    } else {
+        print_str("FAIL\n"); exit(1)
+    }
+}

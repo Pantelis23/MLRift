@@ -56,6 +56,8 @@ static u64 _gpu_fh_qkv_split_speck4  = 0  // speculative qkv_split (per-pos K/V 
 static u64 _gpu_fh_extract_q    = 0       // Qwen3 Q-extract for batched qknorm
 static u64 _gpu_fh_extract_k    = 0       // Qwen3 K-extract: K-slots → contig stage
 static u64 _gpu_fh_insert_k     = 0       // Qwen3 K-insert: contig stage → K-slots
+static u64 _gpu_fh_extract_k_speck4 = 0   // speculative K-extract (per-pos src)
+static u64 _gpu_fh_insert_k_speck4  = 0   // speculative K-insert (per-pos dst)
 static u64 _gpu_fh_attn_decode  = 0       // fused decode-attn (Q·K → softmax → ·V)
 static u64 _gpu_fh_attn_decode_batched = 0  // batched decode-attn (grid (nh, batch))
 static u64 _gpu_fh_attn_decode_speck4  = 0  // multi-Q attn for spec_K=4
@@ -157,6 +159,8 @@ fn _gpu_mm_init_once() {
     _gpu_fh_extract_q         = _gpu_mm_load_co("/tmp/extract_q_qwen3_f32.co", "extract_q_qwen3_f32")
     _gpu_fh_extract_k         = _gpu_mm_load_co("/tmp/extract_k_qwen3_f32.co", "extract_k_qwen3_f32")
     _gpu_fh_insert_k          = _gpu_mm_load_co("/tmp/insert_k_qwen3_f32.co",  "insert_k_qwen3_f32")
+    _gpu_fh_extract_k_speck4  = _gpu_mm_load_co("/tmp/extract_k_qwen3_f32_speck4.co", "extract_k_qwen3_f32_speck4")
+    _gpu_fh_insert_k_speck4   = _gpu_mm_load_co("/tmp/insert_k_qwen3_f32_speck4.co",  "insert_k_qwen3_f32_speck4")
     _gpu_fh_attn_decode       = _gpu_mm_load_co("/tmp/attn_decode_f32.co",    "attn_decode_f32")
     _gpu_fh_attn_decode_batched = _gpu_mm_load_co("/tmp/attn_decode_f32_batched.co", "attn_decode_f32_batched")
     _gpu_fh_attn_decode_speck4  = _gpu_mm_load_co("/tmp/attn_decode_f32_speck4.co", "attn_decode_f32_speck4")
@@ -822,6 +826,40 @@ fn gpu_insert_k_qwen3_f32_to_dev(u64 d_stage, u64 d_k_slot_base, u64 batch_size)
     unsafe { *(kp as u64) = a0 }
     unsafe { *((kp + 8) as u64) = a1 }
     u32 err = hipModuleLaunchKernel(_gpu_fh_insert_k, 8, batch_size, 1, 128, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
+// gpu_extract_k_qwen3_f32_speck4_to_dev: speculative-layout K-extract.
+// Reads K consecutive positions of a single sequence's K-cache slab
+// (per-pos src stride 4096) into a contiguous [K, kv_dim] stage.
+// Caller passes K-slot base already shifted to position pos in
+// batch=0's slab.  Grid (8, K, 1).  Returns 0 on success.
+fn gpu_extract_k_qwen3_f32_speck4_to_dev(u64 d_k_pos_base, u64 d_stage,
+                                          u64 spec_K) -> u64 {
+    if _gpu_fh_extract_k_speck4 == 0 { return 1 }
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_k_pos_base }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_stage }
+    u64 kp = alloc(2 * 8)
+    unsafe { *(kp as u64) = a0 }
+    unsafe { *((kp + 8) as u64) = a1 }
+    u32 err = hipModuleLaunchKernel(_gpu_fh_extract_k_speck4, 8, spec_K, 1, 128, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
+// gpu_insert_k_qwen3_f32_speck4_to_dev: inverse of extract_k_speck4.
+// Writes a contiguous [K, kv_dim] stage back to K consecutive positions
+// of a single sequence's K-cache slab.  Returns 0 on success.
+fn gpu_insert_k_qwen3_f32_speck4_to_dev(u64 d_stage, u64 d_k_pos_base,
+                                         u64 spec_K) -> u64 {
+    if _gpu_fh_insert_k_speck4 == 0 { return 1 }
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_stage }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_k_pos_base }
+    u64 kp = alloc(2 * 8)
+    unsafe { *(kp as u64) = a0 }
+    unsafe { *((kp + 8) as u64) = a1 }
+    u32 err = hipModuleLaunchKernel(_gpu_fh_insert_k_speck4, 8, spec_K, 1, 128, 1, 1, 0, 0, kp, 0)
     if err != 0 { return 1 }
     return 0
 }
