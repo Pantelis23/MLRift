@@ -1258,6 +1258,7 @@ fn qwen3_forward_layer_qkv_batched_gpu(u64 d_x_in_arr_ptr,
 //   0x100  inside 0x08, skip post_norm   (caller batches it)
 //   0x200  inside 0x02, skip Q-rope      (caller batches it)
 //   0x400  inside 0x02, skip attn_decode (caller batches it)
+//   0x800  inside 0x02, skip qknorm Q    (caller batches it via extract_q)
 // Legacy path uses 0xFF (no skip bits) — every sub-step runs inline.
 // Batched path uses 0x02|0x200, 0x08|0x100 plus the batched matmul +
 // post_norm + Q-rope calls dispatched separately by qwen3_generate.
@@ -1357,8 +1358,12 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
         if gpu_qkv_split_f32_to_dev(b_qkv, d_k_slot, d_v_slot) != 0 { return 1 }
 
         // 4b. qknorm: in-place RMSNorm on each Q head + each K head.
-        //     Q reads/writes b_qkv (first q_dim elements of stream's slab).
-        if gpu_qknorm_f32_to_dev(b_q_attn, b_qkv, d_q_gamma, nh) != 0 { return 1 }
+        //     Q-side skippable by 0x800 (caller batches via extract_q +
+        //     batched qknorm).  K-side stays per-stream — K-cache slots
+        //     are non-contiguous across streams.
+        if (phase_mask & 0x800) == 0 {
+            if gpu_qknorm_f32_to_dev(b_q_attn, b_qkv, d_q_gamma, nh) != 0 { return 1 }
+        }
         if gpu_qknorm_f32_to_dev(d_k_slot, d_k_slot, d_k_gamma, nkv) != 0 { return 1 }
 
         // 4c. RoPE: in-place per-head rotation.  Q-rope is skippable

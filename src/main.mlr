@@ -4969,6 +4969,18 @@ fn main() {
                 write(1, qkn_path, qknl)
                 write(1, " (amdgpu qknorm-f32 code object, N=128, eps=1e-6)\n", 51)
                 exit(0)
+            } else if str_starts_with(arg, "--emit-amdgpu-extract-q-qwen3-f32=", 34) != 0 {
+                uint64 eqp_path = arg + 34
+                uint64 eqp_rc = emit_amdgpu_extract_q_qwen3_f32_blob(eqp_path)
+                if eqp_rc != 0 {
+                    write(2, "mlrc: --emit-amdgpu-extract-q-qwen3-f32 failed\n", 47)
+                    exit(1)
+                }
+                write(1, "mlrc: wrote ", 12)
+                uint64 eqpl = str_len(eqp_path)
+                write(1, eqp_path, eqpl)
+                write(1, " (amdgpu extract-q-qwen3-f32 code object, grid=(16,batch))\n", 60)
+                exit(0)
             } else if str_starts_with(arg, "--emit-amdgpu-attn-decode-f32-batched=", 38) != 0 {
                 uint64 adb_path = arg + 38
                 uint64 adb_rc = emit_amdgpu_attn_decode_f32_batched_blob(adb_path)

@@ -407,10 +407,19 @@ fn main() {
                         u64 kc = k_cache + layer * batch_stride + b_attn_phase * layer_stride
                         u64 vc = v_cache + layer * batch_stride + b_attn_phase * layer_stride
                         // 0x02 = attn region; 0x200 = skip Q-rope, 0x400 = skip
-                        // attn_decode (both dispatched batched below).
-                        if qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, kc, vc, num_workers, b_attn_phase, 0x602) != 0 { exit(1) }
+                        // attn_decode, 0x800 = skip qknorm Q (all dispatched
+                        // batched below).
+                        if qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, kc, vc, num_workers, b_attn_phase, 0xE02) != 0 { exit(1) }
                         b_attn_phase = b_attn_phase + 1
                     }
+                    // Q extract: copy Q parts from [batch, qkv_dim] _gpuq_d_qkv
+                    // to contiguous [batch, q_dim] _gpuq_d_q_attn for batched qknorm.
+                    if gpu_extract_q_qwen3_f32_to_dev(_gpuq_d_qkv, _gpuq_d_q_attn, batch_size) != 0 { exit(1) }
+                    // ONE batched qknorm Q (M = batch * nh, in-place on _gpuq_d_q_attn).
+                    u64 d_q_gamma_b = gpu_cache_bf16_as_f32(w.q_norm_w, QWEN3_HEAD_DIM)
+                    if d_q_gamma_b == 0 { exit(1) }
+                    if gpu_qknorm_f32_to_dev(_gpuq_d_q_attn, _gpuq_d_q_attn, d_q_gamma_b,
+                                              batch_size * QWEN3_N_HEADS) != 0 { exit(1) }
                     // ONE batched Q-rope across all streams (n_heads = batch * nh).
                     if gpu_rope_f32_to_dev(_gpuq_d_q_attn, _gpuq_d_rope_cos, _gpuq_d_rope_sin,
                                             batch_size * QWEN3_N_HEADS) != 0 { exit(1) }
