@@ -2549,7 +2549,7 @@ else
     echo "FAIL: migration_apply (command failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f /tmp/mlrc_mig2_$$.mlr /tmp/mlrc_mig2_bin_$$
+rm -f /tmp/mlrc_mig2_$$.mlr /tmp/mlrc_mig2_bin_$$ /tmp/mlrc_mig2_$$.mlr.lcverify.mlr /tmp/mlrc_mig2_$$.mlr.lcverify.o
 
 # mlrc lc on a file with unsafe ops should report legacy_ptr_ops
 TOTAL=$((TOTAL + 1))
@@ -2621,7 +2621,7 @@ else
     echo "FAIL: migration_types (command failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f /tmp/mlrc_migtypes_$$.mlr
+rm -f /tmp/mlrc_migtypes_$$.mlr /tmp/mlrc_migtypes_$$.mlr.lcverify.mlr /tmp/mlrc_migtypes_$$.mlr.lcverify.o
 
 # --- Bootstrap test ---
 echo ""
@@ -6045,6 +6045,685 @@ else
     echo "FAIL: call_args_25_arm64 (exit $CA_A64_ST: '$CA_A64_ERR')"; FAIL=$((FAIL + 1))
 fi
 rm -f "$CA_SRC" "$CA_BIN"
+
+echo ""
+echo "--- lc build-unit mapping ---"
+# A file is verified as part of every BUILD UNIT that contains it, and the
+# membership is parsed out of the Makefile (SRCS and the build/mlr-runner.mlr
+# rule), never hardcoded -- SRCS differs per fork, and src/living.mlr /
+# src/living.kr are held at a one-line divergence. These tests must run with
+# the repo root as the working directory: that is where the Makefile is, and
+# $MLRC is a wrapper around a relative ./build/mlrc path.
+RR="$DIR/.."
+
+# std/net.mlr is imported by no example or test, and a synthesised driver for
+# it fails semantic analysis (net.mlr:153, dealloc/2 -- unrelated to any
+# migration). No build unit covers it, so lc must refuse to rewrite it rather
+# than abort halfway through verification. --dry-run on purpose: "nothing
+# covers this file" is a refusal to touch it at all, not a write-time verdict.
+TOTAL=$((TOTAL + 1))
+NET_OUT=$(cd "$RR" && $MLRC lc --fix --dry-run std/net.mlr 2>&1); NET_ST=$?
+if [ "$NET_ST" != "0" ] && echo "$NET_OUT" | grep -qi "no build unit"; then
+    PASS=$((PASS + 1)); echo "  lc_refuses_uncovered_file: PASS"
+else
+    echo "FAIL: lc_refuses_uncovered_file (exit $NET_ST, got '$NET_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# src/bcj.mlr is in BOTH units: SRCS (Makefile:17 -> build/mlrc.mlr) and the
+# build/mlr-runner.mlr rule (Makefile:40,42). Verifying against one leaves the
+# other unverified, so both must be reported and both must be checked.
+TOTAL=$((TOTAL + 1))
+BCJ_OUT=$(cd "$RR" && $MLRC lc --fix=types --dry-run src/bcj.mlr 2>&1 | grep "build units:")
+if echo "$BCJ_OUT" | grep -q "build/mlrc.mlr" && echo "$BCJ_OUT" | grep -q "build/mlr-runner.mlr"; then
+    PASS=$((PASS + 1)); echo "  lc_maps_file_to_every_unit: PASS"
+else
+    echo "FAIL: lc_maps_file_to_every_unit (got '$BCJ_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# std/sha256.mlr is a std/ module that is ALSO in SRCS (Makefile:18). It must
+# resolve to build/mlrc.mlr, not to a synthesised driver. This is the test
+# that fails if the mapping guesses from the path prefix instead of reading
+# the Makefile: no "src/ means mlrc.mlr" rule can get this file right.
+TOTAL=$((TOTAL + 1))
+SHA_OUT=$(cd "$RR" && $MLRC lc --fix=types --dry-run std/sha256.mlr 2>&1 | grep "build units:")
+if echo "$SHA_OUT" | grep -q "build/mlrc.mlr" && ! echo "$SHA_OUT" | grep -q "(module)"; then
+    PASS=$((PASS + 1)); echo "  lc_srcs_membership_read_from_makefile: PASS"
+else
+    echo "FAIL: lc_srcs_membership_read_from_makefile (got '$SHA_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# A std/ module that no Makefile unit covers IS its own build unit (--emit=obj
+# needs no entry point), and it is verified IN THIS PROCESS -- no outer
+# per-compile driver process.
+# Measured, not assumed: tests/lc/run_spike.sh boundary 3 shows eight compiles
+# of two different sources in one process, both orderings, both targets, all
+# byte-identical to single-shot references at --emit=obj. The emit_mode-0
+# dyn_sym_count leak that would have forced an outer driver cannot reach the
+# object at emit_mode 3.
+#
+# The content is a byte copy of std/hip.mlr, the module the measurement names:
+# 17 @dynamic declarations, the exact input that corrupts a later compile at
+# emit_mode 0. It runs at a scratch path so an interrupted suite can never
+# leave a tracked file rewritten.
+TOTAL=$((TOTAL + 1))
+HIPC="$RR/std/lc_dynprobe_$$.mlr"
+cp "$RR/std/hip.mlr" "$HIPC"
+HIP_OUT=$(cd "$RR" && $MLRC lc --fix=types "std/lc_dynprobe_$$.mlr" 2>&1); HIP_ST=$?
+# The negative half checks no @dynamic DECLARATION still spells a long-form
+# type; the file's header comment still says `uint32` and must, because the
+# token rewriter never touches comments (lc_rewrite_preserves_string_literals).
+if [ "$HIP_ST" = "0" ] && echo "$HIP_OUT" | grep -q "(module)" && \
+   grep -q "hipGetErrorString(u32 err) -> u64" "$HIPC" && \
+   ! grep -q "^@dynamic extern fn .*uint" "$HIPC"; then
+    PASS=$((PASS + 1)); echo "  lc_verifies_dynamic_std_module_in_process: PASS"
+else
+    echo "FAIL: lc_verifies_dynamic_std_module_in_process (exit $HIP_ST, got '$HIP_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# Scratch is truncated, not deleted -- there is no portable delete builtin
+# (see the task-5 report). Everything that CAN live under the gitignored
+# build/ does; the staged rewrite beside a directly-compiled unit cannot move
+# (import resolution) and is covered by a .gitignore rule. Clear both here.
+rm -f "$RR"/std/lc_dynprobe_$$.mlr* "$RR"/std/hip.mlr.lcverify.mlr \
+      "$RR"/build/lcverify.o "$RR"/build/lcverify_src.mlr \
+      "$RR"/build/mlrc.mlr.lcunit_*.mlr "$RR"/build/mlr-runner.mlr.lcunit_*.mlr
+
+# --dry-run previews without writing. It must therefore create NOTHING, in
+# particular not inside tracked std/ -- this project has a recorded incident
+# where a blind `git add -A` swept 767 stray files into a public commit, so a
+# scratch file in a tracked directory is a live hazard, not untidiness.
+# A name that merely STARTS with `main` is not an entry point. `fn main_loop`
+# once matched the column-0 prefix test that decides whether a unit can be
+# linked -- harmless while that answer only picked a unit kind, but it now
+# selects the IR-backend leg, which compiles at emit mode 0 and REQUIRES a
+# real main(). The result was a working migration failing with
+# `error: no 'main' function found`, a diagnostic naming neither lc nor the
+# file, plus a full-content scratch file left behind. No `fn main_*` exists
+# anywhere in src/, std/ or examples/, which is precisely why the rest of
+# the suite cannot see this.
+TOTAL=$((TOTAL + 1))
+ML_DIR=$(mktemp -d)
+printf 'fn main_loop(uint64 n) -> uint64 { return n }\n' > "$ML_DIR/ml.mlr"
+ML_OUT=$(cd "$RR" && $MLRC lc --fix=types "$ML_DIR/ml.mlr" 2>&1); ML_ST=$?
+if [ "$ML_ST" = "0" ] && echo "$ML_OUT" | grep -q "(module)" && grep -q 'u64' "$ML_DIR/ml.mlr"; then
+    PASS=$((PASS + 1)); echo "  lc_fn_main_prefix_is_not_an_entry_point: PASS"
+else
+    echo "FAIL: lc_fn_main_prefix_is_not_an_entry_point (exit $ML_ST: '$(echo "$ML_OUT" | tail -1)')"
+    FAIL=$((FAIL + 1))
+fi
+# The counterpart: a real main() MUST still take the IR leg, or the fix above
+# would "pass" by classifying everything as unlinkable.
+TOTAL=$((TOTAL + 1))
+printf 'fn helper(uint64 n) -> uint64 { return n }\nfn main() { exit(helper(0)) }\n' > "$ML_DIR/rm.mlr"
+RM_OUT=$(cd "$RR" && $MLRC lc --fix=types "$ML_DIR/rm.mlr" 2>&1); RM_ST=$?
+if [ "$RM_ST" = "0" ] && echo "$RM_OUT" | grep -q "IR codegen (linked executable"; then
+    PASS=$((PASS + 1)); echo "  lc_real_main_takes_the_ir_leg: PASS"
+else
+    echo "FAIL: lc_real_main_takes_the_ir_leg (exit $RM_ST: '$(echo "$RM_OUT" | tail -1)')"
+    FAIL=$((FAIL + 1))
+fi
+rm -rf "$ML_DIR"
+
+TOTAL=$((TOTAL + 1))
+BEFORE=$(ls -A "$RR/std" | wc -l)
+(cd "$RR" && $MLRC lc --fix=types --dry-run std/color.mlr >/dev/null 2>&1)
+(cd "$RR" && $MLRC lc --fix --dry-run std/net.mlr >/dev/null 2>&1)
+AFTER=$(ls -A "$RR/std" | wc -l)
+if [ "$BEFORE" = "$AFTER" ]; then
+    PASS=$((PASS + 1)); echo "  lc_dry_run_creates_no_files: PASS"
+else
+    echo "FAIL: lc_dry_run_creates_no_files (std/ went from $BEFORE to $AFTER entries)"
+    ls -A "$RR/std" | grep -i lcverify; FAIL=$((FAIL + 1))
+fi
+
+# Every cap in the mapper must refuse out loud. A cap that silently truncates
+# would let the harness verify against an INCOMPLETE unit set and still report
+# success -- the exact overclaim this verification exists to prevent, and the
+# same "length asserted rather than derived" family as the .strtab overflow
+# and the str_buf cap fixed earlier on this branch.
+#
+# Uses an absolute compiler path on purpose: the cap is reached by walking up
+# from the working directory to a Makefile, so these run from a scratch dir,
+# and $MLRC is a wrapper around a relative ./build/mlrc.
+MLRC_ABS="$(cd "$RR" && pwd)/build/mlrc"
+CAPD="/tmp/mlrc_lccap_$$"
+rm -rf "$CAPD"; mkdir -p "$CAPD/src"
+printf 'fn helper(uint64 a) -> uint64 {\n    return a\n}\n' > "$CAPD/src/x.mlr"
+
+TOTAL=$((TOTAL + 1))
+{ printf 'SRCS = src/x.mlr'
+  i=0; while [ $i -lt 300 ]; do printf ' src/f%s.mlr' $i; i=$((i+1)); done
+  printf '\n\nall:\n\t@true\n'; } > "$CAPD/Makefile"
+CAP_OUT=$(cd "$CAPD" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run src/x.mlr 2>&1); CAP_ST=$?
+if [ "$CAP_ST" != "0" ] && echo "$CAP_OUT" | grep -q "too many SRCS (limit 256)"; then
+    PASS=$((PASS + 1)); echo "  lc_srcs_cap_refuses_loudly: PASS"
+else
+    echo "FAIL: lc_srcs_cap_refuses_loudly (exit $CAP_ST, got '$CAP_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# Reading only the first assignment would silently drop everything a later
+# `+=` adds, so a second assignment is refused rather than ignored.
+TOTAL=$((TOTAL + 1))
+printf 'SRCS = src/x.mlr src/a.mlr\nSRCS += src/b.mlr\n\nall:\n\t@true\n' > "$CAPD/Makefile"
+CAP2_OUT=$(cd "$CAPD" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run src/x.mlr 2>&1); CAP2_ST=$?
+if [ "$CAP2_ST" != "0" ] && echo "$CAP2_OUT" | grep -q "assigned more than once"; then
+    PASS=$((PASS + 1)); echo "  lc_double_srcs_assignment_refused: PASS"
+else
+    echo "FAIL: lc_double_srcs_assignment_refused (exit $CAP2_ST, got '$CAP2_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# `$(VAR)` in SRCS used to be SKIPPED without a word -- the one dropping path
+# in the mapper that was neither a cap nor guarded. Demonstrated before the
+# fix: `SRCS = $(CORE) src/a.mlr` assembled a ONE-member unit missing the file
+# that holds main(), verified the rewrite inside it, found it identical and
+# WROTE the file while printing "build units: build/mlrc.mlr" -- the name of a
+# unit it had not built. Not live in this tree's Makefile, but the reason the
+# Makefile is parsed at all is fork portability.
+TOTAL=$((TOTAL + 1))
+printf 'fn helper(uint64 a) -> uint64 {\n    return a\n}\n' > "$CAPD/src/x.mlr"
+printf 'CORE = src/y.mlr\nSRCS = $(CORE) src/x.mlr\n\nall:\n\t@true\n' > "$CAPD/Makefile"
+CAP3_OUT=$(cd "$CAPD" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run src/x.mlr 2>&1); CAP3_ST=$?
+if [ "$CAP3_ST" != "0" ] && echo "$CAP3_OUT" | grep -q 'unexpanded make variable'; then
+    PASS=$((PASS + 1)); echo "  lc_unexpanded_make_variable_refused: PASS"
+else
+    echo "FAIL: lc_unexpanded_make_variable_refused (exit $CAP3_ST, got '$CAP3_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# `SRCS ?=` matched NO assignment operator, so SRCS resolved to zero members
+# and the file fell through to `src/x.mlr (module)` -- a silently narrower
+# unit, reported as success. It must read as a real assignment.
+TOTAL=$((TOTAL + 1))
+printf 'SRCS ?= src/x.mlr\n\nall:\n\t@true\n' > "$CAPD/Makefile"
+CAP4_OUT=$(cd "$CAPD" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run src/x.mlr 2>&1 | grep "build units:")
+if echo "$CAP4_OUT" | grep -q "build/mlrc.mlr" && ! echo "$CAP4_OUT" | grep -q "(module)"; then
+    PASS=$((PASS + 1)); echo "  lc_optional_assignment_is_read: PASS"
+else
+    echo "FAIL: lc_optional_assignment_is_read (got '$CAP4_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# `!=` is make's SHELL assignment: the value only exists after running a
+# shell. Refuse by name rather than silently missing it the way `?=` was.
+TOTAL=$((TOTAL + 1))
+printf 'SRCS != echo src/x.mlr\n\nall:\n\t@true\n' > "$CAPD/Makefile"
+CAP5_OUT=$(cd "$CAPD" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run src/x.mlr 2>&1); CAP5_ST=$?
+if [ "$CAP5_ST" != "0" ] && echo "$CAP5_OUT" | grep -q 'shell assignment'; then
+    PASS=$((PASS + 1)); echo "  lc_shell_assignment_refused: PASS"
+else
+    echo "FAIL: lc_shell_assignment_refused (exit $CAP5_ST, got '$CAP5_OUT')"; FAIL=$((FAIL + 1))
+fi
+rm -rf "$CAPD"
+
+# Membership is decided by CONTENT, not by the path tail, so it survives the
+# working directory. Run from src/, `lexer.mlr` is shorter than the Makefile
+# token `src/lexer.mlr`, so a tail comparison could never match it and the
+# file silently downgraded to `lexer.mlr (module)` -- verified against none of
+# its real units -- while the SAME file named from the repo root resolved to
+# build/mlrc.mlr. All three spellings must now agree.
+TOTAL=$((TOTAL + 1))
+SUB_A=$(cd "$RR/src" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run lexer.mlr 2>&1 | grep "build units:")
+SUB_B=$(cd "$RR" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run src/lexer.mlr 2>&1 | grep "build units:")
+if echo "$SUB_A" | grep -q "build/mlrc.mlr" && ! echo "$SUB_A" | grep -q "(module)" && \
+   echo "$SUB_B" | grep -q "build/mlrc.mlr"; then
+    PASS=$((PASS + 1)); echo "  lc_maps_file_from_a_subdirectory: PASS"
+else
+    echo "FAIL: lc_maps_file_from_a_subdirectory (from src/: '$SUB_A'; from root: '$SUB_B')"; FAIL=$((FAIL + 1))
+fi
+
+# A file OUTSIDE the repo whose path tail matches a member was spliced into
+# THIS repo's build unit in place of the real member. It matters here
+# specifically: MLRift, MLRift-lc and the other worktrees are siblings with
+# identical file names, so `lc --fix ../MLRift/src/living.mlr` run from this
+# checkout would have verified that file inside this checkout's unit. Refuse.
+TOTAL=$((TOTAL + 1))
+FGN="/tmp/mlrc_lcforeign_$$"
+rm -rf "$FGN"; mkdir -p "$FGN/src"
+printf 'fn q(uint64 z) -> uint64 {\n    return z\n}\n' > "$FGN/src/lexer.mlr"
+cp "$FGN/src/lexer.mlr" "$FGN/src/lexer.orig"
+FGN_OUT=$(cd "$RR" && "$MLRC_ABS" --arch=x86_64 lc --fix=types "$FGN/src/lexer.mlr" 2>&1); FGN_ST=$?
+if [ "$FGN_ST" != "0" ] && echo "$FGN_OUT" | grep -q "by name but is not that file" && \
+   cmp -s "$FGN/src/lexer.mlr" "$FGN/src/lexer.orig"; then
+    PASS=$((PASS + 1)); echo "  lc_refuses_foreign_file_with_matching_tail: PASS"
+else
+    echo "FAIL: lc_refuses_foreign_file_with_matching_tail (exit $FGN_ST, got '$FGN_OUT')"; FAIL=$((FAIL + 1))
+fi
+rm -rf "$FGN"
+
+# The set of targets and the set of BACKENDS a run actually compared must be
+# stated, not inferred. `--emit=obj` is gated OUT of the IR path
+# (src/main.mlr:2790,:2799), so an object comparison alone checks the LEGACY
+# backend -- not the one that ships. A unit with an entry point is therefore
+# also linked and compared on the IR backend; a unit without one cannot be,
+# and has to say so. riscv32/xtensa were named only in source comments.
+TOTAL=$((TOTAL + 1))
+BK_SRC="/tmp/mlrc_lcbk_$$.mlr"
+printf 'fn main() {\n    uint64 a = 1\n    exit(0)\n}\n' > "$BK_SRC"
+BK_OUT=$($MLRC lc --fix=types "$BK_SRC" 2>&1); BK_ST=$?
+BK_MOD=$(cd "$RR" && $MLRC lc --fix=types --dry-run std/color.mlr 2>&1)
+if [ "$BK_ST" = "0" ] && echo "$BK_OUT" | grep -q "IR codegen (linked executable" && \
+   echo "$BK_OUT" | grep -q "legacy codegen (--emit=obj)" && \
+   echo "$BK_OUT" | grep -q "riscv32, xtensa" && \
+   echo "$BK_MOD" | grep -q "ONLY -- no entry point"; then
+    PASS=$((PASS + 1)); echo "  lc_states_backends_and_targets: PASS"
+else
+    echo "FAIL: lc_states_backends_and_targets (exit $BK_ST, got '$BK_OUT' / '$BK_MOD')"; FAIL=$((FAIL + 1))
+fi
+rm -f "$BK_SRC" "$BK_SRC".lcverify.mlr
+
+# The IR leg needs emit_mode 0, which is the mode task 1 proved leaks the
+# @dynamic symbol registry across in-process compiles. The guard has to be
+# read BEFORE that compile, not after it: the four --emit=obj compiles have
+# already accumulated the count (68 -> 85 -> 102 -> 119 for a program
+# importing std/hip.mlr), and at emit_mode 0 an inflated count does not merely
+# change the output, it routes through format_elf_dyn and EXITS ("R segment
+# exceeds one page"). A post-compile check could therefore never fire -- which
+# is exactly what constructing this input revealed. The leg must be refused by
+# name, the obj verification must still stand, and the file must still be
+# written on its strength.
+TOTAL=$((TOTAL + 1))
+DYD="/tmp/mlrc_lcdyn_$$"
+rm -rf "$DYD"; mkdir -p "$DYD"
+ln -s "$(cd "$RR" && pwd)/std" "$DYD/std"
+printf 'import "std/hip.mlr"\n\nfn main() {\n    uint64 a = 1\n    exit(0)\n}\n' > "$DYD/d.mlr"
+DY_OUT=$($MLRC lc --fix=types "$DYD/d.mlr" 2>&1); DY_ST=$?
+if [ "$DY_ST" = "0" ] && echo "$DY_OUT" | grep -q "IR/executable leg NOT RUN" && \
+   echo "$DY_OUT" | grep -q "the IR leg was refused this run" && \
+   grep -q "u64 a = 1" "$DYD/d.mlr"; then
+    PASS=$((PASS + 1)); echo "  lc_dynamic_unit_refuses_ir_leg_by_name: PASS"
+else
+    echo "FAIL: lc_dynamic_unit_refuses_ir_leg_by_name (exit $DY_ST, got '$DY_OUT')"; FAIL=$((FAIL + 1))
+fi
+rm -rf "$DYD"
+
+# A unit whose ORIGINAL does not pass the front end is refused BY RETURN, not
+# by compile() calling exit(1) from underneath the harness. The difference is
+# visible on disk: a hard exit skips mig_scratch_clear and leaves the staged
+# rewrite at FULL content (measured at 4,379,185 bytes for an assembled unit,
+# and 55 bytes for a small one); a returned refusal unwinds and truncates it.
+# It also distinguishes "the original does not build" from "the rewrite does
+# not build", which used to collapse into one anonymous non-zero exit.
+TOTAL=$((TOTAL + 1))
+BAD_SRC="/tmp/mlrc_lcbad_$$.mlr"
+printf 'fn main() {\n    uint64 a = 1\n    dealloc(a, 3)\n    exit(0)\n}\n' > "$BAD_SRC"
+cp "$BAD_SRC" "$BAD_SRC.orig"
+BAD_OUT=$($MLRC lc --fix=types "$BAD_SRC" 2>&1); BAD_ST=$?
+BAD_SCRATCH=$(stat -c%s "$BAD_SRC.lcverify.mlr" 2>/dev/null || echo missing)
+if [ "$BAD_ST" != "0" ] && echo "$BAD_OUT" | grep -q "ORIGINAL build unit" && \
+   cmp -s "$BAD_SRC" "$BAD_SRC.orig" && [ "$BAD_SCRATCH" = "0" ]; then
+    PASS=$((PASS + 1)); echo "  lc_unbuildable_original_refused_and_scratch_cleared: PASS"
+else
+    echo "FAIL: lc_unbuildable_original_refused_and_scratch_cleared (exit $BAD_ST, scratch $BAD_SCRATCH, got '$BAD_OUT')"; FAIL=$((FAIL + 1))
+fi
+rm -f "$BAD_SRC" "$BAD_SRC.orig" "$BAD_SRC.lcverify.mlr"
+
+echo ""
+echo "--- growable string pool ---"
+SP_SRC="/tmp/mlrc_strpool_$$.mlr"
+{
+  echo 'fn main() {'
+  i=0
+  while [ $i -lt 900 ]; do
+    printf '    print_str("padpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpad-%s")\n' "$i"
+    i=$((i + 1))
+  done
+  echo '    exit(0)'
+  echo '}'
+} > "$SP_SRC"
+TOTAL=$((TOTAL + 1))
+if $MLRC --arch=x86_64 "$SP_SRC" -o /tmp/mlrc_strpool_bin_$$ > /tmp/mlrc_strpool_err_$$ 2>&1; then
+    PASS=$((PASS + 1)); echo "  str_pool_grows_past_64k: PASS"
+else
+    echo "FAIL: str_pool_grows_past_64k ($(head -1 /tmp/mlrc_strpool_err_$$))"; FAIL=$((FAIL + 1))
+fi
+rm -f "$SP_SRC" /tmp/mlrc_strpool_bin_$$ /tmp/mlrc_strpool_err_$$
+
+# The legacy ARM64 f-string path used to gate every baked byte on
+# `if str_len < 65535` with NO else: past the cap the byte was dropped and the
+# compile still exited 0. It is the harness's own arm64 leg (mig_verify_unit
+# compiles at --emit=obj, which is legacy codegen), so a silent truncation
+# there makes the arm64 half of "byte-identical on both targets" blind past
+# ~64 KB of string data.
+#
+# Content, not exit status, is the assertion: the defect NEVER failed a build.
+# Measured before the fix on exactly this input: x86_64 900/900 segments,
+# arm64 521/900, both exit 0.
+FS_SRC="/tmp/mlrc_fstr_$$.mlr"
+{
+  echo 'fn main() {'
+  echo '    u64 n = 7'
+  i=0
+  while [ $i -lt 900 ]; do
+    printf '    print_str(f"padpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpad{n}SEG%s-END")\n' "$i"
+    i=$((i + 1))
+  done
+  echo '    exit(0)'
+  echo '}'
+} > "$FS_SRC"
+for FS_A in x86_64 arm64; do
+  TOTAL=$((TOTAL + 1))
+  if $MLRC --arch=$FS_A --emit=obj "$FS_SRC" -o /tmp/mlrc_fstr_$$.o > /tmp/mlrc_fstr_err_$$ 2>&1; then
+      FS_N=$(grep -ao 'SEG[0-9]*-END' /tmp/mlrc_fstr_$$.o | sort -u | wc -l)
+      if [ "$FS_N" = "900" ]; then
+          PASS=$((PASS + 1)); echo "  fstring_segments_survive_past_64k_$FS_A: PASS"
+      else
+          echo "FAIL: fstring_segments_survive_past_64k_$FS_A (only $FS_N/900 segments baked, silently)"; FAIL=$((FAIL + 1))
+      fi
+  else
+      echo "FAIL: fstring_segments_survive_past_64k_$FS_A ($(head -1 /tmp/mlrc_fstr_err_$$))"; FAIL=$((FAIL + 1))
+  fi
+done
+rm -f "$FS_SRC" /tmp/mlrc_fstr_$$.o /tmp/mlrc_fstr_err_$$
+
+echo ""
+echo "--- lc verification harness ---"
+TOTAL=$((TOTAL + 1))
+LCV="/tmp/mlrc_lcv_$$.mlr"
+printf 'fn main() {\n    uint64 a = 1\n    exit(0)\n}\n' > "$LCV"
+cp "$LCV" "${LCV}.orig"
+# --fix-inject-fault rewrites uint64 -> f64, which changes emitted code.
+# (The plan said u32; measured, every integer width emits a byte-identical
+# object for `uint64 a = 1` on both targets, so u32 is not a fault at all.
+# See the comment on mig_short_form in src/living.mlr.)
+$MLRC lc --fix --fix-inject-fault "$LCV" > /tmp/lcv_out_$$ 2>&1
+LCV_ST=$?
+if [ "$LCV_ST" != "0" ] && grep -qi "mismatch" /tmp/lcv_out_$$ && cmp -s "$LCV" "${LCV}.orig"; then
+    PASS=$((PASS + 1)); echo "  lc_harness_rejects_and_leaves_file: PASS"
+else
+    echo "FAIL: lc_harness_rejects_and_leaves_file (exit $LCV_ST, or the file was modified)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCV" "${LCV}.orig" /tmp/lcv_out_$$ "${LCV}.lcverify.mlr" "${LCV}.lcverify.o"
+
+# Positive control. Without it, a harness that rejects EVERYTHING would pass
+# the test above. This also happens to be the only end-to-end coverage of
+# --fix in write mode (everything else is dry-run), and it is the in-process
+# re-entrancy proof: it only passes if compile() called four times in one
+# process still produces identical bytes for identical input.
+TOTAL=$((TOTAL + 1))
+LCP="/tmp/mlrc_lcp_$$.mlr"
+printf 'fn main() {\n    uint64 a = 1\n    exit(0)\n}\n' > "$LCP"
+$MLRC lc --fix "$LCP" >/dev/null 2>&1
+if grep -q "u64 a = 1" "$LCP" && ! grep -q "uint64" "$LCP"; then
+    PASS=$((PASS + 1)); echo "  lc_harness_accepts_valid_rewrite: PASS"
+else
+    echo "FAIL: lc_harness_accepts_valid_rewrite (a correct rewrite was refused)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCP" "${LCP}.lcverify.mlr" "${LCP}.lcverify.o"
+
+echo ""
+echo "--- lc --fix migration split ---"
+
+# --fix=types must never touch a ptrops site: the unsafe{} block stays
+# unsafe{} (only its `uint64` cast keyword gets renamed to `u64`, since that
+# is a real long-form type token like any other -- "load64" text must never
+# appear because the ptrops pass does not run at all).
+TOTAL=$((TOTAL + 1))
+LCT="/tmp/mlrc_lctypes_$$.mlr"
+cat > "$LCT" <<'EOF'
+fn main() {
+    uint64 v = 0
+    u64 p = alloc(8)
+    unsafe { *(p as uint64) -> v }
+    exit(0)
+}
+EOF
+OUT_T=$($MLRC lc --fix=types --dry-run "$LCT" 2>&1 | grep -c "load64")
+if [ "$OUT_T" = "0" ]; then
+    PASS=$((PASS + 1)); echo "  lc_fix_types_leaves_ptrops: PASS"
+else
+    echo "FAIL: lc_fix_types_leaves_ptrops (--fix=types rewrote a pointer op)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCT"
+
+# Symmetric case: --fix=ptrops must never touch a standalone long-form type
+# declaration outside an unsafe{} block, even though it DOES still convert
+# the unsafe{} block itself (mig_parse_type understands both spellings, so
+# `as uint64` still resolves to load64 without the type pass having run).
+TOTAL=$((TOTAL + 1))
+LCP="/tmp/mlrc_lcptrops_$$.mlr"
+cat > "$LCP" <<'EOF'
+fn main() {
+    uint64 v = 0
+    u64 p = alloc(8)
+    unsafe { *(p as uint64) -> v }
+    exit(0)
+}
+EOF
+OUT_P=$($MLRC lc --fix=ptrops --dry-run "$LCP" 2>&1)
+if echo "$OUT_P" | grep -q "load64" && ! echo "$OUT_P" | grep -q "u64 v = 0"; then
+    PASS=$((PASS + 1)); echo "  lc_fix_ptrops_leaves_types: PASS"
+else
+    echo "FAIL: lc_fix_ptrops_leaves_types (expected load64 present, standalone uint64->u64 absent)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCP"
+
+# Task 3's review found run_migration double-counting compound sites: an
+# unsafe{} block whose cast uses a long-form type (`as uint32`) gets counted
+# once by the type pass (a real KwUint32 token) and again by the ptrops pass
+# (the whole block's conversion), so 3 standalone long-form declarations
+# plus 1 combined block used to report "5 migration site(s)" instead of a
+# defensible 4. Each flag must report only its own pass's count, and bare
+# --fix must not sum them into a single inflated total.
+TOTAL=$((TOTAL + 1))
+LCD="/tmp/mlrc_lcdup_$$.mlr"
+cat > "$LCD" <<'EOF'
+fn main() {
+    uint64 a = 1
+    uint32 b = 2
+    uint16 c = 3
+    u64 p = alloc(8)
+    u64 v = 0
+    unsafe { *(p as uint64) -> v }
+    exit(0)
+}
+EOF
+OUT_D=$($MLRC lc --fix --dry-run "$LCD" 2>&1)
+if echo "$OUT_D" | grep -q "4 migration site(s) rewritten (type)" && \
+   echo "$OUT_D" | grep -q "1 migration site(s) rewritten (ptrops)" && \
+   ! echo "$OUT_D" | grep -q "5 migration site(s)"; then
+    PASS=$((PASS + 1)); echo "  lc_fix_reports_no_double_count: PASS"
+else
+    echo "FAIL: lc_fix_reports_no_double_count (bare --fix double-counted a compound site)"
+    echo "$OUT_D"
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$LCD"
+
+# --fix=types and --fix=ptrops must each report only their own count on the
+# same compound file, with no cross-contamination between the two flags.
+TOTAL=$((TOTAL + 1))
+LCS="/tmp/mlrc_lcsolo_$$.mlr"
+cat > "$LCS" <<'EOF'
+fn main() {
+    uint64 a = 1
+    uint32 b = 2
+    uint16 c = 3
+    u64 p = alloc(8)
+    u64 v = 0
+    unsafe { *(p as uint64) -> v }
+    exit(0)
+}
+EOF
+OUT_ST=$($MLRC lc --fix=types --dry-run "$LCS" 2>&1 | head -1)
+cp "$LCS" "${LCS}.p"
+OUT_SP=$($MLRC lc --fix=ptrops --dry-run "${LCS}.p" 2>&1 | head -1)
+if [ "$OUT_ST" = "migration: 4 migration site(s) rewritten" ] && \
+   [ "$OUT_SP" = "migration: 1 migration site(s) rewritten" ]; then
+    PASS=$((PASS + 1)); echo "  lc_fix_scopes_report_own_count: PASS"
+else
+    echo "FAIL: lc_fix_scopes_report_own_count (got types='$OUT_ST' ptrops='$OUT_SP')"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCS" "${LCS}.p"
+
+# --fix=ptrops writes back to the file and the result must still compile and
+# run -- exercises the write path (not just --dry-run) for the split flag.
+TOTAL=$((TOTAL + 1))
+LCW="/tmp/mlrc_lcwrite_$$.mlr"
+cat > "$LCW" <<'EOF'
+fn main() {
+    u64 buf = alloc(16)
+    u64 v = 0
+    store32(buf, 42)
+    unsafe { *(buf as u32) -> v }
+    exit(v)
+}
+EOF
+if $MLRC lc --fix=ptrops "$LCW" > /dev/null 2>&1; then
+    if grep -q "v = load32(buf)" "$LCW"; then
+        if $MLRC $MLRC_FLAGS "$LCW" -o /tmp/mlrc_lcwrite_bin_$$ > /dev/null 2>&1; then
+            chmod +x /tmp/mlrc_lcwrite_bin_$$
+            /tmp/mlrc_lcwrite_bin_$$ > /dev/null 2>&1
+            if [ "$?" = "42" ]; then
+                PASS=$((PASS + 1)); echo "  lc_fix_ptrops_write_compiles: PASS"
+            else
+                echo "FAIL: lc_fix_ptrops_write_compiles (rewritten binary exit != 42)"; FAIL=$((FAIL + 1))
+            fi
+        else
+            echo "FAIL: lc_fix_ptrops_write_compiles (rewritten file did not compile)"; FAIL=$((FAIL + 1))
+        fi
+    else
+        echo "FAIL: lc_fix_ptrops_write_compiles (file was not rewritten)"; FAIL=$((FAIL + 1))
+    fi
+else
+    echo "FAIL: lc_fix_ptrops_write_compiles (command failed)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCW" /tmp/mlrc_lcwrite_bin_$$ "${LCW}.lcverify.mlr" "${LCW}.lcverify.o"
+
+# Unknown --fix= value must be a clean, non-zero-exit diagnostic, not a
+# silent no-op or a crash.
+TOTAL=$((TOTAL + 1))
+LCB="/tmp/mlrc_lcbad_$$.mlr"
+printf 'fn main() {\n    exit(0)\n}\n' > "$LCB"
+LCB_ERR=$($MLRC lc --fix=bogus --dry-run "$LCB" 2>&1); LCB_ST=$?
+if [ "$LCB_ST" != "0" ] && echo "$LCB_ERR" | grep -q "unknown --fix="; then
+    PASS=$((PASS + 1)); echo "  lc_fix_unknown_scope_rejected: PASS"
+else
+    echo "FAIL: lc_fix_unknown_scope_rejected (expected non-zero + diagnostic, got exit $LCB_ST: '$LCB_ERR')"
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$LCB"
+
+echo ""
+echo "--- lc token-driven site scan ---"
+LCS_SRC="/tmp/mlrc_lcscan_$$.mlr"
+cat > "$LCS_SRC" <<'EOF'
+// a uint64 in a comment must not be a site
+fn main() {
+    uint64 x = 0
+    print_str("a uint64 in a string must not be a site")
+    exit(x)
+}
+EOF
+TOTAL=$((TOTAL + 1))
+LCS_OUT=$($MLRC lc --scan-sites "$LCS_SRC" 2>&1)
+if [ "$LCS_OUT" = "sites: 1" ]; then
+    PASS=$((PASS + 1)); echo "  lc_scan_skips_comments_and_strings: PASS"
+else
+    echo "FAIL: lc_scan_skips_comments_and_strings (want 'sites: 1', got '$LCS_OUT')"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCS_SRC"
+
+# StrPart tokens (f-string interior text) carry a real span, so span geometry
+# alone does not protect them the way whole-string StrLit tokens do -- the
+# "uint64" inside f"..." below must NOT be reported as a site.
+TOTAL=$((TOTAL + 1))
+LCF_SRC="/tmp/mlrc_lcfstr_$$.mlr"
+cat > "$LCF_SRC" <<'EOF'
+fn main() {
+    uint64 v = 7
+    print_str(f"uint64 = {v}")
+    exit(0)
+}
+EOF
+LCF_OUT=$($MLRC lc --scan-sites "$LCF_SRC" 2>&1)
+if [ "$LCF_OUT" = "sites: 1" ]; then
+    PASS=$((PASS + 1)); echo "  lc_scan_skips_fstring_text: PASS"
+else
+    echo "FAIL: lc_scan_skips_fstring_text (want 'sites: 1', got '$LCF_OUT')"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCF_SRC"
+
+echo ""
+echo "--- lc token rewriter ---"
+# This is the exact damage the old byte-scanner does on src/lexer.mlr itself
+# (the first file in SRCS): match_keyword(start, len, "uint64", 6) has its
+# string literal rewritten to "u64" while the length argument stays 6, so
+# neither spelling matches and every integer type keyword silently stops
+# being recognised. The token-driven rewriter must leave the string literal
+# untouched while still rewriting the real `uint64` keyword on the same file.
+LCR_SRC="/tmp/mlrc_lcrw_$$.mlr"
+cat > "$LCR_SRC" <<'EOF'
+// keyword table: the literal below must survive, length argument and all
+fn classify(u64 start, u64 len) -> u64 {
+    if match_keyword(start, len, "uint64", 6) != 0 { return 83 }
+    return 0
+}
+fn main() { uint64 x = 0  exit(x) }
+EOF
+TOTAL=$((TOTAL + 1))
+$MLRC lc --fix --dry-run "$LCR_SRC" > /tmp/mlrc_lcrw_out_$$ 2>&1
+if grep -q '"uint64", 6' /tmp/mlrc_lcrw_out_$$ && grep -q 'u64 x = 0' /tmp/mlrc_lcrw_out_$$; then
+    PASS=$((PASS + 1)); echo "  lc_rewrite_preserves_string_literals: PASS"
+else
+    echo "FAIL: lc_rewrite_preserves_string_literals (string literal or code site wrong)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCR_SRC" /tmp/mlrc_lcrw_out_$$
+
+# Running the migration twice must produce a byte-identical file: after one
+# pass every site is u64 (len 3), which mig_long_form_len does not match.
+TOTAL=$((TOTAL + 1))
+LCI="/tmp/mlrc_lci_$$.mlr"
+printf 'fn main() {\n    uint64 a = 1\n    uint32 b = 2\n    exit(0)\n}\n' > "$LCI"
+$MLRC lc --fix "$LCI" >/dev/null 2>&1
+cp "$LCI" "${LCI}.once"
+$MLRC lc --fix "$LCI" >/dev/null 2>&1
+if cmp -s "$LCI" "${LCI}.once"; then
+    PASS=$((PASS + 1)); echo "  lc_rewrite_idempotent: PASS"
+else
+    echo "FAIL: lc_rewrite_idempotent (second pass changed the file)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCI" "${LCI}.once" "${LCI}.lcverify.mlr" "${LCI}.lcverify.o"
+
+# The signed family (int8/16/32/64, kinds 84-87) has DIFFERENT long lengths
+# than unsigned (4/5/5/5 vs 5/6/6/6 -- int8 is the odd short one, not uint8).
+# Mirrors lc_rewrite_preserves_string_literals above but for `int64`: the
+# string literal AND the comment must survive untouched while the real
+# `int64` keyword on the same file gets rewritten to `i64`.
+LCRS_SRC="/tmp/mlrc_lcrws_$$.mlr"
+cat > "$LCRS_SRC" <<'EOF'
+// keyword table: the literal below must survive, an int64 comment mention too
+fn classify(u64 start, u64 len) -> u64 {
+    if match_keyword(start, len, "int64", 5) != 0 { return 87 }
+    return 0
+}
+fn main() { int64 x = 0  exit(x) }
+EOF
+TOTAL=$((TOTAL + 1))
+$MLRC lc --fix --dry-run "$LCRS_SRC" > /tmp/mlrc_lcrws_out_$$ 2>&1
+if grep -q '"int64", 5' /tmp/mlrc_lcrws_out_$$ && grep -q 'int64 comment mention' /tmp/mlrc_lcrws_out_$$ && grep -q 'i64 x = 0' /tmp/mlrc_lcrws_out_$$; then
+    PASS=$((PASS + 1)); echo "  lc_rewrite_preserves_string_literals_signed: PASS"
+else
+    echo "FAIL: lc_rewrite_preserves_string_literals_signed (string/comment literal or code site wrong)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCRS_SRC" /tmp/mlrc_lcrws_out_$$
+
+# Idempotence across the signed family too, covering both the odd-length
+# int8 (long len 4) and int64 (long len 5): after one pass every site is
+# i8/i64 (len 2/3), which mig_long_form_len must not re-match.
+TOTAL=$((TOTAL + 1))
+LCIS="/tmp/mlrc_lci_signed_$$.mlr"
+printf 'fn main() {\n    int64 a = 1\n    int8 b = 2\n    exit(0)\n}\n' > "$LCIS"
+$MLRC lc --fix "$LCIS" >/dev/null 2>&1
+if grep -q 'i64 a' "$LCIS" && grep -q 'i8 b' "$LCIS"; then
+    cp "$LCIS" "${LCIS}.once"
+    $MLRC lc --fix "$LCIS" >/dev/null 2>&1
+    if cmp -s "$LCIS" "${LCIS}.once"; then
+        PASS=$((PASS + 1)); echo "  lc_rewrite_idempotent_signed: PASS"
+    else
+        echo "FAIL: lc_rewrite_idempotent_signed (second pass changed the file)"; FAIL=$((FAIL + 1))
+    fi
+else
+    echo "FAIL: lc_rewrite_idempotent_signed (first pass did not rewrite int64/int8)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCIS" "${LCIS}.once" "${LCIS}.lcverify.mlr" "${LCIS}.lcverify.o"
 
 echo ""
 echo "--- float literal return kinds ---"

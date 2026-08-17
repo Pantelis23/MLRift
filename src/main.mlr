@@ -2306,6 +2306,50 @@ fn time_ns() -> uint64 {
     return 0
 }
 
+// Task 6 (build-unit mapping): run the front end over `path` and RETURN the
+// error count instead of exiting on it. This is the only way the migration
+// engine can ask "does this unit build?" without dying: compile() reports
+// every problem by calling exit(1), and there is no fork/wait builtin
+// (exec_process_argv is execve — it replaces the process, so it cannot be
+// used as a probe either).
+//
+// The mapper uses this to decide whether a module is a real build unit.
+// std/net.mlr is the case that matters: it parses fine and then fails
+// semantic analysis (net.mlr:153, dealloc/2), so no build unit covers that
+// file and `lc --fix` must refuse rather than abort mid-verification.
+//
+// It reads the file in place and writes NOTHING, which is what lets the
+// --dry-run path resolve build units without touching the working tree.
+//
+// Only the semantic class of error is catchable this way. Lexer and parser
+// errors still exit(1) from inside; that is loud and it happens before any
+// file is written, so it stays fail-safe — it just does not produce the
+// "no build unit" wording. import_failed is folded in so a driver whose
+// module cannot even be opened counts as broken.
+//
+// The token/AST buffers are deliberately not freed: the caller immediately
+// re-enters compile(), which re-inits all of them, and freeing a buffer
+// codegen_init still holds a pointer to is not worth the risk.
+fn unit_front_end_errors(uint64 path) -> uint64 {
+    import_init()
+    import_failed = 0
+    import_process(path)
+    uint64 source = import_buf
+    uint64 size = import_buf_len
+    uint64 max_tok = 524288
+    uint64 my_tokens = alloc(max_tok * 16)
+    lexer_init(source, size, my_tokens, max_tok)
+    uint64 tcount = lexer_run()
+    ast_init(524288)
+    codegen_init(1048576, source, my_tokens)
+    parser_init(my_tokens, tcount)
+    uint64 root = parse_module()
+    uint64 errs = run_semantic_checks(root, source, my_tokens)
+    diag_report_all()
+    if import_failed != 0 { errs = errs + 1 }
+    return errs
+}
+
 // arch: 0=x86_64, 1=arm64
 // emit: 0=elfexe, 1=machoexe, 2=peexe, 3=obj (ELF relocatable), 5=asm listing, 6=ir dump
 fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode) {
@@ -5261,6 +5305,11 @@ static uint64 cli_argv = 0
 static uint64 lc_ci_mode = 0
 static uint64 lc_min_fitness = 0
 static uint64 lc_fix_mode = 0
+// Which migration(s) --fix runs: 0 = both (bare --fix, the default),
+// 1 = types only (--fix=types), 2 = ptrops only (--fix=ptrops). See
+// run_migration in living.mlr.
+static uint64 lc_fix_scope = 0
+static uint64 lc_scan_sites_mode = 0
 static uint64 lc_dry_run = 0
 static uint64 lc_list_proposals = 0
 static uint64 lc_promote_name = 0
@@ -6762,6 +6811,28 @@ fn main() {
                 write(1, "commands (living compiler):\n", 28)
                 write(1, "  check <file.mlr>          safety analysis\n", 44)
                 write(1, "  lc <file.mlr>             propose / classify changes\n", 55)
+                uint64 fix_help0 = "  lc --fix <file.mlr>       apply BOTH migrations below\n"
+                write(1, fix_help0, str_len(fix_help0))
+                uint64 fix_help1 = "  lc --fix=types <file.mlr>    uint64->u64 etc; token-driven, safe around comments/strings\n"
+                write(1, fix_help1, str_len(fix_help1))
+                uint64 fix_help2 = "  lc --fix=ptrops <file.mlr>   unsafe{}-pointer-op -> load*/store*; UNSAFE: raw byte-scan, can corrupt comments/strings\n"
+                write(1, fix_help2, str_len(fix_help2))
+                uint64 fix_help3 = "  lc --fix --dry-run <file.mlr>   preview a --fix without writing\n"
+                write(1, fix_help3, str_len(fix_help3))
+                uint64 fix_help3b = "  lc --scan-sites <file.mlr>   count migration sites only; writes nothing\n"
+                write(1, fix_help3b, str_len(fix_help3b))
+                uint64 fix_help4 = "     (--fix writes only if emitted code is byte-identical on x86_64 AND arm64,\n"
+                write(1, fix_help4, str_len(fix_help4))
+                uint64 fix_help4b = "      at --emit=obj (LEGACY codegen) and, for a unit with an entry point, as a\n"
+                write(1, fix_help4b, str_len(fix_help4b))
+                uint64 fix_help4c = "      linked executable (IR codegen -- the default backend). A unit with no entry\n"
+                write(1, fix_help4c, str_len(fix_help4c))
+                uint64 fix_help4d = "      point cannot be linked, so only legacy is checked for it; each run says which.\n"
+                write(1, fix_help4d, str_len(fix_help4d))
+                uint64 fix_help4e = "      riscv32 and xtensa are never checked -- no relocatable writer.)\n"
+                write(1, fix_help4e, str_len(fix_help4e))
+                uint64 fix_help5 = "  lc --fix-inject-fault     testing hook: force a rewrite the verifier must refuse\n"
+                write(1, fix_help5, str_len(fix_help5))
                 write(1, "  fmt <file.mlr>            auto-format source\n\n", 48)
 
                 write(1, "info:\n", 6)
@@ -6800,8 +6871,27 @@ fn main() {
                 debug_info_mode = 1
             } else if str_starts_with(arg, "--ci", 4) != 0 {
                 lc_ci_mode = 1
+            } else if str_starts_with(arg, "--fix-inject-fault", 18) != 0 {
+                // Testing hook only. Must be checked BEFORE "--fix=" and
+                // "--fix", both of which are prefixes of this flag.
+                mig_set_inject_fault(1)
+            } else if str_starts_with(arg, "--fix=", 6) != 0 {
+                lc_fix_mode = 1
+                uint64 fix_scope_str = arg + 6
+                if str_eq_full(fix_scope_str, "types") != 0 {
+                    lc_fix_scope = 1
+                } else if str_eq_full(fix_scope_str, "ptrops") != 0 {
+                    lc_fix_scope = 2
+                } else {
+                    uint64 fs_msg = "mlrc: unknown --fix= value (expected types|ptrops)\n"
+                    write(2, fs_msg, str_len(fs_msg))
+                    exit(1)
+                }
             } else if str_starts_with(arg, "--fix", 5) != 0 {
                 lc_fix_mode = 1
+                lc_fix_scope = 0
+            } else if str_starts_with(arg, "--scan-sites", 12) != 0 {
+                lc_scan_sites_mode = 1
             } else if str_starts_with(arg, "--dry-run", 9) != 0 {
                 lc_dry_run = 1
             } else if str_starts_with(arg, "--list-proposals", 16) != 0 {
@@ -7079,7 +7169,12 @@ fn main() {
         }
         // --fix mode: run the migration engine on the input file
         if lc_fix_mode != 0 {
-            run_migration(input_path, lc_dry_run)
+            run_migration(input_path, lc_dry_run, lc_fix_scope)
+            exit(0)
+        }
+        // --scan-sites mode: token-driven site scan, prints `sites: <n>`
+        if lc_scan_sites_mode != 0 {
+            run_scan_sites(input_path)
             exit(0)
         }
         import_init()
