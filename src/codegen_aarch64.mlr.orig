@@ -1052,10 +1052,6 @@ fn gen_expr_a64(uint64 node) {
         uint64 wtok = tok
         uint64 tstart = tok_text_start(wtok)
         uint64 tlen = tok_text_len(wtok)
-        // Ensure str_buf capacity before copying (this legacy ARM64 path
-        // had no capacity check at all; a program whose total string data
-        // crossed the old fixed cap silently overran the allocation).
-        str_buf_grow_check(str_len + tlen + 1)
         uint64 str_offset = str_len
         uint64 si = 1
         while si < tlen - 1 {
@@ -1086,7 +1082,6 @@ fn gen_expr_a64(uint64 node) {
         // ADRP + ADD to load string address (placeholder, patched later)
         // For now, use a simpler approach: store offset in str_fixups
         // and emit a 2-instruction sequence (8 bytes)
-        str_fixups_grow_check()
         uint64 fentry = str_fixups + str_fixup_count * 8
         uint32 cp = out_len
         unsafe { *(fentry as uint32) = cp }
@@ -1149,19 +1144,13 @@ fn gen_expr_a64(uint64 node) {
                     uint64 fs_i = 0
                     while fs_i < fs_tl {
                         uint64 fs_bb = tok_source_byte(wfs_tk, fs_i)
-                        // GROW, never truncate. This used to be
-                        // `if str_len < 65535 { ... }` with no else: past the
-                        // cap the byte was dropped and the compile still
-                        // exited 0, so an f-string in a program with >64 KB of
-                        // string data came out silently short. str_buf is
-                        // grow-on-demand now (see codegen.mlr:441), so the old
-                        // constant was not even the allocation bound any more.
-                        str_buf_grow_check(str_len + 1)
-                        uint64 fs_dp = str_buf + str_len
-                        uint8 fs_dc = fs_bb
-                        unsafe { *(fs_dp as uint8) = fs_dc }
-                        str_len = str_len + 1
-                        fs_len = fs_len + 1
+                        if str_len < 65535 {
+                            uint64 fs_dp = str_buf + str_len
+                            uint8 fs_dc = fs_bb
+                            unsafe { *(fs_dp as uint8) = fs_dc }
+                            str_len = str_len + 1
+                            fs_len = fs_len + 1
+                        }
                         fs_i = fs_i + 1
                     }
                 } else {
@@ -1169,26 +1158,25 @@ fn gen_expr_a64(uint64 node) {
                     uint64 fs_i = 1
                     while fs_i < fs_tl - 1 {
                         uint64 fs_bb = tok_source_byte(wfs_tk, fs_i)
-                        // Grow, never truncate -- see the sibling loop above.
-                        str_buf_grow_check(str_len + 1)
-                        uint64 fs_dp = str_buf + str_len
-                        uint8 fs_dc = fs_bb
-                        unsafe { *(fs_dp as uint8) = fs_dc }
-                        str_len = str_len + 1
-                        fs_len = fs_len + 1
+                        if str_len < 65535 {
+                            uint64 fs_dp = str_buf + str_len
+                            uint8 fs_dc = fs_bb
+                            unsafe { *(fs_dp as uint8) = fs_dc }
+                            str_len = str_len + 1
+                            fs_len = fs_len + 1
+                        }
                         fs_i = fs_i + 1
                     }
                 }
-                // The terminator ran OUTSIDE both gates, so once str_len
-                // reached the old cap through this path alone it wrote one
-                // byte past the allocation, and one further byte per segment.
-                str_buf_grow_check(str_len + 1)
                 uint64 fs_nzp = str_buf + str_len
                 uint8 fs_nzc = 0
                 unsafe { *(fs_nzp as uint8) = fs_nzc }
                 str_len = str_len + 1
                 if fs_len != 0 {
-                    str_fixups_grow_check()
+                    if str_fixup_count >= 4096 {
+                        write(2, "error: str_fixups overflow\n", 27)
+                        exit(1)
+                    }
                     uint64 fs_fe = str_fixups + str_fixup_count * 8
                     uint32 fs_cp = out_len
                     unsafe { *(fs_fe as uint32) = fs_cp }
@@ -1752,7 +1740,7 @@ fn gen_expr_a64(uint64 node) {
                 emit_a64_mul(0, 0, 9)
             }
         }
-        else if op_kind == 32 || op_kind == 48 {
+        else if op_kind == 32 {
             if debug_mode != 0 {
                 // Division by zero check: cbnz x9, skip; exit(1)
                 uint64 cbnz_div = out_len
@@ -1767,7 +1755,7 @@ fn gen_expr_a64(uint64 node) {
             if legacy_node_is_signed(node) != 0 { emit_a64_sdiv(0, 0, 9) }
             else { emit_a64_udiv(0, 0, 9) }
         }
-        else if op_kind == 33 || op_kind == 49 {
+        else if op_kind == 33 {
             // modulo: x0 = x0 - (x0/x9)*x9
             if debug_mode != 0 {
                 // Division by zero check: cbnz x9, skip; exit(1)
@@ -4173,15 +4161,7 @@ fn gen_expr_a64(uint64 node) {
             uint64 wfa = first_arg
             gen_expr_a64(wfa)
             emit_a64(0x1E270000)  // fmov s0, w0
-            // FCVT Sd, Hn. The word here used to be 0x1E22C000, which decodes
-            // as FCVT Dd, Sn: type=00 (single source) opc=01 (double dest) —
-            // the wrong direction AND the wrong pair. It widened the f16 bit
-            // pattern, read as a single-precision DENORMAL, into d0, and then
-            // the `expr_is_float_a64 = 2` below had the caller read s0, i.e.
-            // the low 32 bits of that f64, which are zero. Every f16_to_f32 on
-            // legacy arm64 returned 0.0f. Correct word: type=11 (half source)
-            // opc=00 (single dest) = 0x1EE24000.
-            emit_a64(0x1EE24000)  // fcvt s0, h0
+            emit_a64(0x1E22C000)  // fcvt s0, h0
             expr_is_float_a64 = 2
             return
         }

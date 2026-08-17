@@ -389,40 +389,6 @@ fn ir_vreg_fkind_get(uint64 vreg) -> uint64 {
     return 0
 }
 
-// Only FKIND_F64 and FKIND_F32 name a FLOAT register class. FKIND_BOOL and
-// FKIND_CHAR are ordinary integers carrying a formatting hint for print and
-// f-strings, and testing `fk != 0` for "is this a float" sent both of them
-// down the FADD / FMUL / FCMP path:
-//
-//     bool b = true   b * 2   -> 0                    (want 2)
-//     char c = 'A'    c / 5   -> 4623507967449235456  (want 13)
-//
-// that last number being the f64 bit pattern of 13.0. Addition and
-// subtraction hid this for years: two small integers read as f64 DENORMALS
-// add and subtract BIT-EXACTLY, so `c + 1` was right and only *, / and unary
-// minus showed damage. Both legacy backends were always correct here.
-fn ir_fkind_is_float(uint64 fk) -> uint64 {
-    if fk == FKIND_F64 { return 1 }
-    if fk == FKIND_F32 { return 1 }
-    return 0
-}
-
-// `as TYPE` clauses (parser.kr's data3 packing) and the static table both
-// spell float kinds 1 = f64, 2 = f32, 3 = f16. That is a DIFFERENT namespace
-// from the vreg one above, where 3 is bool — and feeding a declared kind
-// straight in made `*(p as f16) -> g` and `static f16 s` come back as
-// FKIND_BOOL, so both IR backends printed "true" where the value was 21520.
-//
-// f16 maps to FKIND_INT on purpose, not by omission: this language has no f16
-// register class. An f16 IS a u64 bit pattern produced by f32_to_f16(), and
-// keeping it on the integer path is exactly what both legacy backends already
-// do (see the kind-41 note in codegen.kr).
-fn ir_fkind_from_decl(uint64 declared) -> uint64 {
-    if declared == 1 { return FKIND_F64 }
-    if declared == 2 { return FKIND_F32 }
-    return FKIND_INT
-}
-
 fn ir_vreg_signed_set(uint64 vreg, uint64 s) {
     if vreg < ir_vreg_signed_cap {
         uint64 p = ir_vreg_signed_buf + vreg
@@ -1457,8 +1423,7 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         } else {
             ir_emit(IR_LOAD, pl_dest, pl_addr_v, pl_type_size, 0, ir_current_bb)
         }
-        uint64 pl_vfk = ir_fkind_from_decl(pl_fk)
-        if pl_vfk != 0 { ir_vreg_fkind_set(pl_dest, pl_vfk) }
+        if pl_fk != 0 { ir_vreg_fkind_set(pl_dest, pl_fk) }
         return pl_dest
     }
 
@@ -1599,7 +1564,10 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         uint64 wtok = tok
         uint64 tstart = tok_text_start(wtok)
         uint64 tlen = tok_text_len(wtok)
-        str_buf_grow_check(str_len + tlen + 1)
+        if str_len + tlen >= 65536 {
+            write(2, "error: str_buf overflow (max 65536)\n", 36)
+            exit(1)
+        }
         uint64 str_offset = str_len
         // Copy string bytes (skip quotes, process escapes). Escape table
         // lives in codegen.kr via escape_char_to_byte + hex_digit_pair_to_byte;
@@ -1663,7 +1631,7 @@ fn ir_lower_expr(uint64 node) -> uint64 {
             // Propagate f64/f32 type-flow from the static's declared
             // type so downstream `+`, `*` etc. lower to IR_FADD/FMUL
             // rather than integer ops.
-            uint64 sfk = ir_fkind_from_decl(static_fkind_of(wt))
+            uint64 sfk = static_fkind_of(wt)
             if sfk != 0 { ir_vreg_fkind_set(dest, sfk) }
             return dest
         }
@@ -1692,7 +1660,7 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         uint64 op_kind = tok_kind_at_raw(op_tok)
         // Check if LHS is float-typed
         uint64 lhs_fk = ir_vreg_fkind_get(lhs)
-        if ir_fkind_is_float(lhs_fk) != 0 {
+        if lhs_fk != 0 {
             // Float arithmetic. Mirror the float-compare fix: f32 OP f64 in
             // the same expression must share an fkind, otherwise the f32
             // ADDSS/SUBSS/MULSS/DIVSS reads only the low 32 bits of the
@@ -1849,7 +1817,7 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         uint64 dest = ir_new_vreg()
         // Check if LHS is float-typed
         uint64 cmp_fk = ir_vreg_fkind_get(lhs)
-        if ir_fkind_is_float(cmp_fk) != 0 {
+        if cmp_fk != 0 {
             // Float compare: operands must share an fkind or ucomiss/ucomisd
             // reads the wrong bit width. `f32 a == 1.0` previously compared
             // a 32-bit f32 (0x3F800000) against the low 32 bits of an f64
@@ -1919,7 +1887,7 @@ fn ir_lower_expr(uint64 node) -> uint64 {
             // - (negate). For floats, lower as FSUB(0.0, src) — IR_NEG does
             // integer two's-complement which corrupts IEEE 754 bits.
             uint64 src_fk = ir_vreg_fkind_get(src)
-            if ir_fkind_is_float(src_fk) != 0 {
+            if src_fk != 0 {
                 uint64 fzero = ir_new_vreg()
                 ir_emit(IR_CONST, fzero, 0, 0, 0, ir_current_bb)
                 ir_vreg_fkind_set(fzero, src_fk)
@@ -3464,7 +3432,7 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         ir_emit(IR_LOAD, dest, addr_v, 0, elem_sz, ir_current_bb)
         // Propagate f64/f32 type-flow from the declared array element
         // type so `arr[i] + x` lowers as float arithmetic.
-        uint64 afk = ir_fkind_from_decl(static_fkind_of(warrt))
+        uint64 afk = static_fkind_of(warrt)
         if afk != 0 { ir_vreg_fkind_set(dest, afk) }
         return dest
     }
@@ -3558,7 +3526,10 @@ fn ir_lower_expr(uint64 node) -> uint64 {
                     ir_emit(IR_CONST, len_v, 0, 0, 0, ir_current_bb)
                 } else if wfraw != 0 {
                     // Raw StrPart: copy bytes from source directly (no quote strip)
-                    str_buf_grow_check(str_len + ftlen + 1)
+                    if str_len + ftlen >= 65536 {
+                        write(2, "error: str_buf overflow\n", 24)
+                        exit(1)
+                    }
                     uint64 fstr_offset = str_len
                     uint64 fsi = 0
                     while fsi < ftlen {
@@ -4192,11 +4163,11 @@ fn ir_lower_stmt(uint64 node) {
         ir_current_bb = bb_exit
         ir_scr_free(hdr_count * 8)
         ir_scr_free(snap_count * 8)
-        ir_for_end = saved_ir_for_end
         return
     }
 
     // Block (15)
+        ir_for_end = saved_ir_for_end
     if kind == 15 {
         ir_lower_block(node)
         return
@@ -4399,8 +4370,7 @@ fn ir_lower_stmt(uint64 node) {
         // integer arithmetic instead of IR_FADD.
         uint32 fk32 = ast_data3(node)
         uint64 fk = fk32
-        uint64 vfk = ir_fkind_from_decl(fk)
-        if vfk != 0 { ir_vreg_fkind_set(dest_v, vfk) }
+        if fk != 0 { ir_vreg_fkind_set(dest_v, fk) }
         // Bind dest variable
         uint32 dest_tok = ast_data2(node)
         ir_var_set(dest_tok, dest_v)
@@ -7807,7 +7777,10 @@ fn ir_emit_x86_insn(uint64 ii) {
         uint64 lea_modrm = 0x05 | ((lea_dst & 7) << 3)
         uint8 lea_m = lea_modrm
         emit_byte(lea_m)
-        str_fixups_grow_check()
+        if str_fixup_count >= 4096 {
+            write(2, "error: str_fixups overflow (max 4096)\n", 38)
+            exit(1)
+        }
         uint64 fentry = str_fixups + str_fixup_count * 8
         uint32 cp = out_len
         unsafe { *(fentry as uint32) = cp }

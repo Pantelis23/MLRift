@@ -1,0 +1,40 @@
+--- src/codegen_aarch64.mlr
++++ src/codegen_aarch64.mlr
+@@ -5484,18 +5518,31 @@ fn gen_stmt_a64(uint64 node) {
+         // loaded value silently here, and the program then failed at the
+         // first USE with "use of undeclared identifier".
+         uint32 dest_tok = ast_data2(node)
++        // The `as TYPE` clause is the ONLY place the loaded value's register
++        // class is written down — data3 bits 0..3 carry it (1=f64, 2=f32,
++        // 3=f16). The load above already put the right BITS in x0; what was
++        // missing is telling the rest of the function that dest holds a float,
++        // so every later read of it comes out of d0/s0. Without it,
++        // `fmt_f64(z)` passed z in a GP register while the callee read d0 —
++        // 0.000000000000000 out of memory that held 2.5 exactly.
++        // f16 (3) deliberately stays on the integer path: this language has no
++        // f16 register class, an f16 IS a u64 bit pattern from f32_to_f16(),
++        // and typing it float would break the code that works today.
++        uint32 pl_d3_a = ast_data3(node)
++        uint64 wpl_fk_a = pl_d3_a
++        wpl_fk_a = wpl_fk_a & 15
+         uint64 doff = var_lookup(dest_tok)
+-        if doff != 0xFFFFFFFF {
+-            emit_a64_store_x0(doff)
+-        } else {
++        if doff == 0xFFFFFFFF {
+             uint64 soff = static_lookup(dest_tok)
+             if soff != 0xFFFFFFFF {
+                 emit_a64_static_store(soff)
+-            } else {
+-                uint64 ndoff = var_declare(dest_tok)
+-                emit_a64_store_x0(ndoff)
++                return
+             }
++            doff = var_declare(dest_tok)
+         }
++        if wpl_fk_a == 1 { var_type_register(dest_tok, 96) }
++        if wpl_fk_a == 2 { var_type_register(dest_tok, 95) }
++        emit_a64_store_x0(doff)
+         return
+     }
+ 
