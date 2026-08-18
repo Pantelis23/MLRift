@@ -5014,7 +5014,12 @@ fn ir_lower_function(uint64 fn_node) {
     // would compute the wrong byte offset (or 0xFFFFFFFF if A lacks the
     // field, which then resolves to a garbage offset). See
     // examples/codegen_struct_var_collision.mlr.
-    struct_var_count = 0
+    // Both name-keyed tables this path shares with the legacy emitters, reset
+    // together. Written as one call rather than two assignments on purpose: the
+    // two-assignment version is what was here, minus one of the assignments,
+    // for as long as IR codegen has been the default. See
+    // shared_name_tables_reset in codegen.kr for what that cost.
+    shared_name_tables_reset()
     ir_stack_array_bytes = 0
     ir_current_bb = ir_new_bb()  // entry block
 
