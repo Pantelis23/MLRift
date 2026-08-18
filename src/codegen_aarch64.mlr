@@ -49,6 +49,21 @@ fn emit_a64(uint64 insn) {
 
 // MOV Xd, #imm16 (MOVZ with shift=0)
 // Encoding: 1_10_100101_00_imm16_Rd
+// dealloc(0) must be a no-op: the POSIX lowering LOADS the size header at
+// [ptr-8] before the munmap, so freeing 0 reads address -8 and faults. Guard
+// before the header load. Windows is guarded too even though it does not
+// fault today — one uniform rule beats a per-target exception.
+fn emit_a64_dealloc_null_cbz(uint64 ptr_reg) -> uint64 {
+    uint64 dz_off = out_len
+    emit_a64(0xB4000000 | ptr_reg)              // cbz Xptr, .done (patched)
+    return dz_off
+}
+
+fn emit_a64_dealloc_null_end(uint64 cbz_off, uint64 ptr_reg) {
+    uint64 dz_d = out_len - cbz_off
+    patch_u32(cbz_off, 0xB4000000 | (a64_check_b19(dz_d) << 5) | ptr_reg)
+}
+
 fn emit_a64_movz(uint64 rd, uint64 imm16) {
     uint64 insn = 0xD2800000 | (imm16 << 5) | rd
     emit_a64(insn)
@@ -2756,6 +2771,9 @@ fn gen_expr_a64(uint64 node) {
             gen_expr_a64(wfa)
             // x0 = user pointer (ptr+8 from alloc)
             // Real base = x0 - 8, size = [x0], total = size + 8
+            // dealloc(0) is a no-op — the POSIX arm LDRs the header at [x0-8],
+            // so freeing 0 reads address -8 and faults.
+            uint64 cga_dealloc_null = emit_a64_dealloc_null_cbz(0)
             if target_os == 2 {
                 // Windows ARM64: VirtualFree(base, 0, MEM_RELEASE)
                 // x0 = user ptr (ptr+8), base = x0 - 8
@@ -2776,6 +2794,7 @@ fn gen_expr_a64(uint64 node) {
                 if target_os == 1 { emit_a64_syscall_nr(73) } else { emit_a64_syscall_nr(215) }
                 emit_a64_svc()
             }
+            emit_a64_dealloc_null_end(cga_dealloc_null, 0)
             return
         }
 
