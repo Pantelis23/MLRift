@@ -4227,13 +4227,26 @@ fn gen_expr_a64(uint64 node) {
         uint64 acrem = var_frame_size & 15
         if acrem != 0 { var_frame_size = var_frame_size + 16 - acrem }
 
+        // 32 entries, not 16: `ai` below indexes these by argument number and
+        // nothing bounded it, so a 17-argument call already wrote past the end
+        // of the frame. It stayed quiet up to 22 and then took the compiler
+        // itself down -- a 25-argument call segfaulted the legacy backend under
+        // both --legacy and --emit=obj, while the IR backend compiled the very
+        // same call correctly. The IR path bounds its own uint64[32]
+        // call_arg_vregs and errors past 32; this is that capacity and that
+        // message, so both backends now refuse exactly the same programs
+        // instead of one crashing where the other diagnoses.
+        if arg_count > 32 {
+            write(2, "error: too many call arguments (max 32)\n", 40)
+            exit(1)
+        }
         // Evaluate all args and store to temp slots.
         // Track which args are float (0=int, 1=f64, 2=f32).
-        uint64[16] arg_float_flags_a
+        uint64[32] arg_float_flags_a
         // Track which args are structs (0xFFFFFFFF = not struct, else struct index)
-        uint64[16] arg_struct_flags_a
+        uint64[32] arg_struct_flags_a
         uint64 asfi_a = 0
-        while asfi_a < 16 {
+        while asfi_a < 32 {
             uint64 asf_init = arg_struct_flags_a + asfi_a * 8
             uint64 none_val_a = 0xFFFFFFFF
             unsafe { *(asf_init as uint64) = none_val_a }
@@ -5603,7 +5616,10 @@ fn gen_function_a64(uint64 fn_node) {
     uint64 is_noreturn = ann_flags & 1
 
     // Overflow arg patch tracking (for functions with >8 params)
-    uint64[16] a64_overflow_patches
+    // 32 slots: 8 parameters arrive in x0-x7 and the rest on the stack,
+    // so 16 held only a 24-argument function -- short of the 32-argument
+    // cap the IR and x86 legacy backends both allow.
+    uint64[32] a64_overflow_patches
     uint64 a64_overflow_patch_count = 0
 
     var_reset()
@@ -5912,6 +5928,10 @@ fn gen_function_a64(uint64 fn_node) {
                         emit_a64_str(0, 31, a64_var_base + poff)
                         // Save patch location
                         uint64 opi = reg - 8
+                        if opi >= 32 {
+                            write(2, "error: a64_overflow_patches overflow (max 32)\n", 46)
+                            exit(1)
+                        }
                         uint64 op_entry = a64_overflow_patches + opi * 8
                         uint32 pl32 = patch_loc
                         unsafe { *(op_entry as uint32) = pl32 }

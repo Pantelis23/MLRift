@@ -7136,6 +7136,113 @@ else
 fi
 rm -f "$SR_SRC" "$SR_BIN"
 
+# --- wide argument lists: four width bugs that all present as "wide calls" ---
+#
+# std/qwen3.mlr calls a 25-argument mega-kernel launcher, and that call
+# segfaulted the compiler under --legacy and --emit=obj while the IR backend
+# compiled it correctly. Bisecting it turned up four separate defects:
+#
+#   1. arg_float_flags / arg_struct_flags were uint64[16] frames indexed by
+#      argument number with nothing bounding the index -- 17 arguments wrote
+#      past the end of the frame, silently to 22 and fatally at 23.
+#   2. the callee prologue spilled parameters with a disp8 offset, so the
+#      first parameter whose frame slot reached 128 went to [rsp-128]. That
+#      is parameter 12, i.e. a 13-argument call.
+#   3. `sub rsp, N` / `add rsp, N` around the outgoing stack arguments were
+#      imm8-only; N reaches 128 at 16 stack arguments, i.e. 22 total.
+#   4. overflow_patches was uint64[16] and unchecked on x86; the aarch64 twin
+#      here had NO bound at all, so >24 parameters wrote past its array too.
+#
+# Every row RUNS, at $RUN_ARCH: three of the four produced a WRONG ANSWER
+# rather than a crash, so a compile-only row would have passed throughout.
+MA_SRC="/tmp/mlr_manyargs_$$.mlr"
+MA_BIN="/tmp/mlr_manyargs_$$.bin"
+for MA_N in 13 16 22 25 32; do
+    {
+      printf 'fn ma('
+      i=1; while [ $i -le $MA_N ]; do [ $i -gt 1 ] && printf ', '; printf 'u64 a%d' $i; i=$((i+1)); done
+      printf ') -> u64 {\n    u64 acc = '
+      i=1; while [ $i -le $MA_N ]; do [ $i -gt 1 ] && printf ' + '; printf 'a%d * %d' $i $i; i=$((i+1)); done
+      # The branch is what keeps this callee OUT of the inliner. Without it the
+      # AST inliner (which runs even at -O0) folds the whole call into main, no
+      # call is emitted, and every row below passes while testing nothing --
+      # which is exactly what these rows did when first written.
+      printf '\n    if acc == 999999 { write(1, "x", 1) }\n    return acc\n}\n'
+      # b is an opaque 0: without it the call folds at compile time and the
+      # row silently stops testing the argument path at all.
+      printf 'fn main() {\n    u64 b = write(1, "", 0)\n    exit(ma('
+      i=1; while [ $i -le $MA_N ]; do [ $i -gt 1 ] && printf ', '; printf 'b + %d' $i; i=$((i+1)); done
+      printf ') & 255)\n}\n'
+    } > "$MA_SRC"
+    MA_EXP=$(awk -v n=$MA_N 'BEGIN{s=0; for(k=1;k<=n;k++) s+=k*k; print s%256}')
+    for MA_MODE in "ir" "legacy"; do
+        if [ "$MA_MODE" = "legacy" ]; then MA_FLAG="--legacy"; else MA_FLAG=""; fi
+        TOTAL=$((TOTAL + 1))
+        rm -f "$MA_BIN"
+        if $MLRC --arch=$RUN_ARCH $MA_FLAG "$MA_SRC" -o "$MA_BIN" >/dev/null 2>&1 && [ -s "$MA_BIN" ]; then
+            chmod +x "$MA_BIN"; "$MA_BIN"; MA_RUN=$?
+            if [ "$MA_RUN" = "$MA_EXP" ]; then
+                PASS=$((PASS + 1)); echo "  many_args_${MA_N}_$MA_MODE: PASS (returns $MA_EXP)"
+            else
+                echo "FAIL: many_args_${MA_N}_$MA_MODE (returned $MA_RUN, want $MA_EXP)"; FAIL=$((FAIL + 1))
+            fi
+        else
+            echo "FAIL: many_args_${MA_N}_$MA_MODE ($MA_N arguments must compile)"; FAIL=$((FAIL + 1))
+        fi
+    done
+done
+# --emit=obj is the mode the std modules actually died in, and it forces the
+# LEGACY backend regardless of the default. Compile-only, so it may pin an
+# arch; x86_64 is where three of the four defects lived. The object is checked
+# for a real .text, not merely for exit 0.
+MA_OBJ="/tmp/mlr_manyargs_$$.o"
+TOTAL=$((TOTAL + 1))
+rm -f "$MA_OBJ"
+MA_OBJ_OK=0
+if $MLRC --arch=x86_64 --emit=obj "$MA_SRC" -o "$MA_OBJ" >/dev/null 2>&1 \
+   && [ -s "$MA_OBJ" ] \
+   && readelf -S "$MA_OBJ" 2>/dev/null | grep -q '\.text'; then
+    if ! command -v objdump >/dev/null 2>&1; then
+        MA_OBJ_OK=1   # cannot check for the call; the .text check still stands
+    elif objdump -d "$MA_OBJ" 2>/dev/null | grep -q 'call.*<ma>'; then
+        MA_OBJ_OK=1
+    fi
+fi
+if [ "$MA_OBJ_OK" = "1" ]; then
+    PASS=$((PASS + 1)); echo "  many_args_emit_obj_x86: PASS (32-argument call emits .text and a real call to ma)"
+else
+    echo "FAIL: many_args_emit_obj_x86 (--emit=obj must produce .text containing an actual call to ma -- if the call vanished, the inliner ate it and every many_args row above is vacuous)"
+    FAIL=$((FAIL + 1))
+fi
+# The cap itself still fires, on both backends, at 33. A cap that never fires
+# is not a cap -- and past 32 the flag frames really would overflow again.
+MA33_SRC="/tmp/mlr_manyargs33_$$.mlr"
+{
+  printf 'fn ma33('
+  i=1; while [ $i -le 33 ]; do [ $i -gt 1 ] && printf ', '; printf 'u64 a%d' $i; i=$((i+1)); done
+  printf ') -> u64 {\n    u64 acc = '
+  i=1; while [ $i -le 33 ]; do [ $i -gt 1 ] && printf ' + '; printf 'a%d * %d' $i $i; i=$((i+1)); done
+  # Same anti-inlining branch as above: a one-expression callee folds into the
+  # caller and the cap never gets a call to fire on.
+  printf '\n    if acc == 999999 { write(1, "x", 1) }\n    return acc\n}\n'
+  printf 'fn main() {\n    u64 b = write(1, "", 0)\n    exit(ma33('
+  i=1; while [ $i -le 33 ]; do [ $i -gt 1 ] && printf ', '; printf 'b + %d' $i; i=$((i+1)); done
+  printf ') & 255)\n}\n'
+} > "$MA33_SRC"
+for MA33_MODE in "ir" "legacy"; do
+    if [ "$MA33_MODE" = "legacy" ]; then MA33_FLAG="--legacy"; else MA33_FLAG=""; fi
+    TOTAL=$((TOTAL + 1))
+    MA33_ERR=$($MLRC --arch=x86_64 $MA33_FLAG "$MA33_SRC" -o "$MA_BIN" 2>&1); MA33_ST=$?
+    if [ "$MA33_ST" != "0" ] && echo "$MA33_ERR" | grep -q "max 32"; then
+        PASS=$((PASS + 1)); echo "  many_args_33_rejected_$MA33_MODE: PASS (clean diagnostic, exit $MA33_ST)"
+    else
+        echo "FAIL: many_args_33_rejected_$MA33_MODE (expected a refusal naming max 32, got exit $MA33_ST: '$MA33_ERR')"
+        FAIL=$((FAIL + 1))
+    fi
+done
+rm -f "$MA33_SRC"
+rm -f "$MA_SRC" "$MA_BIN" "$MA_OBJ"
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS/$TOTAL passed, $FAIL failed ==="
