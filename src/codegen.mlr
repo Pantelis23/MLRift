@@ -8695,17 +8695,73 @@ fn gen_expr(uint64 node) {
 
         // Push overflow args (7+) onto stack AFTER register loads (SysV x86_64)
         // Done below, after register arg loading, to avoid rsp shift issues
+        // Outgoing stack arguments (SysV x86_64), AFTER the register loads so
+        // no rsp shift can disturb them.
+        //
+        // WHICH ARGS GO ON THE STACK IS NOT POSITIONAL. This used to take
+        // arguments 6.. and copy them, which is only correct when every
+        // register argument precedes every stack one. SysV fills GPRs and XMMs
+        // from SEPARATE counters, so slot 6 is the 7th ARGUMENT, not the 7th
+        // INTEGER argument -- and the callee's prologue already walks its
+        // parameters with separate counters, so the two ends disagreed the
+        // moment a float sat among the first six arguments.
+        //
+        // The overflow set is replayed from the SAME rule the register passes
+        // above use: a float that found no xmm (8 of them), an int that found
+        // no GPR (6, less one when sret has taken rdi). Order is ARGUMENT
+        // order. Ported from KernRift.
+        uint64 ovf_idx = alloc(arg_count * 8 + 8)
+        uint64 ovf_n = 0
+        uint64 ovf_has_struct = 0
+        uint64 ovf_f = 0
+        uint64 ovf_i = 0
+        if caller_sret_needed != 0 { ovf_i = 1 }
+        uint64 oa = 0
+        while oa < arg_count {
+            uint64 oaf = arg_float_flags + oa * 8
+            uint64 oafv = 0
+            unsafe { *(oaf as uint64) -> oafv }
+            uint64 oas = arg_struct_flags + oa * 8
+            uint64 oasv = 0
+            unsafe { *(oas as uint64) -> oasv }
+            if oasv != 0xFFFFFFFF && abi_struct_pass_by_val != 0 { ovf_has_struct = 1 }
+            uint64 on_stack = 0
+            if oafv != 0 {
+                if ovf_f < 8 { ovf_f = ovf_f + 1 } else { on_stack = 1 }
+            } else {
+                if ovf_i < 6 { ovf_i = ovf_i + 1 } else { on_stack = 1 }
+            }
+            if on_stack != 0 {
+                uint64 ovp = ovf_idx + ovf_n * 8
+                unsafe { *(ovp as uint64) = oa }
+                ovf_n = ovf_n + 1
+            }
+            oa = oa + 1
+        }
+        // A by-value struct consumes one OR TWO integer registers depending on
+        // its ABI class, which the replay above does not model. Rather than
+        // trade one wrong answer for another, fall back to the historical
+        // positional copy whenever such an argument is present: unchanged
+        // behaviour for that case, correct behaviour for every other.
+        if ovf_has_struct != 0 {
+            ovf_n = 0
+            if arg_count > 6 {
+                uint64 pa = 6
+                while pa < arg_count {
+                    uint64 pvp = ovf_idx + ovf_n * 8
+                    unsafe { *(pvp as uint64) = pa }
+                    ovf_n = ovf_n + 1
+                    pa = pa + 1
+                }
+            }
+        }
         uint64 stack_args = 0
-        if arg_count > 6 && target_os != 2 {
-            stack_args = arg_count - 6
+        if ovf_n > 0 && target_os != 2 {
+            stack_args = ovf_n
             if (stack_args & 1) != 0 { stack_args = stack_args + 1 }
         }
 
-        // emit: call rel32 (placeholder)
-        // First, push overflow args (using saved register values would clobber,
-        // so we use rax to load from temp slots and push)
         if stack_args > 0 {
-            // Allocate stack space for overflow args + alignment
             uint64 stack_bytes = stack_args * 8
             // sub rsp, stack_bytes -- imm8 only holds 15 stack args (120 bytes);
             // the 16th makes N=128, which sign-extends to -128.
@@ -8717,12 +8773,13 @@ fn gen_expr(uint64 node) {
                 emit_byte(0x48); emit_byte(0x81); emit_byte(0xEC)
                 emit_u32_le(stack_bytes)
             }
-            // Store overflow args at [rsp+0], [rsp+8], ...
-            // After sub rsp, original data is now at +stack_bytes higher offset
-            uint64 real_overflow = arg_count - 6
+            // After sub rsp the temp slots sit stack_bytes higher.
             uint64 oi = 0
-            while oi < real_overflow {
-                emit_load_rax_from_stack(arg_slots_base + (6 + oi) * 8 + stack_bytes)
+            while oi < ovf_n {
+                uint64 ovg = ovf_idx + oi * 8
+                uint64 ovsrc = 0
+                unsafe { *(ovg as uint64) -> ovsrc }
+                emit_load_rax_from_stack(arg_slots_base + ovsrc * 8 + stack_bytes)
                 emit_store_rax_to_stack(oi * 8)
                 oi = oi + 1
             }
@@ -10740,6 +10797,9 @@ fn gen_function(uint64 fn_node) {
     uint64 pidx = 0
     uint64 int_pidx = 0
     uint64 float_pidx = 0
+    // Outgoing stack parameters, counted in ARGUMENT order so a float
+    // and an integer that both overflow land where the caller put them.
+    uint64 stack_pidx = 0
 
     // If this function returns a MEMORY-class struct, the hidden sret pointer
     // arrives in rdi (SysV) or rcx (Windows) as the first argument.  Spill it
@@ -11109,9 +11169,31 @@ fn gen_function(uint64 fn_node) {
                     }
                     emit_store_rax_to_stack(poff)
                 } else if param_is_float != 0 && target_os != 2 {
-                    // SysV float param: spill xmmN to stack
-                    // movsd [rsp+offset], xmmN
-                    emit_store_xmmN_f64(float_pidx, poff)
+                    if float_pidx < 8 {
+                        // SysV float param: spill xmmN to stack
+                        // movsd [rsp+offset], xmmN
+                        emit_store_xmmN_f64(float_pidx, poff)
+                    } else {
+                        // Past xmm7 the argument arrived on the STACK, and this
+                        // branch used to emit nothing at all -- the parameter
+                        // was simply never read. Same placeholder-load-and-patch
+                        // the integer overflow path below uses; an f64 is eight
+                        // bytes either way, so the plain 64-bit move is right.
+                        emit_byte(0x48); emit_byte(0x8B); emit_byte(0x84)
+                        emit_byte(0x24)
+                        uint64 fpatch_loc = out_len
+                        emit_u32_le(0) // placeholder -- patched later
+                        if stack_pidx >= 32 {
+                            write(2, "error: too many stack parameters (max 32)\n", 42)
+                            exit(1)
+                        }
+                        uint64 fop_entry = overflow_patches + stack_pidx * 8
+                        uint32 fpl32 = fpatch_loc
+                        unsafe { *(fop_entry as uint32) = fpl32 }
+                        overflow_patch_count = stack_pidx + 1
+                        stack_pidx = stack_pidx + 1
+                        emit_store_regN_to_stack(0x48, 0, poff)
+                    }
                     float_pidx = float_pidx + 1
                 } else if target_os == 2 {
                     // Windows calling convention (positional, no change)
@@ -11191,7 +11273,11 @@ fn gen_function(uint64 fn_node) {
                         uint64 patch_loc = out_len
                         emit_u32_le(0) // placeholder — patched later
                         // Save patch location for this overflow arg
-                        uint64 opi = int_pidx - 6
+                        // ARGUMENT order, not int-overflow order: the caller
+                        // pushes floats and ints into one area in argument
+                        // order, so `int_pidx - 6` only agreed with it when no
+                        // float overflowed too.
+                        uint64 opi = stack_pidx
                         if opi >= 32 {
                             write(2, "error: too many stack parameters (max 32)\n", 42)
                             exit(1)
@@ -11200,6 +11286,7 @@ fn gen_function(uint64 fn_node) {
                         uint32 pl32 = patch_loc
                         unsafe { *(op_entry as uint32) = pl32 }
                         overflow_patch_count = opi + 1
+                        stack_pidx = stack_pidx + 1
                         // mov [rsp+off], rax
                         emit_store_regN_to_stack(0x48, 0, poff)
                     }

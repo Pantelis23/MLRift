@@ -7241,6 +7241,99 @@ for MA33_MODE in "ir" "legacy"; do
     fi
 done
 rm -f "$MA33_SRC"
+# Two more defects in the same family, and NEITHER is visible to the
+# all-integer rows above.
+#
+# 5. The overflow set was POSITIONAL on aarch64 -- arguments 8.. -- which is
+#    only right when every register argument precedes every stack one. AAPCS64
+#    fills x0-x7 and v0-v7 from SEPARATE counters, and the callee's prologue
+#    already used separate counters, so the two ends disagreed the moment a
+#    float sat among the first eight arguments. A 14-argument mixed call
+#    returned 177 against the IR backend's 247. (The x86_64 twin of this was
+#    fixed earlier; this is the arm64 half.)
+#
+# 6. A float parameter past the 8th was never received AT ALL. The prologue
+#    spilled dN/xmmN only while a register was left and emitted nothing
+#    afterwards, so a 9-f64 function quietly returned the 8-argument answer on
+#    both legacy backends while the IR backend was correct.
+#
+# The mixed row puts an f64 at every third position, so floats and integers
+# both overflow and the callee has to find them in ARGUMENT order.
+MF_SRC="/tmp/mlr_manyfloat_$$.mlr"
+MF_BIN="/tmp/mlr_manyfloat_$$.bin"
+for MF_N in 9 12 16; do
+    {
+      printf 'fn fl('
+      i=1; while [ $i -le $MF_N ]; do [ $i -gt 1 ] && printf ', '; printf 'f64 a%d' $i; i=$((i+1)); done
+      printf ') -> u64 {\n    u64 acc = '
+      i=1; while [ $i -le $MF_N ]; do [ $i -gt 1 ] && printf ' + '; printf 'f64_to_int(a%d) * %d' $i $i; i=$((i+1)); done
+      printf '\n    if acc == 999999 { write(1, "x", 1) }\n    return acc\n}\n'
+      printf 'fn main() {\n    exit(fl('
+      i=1; while [ $i -le $MF_N ]; do [ $i -gt 1 ] && printf ', '; printf '%d.0' $i; i=$((i+1)); done
+      printf ') & 255)\n}\n'
+    } > "$MF_SRC"
+    MF_EXP=$(awk -v n=$MF_N 'BEGIN{s=0; for(k=1;k<=n;k++) s+=k*k; print s%256}')
+    for MF_MODE in "ir" "legacy"; do
+        if [ "$MF_MODE" = "legacy" ]; then MF_FLAG="--legacy"; else MF_FLAG=""; fi
+        TOTAL=$((TOTAL + 1))
+        rm -f "$MF_BIN"
+        if $MLRC --arch=$RUN_ARCH $MF_FLAG "$MF_SRC" -o "$MF_BIN" >/dev/null 2>&1 && [ -s "$MF_BIN" ]; then
+            chmod +x "$MF_BIN"; "$MF_BIN"; MF_RUN=$?
+            if [ "$MF_RUN" = "$MF_EXP" ]; then
+                PASS=$((PASS + 1)); echo "  many_float_params_${MF_N}_$MF_MODE: PASS (returns $MF_EXP)"
+            else
+                echo "FAIL: many_float_params_${MF_N}_$MF_MODE (returned $MF_RUN, want $MF_EXP -- float parameter 9+ arrives on the stack)"
+                FAIL=$((FAIL + 1))
+            fi
+        else
+            echo "FAIL: many_float_params_${MF_N}_$MF_MODE ($MF_N f64 parameters must compile)"; FAIL=$((FAIL + 1))
+        fi
+    done
+done
+# Mixed: every third argument is an f64, so the float and integer counters
+# both run out and the overflow set is interleaved.
+for MX_N in 14 24 32; do
+    {
+      printf 'fn mx('
+      i=1; while [ $i -le $MX_N ]; do
+          [ $i -gt 1 ] && printf ', '
+          if [ $(( (i-1) % 3 )) -eq 0 ]; then printf 'f64 a%d' $i; else printf 'u64 a%d' $i; fi
+          i=$((i+1))
+      done
+      printf ') -> u64 {\n    u64 acc = '
+      i=1; while [ $i -le $MX_N ]; do
+          [ $i -gt 1 ] && printf ' + '
+          if [ $(( (i-1) % 3 )) -eq 0 ]; then printf 'f64_to_int(a%d) * %d' $i $i; else printf 'a%d * %d' $i $i; fi
+          i=$((i+1))
+      done
+      printf '\n    if acc == 999999 { write(1, "x", 1) }\n    return acc\n}\n'
+      printf 'fn main() {\n    exit(mx('
+      i=1; while [ $i -le $MX_N ]; do
+          [ $i -gt 1 ] && printf ', '
+          if [ $(( (i-1) % 3 )) -eq 0 ]; then printf '%d.0' $i; else printf '%d' $i; fi
+          i=$((i+1))
+      done
+      printf ') & 255)\n}\n'
+    } > "$MF_SRC"
+    MX_EXP=$(awk -v n=$MX_N 'BEGIN{s=0; for(k=1;k<=n;k++) s+=k*k; print s%256}')
+    for MX_MODE in "ir" "legacy"; do
+        if [ "$MX_MODE" = "legacy" ]; then MX_FLAG="--legacy"; else MX_FLAG=""; fi
+        TOTAL=$((TOTAL + 1))
+        rm -f "$MF_BIN"
+        if $MLRC --arch=$RUN_ARCH $MX_FLAG "$MF_SRC" -o "$MF_BIN" >/dev/null 2>&1 && [ -s "$MF_BIN" ]; then
+            chmod +x "$MF_BIN"; "$MF_BIN"; MX_RUN=$?
+            if [ "$MX_RUN" = "$MX_EXP" ]; then
+                PASS=$((PASS + 1)); echo "  mixed_float_int_args_${MX_N}_$MX_MODE: PASS (returns $MX_EXP)"
+            else
+                echo "FAIL: mixed_float_int_args_${MX_N}_$MX_MODE (returned $MX_RUN, want $MX_EXP -- the overflow set is not positional)"
+                FAIL=$((FAIL + 1))
+            fi
+        else
+            echo "FAIL: mixed_float_int_args_${MX_N}_$MX_MODE ($MX_N mixed arguments must compile)"; FAIL=$((FAIL + 1))
+        fi
+    done
+done
+rm -f "$MF_SRC" "$MF_BIN"
 rm -f "$MA_SRC" "$MA_BIN" "$MA_OBJ"
 
 # --- Summary ---
