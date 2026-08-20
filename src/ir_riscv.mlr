@@ -1540,8 +1540,20 @@ fn ir_emit_riscv_insn(uint64 ii) {
             // The callee's IR_COPY (imm 8..99) reads it back at
             // [SP + callee_frame + (imm-8)*4]. 4-byte slots on rv32.
             uint64 oi = imm - 8
+            // 16 overflow slots = 24 arguments, and riscv32 is now the ONLY
+            // backend that stops there: the shared front-end, both x86_64
+            // paths, both arm64 paths and xtensa all take 64. The divergence
+            // is deliberate rather than an oversight. RV_OVERFLOW_RESERVE is
+            // a FIXED region at the bottom of every frame -- unlike
+            // a64_ovf_slots and xtensa's reserve, which are sized from the
+            // widest call actually lowered -- so raising it to 56 slots
+            // would add 160 bytes of stack to every riscv32 function,
+            // including leaves, on the most memory-constrained target here.
+            // The fix is to make the reserve dynamic like the other two, not
+            // to grow the constant. Says so rather than reporting a bare
+            // number the caller cannot act on.
             if oi >= 16 {
-                rv_err("error: riscv32: overflow args overflow (max 16)\n")
+                rv_err("error: riscv32: this call needs more than 16 overflow arguments (24 total). Every other backend takes 64; riscv32 reserves its outgoing-argument area as a fixed RV_OVERFLOW_RESERVE in EVERY frame, so raising the limit costs stack in every function. Split the call, or make the reserve dynamic the way ir_aarch64's a64_ovf_slots and the xtensa backend already do.\n")
             }
             uint64 src_reg = rv_resolve_src(s1_v, RV_T5)
             rv_s(oi * 4, src_reg, RV_SP, 2, 0x23)      // sw src, oi*4(sp)

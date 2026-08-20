@@ -328,7 +328,11 @@ fn ir_init() {
     ir_loop_count = 0
 
     if ir_overflow_args == 0 {
-        ir_overflow_args = alloc(32 * 8)
+        // 64 slots, matching the call-argument cap. Sized deliberately larger
+        // than it needs to be (an overflow index only reaches cap - 6): the
+        // guard that reads it fails SILENTLY, so headroom here is cheaper
+        // than the failure mode.
+        ir_overflow_args = alloc(64 * 8)
     }
     ir_overflow_arg_count = 0
 }
@@ -3053,14 +3057,25 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         }
         // General call: evaluate all arg exprs first, then emit ARGs + CALL
         // This prevents nested calls from clobbering arg registers.
-        // Capacity is 32 args (6 register + up to 26 stack); pushing higher
-        // also requires bumping ir_overflow_args / IR_ARG's oi guard below.
+        // Capacity is 64 args (6 register + up to 58 stack). RAISING THIS IS
+        // NOT ONE CONSTANT. Three things move together and only one of them
+        // announces itself when it is missed:
+        //   * this arena's STRIDE (512 = 64 slots) and its total size,
+        //   * the loop bound and the "max N" refusal below -- loud if wrong,
+        //   * ir_overflow_args' size and the `oi < N` guard at IR_ARG --
+        //     SILENT if wrong. That guard drops the argument and emits
+        //     nothing; the call then runs with a missing argument and no
+        //     diagnostic. oi is `index - 6`, so a stale 32 there starts
+        //     losing arguments at the 39th while the refusal still says 64.
+        // Was 32; raised to 64 because a caller needed more than 32 and the
+        // costs are all bounded -- IR fields are u32, the arena is 32 KB, and
+        // the legacy backends' per-call flag frames go from 512 B to 1 KB.
         // PROTOTYPE: `uint64[32]` locals lower to IR_ALLOC (mmap) — one
         // mmap+munmap syscall pair PER LOWERED CALL SITE (~50k pairs per
         // self-compile). Use a depth-indexed slice of a static arena
         // instead; nested calls in an arg expression bump the depth.
-        if ir_argv_arena == 0 { ir_argv_arena = alloc(64 * 256) }
-        uint64 call_arg_vregs = ir_argv_arena + ir_argv_depth * 256
+        if ir_argv_arena == 0 { ir_argv_arena = alloc(64 * 512) }
+        uint64 call_arg_vregs = ir_argv_arena + ir_argv_depth * 512
         if ir_argv_depth < 63 { ir_argv_depth = ir_argv_depth + 1 }
         uint32 arg = ast_child(node)
         uint64 warg = arg
@@ -3069,7 +3084,7 @@ fn ir_lower_expr(uint64 node) -> uint64 {
         // receiver's real address, never a copy.
         uint64 wct_meth = callee_tok
         uint64 callee_is_method = fn_method_lookup(wct_meth)
-        while warg != 0 && arg_count < 32 {
+        while warg != 0 && arg_count < 64 {
             // Reset the struct-expression tracker so a stale value left by
             // an earlier lowering can never be mistaken for this argument.
             ir_fa_struct_idx = 0xFFFFFFFF
@@ -3114,13 +3129,13 @@ fn ir_lower_expr(uint64 node) -> uint64 {
             uint32 anxt = ast_next(warg)
             warg = anxt
         }
-        // The loop above stops at arg_count == 32 (call_arg_vregs' capacity).
+        // The loop above stops at arg_count == 64 (call_arg_vregs' capacity).
         // Without this check the remaining arguments are silently DROPPED and
         // the callee reads garbage for them — a 33-arg call returned
         // sum(1..32) with no diagnostic. KernRift has always had this guard
         // (ir.kr:2921); MLRift had drifted without it.
         if warg != 0 {
-            write(2, "error: too many call arguments (max 32)\n", 40)
+            write(2, "error: too many call arguments (max 64)\n", 40)
             exit(1)
         }
         // Detect libm float-ABI callees. When matched, IR_ARG slots
@@ -9408,7 +9423,10 @@ fn ir_emit_x86_insn(uint64 ii) {
         } else if imm >= 6 {
             // Overflow arg: save vreg to overflow buffer for IR_CALL to handle
             uint64 oi = imm - 6
-            if oi < 32 {
+            // < 64, matching ir_overflow_args' size and the argument cap.
+            // THIS GUARD IS SILENT: past it the argument is simply not
+            // recorded, so the call runs with it missing and nothing says so.
+            if oi < 64 {
                 uint64 op_ptr = ir_overflow_args + oi * 8
                 uint64 sv = s1_v
                 unsafe { *(op_ptr as uint64) = sv }

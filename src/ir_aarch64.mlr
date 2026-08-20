@@ -1598,8 +1598,13 @@ fn ir_emit_arm64_insn(uint64 ii) {
             // (a 32-arg call returned 1 instead of 33, no diagnostic).
             // Never fall through quietly here.
             uint64 oi = imm - 8
-            if oi >= 24 {
-                write(2, "error: a64 overflow args overflow (max 24)\n", 43)
+            // 56 slots = the 64-argument cap less the 8 that arrive in
+            // x0-x7. The shared front-end refuses a 65th argument before
+            // this is reached, so this is the invariant rather than the
+            // user-facing limit -- and it is kept LOUD for the reason the
+            // note above gives: it was once `oi < 16` with no else.
+            if oi >= 56 {
+                write(2, "error: a64 overflow args overflow (max 56 slots = 64 args)\n", 59)
                 exit(1)
             }
             uint64 src_reg = ir_a64_resolve_src(s1_v, 9)

@@ -5968,29 +5968,32 @@ gen_call_args() {   # $1 = arg count -> writes CA_SRC
       printf ')\n    exit(r)\n}\n'
     } > "$CA_SRC"
 }
+# The cap is 64 now, not 32, so the refusal row moves to 65. Raised because a
+# caller needed more than 32 arguments; every cost was bounded (IR fields are
+# u32, the vreg arena is 32 KB, the legacy flag frames go 512 B -> 1 KB).
 TOTAL=$((TOTAL + 1))
-gen_call_args 33
+gen_call_args 65
 CA_ERR=$($MLRC --arch=$RUN_ARCH "$CA_SRC" -o "$CA_BIN" 2>&1); CA_ST=$?
-if [ "$CA_ST" != "0" ] && echo "$CA_ERR" | grep -q "too many call arguments (max 32)"; then
-    PASS=$((PASS + 1)); echo "  call_args_33_rejected: PASS (exit $CA_ST, clean diagnostic)"
+if [ "$CA_ST" != "0" ] && echo "$CA_ERR" | grep -q "too many call arguments (max 64)"; then
+    PASS=$((PASS + 1)); echo "  call_args_65_rejected: PASS (exit $CA_ST, clean diagnostic)"
 else
-    echo "FAIL: call_args_33_rejected (expected non-zero + 'too many call arguments', got exit $CA_ST: '$CA_ERR')"
+    echo "FAIL: call_args_65_rejected (expected non-zero + 'too many call arguments', got exit $CA_ST: '$CA_ERR')"
     FAIL=$((FAIL + 1))
 fi
-# Positive control: 32 must still compile AND run correctly. Without this, a
+# Positive control: 64 must still compile AND run correctly. Without this, a
 # parser that rejected every call would pass the test above.
 TOTAL=$((TOTAL + 1))
-gen_call_args 32
+gen_call_args 64
 rm -f "$CA_BIN"
 if $MLRC --arch=$RUN_ARCH "$CA_SRC" -o "$CA_BIN" >/dev/null 2>&1 && [ -s "$CA_BIN" ]; then
     chmod +x "$CA_BIN"; "$CA_BIN"; CA_RUN=$?
-    if [ "$CA_RUN" = "33" ]; then    # p1 + p32 = 1 + 32
-        PASS=$((PASS + 1)); echo "  call_args_32_accepted: PASS (compiles and returns 33)"
+    if [ "$CA_RUN" = "65" ]; then    # p1 + p64 = 1 + 64
+        PASS=$((PASS + 1)); echo "  call_args_64_accepted: PASS (compiles and returns 65)"
     else
-        echo "FAIL: call_args_32_accepted (ran but returned $CA_RUN, want 33)"; FAIL=$((FAIL + 1))
+        echo "FAIL: call_args_64_accepted (ran but returned $CA_RUN, want 65)"; FAIL=$((FAIL + 1))
     fi
 else
-    echo "FAIL: call_args_32_accepted (should compile to a non-empty artifact)"; FAIL=$((FAIL + 1))
+    echo "FAIL: call_args_64_accepted (should compile to a non-empty artifact)"; FAIL=$((FAIL + 1))
 fi
 # The same 32-arg call, cross-compiled to arm64. AAPCS64 passes 8 in x0-x7, so
 # 32 args need 24 outgoing stack slots; the arm64 IR_ARG lowering wrote only
@@ -6006,9 +6009,9 @@ TOTAL=$((TOTAL + 1))
 rm -f "$CA_BIN"
 CA_A64_ERR=$($MLRC --arch=arm64 "$CA_SRC" -o "$CA_BIN" 2>&1); CA_A64_ST=$?
 if [ "$CA_A64_ST" = "0" ] && [ -s "$CA_BIN" ]; then
-    PASS=$((PASS + 1)); echo "  call_args_32_accepted_arm64: PASS (cross-compiles)"
+    PASS=$((PASS + 1)); echo "  call_args_64_accepted_arm64: PASS (cross-compiles)"
 else
-    echo "FAIL: call_args_32_accepted_arm64 (exit $CA_A64_ST: '$CA_A64_ERR')"; FAIL=$((FAIL + 1))
+    echo "FAIL: call_args_64_accepted_arm64 (exit $CA_A64_ST: '$CA_A64_ERR')"; FAIL=$((FAIL + 1))
 fi
 # Compile success alone proves nothing here -- the pre-fix compiler compiled
 # this happily and returned the wrong answer. The qemu run is the check that
@@ -6017,15 +6020,17 @@ CA_QEMU="$(command -v qemu-aarch64-static || true)"
 if [ -n "$CA_QEMU" ] && [ -s "$CA_BIN" ]; then
     TOTAL=$((TOTAL + 1))
     chmod +x "$CA_BIN"; "$CA_QEMU" "$CA_BIN" >/dev/null 2>&1; CA_RUN=$?
-    if [ "$CA_RUN" = "33" ]; then
-        PASS=$((PASS + 1)); echo "  call_args_32_runs_arm64: PASS (returns 33 under qemu)"
+    if [ "$CA_RUN" = "65" ]; then
+        PASS=$((PASS + 1)); echo "  call_args_64_runs_arm64: PASS (returns 65 under qemu)"
     else
-        echo "FAIL: call_args_32_runs_arm64 (returned $CA_RUN, want 33)"; FAIL=$((FAIL + 1))
+        echo "FAIL: call_args_64_runs_arm64 (returned $CA_RUN, want 65)"; FAIL=$((FAIL + 1))
     fi
 fi
 # Boundary: 25 args = the first count that needs a 17th stack slot, i.e. the
 # exact case the old bound dropped. 24 always worked, so a test at 24 proves
-# nothing.
+# nothing. 33 is the second boundary, added with the 64-arg cap: the arm64 IR
+# guard was `oi >= 24`, i.e. 32 arguments, so 33 is the first count that guard
+# refused -- and it refused LOUDLY, which is why the raise was safe to make.
 TOTAL=$((TOTAL + 1))
 gen_call_args 25
 rm -f "$CA_BIN"
@@ -7157,7 +7162,12 @@ rm -f "$SR_SRC" "$SR_BIN"
 # rather than a crash, so a compile-only row would have passed throughout.
 MA_SRC="/tmp/mlr_manyargs_$$.mlr"
 MA_BIN="/tmp/mlr_manyargs_$$.bin"
-for MA_N in 13 16 22 25 32; do
+# 39 and 64 are not decoration. The IR backend records an overflow argument at
+# index `oi = position - 6` and its guard is SILENT past the end -- it drops the
+# argument and emits nothing -- so a cap raised without moving that guard gives
+# a wrong answer, not a diagnostic. oi first reaches 32 at the 39th argument,
+# which is why 39 is here; 64 is the cap itself and 63 its neighbour.
+for MA_N in 13 16 22 25 32 33 39 48 63 64; do
     {
       printf 'fn ma('
       i=1; while [ $i -le $MA_N ]; do [ $i -gt 1 ] && printf ', '; printf 'u64 a%d' $i; i=$((i+1)); done
@@ -7247,29 +7257,29 @@ else
     echo "FAIL: many_args_emit_obj_x86 (--emit=obj must produce .text containing an actual call to ma -- if the call vanished, the inliner ate it and every many_args row above is vacuous)"
     FAIL=$((FAIL + 1))
 fi
-# The cap itself still fires, on both backends, at 33. A cap that never fires
+# The cap itself still fires, on both backends, at 65. A cap that never fires
 # is not a cap -- and past 32 the flag frames really would overflow again.
-MA33_SRC="/tmp/mlr_manyargs33_$$.mlr"
+MA33_SRC="/tmp/mlr_manyargs65_$$.mlr"
 {
-  printf 'fn ma33('
-  i=1; while [ $i -le 33 ]; do [ $i -gt 1 ] && printf ', '; printf 'u64 a%d' $i; i=$((i+1)); done
+  printf 'fn ma65('
+  i=1; while [ $i -le 65 ]; do [ $i -gt 1 ] && printf ', '; printf 'u64 a%d' $i; i=$((i+1)); done
   printf ') -> u64 {\n    u64 acc = '
-  i=1; while [ $i -le 33 ]; do [ $i -gt 1 ] && printf ' + '; printf 'a%d * %d' $i $i; i=$((i+1)); done
+  i=1; while [ $i -le 65 ]; do [ $i -gt 1 ] && printf ' + '; printf 'a%d * %d' $i $i; i=$((i+1)); done
   # Same anti-inlining branch as above: a one-expression callee folds into the
   # caller and the cap never gets a call to fire on.
   printf '\n    if acc == 999999 { write(1, "x", 1) }\n    return acc\n}\n'
-  printf 'fn main() {\n    u64 b = write(1, "", 0)\n    exit(ma33('
-  i=1; while [ $i -le 33 ]; do [ $i -gt 1 ] && printf ', '; printf 'b + %d' $i; i=$((i+1)); done
+  printf 'fn main() {\n    u64 b = write(1, "", 0)\n    exit(ma65('
+  i=1; while [ $i -le 65 ]; do [ $i -gt 1 ] && printf ', '; printf 'b + %d' $i; i=$((i+1)); done
   printf ') & 255)\n}\n'
 } > "$MA33_SRC"
 for MA33_MODE in "ir" "legacy"; do
     if [ "$MA33_MODE" = "legacy" ]; then MA33_FLAG="--legacy"; else MA33_FLAG=""; fi
     TOTAL=$((TOTAL + 1))
     MA33_ERR=$($MLRC --arch=x86_64 $MA33_FLAG "$MA33_SRC" -o "$MA_BIN" 2>&1); MA33_ST=$?
-    if [ "$MA33_ST" != "0" ] && echo "$MA33_ERR" | grep -q "max 32"; then
-        PASS=$((PASS + 1)); echo "  many_args_33_rejected_$MA33_MODE: PASS (clean diagnostic, exit $MA33_ST)"
+    if [ "$MA33_ST" != "0" ] && echo "$MA33_ERR" | grep -q "max 64"; then
+        PASS=$((PASS + 1)); echo "  many_args_65_rejected_$MA33_MODE: PASS (clean diagnostic, exit $MA33_ST)"
     else
-        echo "FAIL: many_args_33_rejected_$MA33_MODE (expected a refusal naming max 32, got exit $MA33_ST: '$MA33_ERR')"
+        echo "FAIL: many_args_65_rejected_$MA33_MODE (expected a refusal naming max 64, got exit $MA33_ST: '$MA33_ERR')"
         FAIL=$((FAIL + 1))
     fi
 done
