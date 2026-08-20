@@ -332,6 +332,24 @@ jobs:
           name: mlrift-fatbinary
           path: /tmp/fatbin
 
+      # An x86-capable disassembler. Ubuntu builds binutils with one target set
+      # per host arch, so this runner's /usr/bin/objdump knows aarch64 and
+      # nothing else. many_args_emit_obj_x86 cross-compiles an x86_64 object and
+      # greps its disassembly for a real `call ... <ma>` -- that leg is the
+      # VACUITY GUARD for every many_args row above it, because without it those
+      # rows could all be passing on a call the inliner removed. An objdump that
+      # prints nothing reads as "the call vanished", i.e. a red gate for a green
+      # compiler, which is exactly how this job failed on 2026-08-20.
+      # binutils-x86-64-linux-gnu supplies x86_64-linux-gnu-objdump, which the
+      # row probes for and selects. NOT continue-on-error: if this stops
+      # installing, the suite must go red rather than quietly lose the guard.
+      # Ported from KernRift, whose ARM64 job has carried this since 7c37f94.
+      - name: Install x86_64 cross binutils (for the many_args vacuity guard)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils-x86-64-linux-gnu
+          x86_64-linux-gnu-objdump --version | head -1
+
       - name: Self-compile + tests (everything to debug-kit)
         continue-on-error: true
         timeout-minutes: 12
