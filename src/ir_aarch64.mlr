@@ -759,6 +759,13 @@ fn ir_emit_arm64_win_syscall(uint64 abstract_nr, uint64 dest_v, uint64 dst_r) {
         emit_a64_mov(2, 12)               // x2 = len
         emit_a64_mov(1, 11)               // x1 = buf
         emit_a64_win_call_iat(2)          // WriteFile
+        // AND READ THE COUNT BACK. The slot was allocated, zeroed and pointed
+        // at correctly; only the load was missing, so x0 stayed WriteFile's
+        // BOOL and write(1,"abc",3) answered 1. The ReadFile twin below
+        // records that this same BOOL "made the CI test read 1 instead of 8
+        // on ARM64 Windows" -- the write side was left as it was. Ported from
+        // KernRift.
+        emit_a64(0xB94003E0)              // ldr w0, [sp]   — bytesWritten (zero-extends)
         emit_a64_add_sp_imm(16)           // add sp, sp, #16
     }
 

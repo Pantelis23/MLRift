@@ -2126,14 +2126,25 @@ fn gen_expr_a64(uint64 node) {
                 // WriteFile(handle, buf, len, &bytesWritten, NULL)
                 // Use wr_extra+8 carefully — but we can just pass NULL for bytesWritten
                 // since we don't need the count from write()
-                emit_a64_mov_imm(4, 0)
-                emit_a64_mov_imm(3, 0)
-                emit_a64_load_x0(wr_extra)
-                emit_a64_mov(2, 0)
+                // bytesWritten USED TO BE NULL (emit_a64_mov_imm(3, 0)) and the
+                // BOOL was returned, so write reported 1 for every successful
+                // call where every other target returns the byte count. The
+                // file_read path below always did this properly. temp_slot_1 is
+                // reused as the output slot, with buf taken into x1 FIRST so
+                // the slot is free by the time it is zeroed. Ported from
+                // KernRift.
                 emit_a64_load_x0(temp_slot_1)
-                emit_a64_mov(1, 0)
-                emit_a64_load_x0(temp_slot_0)
+                emit_a64_mov(1, 0)                 // x1 = buf, before the reuse
+                emit_a64_mov_imm(0, 0)
+                emit_a64_store_x0(temp_slot_1)      // zero the count slot
+                emit_a64_add_imm(3, 31, a64_var_base + temp_slot_1)  // x3 = &bytesWritten
+                emit_a64_mov_imm(4, 0)             // x4 = NULL (lpOverlapped)
+                emit_a64_load_x0(wr_extra)
+                emit_a64_mov(2, 0)                 // x2 = len
+                emit_a64_load_x0(temp_slot_0)    // x0 = handle
                 emit_a64_win_call_iat(2)
+                // x0 = bytesWritten, not the BOOL
+                emit_a64_load_x0(temp_slot_1)
             } else {
                 emit_a64_mov(2, 0)
                 emit_a64_load_x0(temp_slot_1)
@@ -2340,14 +2351,25 @@ fn gen_expr_a64(uint64 node) {
                 uint64 fw_etr = var_frame_size & 15
                 if fw_etr != 0 { var_frame_size = var_frame_size + 16 - fw_etr }
                 emit_a64_store_x0(fw_extra)
-                emit_a64_mov_imm(4, 0)
-                emit_a64_mov_imm(3, 0)
-                emit_a64_load_x0(fw_extra)
-                emit_a64_mov(2, 0)
+                // bytesWritten USED TO BE NULL (emit_a64_mov_imm(3, 0)) and the
+                // BOOL was returned, so write reported 1 for every successful
+                // call where every other target returns the byte count. The
+                // file_read path below always did this properly. temp_slot_1 is
+                // reused as the output slot, with buf taken into x1 FIRST so
+                // the slot is free by the time it is zeroed. Ported from
+                // KernRift.
                 emit_a64_load_x0(temp_slot_1)
-                emit_a64_mov(1, 0)
-                emit_a64_load_x0(temp_slot_0)
+                emit_a64_mov(1, 0)                 // x1 = buf, before the reuse
+                emit_a64_mov_imm(0, 0)
+                emit_a64_store_x0(temp_slot_1)      // zero the count slot
+                emit_a64_add_imm(3, 31, a64_var_base + temp_slot_1)  // x3 = &bytesWritten
+                emit_a64_mov_imm(4, 0)             // x4 = NULL (lpOverlapped)
+                emit_a64_load_x0(fw_extra)
+                emit_a64_mov(2, 0)                 // x2 = len
+                emit_a64_load_x0(temp_slot_0)    // x0 = handle
                 emit_a64_win_call_iat(2)
+                // x0 = bytesWritten, not the BOOL
+                emit_a64_load_x0(temp_slot_1)
             } else {
                 emit_a64_mov(2, 0)
                 emit_a64_load_x0(temp_slot_1)
