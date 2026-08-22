@@ -870,10 +870,10 @@ fn parse_ptr_compound_store(uint64 addr_expr, uint64 type_size, uint64 fk_bits) 
     ast_set_child(node, ae)
     uint32 bp = binop
     ast_set_data2(node, bp)
-    // Stores carry no float kind — keep only the volatile bit, matching the
-    // plain `*(addr as TYPE) = val` paths.
-    uint64 vol_only = fk_bits & 16
-    uint32 sd3 = vol_only
+    // Keep BOTH the float kind (bits 0..3) and the volatile bit (bit 4) — the
+    // plain `*(addr as TYPE) = val` path above already stashes the kind, and
+    // dropping it here is what left a compound float store unattributable.
+    uint32 sd3 = fk_bits
     ast_set_data3(node, sd3)
     // data4 = 1: compound. Evaluate the address ONCE, before the value.
     uint32 one = 1
