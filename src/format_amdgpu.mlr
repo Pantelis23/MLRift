@@ -15927,6 +15927,27 @@ fn amdgpu_lower_noesis_lif(uint64 kname_ptr, uint64 nl) -> uint64 {
 // Returns 0 on success; non-zero means "doesn't match the 3a shape"
 // and the caller should fall through to other recognisers.
 // ─────────────────────────────────────────────────────────────────────
+// amdgpu_check_bare_call_shape — validate a 3b/3c row-index prologue.
+//
+// Same defect as the 3a family (see amdgpu_check_gid_shape): these lowerers
+// emit a FIXED row-index sequence, checked only that stmt0 was a VarDecl, and
+// never read its initializer — so the source expression was inert and
+// `uint64 row = 0` compiled to the real per-row kernel. The 3b/3c kernels use
+// a bare nullary call rather than the 3a multiply-add:
+//     uint64 row = block_idx_x()   (rmsnorm / softmax / layernorm / rope /
+//                                   softmax_causal)
+//     uint64 row = tid_x()         (gemv)
+// Returns 0 when stmt0's initializer is exactly `<name>()`, 1 otherwise.
+fn amdgpu_check_bare_call_shape(uint32 stmt0, uint64 name_ptr, uint64 name_len) -> uint64 {
+    uint32 init = ast_child(stmt0)
+    if init == 0 { return 1 }
+    if ast_kind(init) != 35 { return 1 }          // Call
+    if ast_child(init) != 0 { return 1 }          // must take no arguments
+    if tok_matches(ast_data1(init), name_ptr, name_len) == 0 { return 1 }
+    return 0
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // amdgpu_check_gid_shape — validate the 3a grid-index prologue.
 //
 // The 3a lowerers emit a FIXED thread-index sequence (block size is a
@@ -16896,6 +16917,10 @@ fn amdgpu_lower_rmsnorm_f32_3b(uint64 fn_node, uint64 source,
     if ast_kind(body) != 15 { return 1 }
     uint32 stmt0 = ast_child(body)
     if stmt0 == 0 || ast_kind(stmt0) != 10 { return 1 }   // VarDecl row
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
     uint32 stmt1 = ast_next(stmt0)
     if stmt1 == 0 || ast_kind(stmt1) != 10 { return 1 }   // VarDecl lane
     uint32 stmt2 = ast_next(stmt1)
@@ -17337,6 +17362,10 @@ fn amdgpu_lower_softmax_f32_3b(uint64 fn_node, uint64 source,
     if ast_kind(body) != 15 { return 1 }
     uint32 stmt0 = ast_child(body)
     if stmt0 == 0 || ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
     uint32 stmt1 = ast_next(stmt0)
     if stmt1 == 0 || ast_kind(stmt1) != 10 { return 1 }
     uint32 stmt2 = ast_next(stmt1)
@@ -17498,6 +17527,10 @@ fn amdgpu_lower_layernorm_f32_3b(uint64 fn_node, uint64 source,
     if ast_kind(body) != 15 { return 1 }
     uint32 stmt0 = ast_child(body)
     if stmt0 == 0 || ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
     uint32 stmt1 = ast_next(stmt0)
     if stmt1 == 0 || ast_kind(stmt1) != 10 { return 1 }
     uint32 stmt2 = ast_next(stmt1)
@@ -17596,6 +17629,10 @@ fn amdgpu_lower_rope_f32_3c(uint64 fn_node, uint64 source,
     if ast_kind(body) != 15 { return 1 }
     uint32 stmt0 = ast_child(body)
     if stmt0 == 0 || ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
     uint32 stmt1 = ast_next(stmt0)
     if stmt1 == 0 || ast_kind(stmt1) != 10 { return 1 }
     uint32 stmt2 = ast_next(stmt1)
@@ -17806,6 +17843,10 @@ fn amdgpu_lower_softmax_causal_f32_3b(uint64 fn_node, uint64 source,
     if ast_kind(body) != 15 { return 1 }
     uint32 stmt0 = ast_child(body)
     if stmt0 == 0 || ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
     uint32 stmt1 = ast_next(stmt0)
     if stmt1 == 0 || ast_kind(stmt1) != 10 { return 1 }
     uint32 stmt2 = ast_next(stmt1)
@@ -17888,6 +17929,16 @@ fn amdgpu_lower_rope_qwen3_f32_3c(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    // Marker-keyed, but the emitted body is fixed, so the source prologue was
+    // inert here too: `uint64 i = 0` used to emit the real per-row kernel.
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
@@ -17973,6 +18024,10 @@ fn amdgpu_lower_gemv_f32_3c(uint64 fn_node, uint64 source,
     if ast_kind(body) != 15 { return 1 }
     uint32 stmt0 = ast_child(body)
     if stmt0 == 0 || ast_kind(stmt0) != 10 { return 1 }   // VarDecl row
+    if amdgpu_check_bare_call_shape(stmt0, "tid_x", 5) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `tid_x()`\n", 69)
+        return 1
+    }
     uint32 stmt1 = ast_next(stmt0)
     if stmt1 == 0 || ast_kind(stmt1) != 13 { return 1 }   // If
     if ast_next(stmt1) != 0 { return 1 }                   // exactly 2 stmts
