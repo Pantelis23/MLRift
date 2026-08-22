@@ -17019,6 +17019,14 @@ fn amdgpu_lower_rmsnorm_f32_N1024_3b(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
+
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
     while walk != 0 {
@@ -17080,6 +17088,14 @@ fn amdgpu_lower_rmsnorm_f32_N5120_3b(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
@@ -17143,6 +17159,14 @@ fn amdgpu_lower_qknorm_f32_3b(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
@@ -17212,6 +17236,14 @@ fn amdgpu_lower_qknorm_rope_qk_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
+
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
     while walk != 0 {
@@ -17278,6 +17310,14 @@ fn amdgpu_lower_softmax_f32_N128_3b(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
@@ -17441,6 +17481,14 @@ fn amdgpu_lower_layernorm_f32_N128_3b(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
@@ -17760,6 +17808,14 @@ fn amdgpu_lower_softmax_causal_f32_N128_3b(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
@@ -18162,6 +18218,14 @@ fn amdgpu_lower_gemv_coop_f32_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
+
     // Recursive search for any `lds_reduce_sum_f32` Call in the body.
     uint64 saw_lds_reduce = 0
     uint32 walk = ast_child(body)
@@ -18259,6 +18323,14 @@ fn amdgpu_lower_attn_decode_f32_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
+
     // Recursive search for lds_reduce_max_f32.
     uint64 saw_max = 0
     uint32 walk = ast_child(body)
@@ -18349,6 +18421,14 @@ fn amdgpu_lower_attn_decode_f32_batched_3c(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     uint64 saw_max = 0
     uint64 saw_block_y = 0
@@ -18442,6 +18522,14 @@ fn amdgpu_lower_attn_decode_f32_speck4_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
+
     uint64 saw_max = 0
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
@@ -18533,6 +18621,14 @@ fn amdgpu_lower_attn_decode_f32_14b_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
+
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
     while walk != 0 {
@@ -18597,6 +18693,14 @@ fn amdgpu_lower_extract_q_qwen3_f32_3c(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     uint64 saw_block_y = 0
     uint32 walk = ast_child(body)
@@ -18666,6 +18770,14 @@ fn amdgpu_lower_insert_k_qwen3_f32_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
+
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
     while walk != 0 {
@@ -18729,6 +18841,14 @@ fn amdgpu_lower_extract_k_qwen3_f32_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
+
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
     while walk != 0 {
@@ -18790,6 +18910,14 @@ fn amdgpu_lower_extract_k_qwen3_f32_speck4_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
+
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
     while walk != 0 {
@@ -18850,6 +18978,14 @@ fn amdgpu_lower_insert_k_qwen3_f32_speck4_3c(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
@@ -18916,6 +19052,14 @@ fn amdgpu_lower_qkv_split_f32_3c(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     uint64 reject = 0
     uint32 walk = ast_child(body)
@@ -18997,6 +19141,14 @@ fn amdgpu_lower_qkv_split_f32_batched_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
+
     uint64 saw_block_y = 0
     uint32 walk = ast_child(body)
     while walk != 0 {
@@ -19060,6 +19212,14 @@ fn amdgpu_lower_qkv_split_f32_speck4_3c(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     uint64 saw_block_y = 0
     uint64 saw_marker = 0
@@ -19129,6 +19289,14 @@ fn amdgpu_lower_qkv_split_f32_14b_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
+
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
     while walk != 0 {
@@ -19191,6 +19359,14 @@ fn amdgpu_lower_qkv_split_f32_batched_14b_3c(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
@@ -19260,6 +19436,14 @@ fn amdgpu_lower_gemv_coop_q4_0_f32_batched_3c(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     // Recursive search for both `block_idx_y` and `lds_reduce_sum_f32`.
     uint64 saw_block_y = 0
@@ -19358,6 +19542,14 @@ fn amdgpu_lower_gemv_coop_f32_batched_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
+
     uint64 saw_marker = 0
     uint64 saw_lds = 0
     uint64 saw_block_y = 0
@@ -19452,6 +19644,14 @@ fn amdgpu_lower_gemv_coop_bf16_f32_batched_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
+
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
     while walk != 0 {
@@ -19532,6 +19732,14 @@ fn amdgpu_lower_gemv_coop_bf16_f32_3c(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     // Recursive search: must have lds_reduce_sum_f32 AND a u16 PtrLoad.
     uint64 saw_lds_reduce = 0
@@ -19661,6 +19869,18 @@ fn amdgpu_lower_gemm_f32_accum_3c(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    // Index prologue is stmt1 here, not stmt0: stmt0 is the gemm_accum_marker()
+    // discriminator (see the source). Same inert-prologue defect either way.
+    uint32 gstmt0 = ast_child(body)
+    if gstmt0 == 0 { return 1 }
+    uint32 gstmt1 = ast_next(gstmt0)
+    if gstmt1 == 0 { return 1 }
+    if ast_kind(gstmt1) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(gstmt1, "tid_x", 5) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `tid_x()`\n", 69)
+        return 1
+    }
 
     // Require both a While stmt AND a call to gemm_accum_marker().
     uint64 saw_while = 0
@@ -20029,6 +20249,14 @@ fn amdgpu_lower_gemm_f32_lds_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "tid_local_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `tid_local_x()`\n", 75)
+        return 1
+    }
+
     // Recursive search for any Call to {sync_block, lds_load_f32,
     // lds_store_f32} in the body subtree (top-level + nested if/while).
     uint64 saw_lds = 0
@@ -20231,6 +20459,14 @@ fn amdgpu_lower_gemm_f16f32_3c(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "tid_local_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `tid_local_x()`\n", 75)
+        return 1
+    }
 
     // Recursive search for any f16 PtrLoad (data3=3) AND any LDS-Call.
     uint64 saw_lds = 0
@@ -20457,6 +20693,14 @@ fn amdgpu_lower_gemm_f16f32_wmma_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "tid_local_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `tid_local_x()`\n", 75)
+        return 1
+    }
+
     // Reject if body subtree has any While, LDS-intrinsic Call, or
     // f16 PtrLoad — those belong to 3c-3/3c-4/3c-5.
     uint64 reject = 0
@@ -20675,6 +20919,14 @@ fn amdgpu_lower_silu_mul_f32_batched_3c(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "block_idx_x", 11) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x()`\n", 75)
+        return 1
+    }
 
     uint64 saw_marker = 0
     uint32 walk = ast_child(body)
