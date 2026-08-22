@@ -34,7 +34,7 @@ fn lds_reduce_sum_f32(f32 x) -> f32 { return x }
 fn rsqrt_f32(f32 x) -> f32 { return x }
 fn lds_barrier() { return }
 fn lds_store_f32(uint64 idx, f32 v) { return }
-fn lds_load_f32(uint64 idx) -> f32 { return 0.0 }
+fn lds_load_f32(uint64 idx) -> f32 { return 0.0f }
 fn qknorm_rope_qk_marker() -> uint64 { return 0 }
 
 @kernel

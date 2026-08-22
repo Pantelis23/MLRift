@@ -32,7 +32,7 @@ fn tid_local_y() -> uint64 { return 0 }
 fn block_idx_x() -> uint64 { return 0 }
 fn block_idx_y() -> uint64 { return 0 }
 fn sync_block() -> uint64  { return 0 }
-fn lds_load_f32(uint64 idx) -> f32 { return 0.0 }
+fn lds_load_f32(uint64 idx) -> f32 { return 0.0f }
 fn lds_store_f32(uint64 idx, f32 v) -> uint64 { return 0 }
 
 @kernel

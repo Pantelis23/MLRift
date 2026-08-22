@@ -13827,7 +13827,11 @@ fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> u
                 // 0 = success, 1 = unsupported (hard error),
                 // 2 = skip-this-kernel (soft, drop it from the .co
                 //     and resolve from a fallback module at launch).
-                if lrc == 1 { return lrc }
+                // 1 = nothing matched. 5 = a lowerer's dedicated marker claimed
+                // this kernel and then found the body malformed. Both fatal,
+                // both already printed a pointed diagnostic.
+                if lrc == 1 { return 1 }
+                if lrc == 5 { return 1 }
             }
         }
         uint32 nxt = ast_next(wc)
@@ -19870,18 +19874,6 @@ fn amdgpu_lower_gemm_f32_accum_3c(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
 
-    // Index prologue is stmt1 here, not stmt0: stmt0 is the gemm_accum_marker()
-    // discriminator (see the source). Same inert-prologue defect either way.
-    uint32 gstmt0 = ast_child(body)
-    if gstmt0 == 0 { return 1 }
-    uint32 gstmt1 = ast_next(gstmt0)
-    if gstmt1 == 0 { return 1 }
-    if ast_kind(gstmt1) != 10 { return 1 }
-    if amdgpu_check_bare_call_shape(gstmt1, "tid_x", 5) != 0 {
-        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `tid_x()`\n", 69)
-        return 1
-    }
-
     // Require both a While stmt AND a call to gemm_accum_marker().
     uint64 saw_while = 0
     uint64 saw_marker = 0
@@ -19933,6 +19925,18 @@ fn amdgpu_lower_gemm_f32_accum_3c(uint64 fn_node, uint64 source,
     }
     if saw_while == 0 { return 1 }
     if saw_marker == 0 { return 1 }
+
+    // Index prologue is stmt1 here, not stmt0: stmt0 is the gemm_accum_marker()
+    // discriminator (see the source). Same inert-prologue defect either way.
+    uint32 gstmt0 = ast_child(body)
+    if gstmt0 == 0 { return 1 }
+    uint32 gstmt1 = ast_next(gstmt0)
+    if gstmt1 == 0 { return 1 }
+    if ast_kind(gstmt1) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(gstmt1, "tid_x", 5) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `tid_x()`\n", 69)
+        return 5
+    }
 
     // Emit ISA: identical to gemm_f32_3c except:
     //   (1) s_cbranch_execz offset is 54 (was 50) — 4 extra dwords before s_endpgm
@@ -20087,6 +20091,17 @@ fn amdgpu_lower_gemm_f32_3c(uint64 fn_node, uint64 source,
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
     if ast_kind(body) != 15 { return 1 }
+
+    // Plain gemm claims the 6-param + While shape. Without this it also
+    // claimed gemm_f32_lds (whose prologue is tid_local_x()) and emitted
+    // non-LDS ISA for it, byte-identically whatever the body said.
+    uint32 stmt0 = ast_child(body)
+    if stmt0 == 0 { return 1 }
+    if ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_bare_call_shape(stmt0, "tid_x", 5) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `tid_x()`\n", 69)
+        return 1
+    }
     // Recursive search for any While in the body subtree.
     uint64 saw_while = 0
     uint32 walk = ast_child(body)
@@ -22883,7 +22898,11 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     // Runs BEFORE 3c-3 so gemm_accum_marker() presence wins over plain
     // gemm_f32 (both have 6 params + While).
     uint64 gma_rc = amdgpu_lower_gemm_f32_accum_3c(fn_node, source, kname_ptr, nl)
-    if gma_rc == 0 { return 0 }
+    // 5 = the marker identified this AS gemm_f32_accum and then its body was
+    // malformed. Do NOT fall through: 3c-3 below would claim it and emit plain
+    // gemm ISA, which is how `lane = 0` used to still produce a .co. Only 1
+    // ("not my shape") continues down the chain.
+    if gma_rc != 1 { return gma_rc }
 
     // ── Phase 3c-3: AST-walking gemm (16x16 tile, K-loop) ─────────────
     // Catches the 6-param gemm shape (a, b, c, m, n, k_dim) with a
