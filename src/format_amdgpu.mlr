@@ -15931,6 +15931,90 @@ fn amdgpu_lower_noesis_lif(uint64 kname_ptr, uint64 nl) -> uint64 {
 // Returns 0 on success; non-zero means "doesn't match the 3a shape"
 // and the caller should fall through to other recognisers.
 // ─────────────────────────────────────────────────────────────────────
+// amdgpu_subtree_has_call — is there a Call to `name` anywhere under `node`?
+//
+// The 3c recognisers each hand-unrolled a two-level scan (top-level stmts plus
+// one `if` then-block) under a comment claiming it searched the subtree. It did
+// not: gemm_f32_lds and gemm_f16f32 put their lds_store_f32 / lds_load_f32 /
+// sync_block calls inside the K-loop `while`, which the scan never entered, so
+// each kernel's own lowerer refused it and plain gemm_f32_3c claimed it and
+// emitted non-LDS ISA instead — byte-identically whatever the body said.
+//
+// Node layout this relies on (parser.mlr): Block(15) child = stmt list;
+// If(13) child = cond, data1 = then, data2 = else; While(14) child = cond,
+// data1 = body; VarDecl(10) child = init; Call(35) data1 = callee TOKEN (not a
+// node — never recurse into it), child = args.
+fn amdgpu_subtree_has_call(uint32 node, uint64 name_ptr, uint64 name_len) -> uint64 {
+    uint64 wn = node
+    while wn != 0 {
+        uint64 k = ast_kind(wn)
+        if k == 35 {
+            if tok_matches(ast_data1(wn), name_ptr, name_len) != 0 { return 1 }
+        }
+        uint32 ch = ast_child(wn)
+        if ch != 0 {
+            if amdgpu_subtree_has_call(ch, name_ptr, name_len) != 0 { return 1 }
+        }
+        if k == 13 {
+            uint32 tb = ast_data1(wn)
+            if tb != 0 {
+                if amdgpu_subtree_has_call(tb, name_ptr, name_len) != 0 { return 1 }
+            }
+            uint32 eb = ast_data2(wn)
+            if eb != 0 {
+                if amdgpu_subtree_has_call(eb, name_ptr, name_len) != 0 { return 1 }
+            }
+        }
+        if k == 14 {
+            uint32 wb = ast_data1(wn)
+            if wb != 0 {
+                if amdgpu_subtree_has_call(wb, name_ptr, name_len) != 0 { return 1 }
+            }
+        }
+        uint32 nx = ast_next(wn)
+        wn = nx
+    }
+    return 0
+}
+
+// amdgpu_subtree_has_ptrload_kind — is there a PtrLoad(41) whose element kind
+// is `k3` anywhere under `node`? Companion to amdgpu_subtree_has_call, and
+// needed for the same reason: gemm_f16f32's f16 loads live inside the K-loop
+// `while`, which the old two-level scan never entered.
+fn amdgpu_subtree_has_ptrload_kind(uint32 node, uint64 k3) -> uint64 {
+    uint64 wn = node
+    while wn != 0 {
+        uint64 k = ast_kind(wn)
+        if k == 41 {
+            if ast_data3(wn) == k3 { return 1 }
+        }
+        uint32 ch = ast_child(wn)
+        if ch != 0 {
+            if amdgpu_subtree_has_ptrload_kind(ch, k3) != 0 { return 1 }
+        }
+        if k == 13 {
+            uint32 tb = ast_data1(wn)
+            if tb != 0 {
+                if amdgpu_subtree_has_ptrload_kind(tb, k3) != 0 { return 1 }
+            }
+            uint32 eb = ast_data2(wn)
+            if eb != 0 {
+                if amdgpu_subtree_has_ptrload_kind(eb, k3) != 0 { return 1 }
+            }
+        }
+        if k == 14 {
+            uint32 wb = ast_data1(wn)
+            if wb != 0 {
+                if amdgpu_subtree_has_ptrload_kind(wb, k3) != 0 { return 1 }
+            }
+        }
+        uint32 nx = ast_next(wn)
+        wn = nx
+    }
+    return 0
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // amdgpu_check_bare_call_shape — validate a 3b/3c row-index prologue.
 //
 // Same defect as the 3a family (see amdgpu_check_gid_shape): these lowerers
@@ -20274,50 +20358,13 @@ fn amdgpu_lower_gemm_f32_lds_3c(uint64 fn_node, uint64 source,
 
     // Recursive search for any Call to {sync_block, lds_load_f32,
     // lds_store_f32} in the body subtree (top-level + nested if/while).
+    // Recursive: the calls live inside the K-loop `while`, which the old
+    // hand-unrolled two-level scan never entered (see amdgpu_subtree_has_call).
+    uint32 bodyc = ast_child(body)
     uint64 saw_lds = 0
-    uint32 walk = ast_child(body)
-    while walk != 0 {
-        if ast_kind(walk) == 35 {
-            uint32 callee = ast_data1(walk)
-            if tok_matches(callee, "sync_block",     10) != 0 { saw_lds = 1 }
-            if tok_matches(callee, "lds_load_f32",   12) != 0 { saw_lds = 1 }
-            if tok_matches(callee, "lds_store_f32",  13) != 0 { saw_lds = 1 }
-        }
-        if ast_kind(walk) == 10 {
-            uint32 init = ast_child(walk)
-            if init != 0 && ast_kind(init) == 35 {
-                uint32 callee = ast_data1(init)
-                if tok_matches(callee, "sync_block",     10) != 0 { saw_lds = 1 }
-                if tok_matches(callee, "lds_load_f32",   12) != 0 { saw_lds = 1 }
-                if tok_matches(callee, "lds_store_f32",  13) != 0 { saw_lds = 1 }
-            }
-        }
-        if ast_kind(walk) == 13 {
-            uint32 tblk = ast_data1(walk)
-            if tblk != 0 && ast_kind(tblk) == 15 {
-                uint32 tw = ast_child(tblk)
-                while tw != 0 {
-                    if ast_kind(tw) == 35 {
-                        uint32 c2 = ast_data1(tw)
-                        if tok_matches(c2, "sync_block",    10) != 0 { saw_lds = 1 }
-                        if tok_matches(c2, "lds_load_f32",  12) != 0 { saw_lds = 1 }
-                        if tok_matches(c2, "lds_store_f32", 13) != 0 { saw_lds = 1 }
-                    }
-                    if ast_kind(tw) == 10 {
-                        uint32 i2 = ast_child(tw)
-                        if i2 != 0 && ast_kind(i2) == 35 {
-                            uint32 c3 = ast_data1(i2)
-                            if tok_matches(c3, "sync_block",    10) != 0 { saw_lds = 1 }
-                            if tok_matches(c3, "lds_load_f32",  12) != 0 { saw_lds = 1 }
-                            if tok_matches(c3, "lds_store_f32", 13) != 0 { saw_lds = 1 }
-                        }
-                    }
-                    tw = ast_next(tw)
-                }
-            }
-        }
-        walk = ast_next(walk)
-    }
+    if amdgpu_subtree_has_call(bodyc, "sync_block", 10) != 0 { saw_lds = 1 }
+    if amdgpu_subtree_has_call(bodyc, "lds_load_f32", 12) != 0 { saw_lds = 1 }
+    if amdgpu_subtree_has_call(bodyc, "lds_store_f32", 13) != 0 { saw_lds = 1 }
     if saw_lds == 0 { return 1 }
 
     // ── emit ISA ─────────────────────────────────────────────────
@@ -20484,69 +20531,17 @@ fn amdgpu_lower_gemm_f16f32_3c(uint64 fn_node, uint64 source,
     }
 
     // Recursive search for any f16 PtrLoad (data3=3) AND any LDS-Call.
+    // Recursive. While these two scans were hand-unrolled to two levels they
+    // refused their OWN kernel: gemm_f16f32 keeps both its lds_* calls and its
+    // f16 loads inside the K-loop `while`, which the scan never entered, so the
+    // kernel fell through to gemm_f32_lds_3c below and got f32 LDS ISA.
+    // saw_f16 is the discriminator against gemm_f32_lds - keep both.
+    uint32 bodyc = ast_child(body)
     uint64 saw_lds = 0
-    uint64 saw_f16 = 0
-    uint32 walk = ast_child(body)
-    while walk != 0 {
-        if ast_kind(walk) == 41 {
-            if ast_data3(walk) == 3 { saw_f16 = 1 }
-        }
-        if ast_kind(walk) == 35 {
-            uint32 callee = ast_data1(walk)
-            if tok_matches(callee, "sync_block",     10) != 0 { saw_lds = 1 }
-            if tok_matches(callee, "lds_load_f32",   12) != 0 { saw_lds = 1 }
-            if tok_matches(callee, "lds_store_f32",  13) != 0 { saw_lds = 1 }
-        }
-        if ast_kind(walk) == 10 {
-            uint32 init = ast_child(walk)
-            if init != 0 && ast_kind(init) == 35 {
-                uint32 callee = ast_data1(init)
-                if tok_matches(callee, "sync_block",     10) != 0 { saw_lds = 1 }
-                if tok_matches(callee, "lds_load_f32",   12) != 0 { saw_lds = 1 }
-                if tok_matches(callee, "lds_store_f32",  13) != 0 { saw_lds = 1 }
-            }
-        }
-        if ast_kind(walk) == 13 {
-            uint32 tblk = ast_data1(walk)
-            if tblk != 0 && ast_kind(tblk) == 15 {
-                uint32 tw = ast_child(tblk)
-                while tw != 0 {
-                    if ast_kind(tw) == 41 {
-                        if ast_data3(tw) == 3 { saw_f16 = 1 }
-                    }
-                    if ast_kind(tw) == 35 {
-                        uint32 c2 = ast_data1(tw)
-                        if tok_matches(c2, "sync_block",    10) != 0 { saw_lds = 1 }
-                        if tok_matches(c2, "lds_load_f32",  12) != 0 { saw_lds = 1 }
-                        if tok_matches(c2, "lds_store_f32", 13) != 0 { saw_lds = 1 }
-                    }
-                    if ast_kind(tw) == 10 {
-                        uint32 i2 = ast_child(tw)
-                        if i2 != 0 && ast_kind(i2) == 35 {
-                            uint32 c3 = ast_data1(i2)
-                            if tok_matches(c3, "sync_block",    10) != 0 { saw_lds = 1 }
-                            if tok_matches(c3, "lds_load_f32",  12) != 0 { saw_lds = 1 }
-                            if tok_matches(c3, "lds_store_f32", 13) != 0 { saw_lds = 1 }
-                        }
-                    }
-                    if ast_kind(tw) == 13 {
-                        uint32 tb3 = ast_data1(tw)
-                        if tb3 != 0 && ast_kind(tb3) == 15 {
-                            uint32 tw3 = ast_child(tb3)
-                            while tw3 != 0 {
-                                if ast_kind(tw3) == 41 {
-                                    if ast_data3(tw3) == 3 { saw_f16 = 1 }
-                                }
-                                tw3 = ast_next(tw3)
-                            }
-                        }
-                    }
-                    tw = ast_next(tw)
-                }
-            }
-        }
-        walk = ast_next(walk)
-    }
+    if amdgpu_subtree_has_call(bodyc, "sync_block", 10) != 0 { saw_lds = 1 }
+    if amdgpu_subtree_has_call(bodyc, "lds_load_f32", 12) != 0 { saw_lds = 1 }
+    if amdgpu_subtree_has_call(bodyc, "lds_store_f32", 13) != 0 { saw_lds = 1 }
+    uint64 saw_f16 = amdgpu_subtree_has_ptrload_kind(bodyc, 3)
     if saw_lds == 0 { return 1 }
     if saw_f16 == 0 { return 1 }
 

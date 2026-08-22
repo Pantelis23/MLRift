@@ -4892,6 +4892,40 @@ if [ "$ESP_T_OK" = 1 ]; then
 else
     FAIL=$((FAIL + 1))
 fi
+
+# Each gemm @kernel must be lowered by ITS OWN recogniser. They share a shape
+# (6 params + a While), so a recogniser whose body scan is too narrow refuses
+# its own kernel and a broader one downstream claims it and emits the wrong
+# ISA — silently, because the emitted .co still carries the right symbol name.
+# That is what happened to gemm_f32_lds and gemm_f16f32: both put their
+# lds_*/f16 work inside the K-loop `while`, which the old two-level scans never
+# entered, so plain gemm_f32_3c claimed them. Assert all four compile and that
+# all four .co differ — identical bytes between two of them means one lowerer
+# is emitting for a kernel that is not its own.
+TOTAL=$((TOTAL + 1))
+GEMM_OK=1
+GEMM_HASHES=""
+for GK in gemm_f32 gemm_f32_lds gemm_f16f32 gemm_f16f32_wmma; do
+    GEMM_SRC="$DIR/../examples/llm/$GK.mlr"
+    if [ ! -f "$GEMM_SRC" ]; then continue; fi
+    rm -f "/tmp/mlrc_gemm_$$.co"
+    if $MLRC --target=amdgpu-native "$GEMM_SRC" -o "/tmp/mlrc_gemm_$$" > /dev/null 2>&1 \
+       && [ -s "/tmp/mlrc_gemm_$$.co" ]; then
+        GEMM_HASHES="$GEMM_HASHES$(sha256sum "/tmp/mlrc_gemm_$$.co" | cut -d' ' -f1)\n"
+    else
+        echo "FAIL: gemm_kernels_lowered_by_own_recogniser ($GK did not emit a .co)"
+        GEMM_OK=0
+    fi
+    rm -f "/tmp/mlrc_gemm_$$" "/tmp/mlrc_gemm_$$.co"
+done
+GEMM_N=$(printf "$GEMM_HASHES" | grep -c .)
+GEMM_U=$(printf "$GEMM_HASHES" | grep . | sort -u | wc -l)
+if [ "$GEMM_OK" = 1 ] && [ "$GEMM_N" -ge 4 ] && [ "$GEMM_N" = "$GEMM_U" ]; then
+    PASS=$((PASS + 1)); echo "  gemm_kernels_lowered_by_own_recogniser: PASS ($GEMM_N distinct .co)"
+else
+    echo "FAIL: gemm_kernels_lowered_by_own_recogniser ($GEMM_N emitted, $GEMM_U distinct — duplicates mean a lowerer claimed another kernel)"
+    FAIL=$((FAIL + 1))
+fi
 rm -f "$ESP_T_BIN"
 
 # --- esp32 .bss zero-loop bounds -------------------------------------------
