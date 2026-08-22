@@ -6839,6 +6839,35 @@ if [ "$FR_ST" = "0" ] && [ -s "$FR_BIN" ]; then
 else
     echo "FAIL: float_literal_return_values (should compile: '$FR_ERR')"; FAIL=$((FAIL + 1))
 fi
+
+# C6f negative control: the ARGUMENT side of the same silent miscompile the
+# return-kind check guards. Passing an f64 value (an unsuffixed literal is f64)
+# to an f32 parameter put f64 bits in the register and the callee read 0.0,
+# with no diagnostic. Recursive callee so the AST inliner cannot fold the call
+# away and hide the ABI — an inlined one-expression callee is correct, which is
+# exactly why this survived.
+TOTAL=$((TOTAL + 1))
+printf 'fn sink(f32 v) -> f32 {\n if v > 1000000.0f { return sink(v - 1.0f) }\n return v\n}\nfn main() { exit(f32_to_int(sink(1.5))) }\n' > "$FR_SRC"
+FR_ERR=$($MLRC --arch=$RUN_ARCH "$FR_SRC" -o "$FR_BIN" 2>&1); FR_ST=$?
+if [ "$FR_ST" != "0" ] && echo "$FR_ERR" | grep -q "argument float kind does not match"; then
+    PASS=$((PASS + 1)); echo "  f64_literal_to_f32_param_rejected: PASS (exit $FR_ST)"
+else
+    echo "FAIL: f64_literal_to_f32_param_rejected (expected the C6f diagnostic, got exit $FR_ST: '$FR_ERR')"
+    FAIL=$((FAIL + 1))
+fi
+# Positive control, so C6f cannot be satisfied by rejecting everything.
+TOTAL=$((TOTAL + 1))
+printf 'fn sink(f32 v) -> f32 {\n if v > 1000000.0f { return sink(v - 1.0f) }\n return v\n}\nfn main() { exit(f32_to_int(sink(1.5f) * 4.0f)) }\n' > "$FR_SRC"
+if $MLRC --arch=$RUN_ARCH "$FR_SRC" -o "$FR_BIN" > /dev/null 2>&1; then
+    chmod +x "$FR_BIN"; "$FR_BIN"; FR_RUN=$?
+    if [ "$FR_RUN" = "6" ]; then
+        PASS=$((PASS + 1)); echo "  f32_literal_to_f32_param_accepted: PASS (1.5f*4 == 6)"
+    else
+        echo "FAIL: f32_literal_to_f32_param_accepted (want 6, got $FR_RUN)"; FAIL=$((FAIL + 1))
+    fi
+else
+    echo "FAIL: f32_literal_to_f32_param_accepted (should compile)"; FAIL=$((FAIL + 1))
+fi
 # Negative controls: the return-kind check must still FIRE on a genuine
 # mismatch. Both directions were silent miscompiles, not harmless: a
 # non-inlined `-> f64 { return 1.5f }` put f32 bits in xmm0 and the caller
