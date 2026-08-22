@@ -2623,6 +2623,9 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
         } else if anrc == 2 {
             write(2, "mlrc: failed to write .co for --target=amdgpu-native\n", 53)
             exit(1)
+        } else if anrc == 4 {
+            write(2, "mlrc: amdgpu-native: found @kernel fns but lowered none; no .co written\n", 72)
+            exit(1)
         }
         if anrc == 0 {
             write(1, "wrote ", 6)

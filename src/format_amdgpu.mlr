@@ -13817,10 +13817,12 @@ fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> u
     kt_reset()
     uint32 c0 = ast_child(mod_node)
     uint64 wc = c0
+    uint64 kernels_seen = 0
     while wc != 0 {
         uint32 k = ast_kind(wc)
         if k == 2 {
             if ast_fn_is_kernel(wc) != 0 {
+                kernels_seen = kernels_seen + 1
                 uint64 lrc = amdgpu_lower_kernel_to_table(wc, source)
                 // 0 = success, 1 = unsupported (hard error),
                 // 2 = skip-this-kernel (soft, drop it from the .co
@@ -13831,7 +13833,19 @@ fn emit_amdgpu_from_module(uint64 mod_node, uint64 source, uint64 out_path) -> u
         uint32 nxt = ast_next(wc)
         wc = nxt
     }
-    if kt_count == 0 { return 3 }
+    // Nothing landed in the table. Two very different situations share
+    // that symptom and used to be conflated into a silent exit 0:
+    //   - the source has no @kernel at all (a launcher-only .mlr) => 3,
+    //     which the caller treats as "fine, kernel .co comes separately";
+    //   - the source HAS @kernel fns but every one was skipped => 4.
+    // The second is UNREACHABLE today: no lowerer returns the soft-skip
+    // code 2, so a kernel either lowers or hard-errors. This is a guard,
+    // not a bug fix — it exists so that reintroducing the documented skip
+    // contract cannot silently produce no .co while exiting 0.
+    if kt_count == 0 {
+        if kernels_seen != 0 { return 4 }
+        return 3
+    }
 
     uint64 size = emit_amdgpu_multi_code_object()
     uint64 fd = file_open(out_path, 1)
@@ -15912,6 +15926,48 @@ fn amdgpu_lower_noesis_lif(uint64 kname_ptr, uint64 nl) -> uint64 {
 //
 // Returns 0 on success; non-zero means "doesn't match the 3a shape"
 // and the caller should fall through to other recognisers.
+// ─────────────────────────────────────────────────────────────────────
+// amdgpu_check_gid_shape — validate the 3a grid-index prologue.
+//
+// The 3a lowerers emit a FIXED thread-index sequence (block size is a
+// hardcoded immediate, e.g. `s_mov_b32 s14, 0x100` for 256). Until this
+// check existed every one of them accepted ANY VarDecl as stmt0 and never
+// looked at its initializer, so the source's index expression was inert:
+// `uint64 gid = 0` compiled byte-identically to the real prologue and
+// silently became a fully parallel kernel. Same for a mismatched block
+// size — `* 128` emitted `* 256`.
+//
+// Requires exactly:  <name> = block_idx_x() * <expect_blk> + tid_local_x()
+// Returns 0 on match, 1 otherwise.
+fn amdgpu_check_gid_shape(uint32 stmt0, uint64 expect_blk) -> uint64 {
+    uint32 init = ast_child(stmt0)
+    if init == 0 { return 1 }
+    if ast_kind(init) != 33 { return 1 }            // BinOp
+    uint64 opk = tok_kind_at_raw(ast_data1(init))
+    if opk != 30 { return 1 }                       // Plus
+    uint32 lhs = ast_child(init)
+    uint32 rhs = ast_data2(init)
+    if lhs == 0 { return 1 }
+    if rhs == 0 { return 1 }
+    // rhs: tid_local_x()
+    if ast_kind(rhs) != 35 { return 1 }             // Call
+    if tok_matches(ast_data1(rhs), "tid_local_x", 11) == 0 { return 1 }
+    // lhs: block_idx_x() * <expect_blk>
+    if ast_kind(lhs) != 33 { return 1 }
+    uint64 lopk = tok_kind_at_raw(ast_data1(lhs))
+    if lopk != 22 { return 1 }                      // Star
+    uint32 lcall = ast_child(lhs)
+    uint32 lblk = ast_data2(lhs)
+    if lcall == 0 { return 1 }
+    if lblk == 0 { return 1 }
+    if ast_kind(lcall) != 35 { return 1 }
+    if tok_matches(ast_data1(lcall), "block_idx_x", 11) == 0 { return 1 }
+    if ast_kind(lblk) != 30 { return 1 }            // IntLit
+    uint64 blk = parse_int_token(ast_data1(lblk))
+    if blk != expect_blk { return 1 }
+    return 0
+}
+
 fn amdgpu_lower_pointwise_3a(uint64 fn_node, uint64 source,
                               uint64 kname_ptr, uint64 nl) -> uint64 {
     // ── shape: 3 params ──────────────────────────────────────────
@@ -15931,6 +15987,10 @@ fn amdgpu_lower_pointwise_3a(uint64 fn_node, uint64 source,
     uint32 stmt0 = ast_child(body)
     if stmt0 == 0 { return 1 }
     if ast_kind(stmt0) != 10 { return 1 }  // 10 = VarDecl (gid)
+    if amdgpu_check_gid_shape(stmt0, 256) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x() * 256 + tid_local_x()`\n", 97)
+        return 1
+    }
     uint32 stmt1 = ast_next(stmt0)
     if stmt1 == 0 { return 1 }
     if ast_kind(stmt1) != 13 { return 1 }  // 13 = If
@@ -16154,6 +16214,10 @@ fn amdgpu_lower_pointwise_2in_3a(uint64 fn_node, uint64 source,
     if ast_kind(body) != 15 { return 1 }
     uint32 stmt0 = ast_child(body)
     if stmt0 == 0 || ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_gid_shape(stmt0, 256) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x() * 256 + tid_local_x()`\n", 97)
+        return 1
+    }
     uint32 stmt1 = ast_next(stmt0)
     if stmt1 == 0 || ast_kind(stmt1) != 13 { return 1 }
     if ast_next(stmt1) != 0 { return 1 }
@@ -16342,6 +16406,10 @@ fn amdgpu_lower_silu_mul_3a(uint64 fn_node, uint64 source,
     if ast_kind(body) != 15 { return 1 }
     uint32 stmt0 = ast_child(body)
     if stmt0 == 0 || ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_gid_shape(stmt0, 256) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x() * 256 + tid_local_x()`\n", 97)
+        return 1
+    }
     uint32 stmt1 = ast_next(stmt0)
     if stmt1 == 0 || ast_kind(stmt1) != 13 { return 1 }
     if ast_next(stmt1) != 0 { return 1 }
@@ -16529,6 +16597,10 @@ fn amdgpu_lower_silu_f32_3a(uint64 fn_node, uint64 source,
     if ast_kind(body) != 15 { return 1 }
     uint32 stmt0 = ast_child(body)
     if stmt0 == 0 || ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_gid_shape(stmt0, 256) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x() * 256 + tid_local_x()`\n", 97)
+        return 1
+    }
     uint32 stmt1 = ast_next(stmt0)
     if stmt1 == 0 || ast_kind(stmt1) != 13 { return 1 }
     if ast_next(stmt1) != 0 { return 1 }
@@ -16687,6 +16759,10 @@ fn amdgpu_lower_bf16_to_f32_3a(uint64 fn_node, uint64 source,
     if ast_kind(body) != 15 { return 1 }
     uint32 stmt0 = ast_child(body)
     if stmt0 == 0 || ast_kind(stmt0) != 10 { return 1 }
+    if amdgpu_check_gid_shape(stmt0, 256) != 0 {
+        write(2, "mlrc: amdgpu-native: kernel index prologue must be exactly `block_idx_x() * 256 + tid_local_x()`\n", 97)
+        return 1
+    }
     uint32 stmt1 = ast_next(stmt0)
     if stmt1 == 0 || ast_kind(stmt1) != 13 { return 1 }
     if ast_next(stmt1) != 0 { return 1 }
@@ -22204,13 +22280,14 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     if tok_matches(name_tok, "decay_step", 10) != 0 {
         return amdgpu_lower_noesis_decay(kname_ptr, nl)
     }
-    // For the three not-yet-native kernels we emit a warning and
-    // return 2 (= "skip"). emit_amdgpu_from_module turns that into a
-    // continue, so the .co contains only the kernels that DO lower.
-    // The launcher resolves unsupported kernels from a fallback .co
-    // via NOESIS_CSR_CO_PATH (see examples/noesis_60m_gpu_launch.mlr).
-    // This dual-.co strategy lets us land the kernels one-by-one
-    // without blocking the bench writeup on full coverage.
+    // STALE AS WRITTEN (corrected 2026-08-22): this used to say the three
+    // not-yet-native kernels warn and return 2 (= "skip"), letting the .co
+    // carry only the kernels that DO lower, with the launcher resolving the
+    // rest from a fallback .co via NOESIS_CSR_CO_PATH. All three now route
+    // to real emitters below, and NO lowerer returns 2 any more — grep it:
+    // the only `return 2` left in this file is emit_amdgpu_from_module's
+    // file_open failure. The skip contract is documented but unimplemented;
+    // emit_amdgpu_from_module still honours it if it is ever reintroduced.
     if tok_matches(name_tok, "lif_step", 8) != 0 {
         return amdgpu_lower_noesis_lif(kname_ptr, nl)
     }
