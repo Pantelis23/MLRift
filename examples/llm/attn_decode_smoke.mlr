@@ -228,5 +228,6 @@ fn main() {
             jj = jj + 1
         }
     }
+    hipkfd_teardown()
     exit(0)
 }

@@ -105,5 +105,6 @@ fn main() {
     u64 ratio_x100 = (us_b * 100) / us_a
     u64 sg = fmt_dec(ratio_x100); print_str(sg); dealloc(sg); print_str(" % of A\n")
 
+    hipkfd_teardown()
     exit(0)
 }

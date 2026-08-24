@@ -174,5 +174,6 @@ fn main() {
         di = di + 1
     }
 
+    hipkfd_teardown()
     exit(0)
 }

@@ -585,5 +585,6 @@ fn main() {
     hipFree(d_W_q); hipFree(d_W_k); hipFree(d_W_v); hipFree(d_W_o)
     hipFree(d_W_gate); hipFree(d_W_up); hipFree(d_W_down); hipFree(d_W_lmhead)
     hipFree(d_gamma_attn); hipFree(d_gamma_ffn); hipFree(d_gamma_fin)
+    hipkfd_teardown()
     exit(0)
 }

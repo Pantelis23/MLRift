@@ -178,5 +178,6 @@ fn main() {
     print_label_val("first_bad_var_bits",  18, first_bad_var_bits)
 
     hipFree(d_in); hipFree(d_out)
+    hipkfd_teardown()
     exit(0)
 }

@@ -235,5 +235,6 @@ fn main() {
     hipFree(kc); hipFree(vc); hipFree(barrier_ctr); hipFree(gu_scratch)
     hipFree(b_x_norm_g); hipFree(b_qkv_g); hipFree(b_attn_q_g)
     hipFree(b_mid_g); hipFree(b_mid_norm_g); hipFree(b_attn_out_g)
+    hipkfd_teardown()
     exit(0)
 }

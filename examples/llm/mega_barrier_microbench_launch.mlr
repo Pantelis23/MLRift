@@ -203,5 +203,6 @@ fn main() {
     put_kv("projected_28x_us_per_token",   26, per_token_us)
 
     hipFree(d_counter)
+    hipkfd_teardown()
     exit(0)
 }

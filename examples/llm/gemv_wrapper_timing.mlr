@@ -265,5 +265,6 @@ fn main() {
     u64 total2 = a_h2d + a_lnch + a_sync + a_d2h
     dump_us("  avg total:       ", total2 / 100)
 
+    hipkfd_teardown()
     exit(0)
 }

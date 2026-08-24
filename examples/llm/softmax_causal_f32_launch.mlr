@@ -188,5 +188,6 @@ fn main() {
     print_label_val("first_bad_col_mask", 18, first_bad_col_mask)
 
     hipFree(d_in); hipFree(d_out)
+    hipkfd_teardown()
     exit(0)
 }

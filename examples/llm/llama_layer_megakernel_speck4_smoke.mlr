@@ -565,6 +565,7 @@ fn main() {
     put_kv("mismatch_streams", 16, n_mismatch)
     if n_mismatch == 0 {
         puts("PASS -- llama speck4 4-stream out_residual byte-exact vs 4xM=1")
+        hipkfd_teardown()
         exit(0)
     }
     puts("FAIL -- speck4 vs 4xM=1 mismatch")

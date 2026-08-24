@@ -1,0 +1,283 @@
+// residual_add_f32 launcher + CPU verifier.
+//
+// Loads /tmp/residual_add_f32.co (built from examples/llm/residual_add_f32.mlr)
+// and checks out[i] = a[i] + b[i] against a CPU reference.
+//
+// A single f32 add is exactly specified by IEEE-754, so the reference is
+// exact and the gate is BITWISE, not a tolerance. max_abs / max_rel are
+// still printed, because when a mismatch does appear the magnitude of the
+// error is what tells you whether it is a wrong opcode, a wrong operand, or
+// a rounding-mode difference.
+//
+// Data design — a wrong kernel must not be able to pass by accident:
+//   * No all-zero and no all-equal input. `out = a` , `out = b`, `out = 0`,
+//     `out = a*b`, `out = a-b` and `out = b-a` all produce mismatches on
+//     this data.
+//   * The first 12 entries are hand-picked IEEE edge cases: exact
+//     cancellation, both signed zeros (-0 + -0 must stay -0, which a
+//     bitwise compare catches and a float compare would not), total
+//     absorption (1e10 + 1e-10), and the 2^24 round-to-nearest-even
+//     boundary where 2^24 + 1 == 2^24 but 2^24 + 2 != 2^24.
+//   * The remaining entries are built from an LCG as raw bit patterns with
+//     the exponent forced into [111, 142], so every operand is a normal
+//     f32 with a random sign and a random 23-bit mantissa spanning 2^-16
+//     to 2^15. Building operands from bit patterns rather than decimal
+//     literals keeps the test independent of float-literal parsing.
+//
+// Build:
+//   scripts/rebuild_helper_cos.sh                # produces /tmp/residual_add_f32.co
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//       examples/llm/residual_add_f32_launch.mlr -o /tmp/residual_add_f32_launch
+//
+// Exit status: 0 = every element bit-exact, 1 = any mismatch.
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+
+static uint64 N_ELEMS = 65536
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 {
+        uint8 zero = 48
+        unsafe { *(buf as uint8) = zero }
+        return 1
+    }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 {
+        n = n + 1
+        tmp = tmp / 10
+    }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 dp = buf + i
+        uint8 c = 0
+        unsafe { *(sp as uint8) -> c }
+        unsafe { *(dp as uint8) = c }
+        i = i + 1
+    }
+    uint64 p = buf + i
+    uint8 colon = 58
+    unsafe { *(p as uint8) = colon }
+    i = i + 1
+    p = buf + i
+    uint8 space = 32
+    unsafe { *(p as uint8) = space }
+    i = i + 1
+    uint64 n = u64_to_ascii_decimal(val, buf + i)
+    i = i + n
+    p = buf + i
+    uint8 nl = 10
+    unsafe { *(p as uint8) = nl }
+    i = i + 1
+    write(1, buf, i)
+    dealloc(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    hipkfd_teardown()
+    exit(1)
+}
+
+// Store one f32, given its raw bit pattern.
+fn store_bits(uint64 base, uint64 idx, uint64 bits) {
+    uint32 b32 = bits
+    unsafe { *((base + idx * 4) as uint32) = b32 }
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    uint64 n = N_ELEMS
+
+    // ── Load module ───────────────────────────────────────────────────
+    uint64 co_path = "/tmp/residual_add_f32.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/residual_add_f32.co - build first:")
+        puts("  scripts/rebuild_helper_cos.sh")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "residual_add_f32")
+    if err != 0 { die("getFn residual_add_f32", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    // ── Host buffers ──────────────────────────────────────────────────
+    uint64 bytes = n * 4
+    uint64 h_a   = alloc(bytes)
+    uint64 h_b   = alloc(bytes)
+    uint64 h_ref = alloc(bytes)
+
+    // 12 hand-picked IEEE edge pairs.
+    store_bits(h_a, 0, 0x00000000); store_bits(h_b, 0, 0x00000000)  //  0 +  0
+    store_bits(h_a, 1, 0x3F800000); store_bits(h_b, 1, 0xBF800000)  //  1 + -1  (cancel)
+    store_bits(h_a, 2, 0x80000000); store_bits(h_b, 2, 0x00000000)  // -0 +  0  = +0
+    store_bits(h_a, 3, 0x80000000); store_bits(h_b, 3, 0x80000000)  // -0 + -0  = -0
+    store_bits(h_a, 4, 0xC0600000); store_bits(h_b, 4, 0x40E80000)  // -3.5 + 7.25
+    store_bits(h_a, 5, 0x501502F9); store_bits(h_b, 5, 0x2EDBE6FF)  // 1e10 + 1e-10
+    store_bits(h_a, 6, 0xD01502F9); store_bits(h_b, 6, 0x501502F9)  // -1e10 + 1e10
+    store_bits(h_a, 7, 0x4B800000); store_bits(h_b, 7, 0x3F800000)  // 2^24 + 1  (ties-even)
+    store_bits(h_a, 8, 0x4B800000); store_bits(h_b, 8, 0x40000000)  // 2^24 + 2
+    store_bits(h_a, 9, 0x3F000000); store_bits(h_b, 9, 0x3E800000)  // 0.5 + 0.25
+    store_bits(h_a, 10, 0xC0E00000); store_bits(h_b, 10, 0xC1100000) // -7 + -9
+    store_bits(h_a, 11, 0x3FC00000); store_bits(h_b, 11, 0x40200000) // 1.5 + 2.5
+
+    // Remaining entries: LCG-driven normal f32 bit patterns.
+    uint64 s = 0x9E3779B97F4A7C15
+    uint64 i = 12
+    while i < n {
+        s = s * 6364136223846793005 + 1442695040888963407
+        uint64 sa = (s >> 63) - ((s >> 63) >> 1) * 2
+        uint64 ea = 111 + ((s >> 24) - ((s >> 24) >> 5) * 32)
+        uint64 ma = (s >> 33) - ((s >> 33) >> 23) * 8388608
+        store_bits(h_a, i, (sa << 31) + (ea << 23) + ma)
+
+        s = s * 6364136223846793005 + 1442695040888963407
+        uint64 sb = (s >> 63) - ((s >> 63) >> 1) * 2
+        uint64 eb = 111 + ((s >> 24) - ((s >> 24) >> 5) * 32)
+        uint64 mb = (s >> 33) - ((s >> 33) >> 23) * 8388608
+        store_bits(h_b, i, (sb << 31) + (eb << 23) + mb)
+        i = i + 1
+    }
+
+    // CPU reference: out = a + b, in f32.
+    i = 0
+    while i < n {
+        f32 a = 0.0; unsafe { *((h_a + i * 4) as f32) -> a }
+        f32 b = 0.0; unsafe { *((h_b + i * 4) as f32) -> b }
+        f32 r = a + b
+        unsafe { *((h_ref + i * 4) as f32) = r }
+        i = i + 1
+    }
+
+    // ── Device buffers ────────────────────────────────────────────────
+    uint64 d_a = 0
+    uint64 d_b = 0
+    uint64 d_o = 0
+    uint64 slot = alloc(8)
+    err = hipMalloc(slot, bytes); if err != 0 { die("malloc a", err) }
+    unsafe { *(slot as uint64) -> d_a }
+    slot = alloc(8)
+    err = hipMalloc(slot, bytes); if err != 0 { die("malloc b", err) }
+    unsafe { *(slot as uint64) -> d_b }
+    slot = alloc(8)
+    err = hipMalloc(slot, bytes); if err != 0 { die("malloc o", err) }
+    unsafe { *(slot as uint64) -> d_o }
+
+    err = hipMemcpy(d_a, h_a, bytes, 1); if err != 0 { die("H2D a", err) }
+    err = hipMemcpy(d_b, h_b, bytes, 1); if err != 0 { die("H2D b", err) }
+
+    // ── Launch ────────────────────────────────────────────────────────
+    // Prologue is block_idx_x()*256 + tid_local_x(): block MUST be 256.
+    uint64 k_a = alloc(8); unsafe { *(k_a as uint64) = d_a }
+    uint64 k_b = alloc(8); unsafe { *(k_b as uint64) = d_b }
+    uint64 k_o = alloc(8); unsafe { *(k_o as uint64) = d_o }
+    uint64 k_n = alloc(8); uint64 nv = n; unsafe { *(k_n as uint64) = nv }
+    uint64 kp = alloc(4 * 8)
+    unsafe { *(kp        as uint64) = k_a }
+    unsafe { *((kp +  8) as uint64) = k_b }
+    unsafe { *((kp + 16) as uint64) = k_o }
+    unsafe { *((kp + 24) as uint64) = k_n }
+
+    uint32 block = 256
+    uint64 grid_u = (n + 255) / 256
+    uint32 grid = grid_u
+
+    err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize()
+    if err != 0 { die("sync", err) }
+
+    uint64 h_o = alloc(bytes)
+    err = hipMemcpy(h_o, d_o, bytes, 2); if err != 0 { die("D2H out", err) }
+
+    // ── Compare: bitwise gate + magnitude report ──────────────────────
+    uint64 bad = 0
+    uint64 first_bad = 0xFFFFFFFFFFFFFFFF
+    uint64 first_want = 0
+    uint64 first_got  = 0
+    f32 max_abs = 0.0
+    f32 max_rel = 0.0
+    i = 0
+    while i < n {
+        uint32 wbits = 0; unsafe { *((h_ref + i * 4) as uint32) -> wbits }
+        uint32 gbits = 0; unsafe { *((h_o   + i * 4) as uint32) -> gbits }
+        if wbits != gbits {
+            bad = bad + 1
+            if first_bad == 0xFFFFFFFFFFFFFFFF {
+                first_bad  = i
+                first_want = wbits
+                first_got  = gbits
+            }
+        }
+        f32 w = 0.0; unsafe { *((h_ref + i * 4) as f32) -> w }
+        f32 g = 0.0; unsafe { *((h_o   + i * 4) as f32) -> g }
+        f32 d = g - w
+        if d < 0.0 { d = 0.0 - d }
+        f32 aw = w
+        if aw < 0.0 { aw = 0.0 - aw }
+        if d > max_abs { max_abs = d }
+        if aw > 0.000001 {
+            f32 rel = d / aw
+            if rel > max_rel { max_rel = rel }
+        }
+        i = i + 1
+    }
+
+    uint64 ma_slot = alloc(8); unsafe { *(ma_slot as f32) = max_abs }
+    uint64 mr_slot = alloc(8); unsafe { *(mr_slot as f32) = max_rel }
+    uint32 ma_bits = 0; unsafe { *(ma_slot as uint32) -> ma_bits }
+    uint32 mr_bits = 0; unsafe { *(mr_slot as uint32) -> mr_bits }
+
+    print_label_val("elems",         5, n)
+    print_label_val("mismatches",   10, bad)
+    print_label_val("max_abs_bits", 12, ma_bits)
+    print_label_val("max_rel_bits", 12, mr_bits)
+
+    hipFree(d_a); hipFree(d_b); hipFree(d_o)
+    // Mandatory under --target=amdgpu-native: drains the 4 KFD queues.
+    hipkfd_teardown()
+
+    if bad != 0 {
+        print_label_val("first_bad_idx",  13, first_bad)
+        print_label_val("first_bad_want", 14, first_want)
+        print_label_val("first_bad_got",  13, first_got)
+        puts("FAIL residual_add_f32: not bit-exact")
+        exit(1)
+    }
+    puts("PASS residual_add_f32: 65536/65536 bit-exact")
+    exit(0)
+}

@@ -30,23 +30,32 @@
 #   it: gemv_f32 and gemm_f32 emit recognizer-probe noise on stderr first.
 #   See the note above _emit_run.
 #
-#   HARDWARE COVERAGE of these four, as of 2026-08-24 — do not assume an LLM
-#   token-md5 run exercises them, it does not:
-#     bf16_to_f32       LOAD-bearing only. inference_gpu.mlr:360 refuses GPU
-#                       init if it is missing (verified: displacing it makes
-#                       qwen3_generate exit rc=1), but a deliberately wrong
-#                       build (bf16 value +1 ULP) changed NO tokens in either
-#                       the mega-kernel or the per-op config. Not dispatched
-#                       on the qwen3-0.6B path.
-#     residual_add_f32  Same: a build computing `a+b+0.5` changed no tokens.
-#                       qwen3.mlr:2510 routes hidden==1024 through the fused
-#                       gpu_residual_rmsnorm_1024 instead.
-#     gemv_f32          Covered by examples/llm/gemv_f32_launch.mlr vs its CPU
-#                       reference: max_abs 7.6e-5, max_rel 3.1e-7.
-#     gemm_f32          Covered by examples/llm/gemm_f32_launch.mlr vs its CPU
-#                       reference: max_abs 4.6e-5, max_rel 3.7e-7.
-#   Those two launchers are the ONLY correctness gate these kernels have.
-#   Run them after touching the emitters; the LLM gate will not catch it.
+#   HARDWARE COVERAGE of these four, as of 2026-08-24. Do NOT assume an LLM
+#   token-md5 run exercises them — it does not. Negative controls (a
+#   deliberately wrong .co, built via the hipcc path so the perturbed body
+#   compiles) showed bf16_to_f32 and residual_add_f32 change NO tokens in
+#   either the mega-kernel or the per-op config: they are load-bearing
+#   (inference_gpu.mlr:360 refuses GPU init if bf16_to_f32.co is missing) but
+#   not dispatched on the qwen3-0.6B path. qwen3.mlr:2510 routes hidden==1024
+#   through the fused gpu_residual_rmsnorm_1024 instead of gpu_resid_add.
+#
+#   Each therefore has its OWN standalone gate, and these are the only
+#   correctness coverage these four kernels have. All four are MANUAL — no
+#   harness runs them (tests/run_tests.sh is CPU-only). Run them by hand
+#   after touching the emitters:
+#     examples/llm/bf16_to_f32_launch.mlr       exhaustive: all 65536 bf16
+#         patterns (2 zeros / 254 denormals / 2 infs / 254 NaNs / 32768
+#         negatives), bitwise-exact, exits 1 on any mismatch.
+#     examples/llm/residual_add_f32_launch.mlr  65536 elems, bitwise-exact,
+#         12 hand-picked IEEE edge pairs (signed zeros, cancellation,
+#         absorption, the 2^24 ties-to-even boundary) + LCG normals.
+#     examples/llm/gemv_f32_launch.mlr          M=K=1024 vs CPU ref:
+#         max_abs 7.6e-5, max_rel 3.1e-7.
+#     examples/llm/gemm_f32_launch.mlr          M=N=K=512 vs CPU ref:
+#         max_abs 4.6e-5, max_rel 3.7e-7.
+#   The first two use a BITWISE compare on purpose: both ops are exact in
+#   IEEE-754, and a tolerance compare would pass a -0/+0 sign error and would
+#   be vacuous over the 254 NaN inputs (NaN != NaN).
 #
 # Usage:
 #   scripts/rebuild_helper_cos.sh [path/to/mlrc]

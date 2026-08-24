@@ -134,6 +134,7 @@ fn main() {
     if low == value_to_send {
         puts("M1e gate: GREEN")
         hipFree(d_out)
+        hipkfd_teardown()
         exit(0)
     }
     puts("FAIL: value mismatch")

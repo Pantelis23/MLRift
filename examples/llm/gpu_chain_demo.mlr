@@ -154,5 +154,6 @@ fn main() {
     u64 sh = fmt_dec(saved_us); print_str(sh); dealloc(sh); print_str(" us total over ")
     u64 si = fmt_dec(ITERS); print_str(si); dealloc(si); print_str(" iters\n")
 
+    hipkfd_teardown()
     exit(0)
 }

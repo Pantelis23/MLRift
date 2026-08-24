@@ -744,6 +744,7 @@ fn main() {
     puts("===")
     if first_bad_phase == 0xFF {
         puts("PASS")
+        hipkfd_teardown()
         exit(0)
     } else {
         put_kv("first_bad_phase", 15, first_bad_phase)

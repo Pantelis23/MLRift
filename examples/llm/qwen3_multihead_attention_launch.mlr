@@ -394,5 +394,6 @@ fn main() {
     hipFree(d_x); hipFree(d_resid); hipFree(d_x_n); hipFree(d_Q); hipFree(d_K); hipFree(d_V); hipFree(d_ctx)
     hipFree(d_Q_h); hipFree(d_K_h); hipFree(d_V_h); hipFree(d_K_h_T); hipFree(d_scores); hipFree(d_attn); hipFree(d_ctx_h)
     hipFree(d_att_out); hipFree(d_W_q); hipFree(d_W_k); hipFree(d_W_v); hipFree(d_W_o); hipFree(d_gamma)
+    hipkfd_teardown()
     exit(0)
 }

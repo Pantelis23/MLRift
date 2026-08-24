@@ -139,5 +139,6 @@ fn main() {
     print_str("If R1 << R2 << R3, sync_us is dominated by GPU compute, not floor.\n")
     print_str("If R1 ≈ R2 ≈ R3, the floor IS the dominant cost — fix it.\n")
 
+    hipkfd_teardown()
     exit(0)
 }

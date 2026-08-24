@@ -180,5 +180,6 @@ fn main() {
     }
 
     hipFree(d_buf)
+    hipkfd_teardown()
     exit(0)
 }

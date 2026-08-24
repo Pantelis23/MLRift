@@ -247,5 +247,6 @@ fn main() {
 
     hipFree(d_input); hipFree(d_gamma); hipFree(d_gate); hipFree(d_up)
     hipFree(d_norm); hipFree(d_act); hipFree(d_output)
+    hipkfd_teardown()
     exit(0)
 }

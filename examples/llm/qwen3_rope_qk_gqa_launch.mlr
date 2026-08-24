@@ -231,5 +231,6 @@ fn main() {
 
     hipFree(d_q_in); hipFree(d_q_out); hipFree(d_k_in); hipFree(d_k_out)
     hipFree(d_cos); hipFree(d_sin)
+    hipkfd_teardown()
     exit(0)
 }

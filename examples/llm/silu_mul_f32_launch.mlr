@@ -212,5 +212,6 @@ fn main() {
     print_label_val("first_bad_dev_bits", 18, first_bad_dev_bits)
 
     hipFree(d_gate); hipFree(d_up); hipFree(d_out)
+    hipkfd_teardown()
     exit(0)
 }

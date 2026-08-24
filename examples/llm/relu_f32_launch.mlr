@@ -139,5 +139,6 @@ fn main() {
     print_label_val("first_bad",   9, first_bad)
 
     hipFree(d_buf)
+    hipkfd_teardown()
     exit(0)
 }

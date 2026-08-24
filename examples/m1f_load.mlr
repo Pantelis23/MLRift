@@ -160,6 +160,7 @@ fn main() {
     if ok == 1 {
         puts("M1f gate: GREEN")
         hipFree(d_out_a); hipFree(d_out_b)
+        hipkfd_teardown()
         exit(0)
     }
     hipFree(d_out_a); hipFree(d_out_b)

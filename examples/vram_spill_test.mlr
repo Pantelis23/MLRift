@@ -170,5 +170,6 @@ fn main() {
         fi = fi + 1
     }
 
+    hipkfd_teardown()
     exit(0)
 }

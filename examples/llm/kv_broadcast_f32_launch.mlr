@@ -134,5 +134,11 @@ fn main() {
     print_label_val("mismatch",  8, mismatch)
 
     hipFree(d_in); hipFree(d_out)
+    hipkfd_teardown()
+
+    // Was exit(0) unconditionally: it printed the mismatch count and still
+    // reported success, so nothing could tell pass from fail.
+    if mismatch > 0 { puts("FAIL: not bit-exact"); exit(1) }
+    puts("PASS: bit-exact vs CPU reference")
     exit(0)
 }

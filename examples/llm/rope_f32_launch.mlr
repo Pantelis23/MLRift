@@ -238,5 +238,6 @@ fn main() {
     print_label_val("first_bad_dev_bits", 18, first_bad_dev_bits)
 
     hipFree(d_in); hipFree(d_out); hipFree(d_cos); hipFree(d_sin)
+    hipkfd_teardown()
     exit(0)
 }

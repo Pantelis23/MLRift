@@ -311,5 +311,6 @@ fn main() {
     print_label_val("gflops_x100", 11, gflops_x100)
 
     hipFree(d_A); hipFree(d_B); hipFree(d_C)
+    hipkfd_teardown()
     exit(0)
 }

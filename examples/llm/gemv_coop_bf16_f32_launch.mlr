@@ -175,5 +175,6 @@ fn main() {
     print_label_val("bw_mbps_eff",   11, bw_mbps)
 
     hipFree(d_W); hipFree(d_X); hipFree(d_Y)
+    hipkfd_teardown()
     exit(0)
 }

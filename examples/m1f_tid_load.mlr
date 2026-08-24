@@ -140,6 +140,7 @@ fn main() {
     if bad == 0 {
         puts("M1f-tid gate: GREEN")
         hipFree(d_out)
+        hipkfd_teardown()
         exit(0)
     }
     puts("FAIL: some threads wrote wrong values")

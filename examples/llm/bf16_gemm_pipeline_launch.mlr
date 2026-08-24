@@ -281,5 +281,6 @@ fn main() {
     print_label_val("vram_steady_kb",  14, mem_steady / 1024)
 
     hipFree(d_x); hipFree(d_W_bf16); hipFree(d_W_f32); hipFree(d_out)
+    hipkfd_teardown()
     exit(0)
 }

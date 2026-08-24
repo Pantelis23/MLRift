@@ -87,5 +87,6 @@ fn main() {
     u64 t2 = time_now()
     print_str("sync_us="); u64 sb = fmt_dec((t2-t1)/1000); print_str(sb); dealloc(sb); print_str(" err="); u64 see = fmt_dec(err); print_str(see); dealloc(see); print_str("\n")
 
+    hipkfd_teardown()
     exit(0)
 }

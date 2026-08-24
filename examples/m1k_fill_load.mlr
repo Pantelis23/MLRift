@@ -147,6 +147,7 @@ fn main() {
     if bad == 0 {
         puts("M1k gate: GREEN")
         hipFree(d_buf)
+        hipkfd_teardown()
         exit(0)
     }
     puts("FAIL: fill left slots incorrect")

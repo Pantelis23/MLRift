@@ -320,5 +320,6 @@ fn main() {
     }
 
     hipFree(d_W); hipFree(d_X); hipFree(d_Y)
+    hipkfd_teardown()
     exit(0)
 }

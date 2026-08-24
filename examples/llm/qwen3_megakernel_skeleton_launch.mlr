@@ -139,5 +139,6 @@ fn main() {
     puts("(reference hipcc microbench: ~448 ns/barrier at n_wgs=256)")
 
     hipFree(d_counter)
+    hipkfd_teardown()
     exit(0)
 }

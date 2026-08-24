@@ -595,5 +595,6 @@ fn main() {
     hipFree(d_se); hipFree(d_si); hipFree(d_spike)
     hipFree(d_ct); hipFree(d_fired)
     hipFree(d_tgt); hipFree(d_w); hipFree(d_inh)
+    hipkfd_teardown()
     exit(0)
 }

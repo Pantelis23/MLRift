@@ -272,5 +272,6 @@ fn main() {
 
     hipFree(d_Q); hipFree(d_Kt); hipFree(d_V)
     hipFree(d_scores); hipFree(d_attn); hipFree(d_ctx)
+    hipkfd_teardown()
     exit(0)
 }

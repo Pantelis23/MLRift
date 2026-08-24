@@ -60,12 +60,25 @@ fn main() {
 
     // Fill with assorted bf16 patterns: positive small, positive large,
     // negative, denormal-ish, zero — sweep the bit space.
+    // N == 65536 means i covers EVERY bf16 bit pattern exactly once, so the
+    // edge cases that actually break a widening — both signed zeros, all 254
+    // denormals, both infinities, all 254 NaN payloads, every exponent
+    // boundary — are all present by construction. The counters below print
+    // that coverage so it is visible rather than merely asserted.
     uint64 h_in = alloc(in_bytes)
+    uint64 n_zero = 0; uint64 n_den = 0; uint64 n_inf = 0
+    uint64 n_nan  = 0; uint64 n_neg = 0
     uint64 i = 0
     while i < N {
         uint64 p = h_in + i * 2
         uint16 v = i        // every 16-bit pattern in [0, 65536) at least once
         unsafe { *(p as uint16) = v }
+        // bf16: sign bit15, exponent bits14..7, mantissa bits6..0.
+        uint64 e = (i >> 7) - ((i >> 15) << 8)
+        uint64 m = i - ((i >> 7) << 7)
+        if e == 0   { if m == 0 { n_zero = n_zero + 1 } else { n_den = n_den + 1 } }
+        if e == 255 { if m == 0 { n_inf  = n_inf  + 1 } else { n_nan = n_nan + 1 } }
+        if (i >> 15) == 1 { n_neg = n_neg + 1 }
         i = i + 1
     }
     err = hipMemcpy(d_in, h_in, in_bytes, 1); if err != 0 { die("H2D", err) }
@@ -107,9 +120,22 @@ fn main() {
     }
 
     print_label_val("N",        1, N)
+    print_label_val("cov_zero",     8, n_zero)
+    print_label_val("cov_denormal",12, n_den)
+    print_label_val("cov_inf",      7, n_inf)
+    print_label_val("cov_nan",      7, n_nan)
+    print_label_val("cov_negative",12, n_neg)
     print_label_val("mismatch", 8, mismatch)
     if mismatch > 0 { print_label_val("first_bad", 9, first_bad) }
 
     hipFree(d_in); hipFree(d_out)
+    // Mandatory under --target=amdgpu-native: drains the 4 KFD queues.
+    hipkfd_teardown()
+
+    // This used to exit(0) unconditionally: it printed "mismatch: N" and
+    // still reported success, so nothing calling it could tell pass from
+    // fail. A verifier that cannot fail is not a gate.
+    if mismatch > 0 { puts("FAIL bf16_to_f32: not bit-exact"); exit(1) }
+    puts("PASS bf16_to_f32: 65536/65536 bit-exact")
     exit(0)
 }

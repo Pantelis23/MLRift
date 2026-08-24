@@ -207,5 +207,6 @@ fn main() {
     print_label_val("rows_failed_mask",16, fail_mask)
 
     hipFree(d_Q); hipFree(d_Kt); hipFree(d_scores); hipFree(d_attn)
+    hipkfd_teardown()
     exit(0)
 }

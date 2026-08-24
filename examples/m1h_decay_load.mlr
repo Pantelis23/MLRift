@@ -158,6 +158,7 @@ fn main() {
     if bad == 0 {
         puts("M1h gate: GREEN")
         hipFree(d_buf)
+        hipkfd_teardown()
         exit(0)
     }
     puts("FAIL: decay drifted beyond 8 ULP")

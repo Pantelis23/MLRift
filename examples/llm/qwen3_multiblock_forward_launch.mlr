@@ -684,5 +684,6 @@ fn main() {
         b_free = b_free + 1
     }
     hipFree(d_W_lmhead); hipFree(d_gamma_fin)
+    hipkfd_teardown()
     exit(0)
 }

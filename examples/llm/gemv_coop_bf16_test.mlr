@@ -168,5 +168,6 @@ fn main() {
     }
 
     thread_pool_shutdown()
+    hipkfd_teardown()
     exit(0)
 }
