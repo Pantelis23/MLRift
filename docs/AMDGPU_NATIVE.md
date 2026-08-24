@@ -268,13 +268,29 @@ KFD-via-shim on the same code.
   `qwen3_*` (long-running launchers that benefit from `KFD_WAIT_EVENTS`,
   not yet implemented). Compile these with the default path
   (`./build/mlrc examples/...`) — they link `libamdhip64`.
-* **Stay HIP-only — kernel sources for `--target=hip-amd`**:
-  `gpu_atomic.mlr`, `gpu_csr.mlr`, `gpu_csr_i.mlr`, `gpu_decay.mlr`,
-  `gpu_lif.mlr`, `gpu_ring.mlr`, `gpu_stage13.mlr`. These ship
-  `@kernel` definitions to be compiled by `hipcc`. They predate the
-  native AMDGPU emitter and rely on HIP-runtime atomics / shapes the
-  emitter does not yet recognise. Their paired launchers
-  (`gpu_*_launch.mlr`) link `libamdhip64`.
+* **Kernel sources still routed through `--target=hip-amd`** — note that
+  `--target=hip-amd` **forks `hipcc`**, which violates the project rule
+  that every production `.co` comes from MLRift's own AST-walker
+  emitters. This list was re-checked kernel-by-kernel on 2026-08-24
+  (previously it claimed as a group that the emitter "does not yet
+  recognise" them, which was wrong for two of the seven):
+
+  | source | `--target=amdgpu-native` | why |
+  |---|---|---|
+  | `gpu_decay.mlr` | **builds, rc=0** | emits `decay_step`; no longer needs hipcc |
+  | `gpu_lif.mlr` | **builds, rc=0** | emits `lif_step`; no longer needs hipcc |
+  | `gpu_atomic.mlr` | fails | `tid shape: second stmt must be PtrStore` |
+  | `gpu_ring.mlr` | fails | `tid shape: second stmt must be PtrStore` |
+  | `gpu_csr_i.mlr` | fails | `lowering supports 1-5 params (got 7)` |
+  | `gpu_csr.mlr` | fails | `lowering supports 1-5 params (got 11)` |
+  | `gpu_stage13.mlr` | fails | `lowering supports 1-5 params (got 16)` |
+
+  The five failures are real emitter limits (arity cap, and a prologue
+  shape the recognizers reject), not preference. `gpu_decay` and
+  `gpu_lif` should move off hipcc; that is a separate change because
+  their paired launchers (`gpu_*_launch.mlr`) still link `libamdhip64`
+  and load the `.co` through the HIP runtime, so flipping the kernel
+  build alone is not sufficient and needs its own hardware gate.
 * **Removed**: `m1a_load_nop.mlr`, `m1b_load_sentinel.mlr` — trivial
   bring-up tests (NOP kernel + sentinel writer) superseded by
   `b5a_kfd_init_smoke` + `b5a_kfd_m1o_load`. Their kernel emit flags

@@ -26,6 +26,28 @@
 #   rather than clang offload bundles, with identical explicit kernarg layouts
 #   (24 / 40 / 48 / 32 bytes) and identical exported symbol names.
 #
+#   All four exit rc=0 and emit a correct `.co`, but "cleanly" would overstate
+#   it: gemv_f32 and gemm_f32 emit recognizer-probe noise on stderr first.
+#   See the note above _emit_run.
+#
+#   HARDWARE COVERAGE of these four, as of 2026-08-24 — do not assume an LLM
+#   token-md5 run exercises them, it does not:
+#     bf16_to_f32       LOAD-bearing only. inference_gpu.mlr:360 refuses GPU
+#                       init if it is missing (verified: displacing it makes
+#                       qwen3_generate exit rc=1), but a deliberately wrong
+#                       build (bf16 value +1 ULP) changed NO tokens in either
+#                       the mega-kernel or the per-op config. Not dispatched
+#                       on the qwen3-0.6B path.
+#     residual_add_f32  Same: a build computing `a+b+0.5` changed no tokens.
+#                       qwen3.mlr:2510 routes hidden==1024 through the fused
+#                       gpu_residual_rmsnorm_1024 instead.
+#     gemv_f32          Covered by examples/llm/gemv_f32_launch.mlr vs its CPU
+#                       reference: max_abs 7.6e-5, max_rel 3.1e-7.
+#     gemm_f32          Covered by examples/llm/gemm_f32_launch.mlr vs its CPU
+#                       reference: max_abs 4.6e-5, max_rel 3.7e-7.
+#   Those two launchers are the ONLY correctness gate these kernels have.
+#   Run them after touching the emitters; the LLM gate will not catch it.
+#
 # Usage:
 #   scripts/rebuild_helper_cos.sh [path/to/mlrc]
 #
@@ -40,27 +62,43 @@ cd "$REPO"
 mkdir -p /tmp
 echo 'fn main() {}' > /tmp/empty.mlr
 
-emit_flag() {
-    # $1 = flag=/tmp/foo.co  (single-flag emit)
-    local fp="$1"
-    if "$MLRC" --arch=x86_64 "$fp" /tmp/empty.mlr > /dev/null 2>&1; then
-        echo "  ok  $fp"
+# stderr is captured, not discarded. A FAILING emit dumps it — previously
+# `2>&1` swallowed the compiler's diagnostic along with the noise, so a real
+# failure printed only "FAIL <src>" with no reason.
+#
+# On SUCCESS stderr is suppressed but is NOT empty for every kernel: the
+# amdgpu-native recognizers are tried in sequence and each one that declines
+# writes a line before the right one matches. Today `gemv_f32` prints 16 ×
+# "kernel index prologue must be exactly `block_idx_x()`" and `gemm_f32` 2 ×,
+# because those lowerers expect a `block_idx_x()` prologue while gemv/gemm use
+# `tid_x()`. rc is 0 and the emitted `.co` is correct — this is probe noise
+# from a first-match-wins design, not a diagnosis of the source. It is worth
+# fixing in src/format_amdgpu.mlr (a rejection should be silent and only the
+# final no-match should speak, so a genuine error is not lost in the noise),
+# but that is a compiler change, not a script change.
+_emit_run() {
+    # $1 = human label, rest = argv for $MLRC
+    local label="$1"; shift
+    local errf; errf="$(mktemp)"
+    if "$MLRC" "$@" > /dev/null 2>"$errf"; then
+        echo "  ok  $label"
+        rm -f "$errf"
     else
-        echo "  FAIL $fp" >&2
+        echo "  FAIL $label" >&2
+        sed 's/^/      /' "$errf" >&2
+        rm -f "$errf"
         return 1
     fi
 }
 
+emit_flag() {
+    # $1 = flag=/tmp/foo.co  (single-flag emit)
+    _emit_run "$1" --arch=x86_64 "$1" /tmp/empty.mlr
+}
+
 emit_amdgpu_native() {
     # $1 = examples/llm/X.mlr → /tmp/X.co (via AST-walker)
-    local src="$1"
-    local stub_path="$2"
-    if "$MLRC" --target=amdgpu-native "$src" -o "$stub_path" > /dev/null 2>&1; then
-        echo "  ok  $src → ${stub_path}.co"
-    else
-        echo "  FAIL $src" >&2
-        return 1
-    fi
+    _emit_run "$1 → ${2}.co" --target=amdgpu-native "$1" -o "$2"
 }
 
 echo "=== path 1: single-flag AST-walker emits ==="

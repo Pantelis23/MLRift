@@ -6819,6 +6819,14 @@ fn main() {
                 if str_eq_full(tgt_str, "hip-amd") != 0 {
                     // GPU target: trigger format_hip.kr emission alongside
                     // the normal CPU codegen. See docs/GPU_BACKEND.md.
+                    //
+                    // NOTE: this path FORKS hipcc to turn the emitted .hip
+                    // into a .co, which violates the project rule that every
+                    // production .co comes from MLRift's own AST-walker
+                    // emitters. Kept for the kernel sources the native
+                    // emitter still cannot lower (see docs/AMDGPU_NATIVE.md
+                    // for the per-kernel table). Do not route new kernels
+                    // here — use --target=amdgpu-native.
                     target_gpu = 1
                 } else if str_eq_full(tgt_str, "amdgpu-native") != 0 {
                     // Stage-1 native AMDGPU target (M1d): bypass hipcc,
@@ -7242,6 +7250,8 @@ fn main() {
             write(2, "  --emit=elfexe|macho|pe|obj|android|asm\n", 41)
             write(2, "  -c                        emit relocatable .o\n", 48)
             write(2, "  --target=linux|macos|windows|android|esp32|hip-amd|amdgpu-native\n", 67)
+            write(2, "      hip-amd FORKS hipcc - violates the no-hipcc build rule;\n", 62)
+            write(2, "      prefer amdgpu-native (MLRift's own AST-walker emitters)\n", 62)
             write(2, "  --version\n\n", 13)
             write(2, "commands:\n", 10)
             write(2, "  check <file.mlr>  safety analysis\n", 36)

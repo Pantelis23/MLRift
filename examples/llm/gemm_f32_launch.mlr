@@ -292,5 +292,9 @@ fn main() {
     print_label_val("gflops_x100", 11, gflops_x100)
 
     hipFree(d_A); hipFree(d_B); hipFree(d_C)
+    // Mandatory under --target=amdgpu-native: drains the 4 KFD queues.
+    // Skipping it accumulates MES wedge across runs. No-op under the
+    // HIP-runtime path (std/hip.mlr), where ROCm owns queue lifecycle.
+    hipkfd_teardown()
     exit(0)
 }
