@@ -75,3 +75,179 @@ fn bpe_utf8_decode(u64 p, u64 end, u64 out_cp) -> u64 {
     u64 cp = ((c0 & 0x1F) << 6) | (b1 & 0x3F)
     store64(out_cp, cp); return 2
 }
+
+// ---------------------------------------------------------------------------
+// Exact GPT-2 ByteLevel pre-tokenizer
+//
+//   's|'t|'re|'ve|'m|'ll|'d | ?\p{L}+ | ?\p{N}+ | ?[^\s\p{L}\p{N}]+ | \s+(?!\S) | \s+
+//
+// matched leftmost with ORDERED alternation at every cursor position.
+//
+// ORDER MATTERS: the RAW (decoded UTF-8) text is split FIRST and each piece is
+// byte-mapped afterwards by the caller. Splitting byte-mapped text is wrong —
+// the map turns 0xA9 into "©" (a symbol), which would tear "café" in two.
+// ---------------------------------------------------------------------------
+
+// \p{White_Space}
+fn bpe_cp_is_ws(u64 cp) -> u64 {
+    if cp == 0x20 { return 1 }
+    if cp >= 0x09 && cp <= 0x0D { return 1 }
+    if cp == 0x85 || cp == 0xA0 || cp == 0x1680 { return 1 }
+    if cp >= 0x2000 && cp <= 0x200A { return 1 }
+    if cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000 { return 1 }
+    return 0
+}
+
+// Fills offs[i]/lens[i] with each pre-token's offset+length in the ORIGINAL
+// bytes of `text`; returns the piece count.
+fn bpe_pretok_split(u64 text, u64 len, u64 offs, u64 lens, u64 max) -> u64 {
+    u64 pos = 0
+    u64 np = 0
+    u64 cpbuf = alloc(8)
+    while pos < len {
+        u64 start = pos
+        u64 c = 0
+        unsafe { *((text + pos) as u8) -> c }
+        u64 matched = 0
+
+        // --- contractions: tried ONLY at a bare ' (no leading space), lowercase
+        if c == 0x27 {
+            u64 n1 = 0
+            u64 has1 = 0
+            if pos + 1 < len {
+                unsafe { *((text + pos + 1) as u8) -> n1 }
+                has1 = 1
+            }
+            u64 n2 = 0
+            u64 has2 = 0
+            if pos + 2 < len {
+                unsafe { *((text + pos + 2) as u8) -> n2 }
+                has2 = 1
+            }
+            // 2-byte: 's 't 'm 'd
+            if has1 == 1 && (n1 == 0x73 || n1 == 0x74 || n1 == 0x6D || n1 == 0x64) {
+                pos = pos + 2
+                matched = 1
+            }
+            // 3-byte: 're 've 'll — BOTH trailing bytes must match
+            if matched == 0 && has2 == 1 {
+                if n1 == 0x72 && n2 == 0x65 {
+                    pos = pos + 3
+                    matched = 1
+                }
+                if n1 == 0x76 && n2 == 0x65 {
+                    pos = pos + 3
+                    matched = 1
+                }
+                if n1 == 0x6C && n2 == 0x6C {
+                    pos = pos + 3
+                    matched = 1
+                }
+            }
+            // no match (e.g. "'r", a trailing ') → branch C eats the bare '
+        }
+
+        if matched == 0 {
+            u64 cp0 = 0
+            bpe_utf8_decode(text + pos, text + len, cpbuf)
+            unsafe { *(cpbuf as u64) -> cp0 }
+
+            // exactly ONE optional leading 0x20 (no other whitespace attaches)
+            u64 lead_space = 0
+            if cp0 == 0x20 { lead_space = 1 }
+
+            // class the codepoint AFTER the optional space. have1 == 0 means
+            // "there is no codepoint there" (EOF) — kept distinct from cp == 0.
+            u64 cp1 = cp0
+            u64 first = pos
+            u64 have1 = 1
+            if lead_space == 1 {
+                first = pos + 1
+                if first < len {
+                    bpe_utf8_decode(text + first, text + len, cpbuf)
+                    unsafe { *(cpbuf as u64) -> cp1 }
+                } else {
+                    have1 = 0
+                }
+            }
+
+            // Branch A: ` ?\p{L}+`
+            if have1 == 1 && uni_is_letter(cp1) == 1 {
+                pos = first
+                while pos < len {
+                    u64 cpa = 0
+                    u64 ua = bpe_utf8_decode(text + pos, text + len, cpbuf)
+                    unsafe { *(cpbuf as u64) -> cpa }
+                    if uni_is_letter(cpa) == 1 { pos = pos + ua } else { break }
+                }
+                matched = 1
+            }
+
+            // Branch B: ` ?\p{N}+`
+            if matched == 0 && have1 == 1 && uni_is_number(cp1) == 1 {
+                pos = first
+                while pos < len {
+                    u64 cpb = 0
+                    u64 ub = bpe_utf8_decode(text + pos, text + len, cpbuf)
+                    unsafe { *(cpbuf as u64) -> cpb }
+                    if uni_is_number(cpb) == 1 { pos = pos + ub } else { break }
+                }
+                matched = 1
+            }
+
+            // Branch C: ` ?[^\s\p{L}\p{N}]+`
+            if matched == 0 && have1 == 1 && bpe_cp_is_ws(cp1) == 0 && uni_is_letter(cp1) == 0 && uni_is_number(cp1) == 0 {
+                pos = first
+                while pos < len {
+                    u64 cpc = 0
+                    u64 uc = bpe_utf8_decode(text + pos, text + len, cpbuf)
+                    unsafe { *(cpbuf as u64) -> cpc }
+                    if bpe_cp_is_ws(cpc) == 0 && uni_is_letter(cpc) == 0 && uni_is_number(cpc) == 0 {
+                        pos = pos + uc
+                    } else {
+                        break
+                    }
+                }
+                matched = 1
+            }
+
+            // Branch D/E: `\s+(?!\S)` then `\s+`
+            if matched == 0 && bpe_cp_is_ws(cp0) == 1 {
+                u64 runend = pos
+                while runend < len {
+                    u64 cpd = 0
+                    u64 ud = bpe_utf8_decode(text + runend, text + len, cpbuf)
+                    unsafe { *(cpbuf as u64) -> cpd }
+                    if bpe_cp_is_ws(cpd) == 1 { runend = runend + ud } else { break }
+                }
+                if runend < len {
+                    // a non-space follows: \s+(?!\S) takes all but the LAST
+                    // whitespace codepoint; that one leads the next token.
+                    u64 prev = pos
+                    u64 q = pos
+                    while q < runend {
+                        u64 uq = bpe_utf8_decode(text + q, text + len, cpbuf)
+                        prev = q
+                        q = q + uq
+                    }
+                    if prev > pos { pos = prev } else { pos = runend }
+                } else {
+                    // the run reaches EOF: plain \s+ takes the whole run
+                    pos = runend
+                }
+                matched = 1
+            }
+        }
+
+        if pos <= start { pos = start + 1 }        // safety: never stall
+        if np >= max {
+            print("bpe_pretok_split: piece overflow\n")
+            exit(1)
+        }
+        store64(offs + np * 8, start)
+        store64(lens + np * 8, pos - start)
+        np = np + 1
+    }
+    dealloc(cpbuf)
+    return np
+}
