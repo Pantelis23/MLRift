@@ -998,6 +998,18 @@ fn gguf_dequant(u64 dst_f32, GGUFTensor t) -> u64 {
 }
 
 fn gguf_free(GGUFFile gf) {
+    // Call EXACTLY ONCE per handle. Like tokenizer_free, this cannot be made
+    // idempotent by zeroing fields: a struct-typed argument is copied at the
+    // call boundary in MLRift, so writes here never reach the caller's handle.
+    // See the block comment above tokenizer_free for the full reasoning.
+    //
+    // The file region is released FIRST so that a second gguf_free aborts in
+    // mlr_unmap_file's registry check ("unknown region — double free?") before
+    // it can double-dealloc the ten metadata arrays below — a deterministic
+    // stop instead of silent heap corruption.
+    if gf.base_addr != 0 && gf.file_size != 0 {
+        mlr_unmap_file(gf.base_addr, gf.file_size)
+    }
     if gf.key_ptrs    != 0 { dealloc(gf.key_ptrs) }
     if gf.key_lens    != 0 { dealloc(gf.key_lens) }
     if gf.value_ptrs  != 0 { dealloc(gf.value_ptrs) }
@@ -1008,11 +1020,4 @@ fn gguf_free(GGUFFile gf) {
     if gf.tensor_dims      != 0 { dealloc(gf.tensor_dims) }
     if gf.tensor_types     != 0 { dealloc(gf.tensor_types) }
     if gf.tensor_offsets   != 0 { dealloc(gf.tensor_offsets) }
-    if gf.base_addr != 0 && gf.file_size != 0 {
-        mlr_unmap_file(gf.base_addr, gf.file_size)
-        // Zero the handle: with the read fallback in play a second free would
-        // be a heap double-dealloc rather than a harmless failing munmap.
-        gf.base_addr = 0
-        gf.file_size = 0
-    }
 }

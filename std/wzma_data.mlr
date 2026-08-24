@@ -77,11 +77,18 @@ fn wzma_data_open(u64 corpus_path, Tokenizer tk) -> WzmaData {
 // wzma_data_free — munmap the corpus and free the handle. The borrowed
 // Tokenizer is left untouched (the caller owns its lifetime).
 // ---------------------------------------------------------------------------
+// Call EXACTLY ONCE per handle — this is not idempotent, and the pre-existing
+// `d.corpus_base = 0` below does not make it so: a struct-typed argument is
+// copied at the call boundary in MLRift, so that store lands on the callee's
+// private copy and never reaches the caller's handle (see the block comment
+// above tokenizer_free in std/tokenizer.mlr). It is kept as-is rather than
+// removed because this module's ownership contract is deliberately untouched.
+// A second call is caught by mlr_unmap_file's registry check rather than
+// silently releasing the corpus twice.
 fn wzma_data_free(WzmaData d) {
     if d.corpus_base != 0 {
         mlr_unmap_file(d.corpus_base, d.corpus_size)
         d.corpus_base = 0
-        d.corpus_size = 0
     }
     dealloc(d)
 }

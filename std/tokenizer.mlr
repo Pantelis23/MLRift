@@ -1113,12 +1113,37 @@ fn tokenizer_load_from_gguf(GGUFFile gf) -> Tokenizer {
     return tk
 }
 
-// Release all resources held by the tokenizer.
+// Release all resources held by the tokenizer. Call it EXACTLY ONCE per
+// handle.
+//
+// This is deliberately not idempotent, because in MLRift it cannot be. A
+// struct-typed argument is COPIED at the call boundary — the callee gets a
+// pointer to a private copy, so `tk.strs_blob = 0` here does not reach the
+// caller's handle (verified: writing a field of a struct parameter leaves the
+// caller's heap bytes unchanged). Zeroing the fields would therefore be dead
+// code that makes this function merely look safe to free twice. Only a
+// signature change to a raw u64 handle, at every call site, could make the
+// zeroing stick, and that is not worth the churn here.
+//
+// What IS done instead: the file region is released FIRST. mlr_unmap_file
+// looks its base up in the io.mlr region registry, which is process-global and
+// therefore does see the first release. So a second tokenizer_free on a
+// json-loaded handle aborts loudly there ("unknown region — double free?")
+// BEFORE it can double-dealloc the four vocab arrays below. That converts the
+// dangerous case from silent heap corruption into a deterministic, diagnosable
+// stop. A GGUF-loaded handle has file_base == 0 and so has no such tripwire —
+// for it, freeing twice is still corruption. No current caller frees twice;
+// all call sites were audited.
 fn tokenizer_free(Tokenizer tk) {
+    if tk.file_base != 0 && tk.file_size != 0 {
+        mlr_unmap_file(tk.file_base, tk.file_size)
+    }
     if tk.strs_blob != 0 { dealloc(tk.strs_blob) }
     if tk.id_to_off != 0 { dealloc(tk.id_to_off) }
     if tk.id_to_len != 0 { dealloc(tk.id_to_len) }
     if tk.hash_tab != 0  { dealloc(tk.hash_tab)  }
+    // These four are module-level statics, not fields of the copied struct, so
+    // zeroing them genuinely does persist across calls.
     if tk_gpt2_b2c != 0 { dealloc(tk_gpt2_b2c); tk_gpt2_b2c = 0 }
     if tk_gpt2_c2b != 0 { dealloc(tk_gpt2_c2b); tk_gpt2_c2b = 0 }
     if tk_bpe_keys  != 0 { dealloc(tk_bpe_keys);  tk_bpe_keys  = 0 }
@@ -1128,16 +1153,6 @@ fn tokenizer_free(Tokenizer tk) {
     tk_encoder_mode = 0
     tk_bpe_bare_bytelevel = 0
     tk_gpt2_kind = 0
-    if tk.file_base != 0 && tk.file_size != 0 {
-        mlr_unmap_file(tk.file_base, tk.file_size)
-        // Zero the handle so a second tokenizer_free is a no-op rather than a
-        // double release. When file_base was an mmap that was merely a failing
-        // munmap; now that it can be an alloc()'d buffer it would be heap
-        // corruption. No current caller frees twice (all call sites audited),
-        // but this makes the hazard unreintroducible.
-        tk.file_base = 0
-        tk.file_size = 0
-    }
 }
 
 // ---------------------------------------------------------------------------

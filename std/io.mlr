@@ -202,20 +202,56 @@ static u64 MLR_MAP_MODE_ALLOC = 2   // released with dealloc
 // Registry of regions currently owned by callers of mlr_map_file. 16 bytes per
 // slot: base(8) + mode(8). base == 0 marks a free slot. Allocated lazily and
 // grown by doubling, so there is no fixed ceiling on live regions.
+//
+// THREADING: main thread only, and (for the lazy init and the growth realloc)
+// before any worker is spawned. This registry is process-global mutable state
+// with an UNSYNCHRONIZED lazy init, and std/thread.mlr clones with CLONE_VM —
+// workers share this memory. Two threads entering _mlr_map_reg_record with
+// _mlr_map_reg_cap == 0 would both allocate and one table would be leaked and
+// silently ignored, which is exactly the shape of the old bpe_count_words
+// shared-scratch bug. There is no lock in MLRift to take here.
+//
+// That constraint holds today by construction, not by luck: no worker entry
+// point in std/ (bpe_wc_worker, mm_worker_*, vec_mt_*, _hipkfd_h2d_worker)
+// does file I/O, and wordcount_smoke's bpe_munmap_file runs after
+// thread_pool_wait. _mlr_map_busy below is a best-effort detector so that a
+// future caller which breaks the rule fails loudly instead of corrupting the
+// table. It is NOT a lock and NOT thread-safety: it is the same re-entry
+// assertion as bpe_wc_in_flight (std/bpe_train.mlr), and it catches recursive
+// re-entry reliably and a genuine concurrent entry only most of the time. It
+// costs one load and compare per whole-file map/unmap — never on a hot path.
 static u64 _mlr_map_reg     = 0
 static u64 _mlr_map_reg_cap = 0
+static u64 _mlr_map_busy    = 0
+
+fn _mlr_map_reg_enter(u64 who) {
+    if _mlr_map_busy == 1 {
+        print("[mlr_map_file] region registry re-entered during ")
+        println_str(who)
+        print("[mlr_map_file] it is main-thread-only; see the THREADING note in std/io.mlr\n")
+        exit(1)
+    }
+    _mlr_map_busy = 1
+}
 
 fn _mlr_map_reg_record(u64 base, u64 mode) {
+    _mlr_map_reg_enter("record")
     if _mlr_map_reg_cap == 0 {
+        u64 reg0 = alloc(16 * 16)
+        if reg0 == 0 {
+            print("[mlr_map_file] out of memory allocating the region registry\n")
+            exit(1)
+        }
+        memset(reg0, 0, 16 * 16)
+        _mlr_map_reg = reg0
         _mlr_map_reg_cap = 16
-        _mlr_map_reg = alloc(_mlr_map_reg_cap * 16)
-        memset(_mlr_map_reg, 0, _mlr_map_reg_cap * 16)
     }
     u64 i = 0
     while i < _mlr_map_reg_cap {
         if load64(_mlr_map_reg + i * 16) == 0 {
             store64(_mlr_map_reg + i * 16, base)
             store64(_mlr_map_reg + i * 16 + 8, mode)
+            _mlr_map_busy = 0
             return
         }
         i = i + 1
@@ -223,6 +259,14 @@ fn _mlr_map_reg_record(u64 base, u64 mode) {
     // Full: double and retry into the fresh half.
     u64 ncap = _mlr_map_reg_cap * 2
     u64 nreg = alloc(ncap * 16)
+    if nreg == 0 {
+        // Without this the memset/memcpy below would run through a null
+        // pointer and segfault instead of reporting the real problem.
+        print("[mlr_map_file] out of memory growing the region registry to ")
+        print(ncap)
+        print(" slots\n")
+        exit(1)
+    }
     memset(nreg, 0, ncap * 16)
     memcpy(nreg, _mlr_map_reg, _mlr_map_reg_cap * 16)
     dealloc(_mlr_map_reg)
@@ -230,21 +274,25 @@ fn _mlr_map_reg_record(u64 base, u64 mode) {
     store64(nreg + _mlr_map_reg_cap * 16 + 8, mode)
     _mlr_map_reg = nreg
     _mlr_map_reg_cap = ncap
+    _mlr_map_busy = 0
 }
 
 // Look up how `base` was obtained and free its slot. Returns the mode, or 0
 // if `base` was never handed out by mlr_map_file (or was already released).
 fn _mlr_map_reg_take(u64 base) -> u64 {
+    _mlr_map_reg_enter("take")
     u64 i = 0
     while i < _mlr_map_reg_cap {
         if load64(_mlr_map_reg + i * 16) == base {
             u64 mode = load64(_mlr_map_reg + i * 16 + 8)
             store64(_mlr_map_reg + i * 16, 0)
             store64(_mlr_map_reg + i * 16 + 8, 0)
+            _mlr_map_busy = 0
             return mode
         }
         i = i + 1
     }
+    _mlr_map_busy = 0
     return 0
 }
 
@@ -325,7 +373,13 @@ fn mlr_map_file(u64 path, u64 out_size) -> u64 {
             if get_errno(n) == 4 {
                 eintr_run = eintr_run + 1
                 if eintr_run > 1024 {
-                    print("[mlr_map_file] read interrupted repeatedly (EINTR) on ")
+                    print("[mlr_map_file] read interrupted repeatedly (EINTR, ")
+                    print(eintr_run)
+                    print(" consecutive) after ")
+                    print(got)
+                    print(" of ")
+                    print(sz)
+                    print(" bytes on ")
                     println_str(path)
                     failed = 1
                     break
@@ -334,17 +388,30 @@ fn mlr_map_file(u64 path, u64 out_size) -> u64 {
             }
             print("[mlr_map_file] read failed (errno ")
             print(get_errno(n))
-            print(") on ")
+            print(") after ")
+            print(got)
+            print(" of ")
+            print(sz)
+            print(" bytes on ")
             println_str(path)
             failed = 1
             break
         }
-        if n == 0 { break }        // premature EOF — caught by the got != sz check
+        if n == 0 { break }        // premature EOF — reported as a short read below
         eintr_run = 0
         got = got + n
     }
     file_close(fd)
-    if failed != 0 || got != sz {
+    // Two distinct failures, each reporting its own cause. `failed` means the
+    // loop already printed the specific errno (or the EINTR cap) it died on;
+    // adding the short-read line there would misreport a genuine I/O error as
+    // a truncated file. A short read with failed == 0 is the other case: the
+    // reads succeeded but the file ended early.
+    if failed != 0 {
+        dealloc(buf)
+        return 0
+    }
+    if got != sz {
         // Loud, not silent: a partially filled buffer would be parsed as real
         // content rather than reported as an error.
         print("[mlr_map_file] mmap unavailable and short read on ")

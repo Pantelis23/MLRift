@@ -119,18 +119,18 @@ fn safetensors_open(u64 path) -> SafetensorFile {
 
 // Release the mapping and the JSON heap copy. Views previously
 // returned by `safetensors_get` become invalid after this call.
+// Call EXACTLY ONCE per handle. Like tokenizer_free / gguf_free this cannot be
+// made idempotent by zeroing fields — a struct-typed argument is copied at the
+// call boundary in MLRift, so writes here never reach the caller's handle (see
+// the block comment above tokenizer_free). The region is released FIRST so a
+// second call aborts in mlr_unmap_file's registry check before it can
+// double-dealloc the JSON copy below.
 fn safetensors_free(SafetensorFile st) {
-    if st.json_ptr != 0 {
-        dealloc(st.json_ptr)
-        st.json_ptr = 0
-    }
     if st.base_addr != 0 && st.file_size != 0 {
         mlr_unmap_file(st.base_addr, st.file_size)
-        // Zero the handle: with the read fallback in play a second free would
-        // be a heap double-dealloc rather than a harmless failing munmap.
-        st.base_addr = 0
-        st.file_size = 0
-        st.data_ptr = 0
+    }
+    if st.json_ptr != 0 {
+        dealloc(st.json_ptr)
     }
 }
 
