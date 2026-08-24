@@ -2,8 +2,13 @@
 @dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
 @dynamic extern fn exit(uint64 code)
 
+// Was: no accumulator at all — every check could print " FAIL" and the
+// program still exited 0 unconditionally. static so bad() can update it
+// from every call site without threading a counter through main().
+static u64 g_fail_count = 0
+
 fn ok(uint64 lbl, uint64 ll) { write(1, lbl, ll); write(1, " OK\n", 4) }
-fn bad(uint64 lbl, uint64 ll) { write(1, lbl, ll); write(1, " FAIL\n", 6) }
+fn bad(uint64 lbl, uint64 ll) { write(1, lbl, ll); write(1, " FAIL\n", 6); g_fail_count = g_fail_count + 1 }
 
 fn main() {
     int64 a = 5
@@ -39,5 +44,7 @@ fn main() {
     uint64 u = 0xFFFFFFFFFFFF0000
     if u > 0 { ok("uint64 large > 0", 16) } else { bad("uint64 large > 0", 16) }
 
+    // Was: exit(0) unconditionally, so any FAIL above was invisible to rc.
+    if g_fail_count != 0 { exit(1) }
     exit(0)
 }

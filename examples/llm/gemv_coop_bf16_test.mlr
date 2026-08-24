@@ -169,5 +169,11 @@ fn main() {
 
     thread_pool_shutdown()
     hipkfd_teardown()
+    // Was exit(0) unconditionally: fail_001/fail_01 could print nonzero
+    // (real tolerance-based verdicts against the CPU reference, per the
+    // header "Verify gemv_coop_bf16_f32 against CPU matmul") and this
+    // still returned success. Gate on the looser 0.01 bound, matching
+    // gemv_coop_test.mlr's sibling gate.
+    if fail_01 != 0 { exit(1) }
     exit(0)
 }

@@ -175,5 +175,12 @@ fn main() {
     }
 
     hipkfd_teardown()
+    // Was exit(0) unconditionally: fail_001/fail_01 could print nonzero
+    // (real tolerance-based verdicts against the CPU reference, per the
+    // header "Verify and benchmark") and this still returned success.
+    // Gate on the looser 0.01 bound — fail_001 is reported as the tighter
+    // informational metric, matching the 1e-2 tolerance used elsewhere in
+    // this codebase's GEMV/loss verifiers.
+    if fail_01 != 0 { exit(1) }
     exit(0)
 }

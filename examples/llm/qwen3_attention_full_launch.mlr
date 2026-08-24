@@ -273,5 +273,12 @@ fn main() {
     hipFree(d_Q); hipFree(d_Kt); hipFree(d_V)
     hipFree(d_scores); hipFree(d_attn); hipFree(d_ctx)
     hipkfd_teardown()
+    // Was exit(0) unconditionally: rows_failed_sum/rows_failed_mask/
+    // ctx_cells_failed could all print nonzero (real softmax-normalisation,
+    // causal-mask, and attn@V cross-check verdicts) and this still returned
+    // success.
+    if fail_sum != 0 { exit(1) }
+    if fail_mask != 0 { exit(1) }
+    if fail_ctx != 0 { exit(1) }
     exit(0)
 }

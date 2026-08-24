@@ -5,10 +5,16 @@
 // decompressor produces exactly that.
 //
 // Test 2 (real firmware): attempt to decompress one of the .bin.zst
-// firmware blobs. Phase B.1 doesn't handle compressed blocks, so the
-// expected outcome is ZSTD_ERR_COMPRESSED_BLOCK_NOT_IMPL = 7 — but
-// only AFTER the magic number and frame header parse cleanly. That's
-// the "we made it to the block loop" validation.
+// firmware blobs. Originally written when Phase B.1 didn't handle
+// compressed blocks (expected ZSTD_ERR_COMPRESSED_BLOCK_NOT_IMPL = 7,
+// after the magic number and frame header parsed cleanly — the "we made
+// it to the block loop" validation). std/zstd.mlr has since grown a full
+// Huffman+FSE+LZ77 decoder (see its header), so this file now decompresses
+// this exact blob completely, and phase3_zstd_verify_pfp.mlr independently
+// proves that output is byte-exact against zstdcat. So both outcomes are
+// legitimate PASSes today: NOT_IMPL (older/partial substrate on some
+// frame shape) or OK (full decode, the common case now) — anything else
+// is a real substrate error.
 
 import "../std/zstd.mlr"
 import "../std/sys.mlr"
@@ -191,10 +197,24 @@ fn main() {
         _print_dec("  bytes_written_before_stop", 27, wrote)
 
         if e2 == ZSTD_ERR_COMPRESSED_BLOCK_NOT_IMPL {
-            puts("  EXPECTED: hit compressed block, frame header parsed cleanly first.")
-            puts("  Phase B.1 substrate validated.")
+            puts("  PASS: hit compressed block, frame header parsed cleanly first.")
+            puts("  (partial substrate outcome — still a valid pass; see header comment)")
         } else if e2 == ZSTD_OK {
-            puts("  UNEXPECTED OK: file contained only raw/RLE blocks (rare)")
+            // Was: printed "UNEXPECTED OK" and left `fails` untouched — an
+            // outcome that fell through uncounted either way. This branch
+            // is not actually unexpected: std/zstd.mlr's decoder now fully
+            // supports this blob, and phase3_zstd_verify_pfp.mlr
+            // independently proves the output is byte-exact against
+            // zstdcat. Full decode is a real PASS, not a failure to
+            // classify as one just because it wasn't the historical
+            // Phase-B.1 outcome. `wrote` is required to be non-zero so a
+            // degenerate "OK but produced nothing" can't sneak through.
+            if wrote > 0 {
+                puts("  PASS: full decode succeeded (byte-exactness proven by phase3_zstd_verify_pfp).")
+            } else {
+                fails = fails + 1
+                puts("  FAIL: OK but wrote 0 bytes")
+            }
         } else {
             fails = fails + 1
             puts("  FAIL: substrate error before reaching compressed block")
@@ -206,21 +226,30 @@ fn main() {
     // Was: print GREEN and exit(0) unconditionally, even directly after
     // printing FAIL. A smoke test that reports GREEN on failure is worse
     // than no smoke test.
-    if fails > 0 {
-        _print_dec("phase3_zstd_smoke (B.1): RED, failures", 38, fails)
-        exit(1)
-    }
+    //
+    // phase3_zstd family exit-code convention (matches
+    // phase3_zstd_verify_pfp's existing exit(1)-on-missing-input /
+    // exit(2)-on-real-defect split — adopted here rather than inverted,
+    // so the family has ONE scheme instead of a third one of its own):
+    //   0 = GREEN     — ran to completion, every check passed.
+    //   1 = INCOMPLETE — a required input could not be loaded; no verdict
+    //                    was reached (environment/fixture problem, not a
+    //                    proven code defect).
+    //   2 = FAIL       — ran to completion and found a real defect.
     // Was also: a genuinely-absent firmware input made Test 2 silently
     // skip (no `fails` increment), then this fell through to print GREEN
     // having only run Test 1 — "GREEN" on an incomplete run is the same
-    // defect class as printing FAIL and exiting 0. Distinguish "input
-    // present but wrong" (exit 1, above — a real regression) from "input
-    // genuinely absent" (exit 2 — an environment/fixture problem, not a
-    // code defect) rather than collapsing both into a false GREEN, per
-    // phase3_zstd_verify_pfp's non-zero-on-missing-input precedent.
+    // defect class as printing FAIL and exiting 0.
+    // A real, verified defect (fails>0, from Test 1 or Test 2's substrate
+    // check) takes priority over "incomplete" — don't let a missing Test 2
+    // input mask a Test 1 regression that already ran to completion.
+    if fails > 0 {
+        _print_dec("phase3_zstd_smoke (B.1): RED, failures", 38, fails)
+        exit(2)
+    }
     if missing != 0 {
         puts("phase3_zstd_smoke (B.1): INCOMPLETE — firmware input missing, Test 2 did not run")
-        exit(2)
+        exit(1)
     }
     puts("phase3_zstd_smoke (B.1): GREEN")
     exit(0)

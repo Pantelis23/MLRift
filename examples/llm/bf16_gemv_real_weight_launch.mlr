@@ -256,5 +256,12 @@ fn main() {
     safetensors_free(st)
     thread_pool_shutdown()
     hipkfd_teardown()
+    // DIAGNOSTIC, NOT A GATE — exit(0) either way is deliberate.
+    // Per the header: this is a bisection diagnostic, and BOTH outcomes are
+    // the finding it's looking for — divergence vs CPU localises the bug to
+    // the kernel's real bf16 NaN/denormal handling, a match localises it to
+    // std/inference_gpu.mlr's wrapper instead. Neither outcome is itself a
+    // regression to fail a build on. Read the printed fail_count/probe
+    // dump; do not wire this into a pass/fail harness.
     exit(0)
 }

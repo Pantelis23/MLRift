@@ -282,5 +282,9 @@ fn main() {
 
     hipFree(d_x); hipFree(d_W_bf16); hipFree(d_W_f32); hipFree(d_out)
     hipkfd_teardown()
+    // Was exit(0) unconditionally: fail_count could print nonzero (a real
+    // bit-exactness verdict against the CPU reference, per the header
+    // comment) and this still returned success.
+    if fail_count != 0 { exit(1) }
     exit(0)
 }

@@ -257,5 +257,9 @@ fn main() {
 
     hipFree(d_x); hipFree(d_gate); hipFree(d_up); hipFree(d_act); hipFree(d_y)
     hipkfd_teardown()
+    // Was exit(0) unconditionally: cells_failed could print nonzero (a real
+    // relative-error verdict against ref_chain()) and this still returned
+    // success.
+    if fail != 0 { exit(1) }
     exit(0)
 }

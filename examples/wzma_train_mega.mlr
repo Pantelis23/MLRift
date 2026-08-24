@@ -768,7 +768,16 @@ fn main() {
                 // Oracle dump (run this build FIRST).
                 print_str("--- Task 4: dumping NW=1 ORACLE grads → oracle_grads.bin ---\n")
                 u64 fd = file_open(grad_path, 1)
-                if fd == 0 { print_str("Cannot open oracle_grads.bin for write\n") }
+                if fd == 0 {
+                    print_str("Cannot open oracle_grads.bin for write\n")
+                    // Was: printed the error and left red_ok_final at its
+                    // initializer 1 — the oracle-PRODUCING build reported
+                    // GREEN while writing no oracle at all, so the next
+                    // NW>1 run would silently compare against an absent or
+                    // stale file. This run did not do what it claims to
+                    // have done, so it must not exit 0.
+                    red_ok_final = 0
+                }
                 else {
                     file_write(fd, hU,    bU)
                     file_write(fd, hV,    bV)
@@ -784,22 +793,43 @@ fn main() {
                 u64 fd = file_open(grad_path, 0)
                 if fd == 0 {
                     print_str("Cannot open oracle_grads.bin — run the NW=1 build first!\n")
+                    // Was: printed the error and left red_ok_final at its
+                    // initializer 1, so a run that verified NOTHING (the
+                    // REDUCE check never happened) still exited 0. This is
+                    // the same defect class this commit exists to close,
+                    // wearing an environment-error hat instead of a
+                    // numeric-mismatch one.
+                    red_ok_final = 0
                 } else {
-                    u64 oU    = alloc(bU);    file_read(fd, oU,    bU)
-                    u64 oV    = alloc(bV);    file_read(fd, oV,    bV)
-                    u64 oGW   = alloc(bGW);   file_read(fd, oGW,   bGW)
-                    u64 oGB   = alloc(bGB);   file_read(fd, oGB,   bGB)
-                    u64 oBIAS = alloc(bBIAS); file_read(fd, oBIAS, bBIAS)
+                    u64 oU    = alloc(bU);    u64 nrU    = file_read(fd, oU,    bU)
+                    u64 oV    = alloc(bV);    u64 nrV    = file_read(fd, oV,    bV)
+                    u64 oGW   = alloc(bGW);   u64 nrGW   = file_read(fd, oGW,   bGW)
+                    u64 oGB   = alloc(bGB);   u64 nrGB   = file_read(fd, oGB,   bGB)
+                    u64 oBIAS = alloc(bBIAS); u64 nrBIAS = file_read(fd, oBIAS, bBIAS)
                     file_close(fd)
+                    // Was: file_read's return values were discarded, so a
+                    // truncated/stale oracle_grads.bin (e.g. from an older
+                    // build with different K/D/R and thus a different byte
+                    // count) would compare live grads against partly
+                    // garbage/zero buffers, in either direction — a false
+                    // PASS from coincidentally-small diffs, or a false FAIL
+                    // from comparing against uninitialized memory. Refuse
+                    // to trust the comparison unless every read was
+                    // complete.
                     u64 red_ok = 1
-                    if cmp_grad("dU",    hU,    oU,    nU)    == 0 { red_ok = 0 }
-                    if cmp_grad("dV",    hV,    oV,    nV)    == 0 { red_ok = 0 }
-                    if cmp_grad("dgw",   hGW,   oGW,   nGW)   == 0 { red_ok = 0 }
-                    if cmp_grad("dgb",   hGB,   oGB,   nGB)   == 0 { red_ok = 0 }
-                    if cmp_grad("dbias", hBIAS, oBIAS, nBIAS) == 0 { red_ok = 0 }
+                    if nrU != bU || nrV != bV || nrGW != bGW || nrGB != bGB || nrBIAS != bBIAS {
+                        print_str("REDUCE vs oracle: FAIL (oracle_grads.bin truncated/stale — short read)\n")
+                        red_ok = 0
+                    } else {
+                        if cmp_grad("dU",    hU,    oU,    nU)    == 0 { red_ok = 0 }
+                        if cmp_grad("dV",    hV,    oV,    nV)    == 0 { red_ok = 0 }
+                        if cmp_grad("dgw",   hGW,   oGW,   nGW)   == 0 { red_ok = 0 }
+                        if cmp_grad("dgb",   hGB,   oGB,   nGB)   == 0 { red_ok = 0 }
+                        if cmp_grad("dbias", hBIAS, oBIAS, nBIAS) == 0 { red_ok = 0 }
+                        if red_ok == 1 { print_str("REDUCE vs oracle: all 5 dense grads <=1e-3  PASS\n") }
+                        else           { print_str("REDUCE vs oracle: FAIL\n") }
+                    }
                     dealloc(oU); dealloc(oV); dealloc(oGW); dealloc(oGB); dealloc(oBIAS)
-                    if red_ok == 1 { print_str("REDUCE vs oracle: all 5 dense grads <=1e-3  PASS\n") }
-                    else           { print_str("REDUCE vs oracle: FAIL\n") }
                     // Was: local to this block, so the verdict never reached
                     // the final exit gate. Propagate to the hoisted flag.
                     red_ok_final = red_ok

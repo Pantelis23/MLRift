@@ -208,5 +208,10 @@ fn main() {
 
     hipFree(d_Q); hipFree(d_Kt); hipFree(d_scores); hipFree(d_attn)
     hipkfd_teardown()
+    // Was exit(0) unconditionally: rows_failed_sum/rows_failed_mask could
+    // print nonzero (real softmax-normalisation and causal-mask invariant
+    // violations) and this still returned success.
+    if fail_sum != 0 { exit(1) }
+    if fail_mask != 0 { exit(1) }
     exit(0)
 }
