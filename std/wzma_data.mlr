@@ -54,21 +54,20 @@ fn wzma_data_open(u64 corpus_path, Tokenizer tk) -> WzmaData {
     d.corpus_size = 0
     d.tk_ptr = tk
 
-    u64 fd = file_open(corpus_path, 0)
-    if is_errno(fd) != 0 {
-        print("[wzma_data] open failed: ")
+    // Portable map-or-read (std/io.mlr) — the inline mmap this replaces used
+    // syscall 9, which is mmap only on x86_64. Ownership is unchanged: the
+    // corpus region is owned here and released by wzma_data_free, while the
+    // Tokenizer in d.tk_ptr stays borrowed and is never freed by this module.
+    u64 szbox = alloc(8)
+    store64(szbox, 0)
+    u64 base = mlr_map_file(corpus_path, szbox)
+    u64 sz = load64(szbox)
+    dealloc(szbox)
+    if base == 0 {
+        print("[wzma_data] could not load: ")
         println_str(corpus_path)
         return d
     }
-    u64 sz = file_size(fd)
-    // mmap PROT_READ (1) MAP_PRIVATE (2)
-    u64 base = syscall_raw(9, 0, sz, 1, 2, fd, 0)
-    if is_errno(base) != 0 {
-        print("[wzma_data] mmap failed\n")
-        file_close(fd)
-        return d
-    }
-    file_close(fd)
     d.corpus_base = base
     d.corpus_size = sz
     return d
@@ -78,9 +77,17 @@ fn wzma_data_open(u64 corpus_path, Tokenizer tk) -> WzmaData {
 // wzma_data_free — munmap the corpus and free the handle. The borrowed
 // Tokenizer is left untouched (the caller owns its lifetime).
 // ---------------------------------------------------------------------------
+// Call EXACTLY ONCE per handle — this is not idempotent, and the pre-existing
+// `d.corpus_base = 0` below does not make it so: a struct-typed argument is
+// copied at the call boundary in MLRift, so that store lands on the callee's
+// private copy and never reaches the caller's handle (see the block comment
+// above tokenizer_free in std/tokenizer.mlr). It is kept as-is rather than
+// removed because this module's ownership contract is deliberately untouched.
+// A second call is caught by mlr_unmap_file's registry check rather than
+// silently releasing the corpus twice.
 fn wzma_data_free(WzmaData d) {
     if d.corpus_base != 0 {
-        syscall_raw(11, d.corpus_base, d.corpus_size, 0, 0, 0, 0)   // munmap
+        mlr_unmap_file(d.corpus_base, d.corpus_size)
         d.corpus_base = 0
     }
     dealloc(d)
