@@ -130,7 +130,23 @@ fn wj_int(u64 st) -> u64 {
 // Builds `"name"` (quoted, NUL-terminated) into `out`, which has room for
 // `cap` bytes; returns its length. Dies loud rather than overflow `out` if
 // `name` (plus its 2 quote bytes and NUL) doesn't fit.
+//
+// Two guards, two different jobs — deliberately kept both rather than
+// relying on either alone:
+//   - the IN-LOOP guard bounds each per-character copy conservatively
+//     (`i+2 < cap`, checked before every `store8(out+1+i, ...)`) so a long
+//     or unterminated `name` can't run away and overflow `out` one byte at
+//     a time. On its own it would still let `len` reach `cap-2` — one byte
+//     too many for the two TAIL writes below.
+//   - the POST-LOOP guard enforces the exact tighter bound those two tail
+//     writes need: closing quote at `out+1+len` and NUL at `out+2+len`
+//     together require `len <= cap-3`. Without it, `len == cap-2` writes
+//     the NUL one byte past `out[cap-1]`.
 fn wj_mk_key(u64 name, u64 out, u64 cap) -> u64 {
+    if cap < 3 {
+        print("wj_mk_key: buffer too small\n")
+        exit(1)
+    }
     store8(out, 0x22)
     u64 i = 0
     while load8(name + i) != 0 {
@@ -140,6 +156,10 @@ fn wj_mk_key(u64 name, u64 out, u64 cap) -> u64 {
         }
         store8(out + 1 + i, load8(name + i))
         i = i + 1
+    }
+    if i + 2 >= cap {
+        print("wj_mk_key: key too long\n")
+        exit(1)
     }
     store8(out + 1 + i, 0x22)
     store8(out + 2 + i, 0)
