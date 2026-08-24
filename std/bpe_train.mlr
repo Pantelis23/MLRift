@@ -1560,3 +1560,132 @@ fn bpe_train_merges(u64 wt, u64 vocab_size, u64 vocab_out, u64 merges_out) -> u6
     bpe_pc_free(pc)
     return nmerges
 }
+
+// ===========================================================================
+// Task 5: tokenizer.json writer.
+//
+// Emits the exact shape HF `tokenizers` 0.23.1 writes (verified against
+// tests/bpe/golden/tiny_tokenizer.json): version, truncation, padding,
+// added_tokens (the 4 specials, ids 0-3), normalizer, pre_tokenizer,
+// post_processor, decoder, model (BPE, vocab + merges). Whitespace is
+// compact (no pretty-printing) — every consumer here (std/tokenizer.mlr's
+// reader, HF's own `tokenizers`, and Python's `json` module) is
+// whitespace-agnostic, and the golden's own pretty-printing is not part of
+// its semantic content.
+//
+// Token strings are byte-mapped UTF-8 and MUST be appended with an explicit
+// length, never via sb_append_str (which scans for a NUL terminator and
+// would run off the end of the Vocab's blob, which is not NUL-separated).
+// ===========================================================================
+
+// Appends `s`/`slen` as a quoted JSON string, escaping exactly the two bytes
+// that can appear in a byte-mapped ByteLevel token and are JSON-significant:
+// '"' (0x22) -> \" and '\' (0x5C) -> \\. The byte->codepoint map (see
+// bpe_b2c_ensure) never produces a control byte (<0x20), so no other escape
+// is ever needed, and non-ASCII UTF-8 bytes are emitted verbatim (never
+// \u-escaped) to match HF/serde_json's own output.
+fn bpe_write_json_string(u64 sb, u64 s, u64 slen) -> u64 {
+    sb = sb_append_byte(sb, 0x22)
+    u64 i = 0
+    while i < slen {
+        u64 b = load8(s + i)
+        if b == 0x22 {
+            sb = sb_append_byte(sb, 0x5C)
+            sb = sb_append_byte(sb, 0x22)
+        } else if b == 0x5C {
+            sb = sb_append_byte(sb, 0x5C)
+            sb = sb_append_byte(sb, 0x5C)
+        } else {
+            sb = sb_append_byte(sb, b)
+        }
+        i = i + 1
+    }
+    sb = sb_append_byte(sb, 0x22)
+    return sb
+}
+
+// Appends one `added_tokens[]` entry. `content` is a NUL-terminated string
+// literal (e.g. "<PAD>") — safe for sb_append_str, unlike Vocab-blob bytes.
+fn bpe_write_added_token(u64 sb, u64 id, u64 content) -> u64 {
+    sb = sb_append_str(sb, "{\"id\":")
+    sb = sb_append_int(sb, id)
+    sb = sb_append_str(sb, ",\"content\":\"")
+    sb = sb_append_str(sb, content)
+    sb = sb_append_str(sb, "\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":false,\"special\":true}")
+    return sb
+}
+
+// Writes a complete tokenizer.json to `path`. `vocab` is a Vocab (Task 4);
+// `merges`/`nmerges` are the (left_id,right_id) array bpe_train_merges wrote
+// (16 bytes per entry). Every token string is resolved id -> bytes via
+// bpe_vocab_str, so the emitted vocab/merges are exactly what `vocab` holds.
+fn bpe_write_tokenizer_json(u64 vocab, u64 merges, u64 nmerges, u64 path) {
+    u64 sb = sb_new(65536)
+    sb = sb_append_byte(sb, 0x7B)   // {
+    sb = sb_append_str(sb, "\"version\":\"1.0\",")
+    sb = sb_append_str(sb, "\"truncation\":null,")
+    sb = sb_append_str(sb, "\"padding\":null,")
+
+    sb = sb_append_str(sb, "\"added_tokens\":[")
+    sb = bpe_write_added_token(sb, 0, "<PAD>")
+    sb = sb_append_byte(sb, 0x2C)
+    sb = bpe_write_added_token(sb, 1, "<UNK>")
+    sb = sb_append_byte(sb, 0x2C)
+    sb = bpe_write_added_token(sb, 2, "<BOS>")
+    sb = sb_append_byte(sb, 0x2C)
+    sb = bpe_write_added_token(sb, 3, "<EOS>")
+    sb = sb_append_str(sb, "],")
+
+    sb = sb_append_str(sb, "\"normalizer\":null,")
+    sb = sb_append_str(sb, "\"pre_tokenizer\":{\"type\":\"ByteLevel\",\"add_prefix_space\":false,\"trim_offsets\":true,\"use_regex\":true},")
+    sb = sb_append_str(sb, "\"post_processor\":{\"type\":\"ByteLevel\",\"add_prefix_space\":true,\"trim_offsets\":false,\"use_regex\":true},")
+    sb = sb_append_str(sb, "\"decoder\":{\"type\":\"ByteLevel\",\"add_prefix_space\":true,\"trim_offsets\":true,\"use_regex\":true},")
+
+    sb = sb_append_str(sb, "\"model\":{\"type\":\"BPE\",\"dropout\":null,\"unk_token\":null,\"continuing_subword_prefix\":null,\"end_of_word_suffix\":null,\"fuse_unk\":false,\"byte_fallback\":false,\"ignore_merges\":false,")
+
+    u64 sp = alloc(8)
+    u64 sl = alloc(8)
+
+    sb = sb_append_str(sb, "\"vocab\":{")
+    u64 vcount = bpe_vocab_count(vocab)
+    u64 vi = 0
+    while vi < vcount {
+        bpe_vocab_str(vocab, vi, sp, sl)
+        sb = bpe_write_json_string(sb, load64(sp), load64(sl))
+        sb = sb_append_byte(sb, 0x3A)    // :
+        sb = sb_append_int(sb, vi)
+        if vi + 1 < vcount { sb = sb_append_byte(sb, 0x2C) }
+        vi = vi + 1
+    }
+    sb = sb_append_str(sb, "},")
+
+    sb = sb_append_str(sb, "\"merges\":[")
+    u64 mi = 0
+    while mi < nmerges {
+        u64 lid = load64(merges + mi * 16)
+        u64 rid = load64(merges + mi * 16 + 8)
+        sb = sb_append_byte(sb, 0x5B)    // [
+        bpe_vocab_str(vocab, lid, sp, sl)
+        sb = bpe_write_json_string(sb, load64(sp), load64(sl))
+        sb = sb_append_byte(sb, 0x2C)
+        bpe_vocab_str(vocab, rid, sp, sl)
+        sb = bpe_write_json_string(sb, load64(sp), load64(sl))
+        sb = sb_append_byte(sb, 0x5D)    // ]
+        if mi + 1 < nmerges { sb = sb_append_byte(sb, 0x2C) }
+        mi = mi + 1
+    }
+    sb = sb_append_str(sb, "]}}")        // close merges[], model{}, top-level{}
+
+    dealloc(sp)
+    dealloc(sl)
+
+    u64 fd = file_open(path, 1)
+    if is_errno(fd) != 0 {
+        print("bpe_write_tokenizer_json: cannot open output path\n")
+        exit(1)
+    }
+    u64 len = load64(sb + 8)
+    file_write(fd, sb + 16, len)
+    file_close(fd)
+    sb_free(sb)
+}

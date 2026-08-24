@@ -1,0 +1,603 @@
+// Task 5 smoke test: bpe_write_tokenizer_json must produce a tokenizer.json
+// that (a) loads and round-trips through std/tokenizer.mlr, and (b) is
+// byte-for-byte identical, once JSON-parsed, to what HuggingFace itself
+// wrote for this corpus (tests/bpe/golden/tiny_tokenizer.json).
+//
+// If this test fails, the bug is in std/bpe_train.mlr's writer — never edit
+// the golden.
+import "../../std/bpe_train.mlr"
+import "../../std/io.mlr"
+import "../../std/string.mlr"
+import "../../std/tokenizer.mlr"
+
+// ---------------------------------------------------------------------------
+// Minimal JSON reader for model.vocab / model.merges — same shape/style as
+// tests/bpe/merge_smoke.mlr's gj_* reader, but instance-based (a `wj_*`
+// state handle instead of static globals) so two files (golden + our own
+// written output) can be parsed and held in memory at the same time for a
+// direct structural diff.
+// ---------------------------------------------------------------------------
+
+// State (48 bytes): B(0) E(8) P(16) BLOB(24) BLEN(32) BCAP(40)
+fn wj_new() -> u64 {
+    u64 st = alloc(48)
+    store64(st, 0)
+    store64(st + 8, 0)
+    store64(st + 16, 0)
+    u64 bcap = 65536
+    store64(st + 24, alloc(bcap))
+    store64(st + 32, 0)
+    store64(st + 40, bcap)
+    return st
+}
+
+fn wj_free(u64 st) {
+    dealloc(load64(st + 24))
+    dealloc(st)
+}
+
+fn wj_fail(u64 st, u64 msg) {
+    print_str(msg)
+    print(" at byte offset ")
+    print(load64(st + 16) - load64(st))
+    print("\n")
+    exit(1)
+}
+
+fn wj_put(u64 st, u64 b) {
+    u64 blen = load64(st + 32)
+    u64 bcap = load64(st + 40)
+    if blen >= bcap {
+        u64 nc = bcap * 2
+        u64 np = alloc(nc)
+        memcpy(np, load64(st + 24), blen)
+        dealloc(load64(st + 24))
+        store64(st + 24, np)
+        store64(st + 40, nc)
+    }
+    store8(load64(st + 24) + blen, b)
+    store64(st + 32, blen + 1)
+}
+
+fn wj_ws(u64 st) {
+    u64 e = load64(st + 8)
+    while load64(st + 16) < e {
+        u64 c = load8(load64(st + 16))
+        if c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D {
+            store64(st + 16, load64(st + 16) + 1)
+        } else {
+            break
+        }
+    }
+}
+
+fn wj_expect(u64 st, u64 ch, u64 msg) {
+    wj_ws(st)
+    if load64(st + 16) >= load64(st + 8) { wj_fail(st, msg) }
+    if load8(load64(st + 16)) != ch { wj_fail(st, msg) }
+    store64(st + 16, load64(st + 16) + 1)
+}
+
+// Reads a JSON string into the state's arena; writes its arena OFFSET to
+// *out_off and byte length to *out_len (offsets, not pointers — the arena
+// moves when it grows).
+fn wj_string(u64 st, u64 out_off, u64 out_len) {
+    wj_expect(st, 0x22, "json: expected a string")
+    u64 off = load64(st + 32)
+    while 1 {
+        if load64(st + 16) >= load64(st + 8) { wj_fail(st, "json: unterminated string") }
+        u64 c = load8(load64(st + 16))
+        store64(st + 16, load64(st + 16) + 1)
+        if c == 0x22 { break }
+        if c == 0x5C {
+            if load64(st + 16) >= load64(st + 8) { wj_fail(st, "json: truncated escape") }
+            u64 e = load8(load64(st + 16))
+            store64(st + 16, load64(st + 16) + 1)
+            u64 v = 0x100                      // 0x100 == "not a known escape"
+            if e == 0x22 { v = 0x22 }
+            if e == 0x5C { v = 0x5C }
+            if e == 0x2F { v = 0x2F }
+            if e == 0x62 { v = 8 }
+            if e == 0x66 { v = 12 }
+            if e == 0x6E { v = 10 }
+            if e == 0x72 { v = 13 }
+            if e == 0x74 { v = 9 }
+            if v == 0x100 { wj_fail(st, "json: unsupported escape (\\u is not handled)") }
+            wj_put(st, v)
+        } else {
+            wj_put(st, c)
+        }
+    }
+    store64(out_off, off)
+    store64(out_len, load64(st + 32) - off)
+}
+
+fn wj_int(u64 st) -> u64 {
+    wj_ws(st)
+    u64 v = 0
+    u64 any = 0
+    while load64(st + 16) < load64(st + 8) {
+        u64 c = load8(load64(st + 16))
+        if c < 0x30 || c > 0x39 { break }
+        v = v * 10 + (c - 0x30)
+        any = 1
+        store64(st + 16, load64(st + 16) + 1)
+    }
+    if any == 0 { wj_fail(st, "json: expected an integer") }
+    return v
+}
+
+// Builds `"name"` (quoted, NUL-terminated) into `out`; returns its length.
+fn wj_mk_key(u64 name, u64 out) -> u64 {
+    store8(out, 0x22)
+    u64 i = 0
+    while load8(name + i) != 0 {
+        store8(out + 1 + i, load8(name + i))
+        i = i + 1
+    }
+    store8(out + 1 + i, 0x22)
+    store8(out + 2 + i, 0)
+    return i + 2
+}
+
+// Moves the cursor just past the next occurrence of the quoted key `name`,
+// searching FORWARD FROM THE CURRENT CURSOR (see merge_smoke.mlr for why:
+// vocab tokens can themselves spell a key name).
+fn wj_seek(u64 st, u64 name) {
+    u64 key = alloc(64)
+    u64 klen = wj_mk_key(name, key)
+    u64 p = load64(st + 16)
+    u64 e = load64(st + 8)
+    while p + klen <= e {
+        if bpe_bytes_eq(p, key, klen) == 1 {
+            store64(st + 16, p + klen)
+            dealloc(key)
+            return
+        }
+        p = p + 1
+    }
+    print("json: key not found: ")
+    print_str(name)
+    print("\n")
+    exit(1)
+}
+
+static u64 PJ_MAX = 65536
+
+// Parses model.vocab (object string->int) and model.merges (array of
+// 2-element string arrays) out of the tokenizer.json at `path`. Writes
+// counts to *vn_out / *mn_out. Returns the wj_new() state handle — its
+// arena (BLOB) holds every decoded string, so the caller must keep it alive
+// (and eventually wj_free it) for as long as it reads strings via the
+// returned v_off/v_len/m_*off/m_*len arrays.
+fn parse_tokenizer_json(u64 path,
+                         u64 v_off, u64 v_len, u64 v_id, u64 vn_out,
+                         u64 m_loff, u64 m_llen, u64 m_roff, u64 m_rlen, u64 mn_out) -> u64 {
+    u64 szp = alloc(8)
+    u64 base = bpe_mmap_file(path, szp)
+    if base == 0 {
+        print("FAIL: cannot mmap ")
+        print_str(path)
+        print("\n")
+        exit(1)
+    }
+    u64 sz = load64(szp)
+    dealloc(szp)
+
+    u64 st = wj_new()
+    store64(st, base)
+    store64(st + 8, base + sz)
+    store64(st + 16, base)
+
+    // model.vocab : { "<tok>": <id>, ... }
+    wj_seek(st, "vocab")
+    wj_expect(st, 0x3A, "json: expected ':' after \"vocab\"")
+    wj_expect(st, 0x7B, "json: expected '{' opening \"vocab\"")
+    wj_ws(st)
+    u64 vn = 0
+    if load64(st + 16) < load64(st + 8) && load8(load64(st + 16)) == 0x7D {
+        store64(st + 16, load64(st + 16) + 1)
+    } else {
+        while 1 {
+            if vn >= PJ_MAX { print("parse_tokenizer_json: too many vocab entries\n"); exit(1) }
+            wj_string(st, v_off + vn * 8, v_len + vn * 8)
+            wj_expect(st, 0x3A, "json: expected ':' in \"vocab\"")
+            store64(v_id + vn * 8, wj_int(st))
+            vn = vn + 1
+            wj_ws(st)
+            if load64(st + 16) >= load64(st + 8) { wj_fail(st, "json: unterminated \"vocab\"") }
+            u64 c = load8(load64(st + 16))
+            store64(st + 16, load64(st + 16) + 1)
+            if c == 0x7D { break }
+            if c != 0x2C { wj_fail(st, "json: expected ',' or '}' in \"vocab\"") }
+        }
+    }
+    store64(vn_out, vn)
+
+    // model.merges : [ [ "<l>", "<r>" ], ... ]
+    wj_seek(st, "merges")
+    wj_expect(st, 0x3A, "json: expected ':' after \"merges\"")
+    wj_expect(st, 0x5B, "json: expected '[' opening \"merges\"")
+    wj_ws(st)
+    u64 mn = 0
+    if load64(st + 16) < load64(st + 8) && load8(load64(st + 16)) == 0x5D {
+        store64(st + 16, load64(st + 16) + 1)
+    } else {
+        while 1 {
+            if mn >= PJ_MAX { print("parse_tokenizer_json: too many merges\n"); exit(1) }
+            wj_expect(st, 0x5B, "json: expected '[' opening a merge")
+            wj_string(st, m_loff + mn * 8, m_llen + mn * 8)
+            wj_expect(st, 0x2C, "json: expected ',' inside a merge")
+            wj_string(st, m_roff + mn * 8, m_rlen + mn * 8)
+            wj_expect(st, 0x5D, "json: expected ']' closing a merge")
+            mn = mn + 1
+            wj_ws(st)
+            if load64(st + 16) >= load64(st + 8) { wj_fail(st, "json: unterminated \"merges\"") }
+            u64 c2 = load8(load64(st + 16))
+            store64(st + 16, load64(st + 16) + 1)
+            if c2 == 0x5D { break }
+            if c2 != 0x2C { wj_fail(st, "json: expected ',' or ']' in \"merges\"") }
+        }
+    }
+    store64(mn_out, mn)
+
+    bpe_munmap_file(base, sz)
+    return st
+}
+
+// ---------------------------------------------------------------------------
+
+fn print_bytes(u64 p, u64 n) {
+    if n == 0 { return }
+    syscall_raw(1, 1, p, n, 0, 0, 0)
+}
+
+// Search `[base, base+size)` for the 2-byte sequence (b0,b1). Returns 1 if
+// found, 0 otherwise.
+fn find2(u64 base, u64 size, u64 b0, u64 b1) -> u64 {
+    if size < 2 { return 0 }
+    u64 i = 0
+    while i + 1 < size {
+        if load8(base + i) == b0 && load8(base + i + 1) == b1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn main() {
+    // =======================================================================
+    // (a) Train the tiny corpus, write /tmp/mlrift_tiny.json.
+    // =======================================================================
+    u64 szp = alloc(8)
+    u64 base = bpe_mmap_file("tests/bpe/tiny_corpus.txt", szp)
+    if base == 0 {
+        print("FAIL: cannot mmap tests/bpe/tiny_corpus.txt\n")
+        exit(1)
+    }
+    u64 size = load64(szp)
+    dealloc(szp)
+
+    u64 wt = bpe_count_words_1t(base, size)
+    u64 vocab_size = 320
+    u64 v = bpe_vocab_new()
+    u64 merges = alloc(vocab_size * 16)
+    u64 nm = bpe_train_merges(wt, vocab_size, v, merges)
+
+    u64 out_path = "/tmp/mlrift_tiny.json"
+    bpe_write_tokenizer_json(v, merges, nm, out_path)
+
+    // =======================================================================
+    // (b) Round-trip through std/tokenizer.mlr: decode(encode(x)) == x for
+    // several probes drawn straight from the training corpus (so every byte
+    // they contain is guaranteed to be in this tiny trained alphabet —
+    // tiny_corpus.txt contains zero '"' or '\' bytes, verified with grep, so
+    // the trained vocab has no single-char token for either and the BPE
+    // encoder in std/tokenizer.mlr would silently DROP such a byte
+    // (WARNING + skip) rather than exercise the writer's escaping. That
+    // path is instead covered directly in part (d) below, against the exact
+    // bpe_write_json_string() code path, independent of corpus coverage.
+    // =======================================================================
+    Tokenizer tk = tokenizer_load(out_path)
+    if tk.file_size == 0 {
+        print("FAIL: tokenizer_load could not open the written file\n")
+        exit(1)
+    }
+    if tk_encoder_mode != 1 {
+        print("FAIL: written tokenizer.json did not select the BPE encoder (tk_encoder_mode=")
+        print(tk_encoder_mode)
+        print(")\n")
+        exit(1)
+    }
+
+    u64 nprobes = 4
+    u64 probe0 = "the quick brown fox"
+    u64 probe1 = "wwwww aaa abab ababab"
+    u64 probe2 = "don't stop, e'er 've 'll"
+    u64 probe3 = "caf\xc3\xa9 \xcf\x80 \xc2\xbd \xc5\x83"   // "café π ½ Ń"
+    u64 pi = 0
+    while pi < nprobes {
+        u64 text = probe0
+        if pi == 1 { text = probe1 }
+        if pi == 2 { text = probe2 }
+        if pi == 3 { text = probe3 }
+        u64 tlen = str_len(text)
+
+        uint64[1] ids_slot
+        uint64[1] cnt_slot
+        u64 ids_p = ids_slot
+        u64 cnt_p = cnt_slot
+        tokenizer_encode(tk, text, tlen, ids_p, cnt_p)
+        u64 ids = 0
+        u64 cnt = 0
+        unsafe { *(ids_p as u64) -> ids }
+        unsafe { *(cnt_p as u64) -> cnt }
+
+        u64 dec = tokenizer_decode(tk, ids, cnt)
+        if str_compare(dec, text) != 0 {
+            print("FAIL roundtrip: probe ")
+            print(pi)
+            print("\n  got  \"")
+            print_str(dec)
+            print("\"\n  want \"")
+            print_str(text)
+            print("\"\n")
+            exit(1)
+        }
+        dealloc(dec)
+        if ids != 0 { dealloc(ids) }
+        pi = pi + 1
+    }
+    tokenizer_free(tk)
+
+    // =======================================================================
+    // (c) Payload equality: re-read /tmp/mlrift_tiny.json with the golden-
+    // JSON reader style and assert its merges/vocab are IDENTICAL to
+    // tests/bpe/golden/tiny_tokenizer.json.
+    // =======================================================================
+    u64 gv_off = alloc(PJ_MAX * 8); u64 gv_len = alloc(PJ_MAX * 8); u64 gv_id = alloc(PJ_MAX * 8)
+    u64 gm_loff = alloc(PJ_MAX * 8); u64 gm_llen = alloc(PJ_MAX * 8)
+    u64 gm_roff = alloc(PJ_MAX * 8); u64 gm_rlen = alloc(PJ_MAX * 8)
+    u64 gvn_p = alloc(8); u64 gmn_p = alloc(8)
+    u64 gst = parse_tokenizer_json("tests/bpe/golden/tiny_tokenizer.json",
+                                    gv_off, gv_len, gv_id, gvn_p,
+                                    gm_loff, gm_llen, gm_roff, gm_rlen, gmn_p)
+    u64 gvn = load64(gvn_p)
+    u64 gmn = load64(gmn_p)
+    u64 gblob = load64(gst + 24)
+
+    u64 mv_off = alloc(PJ_MAX * 8); u64 mv_len = alloc(PJ_MAX * 8); u64 mv_id = alloc(PJ_MAX * 8)
+    u64 mm_loff = alloc(PJ_MAX * 8); u64 mm_llen = alloc(PJ_MAX * 8)
+    u64 mm_roff = alloc(PJ_MAX * 8); u64 mm_rlen = alloc(PJ_MAX * 8)
+    u64 mvn_p = alloc(8); u64 mmn_p = alloc(8)
+    u64 mst = parse_tokenizer_json(out_path,
+                                    mv_off, mv_len, mv_id, mvn_p,
+                                    mm_loff, mm_llen, mm_roff, mm_rlen, mmn_p)
+    u64 mvn = load64(mvn_p)
+    u64 mmn = load64(mmn_p)
+    u64 mblob = load64(mst + 24)
+
+    if mvn != gvn {
+        print("FAIL vocab: size got=")
+        print(mvn)
+        print(" want=")
+        print(gvn)
+        print("\n")
+        exit(1)
+    }
+    u64 k = 0
+    while k < gvn {
+        u64 gp = gblob + load64(gv_off + k * 8)
+        u64 gl = load64(gv_len + k * 8)
+        u64 mp = mblob + load64(mv_off + k * 8)
+        u64 ml = load64(mv_len + k * 8)
+        u64 gid = load64(gv_id + k * 8)
+        u64 mid = load64(mv_id + k * 8)
+        u64 bad = 0
+        if gid != mid { bad = 1 }
+        if bad == 0 {
+            if gl != ml { bad = 1 } else {
+                if bpe_bytes_eq(gp, mp, gl) == 0 { bad = 1 }
+            }
+        }
+        if bad == 1 {
+            print("FAIL vocab: first mismatch at index ")
+            print(k)
+            print("\n  got  \"")
+            print_bytes(mp, ml)
+            print("\" id=")
+            print(mid)
+            print("\n  want \"")
+            print_bytes(gp, gl)
+            print("\" id=")
+            print(gid)
+            print("\n")
+            exit(1)
+        }
+        k = k + 1
+    }
+
+    if mmn != gmn {
+        print("FAIL merges: count got=")
+        print(mmn)
+        print(" want=")
+        print(gmn)
+        print("\n")
+        exit(1)
+    }
+    u64 mi = 0
+    while mi < gmn {
+        u64 glp = gblob + load64(gm_loff + mi * 8); u64 gll = load64(gm_llen + mi * 8)
+        u64 grp = gblob + load64(gm_roff + mi * 8); u64 grl = load64(gm_rlen + mi * 8)
+        u64 mlp = mblob + load64(mm_loff + mi * 8); u64 mll = load64(mm_llen + mi * 8)
+        u64 mrp = mblob + load64(mm_roff + mi * 8); u64 mrl = load64(mm_rlen + mi * 8)
+        u64 bad2 = 0
+        if gll != mll { bad2 = 1 } else if bpe_bytes_eq(glp, mlp, gll) == 0 { bad2 = 1 }
+        if bad2 == 0 {
+            if grl != mrl { bad2 = 1 } else if bpe_bytes_eq(grp, mrp, grl) == 0 { bad2 = 1 }
+        }
+        if bad2 == 1 {
+            print("FAIL merges: first mismatch at index ")
+            print(mi)
+            print("\n  got  [")
+            print_bytes(mlp, mll)
+            print(", ")
+            print_bytes(mrp, mrl)
+            print("]\n  want [")
+            print_bytes(glp, gll)
+            print(", ")
+            print_bytes(grp, grl)
+            print("]\n")
+            exit(1)
+        }
+        mi = mi + 1
+    }
+
+    wj_free(gst)
+    wj_free(mst)
+    dealloc(gv_off); dealloc(gv_len); dealloc(gv_id)
+    dealloc(gm_loff); dealloc(gm_llen); dealloc(gm_roff); dealloc(gm_rlen)
+    dealloc(gvn_p); dealloc(gmn_p)
+    dealloc(mv_off); dealloc(mv_len); dealloc(mv_id)
+    dealloc(mm_loff); dealloc(mm_llen); dealloc(mm_roff); dealloc(mm_rlen)
+    dealloc(mvn_p); dealloc(mmn_p)
+
+    // =======================================================================
+    // (d) JSON escaping, exercised directly: a synthetic Vocab whose alphabet
+    // includes a raw '"' (0x22) token, a raw '\' (0x5C) token, and a 2-byte
+    // merge result "\<quote> (0x22,0x5C) — bytes the trained tiny corpus
+    // never contains (see the note in (b)). Writes through the exact same
+    // bpe_write_tokenizer_json() used above, then:
+    //   (i)  confirms the raw output bytes actually contain the escape
+    //        sequences \" (0x5C,0x22) and \\ (0x5C,0x5C) — i.e. escaping
+    //        really happened, not just "happened to still parse";
+    //   (ii) re-parses the file with the same JSON-string reader used above
+    //        and confirms the decoded bytes are exactly the original raw
+    //        bytes (round-trip through escaping is lossless).
+    // =======================================================================
+    u64 ev = bpe_vocab_new()
+    bpe_vocab_add(ev, "<PAD>", 5)
+    bpe_vocab_add(ev, "<UNK>", 5)
+    bpe_vocab_add(ev, "<BOS>", 5)
+    bpe_vocab_add(ev, "<EOS>", 5)
+    u64 qid = bpe_vocab_add(ev, "\"", 1)     // id 4: raw 0x22
+    u64 bid = bpe_vocab_add(ev, "\\", 1)     // id 5: raw 0x5C
+    u64 mergebuf = alloc(2)
+    store8(mergebuf, 0x22)
+    store8(mergebuf + 1, 0x5C)
+    u64 mergeid = bpe_vocab_add(ev, mergebuf, 2)   // id 6: 0x22,0x5C
+
+    u64 emerges = alloc(16)
+    store64(emerges, qid)
+    store64(emerges + 8, bid)
+
+    u64 escape_path = "/tmp/mlrift_escape_test.json"
+    bpe_write_tokenizer_json(ev, emerges, 1, escape_path)
+
+    u64 eszp = alloc(8)
+    u64 ebase = bpe_mmap_file(escape_path, eszp)
+    if ebase == 0 {
+        print("FAIL: cannot mmap ")
+        print_str(escape_path)
+        print("\n")
+        exit(1)
+    }
+    u64 esize = load64(eszp)
+    dealloc(eszp)
+    if find2(ebase, esize, 0x5C, 0x22) == 0 {
+        print("FAIL escape: no \\\" sequence found in output — quote not escaped\n")
+        exit(1)
+    }
+    if find2(ebase, esize, 0x5C, 0x5C) == 0 {
+        print("FAIL escape: no \\\\ sequence found in output — backslash not escaped\n")
+        exit(1)
+    }
+    bpe_munmap_file(ebase, esize)
+
+    u64 ev_off = alloc(PJ_MAX * 8); u64 ev_len = alloc(PJ_MAX * 8); u64 ev_id = alloc(PJ_MAX * 8)
+    u64 em_loff = alloc(PJ_MAX * 8); u64 em_llen = alloc(PJ_MAX * 8)
+    u64 em_roff = alloc(PJ_MAX * 8); u64 em_rlen = alloc(PJ_MAX * 8)
+    u64 evn_p = alloc(8); u64 emn_p = alloc(8)
+    u64 est = parse_tokenizer_json(escape_path,
+                                    ev_off, ev_len, ev_id, evn_p,
+                                    em_loff, em_llen, em_roff, em_rlen, emn_p)
+    u64 evn = load64(evn_p)
+    u64 emn = load64(emn_p)
+    u64 eblob = load64(est + 24)
+
+    if evn != 7 {
+        print("FAIL escape: vocab size got=")
+        print(evn)
+        print(" want=7\n")
+        exit(1)
+    }
+    // Find id 4 (quote), id 5 (backslash), id 6 (merged) in the parsed table
+    // and check their decoded bytes.
+    u64 found_q = 0
+    u64 found_b = 0
+    u64 found_m = 0
+    u64 ei = 0
+    while ei < evn {
+        u64 eid = load64(ev_id + ei * 8)
+        u64 ep = eblob + load64(ev_off + ei * 8)
+        u64 el = load64(ev_len + ei * 8)
+        if eid == qid {
+            found_q = 1
+            if el != 1 || load8(ep) != 0x22 {
+                print("FAIL escape: quote token decoded wrong (len=")
+                print(el)
+                print(")\n")
+                exit(1)
+            }
+        }
+        if eid == bid {
+            found_b = 1
+            if el != 1 || load8(ep) != 0x5C {
+                print("FAIL escape: backslash token decoded wrong (len=")
+                print(el)
+                print(")\n")
+                exit(1)
+            }
+        }
+        if eid == mergeid {
+            found_m = 1
+            if el != 2 || load8(ep) != 0x22 || load8(ep + 1) != 0x5C {
+                print("FAIL escape: merged token decoded wrong (len=")
+                print(el)
+                print(")\n")
+                exit(1)
+            }
+        }
+        ei = ei + 1
+    }
+    if found_q == 0 || found_b == 0 || found_m == 0 {
+        print("FAIL escape: expected token id(s) missing from written vocab\n")
+        exit(1)
+    }
+    if emn != 1 {
+        print("FAIL escape: merges count got=")
+        print(emn)
+        print(" want=1\n")
+        exit(1)
+    }
+    u64 elp = eblob + load64(em_loff); u64 ell = load64(em_llen)
+    u64 erp = eblob + load64(em_roff); u64 erl = load64(em_rlen)
+    if ell != 1 || load8(elp) != 0x22 || erl != 1 || load8(erp) != 0x5C {
+        print("FAIL escape: merges[0] decoded wrong\n")
+        exit(1)
+    }
+
+    wj_free(est)
+    dealloc(ev_off); dealloc(ev_len); dealloc(ev_id)
+    dealloc(em_loff); dealloc(em_llen); dealloc(em_roff); dealloc(em_rlen)
+    dealloc(evn_p); dealloc(emn_p)
+    dealloc(mergebuf)
+    dealloc(emerges)
+    bpe_vocab_free(ev)
+
+    dealloc(merges)
+    bpe_vocab_free(v)
+    bpe_wt_free(wt)
+    bpe_munmap_file(base, size)
+
+    print("PASS writer\n")
+}
