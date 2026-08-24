@@ -1,0 +1,77 @@
+import "io.mlr"
+import "string.mlr"
+import "bpe_unicode.mlr"
+
+static u64 bpe_b2c = 0        // u32[256] byte -> codepoint
+static u64 bpe_b2c_init = 0
+
+fn bpe_b2c_ensure() {
+    if bpe_b2c_init == 1 { return }
+    bpe_b2c = alloc(256 * 4)
+    u64 b = 0
+    u64 n = 0                 // counter for the "other" remap into 0x100+
+    while b < 256 {
+        // printable set: 0x21..0x7E, 0xA1..0xAC, 0xAE..0xFF map to themselves
+        u64 printable = 0
+        if b >= 0x21 && b <= 0x7E { printable = 1 }
+        if b >= 0xA1 && b <= 0xAC { printable = 1 }
+        if b >= 0xAE && b <= 0xFF { printable = 1 }
+        u32 cp = 0
+        if printable == 1 { cp = b } else { cp = 0x100 + n; n = n + 1 }
+        store32(bpe_b2c + b*4, cp)
+        b = b + 1
+    }
+    bpe_b2c_init = 1
+}
+
+fn bpe_utf8_encode_cp(u64 dst, u64 cp) -> u64 {
+    if cp < 0x80 { store8(dst, cp); return 1 }
+    if cp < 0x800 {
+        store8(dst,   0xC0 | (cp >> 6))
+        store8(dst+1, 0x80 | (cp & 0x3F)); return 2 }
+    if cp < 0x10000 {
+        store8(dst,   0xE0 | (cp >> 12))
+        store8(dst+1, 0x80 | ((cp >> 6) & 0x3F))
+        store8(dst+2, 0x80 | (cp & 0x3F)); return 3 }
+    store8(dst,   0xF0 | (cp >> 18))
+    store8(dst+1, 0x80 | ((cp >> 12) & 0x3F))
+    store8(dst+2, 0x80 | ((cp >> 6) & 0x3F))
+    store8(dst+3, 0x80 | (cp & 0x3F)); return 4
+}
+
+fn bpe_byte_map_piece(u64 src, u64 slen, u64 dst) -> u64 {
+    bpe_b2c_ensure()
+    u64 i = 0; u64 o = 0
+    while i < slen {
+        u64 bb = 0; unsafe { *((src + i) as u8) -> bb }      // zero-extend load
+        u64 cp = 0; unsafe { *((bpe_b2c + bb*4) as u32) -> cp }
+        o = o + bpe_utf8_encode_cp(dst + o, cp)
+        i = i + 1
+    }
+    return o
+}
+
+// NOTE: NO `expr as uNN` value casts anywhere — they do not parse in MLRift
+// (`(b as u64)` is a parse error). Load bytes straight into u64 locals with a
+// typed unsafe load (zero-extends), which is the in-tree idiom.
+fn bpe_utf8_decode(u64 p, u64 end, u64 out_cp) -> u64 {
+    if p >= end { return 0 }
+    u64 c0 = 0; unsafe { *(p as u8) -> c0 }
+    if c0 < 0x80 { store64(out_cp, c0); return 1 }
+    if c0 >= 0xF0 {
+        if p + 4 > end { store64(out_cp, c0); return 1 }
+        u64 b1=0; u64 b2=0; u64 b3=0
+        unsafe { *((p+1) as u8) -> b1 } unsafe { *((p+2) as u8) -> b2 } unsafe { *((p+3) as u8) -> b3 }
+        u64 cp = ((c0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
+        store64(out_cp, cp); return 4 }
+    if c0 >= 0xE0 {
+        if p + 3 > end { store64(out_cp, c0); return 1 }
+        u64 b1=0; u64 b2=0
+        unsafe { *((p+1) as u8) -> b1 } unsafe { *((p+2) as u8) -> b2 }
+        u64 cp = ((c0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+        store64(out_cp, cp); return 3 }
+    if p + 2 > end { store64(out_cp, c0); return 1 }
+    u64 b1=0; unsafe { *((p+1) as u8) -> b1 }
+    u64 cp = ((c0 & 0x1F) << 6) | (b1 & 0x3F)
+    store64(out_cp, cp); return 2
+}
