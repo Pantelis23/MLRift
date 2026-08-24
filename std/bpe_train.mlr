@@ -1584,6 +1584,14 @@ fn bpe_train_merges(u64 wt, u64 vocab_size, u64 vocab_out, u64 merges_out) -> u6
 // bpe_b2c_ensure) never produces a control byte (<0x20), so no other escape
 // is ever needed, and non-ASCII UTF-8 bytes are emitted verbatim (never
 // \u-escaped) to match HF/serde_json's own output.
+//
+// That "never produces a control byte" guarantee holds for anything that
+// went through bpe_b2c_ensure's map, but this function is also callable on
+// a hand-built Vocab (bpe_vocab_add takes arbitrary bytes — see the
+// synthetic-vocab escape test in tests/bpe/writer_smoke.mlr). A control
+// byte reaching the `else` branch would be emitted raw, silently producing
+// invalid JSON, so that assumption is enforced here rather than merely
+// asserted in this comment.
 fn bpe_write_json_string(u64 sb, u64 s, u64 slen) -> u64 {
     sb = sb_append_byte(sb, 0x22)
     u64 i = 0
@@ -1596,6 +1604,10 @@ fn bpe_write_json_string(u64 sb, u64 s, u64 slen) -> u64 {
             sb = sb_append_byte(sb, 0x5C)
             sb = sb_append_byte(sb, 0x5C)
         } else {
+            if b < 0x20 {
+                print("bpe_write_json_string: control byte in token — not a byte-mapped string\n")
+                exit(1)
+            }
             sb = sb_append_byte(sb, b)
         }
         i = i + 1
@@ -1619,7 +1631,44 @@ fn bpe_write_added_token(u64 sb, u64 id, u64 content) -> u64 {
 // `merges`/`nmerges` are the (left_id,right_id) array bpe_train_merges wrote
 // (16 bytes per entry). Every token string is resolved id -> bytes via
 // bpe_vocab_str, so the emitted vocab/merges are exactly what `vocab` holds.
+//
+// PRECONDITION: `vocab` must have ids 0-3 bound to exactly "<PAD>", "<UNK>",
+// "<BOS>", "<EOS>" (bpe_train_merges' R1a guarantees this for a
+// freshly-trained Vocab) — the `added_tokens` stanza hardcodes those four
+// strings independently of whatever `vocab` actually holds at those ids, so
+// a mismatch would silently write a self-inconsistent file. Checked below
+// and a loud death on violation, rather than a silent inconsistency.
 fn bpe_write_tokenizer_json(u64 vocab, u64 merges, u64 nmerges, u64 path) {
+    u64 vcount = bpe_vocab_count(vocab)
+    if vcount < 4 {
+        print("bpe_write_tokenizer_json: vocab has fewer than the 4 required special-token ids\n")
+        exit(1)
+    }
+    u64 chk_p = alloc(8)
+    u64 chk_l = alloc(8)
+    bpe_vocab_str(vocab, 0, chk_p, chk_l)
+    if load64(chk_l) != 5 || bpe_bytes_eq(load64(chk_p), "<PAD>", 5) == 0 {
+        print("bpe_write_tokenizer_json: vocab id 0 is not \"<PAD>\"\n")
+        exit(1)
+    }
+    bpe_vocab_str(vocab, 1, chk_p, chk_l)
+    if load64(chk_l) != 5 || bpe_bytes_eq(load64(chk_p), "<UNK>", 5) == 0 {
+        print("bpe_write_tokenizer_json: vocab id 1 is not \"<UNK>\"\n")
+        exit(1)
+    }
+    bpe_vocab_str(vocab, 2, chk_p, chk_l)
+    if load64(chk_l) != 5 || bpe_bytes_eq(load64(chk_p), "<BOS>", 5) == 0 {
+        print("bpe_write_tokenizer_json: vocab id 2 is not \"<BOS>\"\n")
+        exit(1)
+    }
+    bpe_vocab_str(vocab, 3, chk_p, chk_l)
+    if load64(chk_l) != 5 || bpe_bytes_eq(load64(chk_p), "<EOS>", 5) == 0 {
+        print("bpe_write_tokenizer_json: vocab id 3 is not \"<EOS>\"\n")
+        exit(1)
+    }
+    dealloc(chk_p)
+    dealloc(chk_l)
+
     u64 sb = sb_new(65536)
     sb = sb_append_byte(sb, 0x7B)   // {
     sb = sb_append_str(sb, "\"version\":\"1.0\",")
@@ -1647,7 +1696,6 @@ fn bpe_write_tokenizer_json(u64 vocab, u64 merges, u64 nmerges, u64 path) {
     u64 sl = alloc(8)
 
     sb = sb_append_str(sb, "\"vocab\":{")
-    u64 vcount = bpe_vocab_count(vocab)
     u64 vi = 0
     while vi < vcount {
         bpe_vocab_str(vocab, vi, sp, sl)
@@ -1685,7 +1733,11 @@ fn bpe_write_tokenizer_json(u64 vocab, u64 merges, u64 nmerges, u64 path) {
         exit(1)
     }
     u64 len = load64(sb + 8)
-    file_write(fd, sb + 16, len)
+    u64 w = file_write(fd, sb + 16, len)
+    if w != len {
+        print("bpe_write_tokenizer_json: short write\n")
+        exit(1)
+    }
     file_close(fd)
     sb_free(sb)
 }

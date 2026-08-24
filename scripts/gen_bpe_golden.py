@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Offline oracle. Run with AtlasLM/.venv (tokenizers 0.23.1). NOT in runtime path.
+import json
 import os
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders, processors
 OUT = os.path.dirname(__file__) + "/../tests/bpe"
@@ -45,4 +46,14 @@ tok.train([OUT + "/tiny_corpus.txt"],
           trainers.BpeTrainer(vocab_size=320,
                               special_tokens=["<PAD>","<UNK>","<BOS>","<EOS>"]))
 tok.save(OUT + "/golden/tiny_tokenizer.json")
+
+# (c) minified byte-for-byte twin of the golden — same content, no
+# pretty-printing whitespace — so std/bpe_train.mlr's writer (which emits
+# compact JSON) can be diffed against it byte-for-byte instead of only
+# through a JSON-structural comparison.
+with open(OUT + "/golden/tiny_tokenizer.json", encoding="utf-8") as f:
+    golden_obj = json.load(f)
+with open(OUT + "/golden/tiny_tokenizer.min.json", "w", encoding="utf-8") as f:
+    f.write(json.dumps(golden_obj, separators=(",", ":"), ensure_ascii=False))
+
 print("wrote fixtures to", OUT)

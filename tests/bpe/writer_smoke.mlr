@@ -127,11 +127,17 @@ fn wj_int(u64 st) -> u64 {
     return v
 }
 
-// Builds `"name"` (quoted, NUL-terminated) into `out`; returns its length.
-fn wj_mk_key(u64 name, u64 out) -> u64 {
+// Builds `"name"` (quoted, NUL-terminated) into `out`, which has room for
+// `cap` bytes; returns its length. Dies loud rather than overflow `out` if
+// `name` (plus its 2 quote bytes and NUL) doesn't fit.
+fn wj_mk_key(u64 name, u64 out, u64 cap) -> u64 {
     store8(out, 0x22)
     u64 i = 0
     while load8(name + i) != 0 {
+        if i + 2 >= cap {
+            print("wj_mk_key: key too long\n")
+            exit(1)
+        }
         store8(out + 1 + i, load8(name + i))
         i = i + 1
     }
@@ -145,7 +151,7 @@ fn wj_mk_key(u64 name, u64 out) -> u64 {
 // vocab tokens can themselves spell a key name).
 fn wj_seek(u64 st, u64 name) {
     u64 key = alloc(64)
-    u64 klen = wj_mk_key(name, key)
+    u64 klen = wj_mk_key(name, key, 64)
     u64 p = load64(st + 16)
     u64 e = load64(st + 8)
     while p + klen <= e {
@@ -252,13 +258,80 @@ fn print_bytes(u64 p, u64 n) {
     syscall_raw(1, 1, p, n, 0, 0, 0)
 }
 
-// Search `[base, base+size)` for the 2-byte sequence (b0,b1). Returns 1 if
-// found, 0 otherwise.
-fn find2(u64 base, u64 size, u64 b0, u64 b1) -> u64 {
-    if size < 2 { return 0 }
+// Prints up to 40 bytes of context on each side of `offset` within
+// `[base, base+size)`, clamped to the buffer's bounds.
+fn print_context(u64 base, u64 size, u64 offset) {
+    u64 cs = 0
+    if offset > 40 { cs = offset - 40 }
+    u64 ce = offset + 40
+    if ce > size { ce = size }
+    print_bytes(base + cs, ce - cs)
+}
+
+// Byte-for-byte compare of two whole files (already mmap'd). Dies loud with
+// the offset, the got/want bytes there, and ~40 bytes of context either
+// side on the FIRST difference (including a length mismatch, reported at
+// the position where the shorter buffer ends). This is the catch-all for
+// every field the structural payload/round-trip checks don't cover
+// (added_tokens, pre_tokenizer/post_processor/decoder flags, the "model"
+// scalar fields, version/truncation/padding/normalizer) — see I-1.
+fn bpe_bytecmp_or_die(u64 got, u64 got_len, u64 want, u64 want_len) {
+    u64 n = got_len
+    if want_len < n { n = want_len }
     u64 i = 0
-    while i + 1 < size {
-        if load8(base + i) == b0 && load8(base + i + 1) == b1 { return 1 }
+    while i < n {
+        if load8(got + i) != load8(want + i) {
+            print("FAIL byte-compare: mismatch at offset ")
+            print(i)
+            print("\n  got  byte=0x")
+            print_hex_byte(load8(got + i))
+            print("\n  want byte=0x")
+            print_hex_byte(load8(want + i))
+            print("\n  got  context: \"")
+            print_context(got, got_len, i)
+            print("\"\n  want context: \"")
+            print_context(want, want_len, i)
+            print("\"\n")
+            exit(1)
+        }
+        i = i + 1
+    }
+    if got_len != want_len {
+        print("FAIL byte-compare: length mismatch at offset ")
+        print(n)
+        print(" got_len=")
+        print(got_len)
+        print(" want_len=")
+        print(want_len)
+        print("\n  got  context: \"")
+        print_context(got, got_len, n)
+        print("\"\n  want context: \"")
+        print_context(want, want_len, n)
+        print("\"\n")
+        exit(1)
+    }
+}
+
+fn print_hex_byte(u64 b) {
+    u64 hi = (b >> 4) & 0xF
+    u64 lo = b & 0xF
+    u8 hc = 48 + hi
+    if hi > 9 { hc = 97 + (hi - 10) }
+    u8 lc = 48 + lo
+    if lo > 9 { lc = 97 + (lo - 10) }
+    u8[2] hexbuf
+    hexbuf[0] = hc
+    hexbuf[1] = lc
+    syscall_raw(1, 1, hexbuf, 2, 0, 0, 0)
+}
+
+// Search `[base, base+size)` for the exact byte sequence `pat`/`patlen`.
+// Returns 1 if found, 0 otherwise. The loop bound `i + patlen <= size`
+// already returns 0 whenever `patlen > size` (no separate guard needed).
+fn findn(u64 base, u64 size, u64 pat, u64 patlen) -> u64 {
+    u64 i = 0
+    while i + patlen <= size {
+        if bpe_bytes_eq(base + i, pat, patlen) == 1 { return 1 }
         i = i + 1
     }
     return 0
@@ -462,6 +535,44 @@ fn main() {
     dealloc(mvn_p); dealloc(mmn_p)
 
     // =======================================================================
+    // (c2) Byte-for-byte compare against a minified twin of the golden
+    // (tests/bpe/golden/tiny_tokenizer.min.json = the golden re-serialized
+    // with json.dumps(..., separators=(',',':'), ensure_ascii=False) — same
+    // content, no pretty-printing whitespace). This is the catch-all: (b)
+    // and (c) above only exercise what std/tokenizer.mlr's reader and the
+    // model.vocab/model.merges structural diff can see, which is silent on
+    // every OTHER field the brief requires — version/truncation/padding/
+    // normalizer, all 4 added_tokens objects, and every pre_tokenizer/
+    // post_processor/decoder/model scalar flag. A byte-for-byte compare
+    // against a known-correct compact serialization catches all of those at
+    // once, since std/bpe_train.mlr's writer also emits compact JSON.
+    // =======================================================================
+    u64 minszp = alloc(8)
+    u64 minbase = bpe_mmap_file("tests/bpe/golden/tiny_tokenizer.min.json", minszp)
+    if minbase == 0 {
+        print("FAIL: cannot mmap tests/bpe/golden/tiny_tokenizer.min.json\n")
+        exit(1)
+    }
+    u64 minsize = load64(minszp)
+    dealloc(minszp)
+
+    u64 outszp = alloc(8)
+    u64 outbase = bpe_mmap_file(out_path, outszp)
+    if outbase == 0 {
+        print("FAIL: cannot mmap ")
+        print_str(out_path)
+        print("\n")
+        exit(1)
+    }
+    u64 outsize = load64(outszp)
+    dealloc(outszp)
+
+    bpe_bytecmp_or_die(outbase, outsize, minbase, minsize)
+
+    bpe_munmap_file(minbase, minsize)
+    bpe_munmap_file(outbase, outsize)
+
+    // =======================================================================
     // (d) JSON escaping, exercised directly: a synthetic Vocab whose alphabet
     // includes a raw '"' (0x22) token, a raw '\' (0x5C) token, and a 2-byte
     // merge result "\<quote> (0x22,0x5C) — bytes the trained tiny corpus
@@ -503,14 +614,37 @@ fn main() {
     }
     u64 esize = load64(eszp)
     dealloc(eszp)
-    if find2(ebase, esize, 0x5C, 0x22) == 0 {
-        print("FAIL escape: no \\\" sequence found in output — quote not escaped\n")
+    // Search for the exact vocab-KEY sequences `"\"":`  (quote token's own
+    // vocab entry) and `"\\":` (backslash token's), not a bare 2-byte
+    // `\"`/`\\` pair — a bare pair is satisfiable by a BROKEN writer (e.g.
+    // one that drops the '"'-escape branch entirely): the backslash
+    // token's own correct `\\` output, and the merged token's `"\` body,
+    // both incidentally contain the byte pair (0x5C,0x22) even with no
+    // quote-escaping logic at all. The 5-byte key-with-colon sequence can
+    // only appear from a correctly escaped, correctly quoted, correctly
+    // colon-terminated JSON object key for that exact one-byte token.
+    u64 qkey = alloc(5)     // "\"":   = 0x22,0x5C,0x22,0x22,0x3A
+    store8(qkey, 0x22)
+    store8(qkey + 1, 0x5C)
+    store8(qkey + 2, 0x22)
+    store8(qkey + 3, 0x22)
+    store8(qkey + 4, 0x3A)
+    u64 bkey = alloc(5)     // "\\":   = 0x22,0x5C,0x5C,0x22,0x3A
+    store8(bkey, 0x22)
+    store8(bkey + 1, 0x5C)
+    store8(bkey + 2, 0x5C)
+    store8(bkey + 3, 0x22)
+    store8(bkey + 4, 0x3A)
+    if findn(ebase, esize, qkey, 5) == 0 {
+        print("FAIL escape: no \"\\\"\": key found in output — quote not escaped\n")
         exit(1)
     }
-    if find2(ebase, esize, 0x5C, 0x5C) == 0 {
-        print("FAIL escape: no \\\\ sequence found in output — backslash not escaped\n")
+    if findn(ebase, esize, bkey, 5) == 0 {
+        print("FAIL escape: no \"\\\\\": key found in output — backslash not escaped\n")
         exit(1)
     }
+    dealloc(qkey)
+    dealloc(bkey)
     bpe_munmap_file(ebase, esize)
 
     u64 ev_off = alloc(PJ_MAX * 8); u64 ev_len = alloc(PJ_MAX * 8); u64 ev_id = alloc(PJ_MAX * 8)
