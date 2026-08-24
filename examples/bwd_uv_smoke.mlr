@@ -132,7 +132,11 @@ fn sync_or_die(u64 tag) {
 }
 
 // Compare D2H buffer vs CPU reference over n elems; print max_err + PASS/FAIL.
-fn check(u64 tag, u64 d_buf, u64 h_ref, u64 h_dev, u64 n, f32 tol) {
+// Returns 1 on FAIL, 0 on PASS — the file's primary job is wedge bisection
+// (which dispatch's post-sync print is last before a hang), but these CHECK
+// calls are real correctness assertions against a CPU reference, so a FAIL
+// here must not be swallowed by the diagnostic framing around it.
+fn check(u64 tag, u64 d_buf, u64 h_ref, u64 h_dev, u64 n, f32 tol) -> u64 {
     u32 err = hipMemcpy(h_dev, d_buf, n * 4, 2)
     if err != 0 { die_gpu("D2H check", err) }
     f32 max_err = 0.0f; u64 wi = 0; f32 wd = 0.0f; f32 wr = 0.0f
@@ -150,7 +154,9 @@ fn check(u64 tag, u64 d_buf, u64 h_ref, u64 h_dev, u64 n, f32 tol) {
     print_str(" worst[i="); s = fmt_dec(wi); print_str(s); dealloc(s)
     print_str(" dev="); s = fmt_f32(wd, 6); print_str(s); dealloc(s)
     print_str(" ref="); s = fmt_f32(wr, 6); print_str(s); dealloc(s); print_str("] ")
-    if max_err < tol { print_str("PASS\n") } else { print_str("FAIL\n") }
+    if max_err < tol { print_str("PASS\n"); return 0 }
+    print_str("FAIL\n")
+    return 1
 }
 
 fn main() {
@@ -361,12 +367,13 @@ fn main() {
     print_str("Inputs uploaded.\n")
 
     f32 tol = 0.01f
+    u64 check_fails = 0
 
     // ── FIRE THE EXACT bwd_uv ONE-BANK SEQUENCE ─────────────────────────────
     print_str("\n--- DISPATCH 1: row_scale doutk = alpha . dz  (n=BS*D=49152 rw=D=384) ---\n")
     launch_row_scale(fh_rscale, d_dz, d_alpha, d_doutk, BS * D, D)
     sync_or_die("D1 row_scale")
-    check("doutk[BS,D]", d_doutk, h_doutk_ref, h_dev, BS * D, tol)
+    check_fails = check_fails + check("doutk[BS,D]", d_doutk, h_doutk_ref, h_dev, BS * D, tol)
 
     print_str("\n--- DISPATCH 2: transpose V_k[R=32,D=384] -> VkT[D,R]  grid=2*24=48 ---\n")
     launch_transpose(fh_transp, d_V, d_VkT, R, D)
@@ -375,7 +382,7 @@ fn main() {
     print_str("\n--- DISPATCH 3: gemm dinter = doutk[BS,D] @ VkT[D,R]  M=128 N=32 K=384 grid=8*2=16 ---\n")
     launch_gemm6(fh_gemm, d_doutk, d_VkT, d_dinter, BS, R, D)
     sync_or_die("D3 gemm dinter")
-    check("dinter[BS,R]", d_dinter, h_dinter_ref, h_dev, BS * R, tol)
+    check_fails = check_fails + check("dinter[BS,R]", d_dinter, h_dinter_ref, h_dev, BS * R, tol)
 
     print_str("\n--- DISPATCH 4: transpose inter_k[BS=128,R=32] -> interT[R,BS]  grid=8*2=16 ---\n")
     launch_transpose(fh_transp, d_inter, d_interT, BS, R)
@@ -384,7 +391,7 @@ fn main() {
     print_str("\n--- DISPATCH 5: gemm_accum dV += interT[R,BS] @ doutk[BS,D]  M=32 N=384 K=128 grid=2*24=48 ---\n")
     launch_gemm6(fh_gaccum, d_interT, d_doutk, d_dV, R, D, BS)
     sync_or_die("D5 gemm_accum dV")
-    check("dV[R,D]", d_dV, h_dV_ref, h_dev, R * D, tol)
+    check_fails = check_fails + check("dV[R,D]", d_dV, h_dV_ref, h_dev, R * D, tol)
 
     print_str("\n--- DISPATCH 6: transpose x[BS=128,D=384] -> xT[D,BS]  grid=8*24=192 ---\n")
     launch_transpose(fh_transp, d_x, d_xT, BS, D)
@@ -393,7 +400,7 @@ fn main() {
     print_str("\n--- DISPATCH 7: gemm_accum dU += xT[D,BS] @ dinter[BS,R]  M=384 N=32 K=128 grid=24*2=48 ---\n")
     launch_gemm6(fh_gaccum, d_xT, d_dinter, d_dU, D, R, BS)
     sync_or_die("D7 gemm_accum dU")
-    check("dU[D,R]", d_dU, h_dU_ref, h_dev, D * R, tol)
+    check_fails = check_fails + check("dU[D,R]", d_dU, h_dU_ref, h_dev, D * R, tol)
 
     print_str("\n--- DISPATCH 8: transpose U_k[D=384,R=32] -> UkT[R,D]  grid=24*2=48 ---\n")
     launch_transpose(fh_transp, d_U, d_UkT, D, R)
@@ -402,7 +409,7 @@ fn main() {
     print_str("\n--- DISPATCH 9: gemm_accum dx += dinter[BS,R] @ UkT[R,D]  M=128 N=384 K=32 grid=8*24=192 ---\n")
     launch_gemm6(fh_gaccum, d_dinter, d_UkT, d_dx, BS, D, R)
     sync_or_die("D9 gemm_accum dx")
-    check("dx[BS,D]", d_dx, h_dx_ref, h_dev, BS * D, tol)
+    check_fails = check_fails + check("dx[BS,D]", d_dx, h_dx_ref, h_dev, BS * D, tol)
 
     print_str("\n=== PHASE A: ALL 9 ONE-BANK DISPATCHES RAN (per-dispatch sync) ===\n")
 
@@ -501,5 +508,11 @@ fn main() {
 
     hipkfd_teardown()
     print_str("teardown OK — done.\n")
+    // PHASE A/B progress prints are diagnostic (wedge bisection: whichever
+    // print is LAST before a hang names the culprit dispatch — a real hang
+    // has no exit code to gate on). But the CHECK() calls above are genuine
+    // correctness assertions against a CPU reference; a FAIL there must not
+    // be buried under "ALL PHASES GREEN" and a bare exit(0).
+    if check_fails != 0 { exit(1) }
     exit(0)
 }

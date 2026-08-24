@@ -257,9 +257,11 @@ fn main() {
     // f32 dot over K=128 with ~0.01 magnitudes: tolerance generous but tight enough
     // to catch a missing-accumulate (which would be off by the whole C_init ~1-9).
     f32 tol = 0.005f
+    u64 accum_ok = 1
     if max_err < tol {
         print_str("accum PASS  (no wedge)\n")
     } else {
+        accum_ok = 0
         print_str("accum FAIL  (ran, numerically WRONG)\n")
     }
 
@@ -271,5 +273,9 @@ fn main() {
 
     hipkfd_teardown()
     print_str("teardown OK — done.\n")
+    // Was exit(0) unconditionally: it printed "accum FAIL (ran, numerically
+    // WRONG)" and still returned success. This file exists to confirm or
+    // deny the accum kernel, so the numeric verdict must be the gate.
+    if accum_ok == 0 { exit(1) }
     exit(0)
 }

@@ -57,4 +57,9 @@ fn main() {
     if a64 != c64 { print_str("f64 != finite PASS\n") } else { print_str("f64 != finite FAIL\n"); fail = fail + 1 }
 
     if fail == 0 { print_str("ALL TESTS PASS\n") } else { print_str("SOME TESTS FAILED\n") }
+    // Was: fall off the end after printing "SOME TESTS FAILED", rc 0 either
+    // way. This is the regression smoke for the FCMP_NE/EQ NaN fix, so a
+    // failed comparison must fail the build.
+    if fail != 0 { exit(1) }
+    exit(0)
 }

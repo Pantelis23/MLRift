@@ -662,6 +662,12 @@ fn main() {
     f32 lossN_saved   = 0.0f
     f32 max_loss_err  = 0.0f
     u64 all_loss_ok   = 1
+    // Hoisted out of the step loop (and out of the nested Task-4 `if step==0`
+    // block it's computed in) so the REDUCE-vs-oracle verdict can reach the
+    // final exit gate instead of only driving a print. Declaring it inside
+    // the loop/block would make it loop-local and lose the verdict the
+    // instant control left that scope — the same trap vram_spill_test hit.
+    u64 red_ok_final = 1
     u64 step = 0
     while step < STEPS {
         u64 t0 = time_now()
@@ -794,6 +800,9 @@ fn main() {
                     dealloc(oU); dealloc(oV); dealloc(oGW); dealloc(oGB); dealloc(oBIAS)
                     if red_ok == 1 { print_str("REDUCE vs oracle: all 5 dense grads <=1e-3  PASS\n") }
                     else           { print_str("REDUCE vs oracle: FAIL\n") }
+                    // Was: local to this block, so the verdict never reached
+                    // the final exit gate. Propagate to the hoisted flag.
+                    red_ok_final = red_ok
                 }
             }
             dealloc(hU); dealloc(hV); dealloc(hGW); dealloc(hGB); dealloc(hBIAS)
@@ -1022,5 +1031,12 @@ fn main() {
     hipFree(d_barrier)
     hipFree(d_partial)
     hipkfd_teardown()
+    // Was exit(0) unconditionally: "grad ... FAIL", "REDUCE vs oracle: FAIL"
+    // and "TASK 7 FAIL" could all print and this still returned success.
+    // This is the trainer's own correctness gate against the loss reference
+    // and the NW=1 oracle grads, so either verdict going bad must fail the
+    // build.
+    if red_ok_final == 0 { exit(1) }
+    if all_loss_ok == 0 { exit(1) }
     exit(0)
 }

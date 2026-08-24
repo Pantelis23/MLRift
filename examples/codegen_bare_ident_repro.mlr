@@ -64,4 +64,7 @@ fn main() {
         print_str("FAIL count=")
         u64 s = fmt_dec(fail); print_str(s); dealloc(s); print_str("\n")
     }
+    // Was: fall off the end after printing FAIL count=N, rc 0 either way.
+    if fail != 0 { exit(1) }
+    exit(0)
 }

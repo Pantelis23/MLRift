@@ -1513,6 +1513,12 @@ fn main() {
     }
     f32 fNSTEPS = f64_to_f32(int_to_f64(NSTEPS))
     f32 max_loss_err = 0.0f
+    // Declared here — function scope, before the loop — not inside it: a
+    // counter declared inside the loop body would be loop-local and lose
+    // every earlier iteration's failure the moment the loop re-entered the
+    // block (the vram_spill_test trap). Counts periodic + final checkpoint
+    // save failures so "[ckpt] SAVE FAILED" reaches the exit gate below.
+    u64 ckpt_save_fails = 0
     u64 step = start_step               // resume point (0 unless MLRIFT_CKPT_LOAD)
     u64 step_end = start_step + NSTEPS  // run NSTEPS more steps from here
     while step < step_end {
@@ -2317,7 +2323,7 @@ fn main() {
                 u64 se = wzma_ckpt_save(ck_save_path, done, VOCAB, D, K, R, ck_bufs, ck_sizes, ck_nblk)
                 if se == 0 {
                     print_str("  [ckpt] saved at step "); u64 ds = fmt_dec(done); print_str(ds); dealloc(ds); print_str("\n")
-                } else { print_str("  [ckpt] SAVE FAILED\n") }
+                } else { print_str("  [ckpt] SAVE FAILED\n"); ckpt_save_fails = ckpt_save_fails + 1 }
             }
         } } }
 
@@ -2364,7 +2370,7 @@ fn main() {
             if se == 0 {
                 print_str("final checkpoint saved to "); print_str(ck_save_path)
                 print_str(" (step "); u64 fs = fmt_dec(step); print_str(fs); dealloc(fs); print_str(")\n")
-            } else { print_str("final checkpoint SAVE FAILED\n") }
+            } else { print_str("final checkpoint SAVE FAILED\n"); ckpt_save_fails = ckpt_save_fails + 1 }
         }
         if ck_bufs != 0 { dealloc(ck_bufs); dealloc(ck_sizes) }
         print_str("real-corpus contrastive run complete; bench_ref identity check skipped.\n")
@@ -2376,6 +2382,12 @@ fn main() {
     if max_loss_err > 0.01f { print_str("FAIL: some step loss > 1e-2 from bench_ref\n"); ok = 0 }
     if ok == 1 { print_str("PASS: all 50 losses within 1e-2 of bench_ref.json\n") }
     }
+
+    // Was: "[ckpt] SAVE FAILED" / "final checkpoint SAVE FAILED" printed a
+    // real error but never touched `ok`, so a checkpoint write failure was
+    // invisible to the exit code. Fold it in without disturbing the loss
+    // verdict computed above.
+    if ckpt_save_fails > 0 { ok = 0 }
 
     dealloc(zbig)
     hipkfd_teardown()

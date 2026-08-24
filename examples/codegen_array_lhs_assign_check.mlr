@@ -37,4 +37,7 @@ fn main() {
     } else {
         print_str("FAIL\n")
     }
+    // Was: fall off the end after printing FAIL, rc 0 either way.
+    if fail != 0 { exit(1) }
+    exit(0)
 }

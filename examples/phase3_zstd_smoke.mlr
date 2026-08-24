@@ -168,8 +168,11 @@ fn main() {
     uint64 bptr = alloc(8); unsafe { *(bptr as uint64) = 0 }
     uint64 sptr = alloc(8); unsafe { *(sptr as uint64) = 0 }
     uint64 le = _load_file("/lib/firmware/amdgpu/gc_11_0_3_pfp.bin.zst", bptr, sptr)
+    uint64 missing = 0
     if le != 0 {
         _print_dec("  load_file errno", 16, le)
+        puts("  SKIP: firmware input not present — Test 2 did not run")
+        missing = 1
         dealloc(bptr); dealloc(sptr)
     } else {
         uint64 fbuf = 0; unsafe { *(bptr as uint64) -> fbuf }
@@ -206,6 +209,18 @@ fn main() {
     if fails > 0 {
         _print_dec("phase3_zstd_smoke (B.1): RED, failures", 38, fails)
         exit(1)
+    }
+    // Was also: a genuinely-absent firmware input made Test 2 silently
+    // skip (no `fails` increment), then this fell through to print GREEN
+    // having only run Test 1 — "GREEN" on an incomplete run is the same
+    // defect class as printing FAIL and exiting 0. Distinguish "input
+    // present but wrong" (exit 1, above — a real regression) from "input
+    // genuinely absent" (exit 2 — an environment/fixture problem, not a
+    // code defect) rather than collapsing both into a false GREEN, per
+    // phase3_zstd_verify_pfp's non-zero-on-missing-input precedent.
+    if missing != 0 {
+        puts("phase3_zstd_smoke (B.1): INCOMPLETE — firmware input missing, Test 2 did not run")
+        exit(2)
     }
     puts("phase3_zstd_smoke (B.1): GREEN")
     exit(0)
