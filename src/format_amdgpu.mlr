@@ -12973,7 +12973,16 @@ fn _emit_transpose_f32_body(uint64 args_desc) {
 // _emit_transpose_f32_body and pushes a kt entry with the correct
 // LDS size (1088 = 17×16×4 with +1 stride padding).
 fn amdgpu_lower_transpose_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
-    uint64[8] args_desc
+    // HEAP, not `uint64[8] args_desc`: kt_push_lds only stores the POINTER,
+    // and the msgpack note is emitted long after this function returns.  A
+    // stack array here is read back after its frame is dead, so every arg
+    // descriptor except the first came out of freed stack memory — the
+    // emitted .note carried garbage sizes/offsets (e.g. .offset/.size =
+    // 0x004D1ACD, an address inside mlrc's own image) and the .co bytes
+    // shifted with any unrelated compiler edit.  Every other
+    // amdgpu_lower_* kernel already alloc()s this; transpose_f32 was the
+    // lone hold-out.
+    uint64 args_desc = alloc(4 * 16)
     _emit_transpose_f32_body(args_desc)
 
     uint64 k_text_size = asm_text_len
