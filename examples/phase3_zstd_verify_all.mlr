@@ -159,10 +159,12 @@ fn main() {
     puts("")
     _print_dec("PASSES", 6, passes)
     _print_dec("FAILS",  5, fails)
+    // Was exit(0) unconditionally: "FAILURES PRESENT" still returned
+    // success, so nothing calling this could tell green from red.
     if fails == 0 {
         puts("phase3_zstd_verify_all: ALL 11 FIRMWARE BLOBS BYTE-EXACT GREEN")
-    } else {
-        puts("phase3_zstd_verify_all: FAILURES PRESENT")
+        exit(0)
     }
-    exit(0)
+    puts("phase3_zstd_verify_all: FAILURES PRESENT")
+    exit(1)
 }

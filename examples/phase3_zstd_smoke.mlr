@@ -120,6 +120,7 @@ fn _load_file(uint64 path, uint64 out_buf_ptr, uint64 out_size_ptr) -> uint64 {
 }
 
 fn main() {
+    uint64 fails = 0
     puts("=== Test 1: synthetic raw-block frame ===")
     // I miscounted in _build_synthetic_frame — let me fix at runtime
     // to use a size of 5 ("hello") to match what I actually wrote.
@@ -153,9 +154,11 @@ fn main() {
         if ok != 0 {
             puts("  PASS: synthetic raw-block decompressed bit-exact")
         } else {
+            fails = fails + 1
             puts("  FAIL: output bytes mismatch")
         }
     } else {
+        fails = fails + 1
         puts("  FAIL: decompress did not return OK / wrote wrong byte count")
     }
     dealloc(src); dealloc(dst); dealloc(written_ptr)
@@ -190,12 +193,20 @@ fn main() {
         } else if e2 == ZSTD_OK {
             puts("  UNEXPECTED OK: file contained only raw/RLE blocks (rare)")
         } else {
+            fails = fails + 1
             puts("  FAIL: substrate error before reaching compressed block")
         }
         dealloc(outbuf); dealloc(wptr); dealloc(fbuf)
     }
 
     puts("")
+    // Was: print GREEN and exit(0) unconditionally, even directly after
+    // printing FAIL. A smoke test that reports GREEN on failure is worse
+    // than no smoke test.
+    if fails > 0 {
+        _print_dec("phase3_zstd_smoke (B.1): RED, failures", 38, fails)
+        exit(1)
+    }
     puts("phase3_zstd_smoke (B.1): GREEN")
     exit(0)
 }

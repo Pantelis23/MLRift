@@ -134,5 +134,11 @@ fn main() {
     } else {
         print_str("=== LUT DIFFERS — gemma3 drift may be here ===\n")
     }
+    // DIAGNOSTIC, NOT A GATE — exit(0) either way is deliberate.
+    // This file exists to answer "is the gemma3 drift in the LUT seed?",
+    // and BOTH answers are the finding it is looking for: mismatches == 0
+    // localises the drift elsewhere, mismatches > 0 localises it here.
+    // Neither outcome is a regression, so neither should fail a build.
+    // Read the printed verdict; do not wire this into a pass/fail harness.
     exit(0)
 }

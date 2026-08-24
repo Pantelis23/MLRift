@@ -129,5 +129,10 @@ fn main() {
 
     hipFree(d_in); hipFree(d_out)
     hipkfd_teardown()
+
+    // Was exit(0) unconditionally: it printed the mismatch count and still
+    // reported success, so nothing could tell pass from fail.
+    if mismatch > 0 { puts("FAIL transpose_f32: not bit-exact"); exit(1) }
+    puts("PASS transpose_f32: bit-exact vs CPU reference")
     exit(0)
 }

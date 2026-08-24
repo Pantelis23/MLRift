@@ -83,6 +83,7 @@ fn main() {
     u64 n_vram_only  = 0
     u64 n_gtt_spill  = 0
     u64 first_spill_at = max_chunks         // sentinel: never spilled
+    u64 total_bad_chunks = 0                // chunks whose sentinel failed to round-trip
 
     u64 idx = 0
     while idx < max_chunks {
@@ -142,6 +143,7 @@ fn main() {
         if mismatches == 0 {
             print_str("ok\n")
         } else {
+            total_bad_chunks = total_bad_chunks + 1
             print_str("FAIL ("); u64 ms = fmt_dec(mismatches); print_str(ms); dealloc(ms); print_str(" mismatches, first @ ")
             u64 sis = fmt_dec(sample_idx); print_str(sis); dealloc(sis); print_str(" got=")
             u64 vs = fmt_dec(v); print_str(vs); dealloc(vs); print_str(")\n")
@@ -171,5 +173,16 @@ fn main() {
     }
 
     hipkfd_teardown()
+
+    // Was exit(0) unconditionally: a chunk whose sentinel failed to
+    // round-trip printed "FAIL (... mismatches ...)" and the test still
+    // reported success. A corrupted SDMA staging path is exactly what this
+    // file exists to catch, so it must exit non-zero.
+    if total_bad_chunks > 0 {
+        print_str("FAIL: "); u64 tb = fmt_dec(total_bad_chunks); print_str(tb); dealloc(tb)
+        print_str(" chunk(s) did not round-trip through SDMA staging\n")
+        exit(1)
+    }
+    print_str("PASS: all chunks round-tripped through SDMA staging\n")
     exit(0)
 }

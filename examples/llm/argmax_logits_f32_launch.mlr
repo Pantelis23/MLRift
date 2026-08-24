@@ -138,5 +138,10 @@ fn main() {
 
     hipFree(d_logits); hipFree(d_out)
     hipkfd_teardown()
+
+    // Was exit(0) unconditionally: it printed the mismatch count and still
+    // reported success, so nothing could tell pass from fail.
+    if mismatch > 0 { puts("FAIL argmax_logits_f32: mismatch vs CPU argmax"); exit(1) }
+    puts("PASS argmax_logits_f32: matches CPU argmax")
     exit(0)
 }

@@ -33,7 +33,11 @@ fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
     uint64 nul_p = buf + label_len + 2 + dlen; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
     puts(buf)
 }
-fn die(uint64 msg, uint64 code) { puts(msg); print_label_val("e", 1, code); exit(1) }
+// The explicit teardown matches residual_add_f32_launch.mlr's die(). It is
+// belt-and-braces: the compiler already injects hipkfd_teardown() before
+// every exit path under --target=amdgpu-native (src/ir.mlr:9673 covers the
+// extern-exit case), and std/hip_kfd.mlr:1231 makes the second call a no-op.
+fn die(uint64 msg, uint64 code) { puts(msg); print_label_val("e", 1, code); hipkfd_teardown(); exit(1) }
 
 fn main() {
     uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }

@@ -388,5 +388,9 @@ fn main() {
 
     hipFree(d_W); hipFree(d_X); hipFree(d_Y)
     hipkfd_teardown()
+
+    // Was exit(0) unconditionally: it printed PASS or FAIL and returned
+    // success either way, so nothing could tell them apart.
+    if mismatch > 0 { exit(1) }
     exit(0)
 }

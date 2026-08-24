@@ -290,5 +290,8 @@ fn main() {
         _print_dec("phase3_zstd_unit_smoke FAILS", 28, nfails)
     }
     dealloc(fails)
+    // Was exit(0) unconditionally: it printed the failure count and still
+    // returned success, so no caller could tell pass from fail.
+    if nfails > 0 { exit(1) }
     exit(0)
 }

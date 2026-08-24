@@ -201,6 +201,8 @@ fn main() {
     put_kv("ATTN_COOP",  9, 2)
     put_kv("MAX_SEQ_LDS", 11, MAX_SEQ)
 
+    uint64 barrier_fails = 0
+
     uint64 mp = 0
     while mp <= 7 {
         err = hipMemcpy(barrier_ctr, h_zero4, 4, 1); if err != 0 { die("clear barrier", err) }
@@ -224,7 +226,7 @@ fn main() {
         uint64 expected = (mp + 1) * WG_PERSIST
         put_kv("counter_final", 13, ctr_u64)
         put_kv("counter_expected", 16, expected)
-        if ctr_u64 == expected { puts("PASS") } else { puts("FAIL") }
+        if ctr_u64 == expected { puts("PASS") } else { puts("FAIL"); barrier_fails = barrier_fails + 1 }
         dealloc(h_ctr_buf)
         mp = mp + 1
     }
@@ -236,5 +238,10 @@ fn main() {
     hipFree(b_x_norm_g); hipFree(b_qkv_g); hipFree(b_attn_q_g)
     hipFree(b_mid_g); hipFree(b_mid_norm_g); hipFree(b_attn_out_g)
     hipkfd_teardown()
+
+    // Was exit(0) unconditionally: it printed PASS or FAIL per
+    // persist-mode and returned success either way.
+    if barrier_fails > 0 { puts("FAIL: barrier counter wrong in one or more persist modes"); exit(1) }
+    puts("PASS: barrier counter correct in all persist modes")
     exit(0)
 }

@@ -229,5 +229,9 @@ fn main() {
         }
     }
     hipkfd_teardown()
+
+    // Was exit(0) unconditionally: it printed "FAIL - head 0 first 8
+    // elements", dumped them, and still returned success.
+    if fail > 0 { exit(1) }
     exit(0)
 }

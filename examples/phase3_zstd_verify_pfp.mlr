@@ -116,5 +116,10 @@ fn main() {
 
     dealloc(cbuf); dealloc(rbuf); dealloc(outbuf)
     dealloc(cb_p); dealloc(cs_p); dealloc(ref_p); dealloc(rs_p); dealloc(wp)
+
+    // Was exit(0) unconditionally: it printed "FAIL: decompressed output
+    // diverges from reference" and still returned success. This file exists
+    // to certify MLRift's zstd against zstdcat, so it must exit non-zero.
+    if mismatches > 0 { exit(1) }
     exit(0)
 }
