@@ -682,3 +682,857 @@ fn bpe_count_words_1t(u64 corpus_base, u64 corpus_size) -> u64 {
     dealloc(mapped)
     return wt
 }
+
+// ===========================================================================
+// Task 4: Vocab, pair counts, max-heap, and the incremental merge loop.
+//
+// Every rule below is a byte-exactness requirement against HuggingFace
+// `tokenizers` 0.23.1 (`BpeTrainer::do_train` in trainer.rs). Do not "improve"
+// any of them — each one was verified against the real Rust implementation.
+//
+//   R1 Alphabet & ids. ids 0-3 are the four special tokens, added BEFORE the
+//      alphabet. The alphabet is the set of distinct byte-mapped SINGLE
+//      CODEPOINTS actually present in the word set (NOT the full 256-char
+//      ByteLevel alphabet), sorted by codepoint, ids 4.. contiguous. Merge
+//      tokens are appended afterwards in merge order.
+//   R2 Initial pair counts: every adjacency in every word, weighted by that
+//      word's corpus frequency.
+//   R3 Tie-break: max-heap on count; on EQUAL count the SMALLER
+//      (left_id, right_id) tuple wins (HF `Merge::cmp` orders by count
+//      ascending then `other.pair.cmp(&self.pair)`, so in the max-heap the
+//      smaller pair pops first).
+//   R4 Pop discipline: correct-and-REPUSH, NEVER discard. See the loop.
+//   R5 Applying a merge: left-to-right, NON-OVERLAPPING replacement with
+//      exact +/-freq neighbour deltas; see bpe_word_merge_pair.
+//   R6 Vocab-id reuse: if the concatenated token already exists, reuse its id
+//      and do not grow the vocab, but still append (l,r) to merges.
+// ===========================================================================
+
+// M-6: constants-by-convention (MLRift has no `const`, only mutable
+// `static`). Nothing in this file or any importer may assign to these.
+static u64 BPE_NOT_FOUND = 0xFFFFFFFFFFFFFFFF
+// Byte-mapping (bpe_b2c_ensure) produces codepoints 0x21-0xFF for the 188
+// printable bytes and 0x100 + n for the other 68, so every codepoint a
+// byte-mapped word can contain is < 0x144. 512 covers that with room to spare.
+static u64 BPE_CP_LIMIT = 512
+
+// ---------------------------------------------------------------------------
+// Vocab — open-addressed hash of token bytes -> id, plus an id-indexed entry
+// array so id -> bytes is a direct lookup. ids are assigned in insertion
+// order, so `count` is also the next id.
+//
+// Header (64 bytes), all u64:
+//   +0  cap          hash-slot capacity (power of two)
+//   +8  count        number of tokens == next id
+//   +16 slots_ptr    cap slots, 24B each: used(8)+hash(8)+id(8)
+//   +24 entries_ptr  entries, 16B each: blob_off(8)+len(8), indexed BY ID
+//   +32 entries_cap
+//   +40 blob_ptr     growable byte blob holding token bytes
+//   +48 blob_len
+//   +56 blob_cap
+// ---------------------------------------------------------------------------
+
+fn bpe_vocab_new() -> u64 {
+    u64 v = alloc(64)
+    u64 c = 1024
+    store64(v, c)
+    store64(v + 8, 0)
+    u64 slots = alloc(c * 24)
+    memset(slots, 0, c * 24)
+    store64(v + 16, slots)
+    u64 entries = alloc(c * 16)
+    memset(entries, 0, c * 16)
+    store64(v + 24, entries)
+    store64(v + 32, c)
+    u64 bcap = 8192
+    store64(v + 40, alloc(bcap))
+    store64(v + 48, 0)
+    store64(v + 56, bcap)
+    return v
+}
+
+fn bpe_vocab_count(u64 v) -> u64 {
+    return load64(v + 8)
+}
+
+fn bpe_vocab_grow_slots(u64 v) {
+    u64 cap = load64(v)
+    u64 slots = load64(v + 16)
+    u64 new_cap = cap * 2
+    u64 new_slots = alloc(new_cap * 24)
+    memset(new_slots, 0, new_cap * 24)
+    u64 i = 0
+    while i < cap {
+        u64 slot = slots + i * 24
+        if load64(slot) == 1 {
+            u64 hash = load64(slot + 8)
+            u64 j = hash & (new_cap - 1)
+            while load64(new_slots + j * 24) != 0 { j = (j + 1) & (new_cap - 1) }
+            store64(new_slots + j * 24, 1)
+            store64(new_slots + j * 24 + 8, hash)
+            store64(new_slots + j * 24 + 16, load64(slot + 16))
+        }
+        i = i + 1
+    }
+    dealloc(slots)
+    store64(v, new_cap)
+    store64(v + 16, new_slots)
+}
+
+// Returns the id of the token `s`/`slen`, or BPE_NOT_FOUND if it isn't in the
+// Vocab.
+fn bpe_vocab_id(u64 v, u64 s, u64 slen) -> u64 {
+    u64 hash = bpe_fnv1a(s, slen)
+    u64 cap = load64(v)
+    u64 slots = load64(v + 16)
+    u64 entries = load64(v + 24)
+    u64 blob = load64(v + 40)
+    u64 i = hash & (cap - 1)
+    u64 probes = 0
+    while probes < cap {
+        u64 slot = slots + i * 24
+        if load64(slot) == 0 { return BPE_NOT_FOUND }
+        if load64(slot + 8) == hash {
+            u64 id = load64(slot + 16)
+            u64 e = entries + id * 16
+            if load64(e + 8) == slen {
+                if bpe_bytes_eq(blob + load64(e), s, slen) == 1 { return id }
+            }
+        }
+        i = (i + 1) & (cap - 1)
+        probes = probes + 1
+    }
+    // bpe_vocab_add keeps the table below 0.7 load, so an empty slot always
+    // exists and the loop above always returns. Reaching here means that
+    // invariant broke — die loud rather than report a bogus "not found".
+    print("bpe_vocab_id: hash table full\n")
+    exit(1)
+}
+
+// Get-or-insert. Returns the existing id if `s` is already present (nothing is
+// appended in that case), otherwise assigns and returns the next id.
+fn bpe_vocab_add(u64 v, u64 s, u64 slen) -> u64 {
+    u64 existing = bpe_vocab_id(v, s, slen)
+    if existing != BPE_NOT_FOUND { return existing }
+
+    u64 count = load64(v + 8)
+    // Rehash BEFORE probing so the insert probe always finds an empty slot.
+    if (count + 1) * 10 >= load64(v) * 7 { bpe_vocab_grow_slots(v) }
+
+    u64 ecap = load64(v + 32)
+    if count >= ecap {
+        u64 new_ecap = ecap * 2
+        u64 ne = alloc(new_ecap * 16)
+        memset(ne, 0, new_ecap * 16)
+        memcpy(ne, load64(v + 24), count * 16)
+        dealloc(load64(v + 24))
+        store64(v + 24, ne)
+        store64(v + 32, new_ecap)
+    }
+
+    u64 blen = load64(v + 48)
+    u64 bcap = load64(v + 56)
+    if blen + slen > bcap {
+        u64 nb = bcap * 2
+        while nb < blen + slen { nb = nb * 2 }
+        u64 nbp = alloc(nb)
+        memcpy(nbp, load64(v + 40), blen)
+        dealloc(load64(v + 40))
+        store64(v + 40, nbp)
+        store64(v + 56, nb)
+    }
+    memcpy(load64(v + 40) + blen, s, slen)
+    store64(v + 48, blen + slen)
+    u64 e = load64(v + 24) + count * 16
+    store64(e, blen)
+    store64(e + 8, slen)
+
+    u64 hash = bpe_fnv1a(s, slen)
+    u64 cap = load64(v)
+    u64 slots = load64(v + 16)
+    u64 i = hash & (cap - 1)
+    u64 probes = 0
+    while probes < cap {
+        u64 slot = slots + i * 24
+        if load64(slot) == 0 {
+            store64(slot, 1)
+            store64(slot + 8, hash)
+            store64(slot + 16, count)
+            store64(v + 8, count + 1)
+            return count
+        }
+        i = (i + 1) & (cap - 1)
+        probes = probes + 1
+    }
+    // Unreachable: the rehash above guarantees a free slot.
+    print("bpe_vocab_add: hash table full\n")
+    exit(1)
+}
+
+// Writes the token bytes for `id` to *out_ptr and its length to *out_len. The
+// pointer aims into the Vocab's blob and is INVALIDATED by any later
+// bpe_vocab_add that grows the blob — copy the bytes out before adding.
+fn bpe_vocab_str(u64 v, u64 id, u64 out_ptr, u64 out_len) {
+    if id >= load64(v + 8) {
+        print("bpe_vocab_str: id out of range\n")
+        exit(1)
+    }
+    u64 e = load64(v + 24) + id * 16
+    store64(out_ptr, load64(v + 40) + load64(e))
+    store64(out_len, load64(e + 8))
+}
+
+// One-shot, same rules as bpe_wt_free: `v` is unusable afterwards.
+fn bpe_vocab_free(u64 v) {
+    dealloc(load64(v + 16))
+    dealloc(load64(v + 24))
+    dealloc(load64(v + 40))
+    dealloc(v)
+}
+
+// ---------------------------------------------------------------------------
+// Growable u64 vector — used for the per-merge "pairs that got a positive
+// delta" list (the keys of HF's `where_to_update`).
+// Header (24 bytes): n(0) cap(8) ptr(16)
+// ---------------------------------------------------------------------------
+
+fn bpe_uvec_new(u64 cap) -> u64 {
+    u64 uv = alloc(24)
+    u64 c = cap
+    if c < 16 { c = 16 }
+    store64(uv, 0)
+    store64(uv + 8, c)
+    store64(uv + 16, alloc(c * 8))
+    return uv
+}
+
+fn bpe_uvec_push(u64 uv, u64 x) {
+    u64 n = load64(uv)
+    u64 c = load64(uv + 8)
+    if n >= c {
+        u64 nc = c * 2
+        u64 np = alloc(nc * 8)
+        memcpy(np, load64(uv + 16), n * 8)
+        dealloc(load64(uv + 16))
+        store64(uv + 16, np)
+        store64(uv + 8, nc)
+    }
+    store64(load64(uv + 16) + n * 8, x)
+    store64(uv, n + 1)
+}
+
+fn bpe_uvec_free(u64 uv) {
+    dealloc(load64(uv + 16))
+    dealloc(uv)
+}
+
+// ---------------------------------------------------------------------------
+// Pair-count map `pc`. Key = (left_id << 32) | right_id.
+//
+// Each slot also carries the pair's OCCURRENCE LIST (the word indices that
+// contain, or once contained, the pair — the value side of HF's
+// `where_to_update`) and a `pending` flag used to push exactly one refreshed
+// heap entry per merge.
+//
+// Header (32 bytes): cap(0) used(8) slots_ptr(16)
+// Slot (56 bytes):
+//   +0  used
+//   +8  key
+//   +16 count     wrapping u64; `0 - freq` is the decrement idiom. Counts are
+//                 logically >= 0 at every point where they are observed.
+//   +24 occ_ptr   growable u64 array of word indices
+//   +32 occ_len
+//   +40 occ_cap
+//   +48 pending   1 while this pair sits in the current merge's pending list
+// ---------------------------------------------------------------------------
+
+fn bpe_pc_hash(u64 key) -> u64 {
+    u64 h = key
+    h = h ^ (h >> 33)
+    h = h * 0xFF51AFD7ED558CCD
+    h = h ^ (h >> 33)
+    h = h * 0xC4CEB9FE1A85EC53
+    h = h ^ (h >> 33)
+    return h
+}
+
+fn bpe_pc_new(u64 cap) -> u64 {
+    u64 pc = alloc(32)
+    u64 c = bpe_wt_next_pow2(cap)
+    store64(pc, c)
+    store64(pc + 8, 0)
+    u64 slots = alloc(c * 56)
+    memset(slots, 0, c * 56)
+    store64(pc + 16, slots)
+    return pc
+}
+
+fn bpe_pc_grow(u64 pc) {
+    u64 cap = load64(pc)
+    u64 slots = load64(pc + 16)
+    u64 new_cap = cap * 2
+    u64 ns = alloc(new_cap * 56)
+    memset(ns, 0, new_cap * 56)
+    u64 i = 0
+    while i < cap {
+        u64 slot = slots + i * 56
+        if load64(slot) == 1 {
+            u64 j = bpe_pc_hash(load64(slot + 8)) & (new_cap - 1)
+            while load64(ns + j * 56) != 0 { j = (j + 1) & (new_cap - 1) }
+            memcpy(ns + j * 56, slot, 56)
+        }
+        i = i + 1
+    }
+    dealloc(slots)
+    store64(pc, new_cap)
+    store64(pc + 16, ns)
+}
+
+// Get-or-insert the slot for `key`, returning its address. The address is
+// INVALIDATED by any later call that can grow the map (bpe_pc_slot itself,
+// bpe_pc_add, bpe_pc_add_pos) — re-look-up instead of caching across those.
+fn bpe_pc_slot(u64 pc, u64 key) -> u64 {
+    u64 used = load64(pc + 8)
+    // Rehash BEFORE probing so the probe below always finds an empty slot.
+    if (used + 1) * 10 >= load64(pc) * 7 { bpe_pc_grow(pc) }
+    u64 cap = load64(pc)
+    u64 slots = load64(pc + 16)
+    u64 i = bpe_pc_hash(key) & (cap - 1)
+    u64 probes = 0
+    while probes < cap {
+        u64 slot = slots + i * 56
+        if load64(slot) == 0 {
+            store64(slot, 1)
+            store64(slot + 8, key)
+            store64(slot + 16, 0)
+            store64(slot + 24, 0)
+            store64(slot + 32, 0)
+            store64(slot + 40, 0)
+            store64(slot + 48, 0)
+            store64(pc + 8, used + 1)
+            return slot
+        }
+        if load64(slot + 8) == key { return slot }
+        i = (i + 1) & (cap - 1)
+        probes = probes + 1
+    }
+    // Unreachable: the rehash above guarantees a free slot.
+    print("bpe_pc_slot: hash table full\n")
+    exit(1)
+}
+
+// Get-or-insert (l,r) and add `delta` with a WRAPPING u64 add — `0 - freq` is
+// the decrement idiom, and u64 wrap is exact mod 2^64.
+//
+// MAP ONLY: this NEVER touches the max-heap. Heap pushes happen once per
+// changed pair at the END of a merge's word sweep (HF's `where_to_update`
+// drain), never per delta.
+fn bpe_pc_add(u64 pc, u64 l, u64 r, u64 delta) {
+    u64 slot = bpe_pc_slot(pc, (l << 32) | r)
+    store64(slot + 16, load64(slot + 16) + delta)
+}
+
+// Read-only count lookup; 0 when the pair was never inserted.
+fn bpe_pc_get(u64 pc, u64 l, u64 r) -> u64 {
+    u64 key = (l << 32) | r
+    u64 cap = load64(pc)
+    u64 slots = load64(pc + 16)
+    u64 i = bpe_pc_hash(key) & (cap - 1)
+    u64 probes = 0
+    while probes < cap {
+        u64 slot = slots + i * 56
+        if load64(slot) == 0 { return 0 }
+        if load64(slot + 8) == key { return load64(slot + 16) }
+        i = (i + 1) & (cap - 1)
+        probes = probes + 1
+    }
+    return 0
+}
+
+// Appends word index `iw` to a pc slot's occurrence list.
+//
+// Dedup is against the LAST entry only, which is sufficient: a word is
+// processed to completion before the next one, so every append for a given
+// (pair, word) lands consecutively.
+fn bpe_occ_append(u64 slot, u64 iw) {
+    u64 len = load64(slot + 32)
+    u64 ptr = load64(slot + 24)
+    if len > 0 {
+        if load64(ptr + (len - 1) * 8) == iw { return }
+    }
+    u64 cap = load64(slot + 40)
+    if len >= cap {
+        u64 ncap = cap * 2
+        if ncap < 4 { ncap = 4 }
+        u64 np = alloc(ncap * 8)
+        if cap > 0 {
+            memcpy(np, ptr, len * 8)
+            dealloc(ptr)
+        }
+        store64(slot + 24, np)
+        store64(slot + 40, ncap)
+        ptr = np
+    }
+    store64(ptr + len * 8, iw)
+    store64(slot + 32, len + 1)
+}
+
+// Positive-delta form of bpe_pc_add: same wrapping add, and additionally
+// records `iw` in the pair's occurrence list and queues the pair (once) in
+// `pend` so the caller can push ONE refreshed heap entry for it after the
+// whole word sweep. Still MAP ONLY — the heap is untouched here.
+fn bpe_pc_add_pos(u64 pc, u64 l, u64 r, u64 delta, u64 iw, u64 pend) {
+    u64 key = (l << 32) | r
+    u64 slot = bpe_pc_slot(pc, key)
+    store64(slot + 16, load64(slot + 16) + delta)
+    bpe_occ_append(slot, iw)
+    if load64(slot + 48) == 0 {
+        store64(slot + 48, 1)
+        bpe_uvec_push(pend, key)
+    }
+}
+
+// One-shot, same rules as bpe_wt_free.
+fn bpe_pc_free(u64 pc) {
+    u64 cap = load64(pc)
+    u64 slots = load64(pc + 16)
+    u64 i = 0
+    while i < cap {
+        u64 s = slots + i * 56
+        if load64(s) == 1 {
+            if load64(s + 40) > 0 { dealloc(load64(s + 24)) }
+        }
+        i = i + 1
+    }
+    dealloc(slots)
+    dealloc(pc)
+}
+
+// ---------------------------------------------------------------------------
+// Max-heap of (count, left_id, right_id).
+// Header (24 bytes): cap(0) n(8) data(16). Entry: count(0) left(8) right(16).
+// ---------------------------------------------------------------------------
+
+fn bpe_heap_new(u64 cap) -> u64 {
+    u64 h = alloc(24)
+    u64 c = cap
+    if c < 16 { c = 16 }
+    store64(h, c)
+    store64(h + 8, 0)
+    store64(h + 16, alloc(c * 24))
+    return h
+}
+
+fn bpe_heap_len(u64 h) -> u64 {
+    return load64(h + 8)
+}
+
+// R3: 1 iff (ca,la,ra) outranks (cb,lb,rb). Higher count first; on an EQUAL
+// count the SMALLER (left,right) tuple wins, comparing left then right as
+// integers.
+fn bpe_heap_gt(u64 ca, u64 la, u64 ra, u64 cb, u64 lb, u64 rb) -> u64 {
+    if ca != cb {
+        if ca > cb { return 1 }
+        return 0
+    }
+    if la != lb {
+        if la < lb { return 1 }
+        return 0
+    }
+    if ra < rb { return 1 }
+    return 0
+}
+
+fn bpe_heap_swap(u64 d, u64 x, u64 y) {
+    u64 t0 = load64(d + x * 24)
+    u64 t1 = load64(d + x * 24 + 8)
+    u64 t2 = load64(d + x * 24 + 16)
+    store64(d + x * 24, load64(d + y * 24))
+    store64(d + x * 24 + 8, load64(d + y * 24 + 8))
+    store64(d + x * 24 + 16, load64(d + y * 24 + 16))
+    store64(d + y * 24, t0)
+    store64(d + y * 24 + 8, t1)
+    store64(d + y * 24 + 16, t2)
+}
+
+fn bpe_heap_push(u64 h, u64 count, u64 l, u64 r) {
+    u64 n = load64(h + 8)
+    u64 cap = load64(h)
+    if n >= cap {
+        u64 nc = cap * 2
+        u64 nd = alloc(nc * 24)
+        memcpy(nd, load64(h + 16), n * 24)
+        dealloc(load64(h + 16))
+        store64(h + 16, nd)
+        store64(h, nc)
+    }
+    u64 d = load64(h + 16)
+    store64(d + n * 24, count)
+    store64(d + n * 24 + 8, l)
+    store64(d + n * 24 + 16, r)
+    store64(h + 8, n + 1)
+    u64 ci = n
+    while ci > 0 {
+        u64 pi = (ci - 1) / 2
+        u64 up = bpe_heap_gt(load64(d + ci * 24), load64(d + ci * 24 + 8), load64(d + ci * 24 + 16),
+                             load64(d + pi * 24), load64(d + pi * 24 + 8), load64(d + pi * 24 + 16))
+        if up == 0 { break }
+        bpe_heap_swap(d, ci, pi)
+        ci = pi
+    }
+}
+
+// Pops the maximum into out[0]=count, out[1]=left, out[2]=right. Returns 1, or
+// 0 when the heap is empty (out untouched).
+fn bpe_heap_pop(u64 h, u64 out) -> u64 {
+    u64 n = load64(h + 8)
+    if n == 0 { return 0 }
+    u64 d = load64(h + 16)
+    store64(out, load64(d))
+    store64(out + 8, load64(d + 8))
+    store64(out + 16, load64(d + 16))
+    n = n - 1
+    store64(h + 8, n)
+    if n == 0 { return 1 }
+    store64(d, load64(d + n * 24))
+    store64(d + 8, load64(d + n * 24 + 8))
+    store64(d + 16, load64(d + n * 24 + 16))
+    u64 i = 0
+    while 1 {
+        u64 li = i * 2 + 1
+        u64 ri = i * 2 + 2
+        u64 best = i
+        if li < n {
+            u64 gl = bpe_heap_gt(load64(d + li * 24), load64(d + li * 24 + 8), load64(d + li * 24 + 16),
+                                 load64(d + best * 24), load64(d + best * 24 + 8), load64(d + best * 24 + 16))
+            if gl == 1 { best = li }
+        }
+        if ri < n {
+            u64 gr = bpe_heap_gt(load64(d + ri * 24), load64(d + ri * 24 + 8), load64(d + ri * 24 + 16),
+                                 load64(d + best * 24), load64(d + best * 24 + 8), load64(d + best * 24 + 16))
+            if gr == 1 { best = ri }
+        }
+        if best == i { break }
+        bpe_heap_swap(d, i, best)
+        i = best
+    }
+    return 1
+}
+
+fn bpe_heap_free(u64 h) {
+    dealloc(load64(h + 16))
+    dealloc(h)
+}
+
+// ---------------------------------------------------------------------------
+// R5 — apply one merge to one word.
+//
+// Replaces adjacent (l,r) with `newid` LEFT-TO-RIGHT and NON-OVERLAPPING: in
+// `a a a`, merging (a,a) yields `aa a` — ONE merge, not two. That falls out of
+// the read-cursor/write-cursor structure: `newid` is written at `w`, and the
+// "previous symbol" for the next match is read back from syms[w-1] (i.e. the
+// already-written newid), exactly as HF's `Word::merge` does.
+//
+// Neighbour deltas are emitted against the ORIGINAL sequence: the destroyed
+// (prev,l) and (r,next) pairs lose `freq`, the created (prev,newid) and
+// (newid,next) pairs gain `freq`.
+//
+// It also emits `(l,r) -= freq` per replacement. On an overlapping run that
+// does NOT drive the count to zero (`a a a` has two (a,a) adjacencies but only
+// one replacement), so a residue can remain in `pc`. That is benign and
+// matches HF: this pair's heap entry was just popped and is never re-pushed
+// (only POSITIVELY changed pairs are), so the residue cannot resurrect it.
+//
+// `iw`/`pend` are the recording side-channel for the push protocol; the delta
+// arithmetic in bpe_pc_add_pos is identical to plain bpe_pc_add.
+fn bpe_word_merge_pair(u64 syms, u64 nsym_ptr, u64 freq, u64 l, u64 r, u64 newid, u64 pc, u64 iw, u64 pend) -> u64 {
+    u64 n = 0
+    unsafe { *(nsym_ptr as u64) -> n }
+    u64 i = 0
+    u64 w = 0
+    while i < n {
+        u64 mp_a = 0
+        unsafe { *((syms + i * 4) as u32) -> mp_a }
+        u64 next_is_pair = 0
+        if i + 1 < n {
+            u64 mp_b = 0
+            unsafe { *((syms + (i + 1) * 4) as u32) -> mp_b }
+            if mp_a == l && mp_b == r { next_is_pair = 1 }
+        }
+        if next_is_pair == 1 {
+            if w > 0 {
+                u64 mp_pv = 0
+                unsafe { *((syms + (w - 1) * 4) as u32) -> mp_pv }
+                bpe_pc_add(pc, mp_pv, l, 0 - freq)
+                bpe_pc_add_pos(pc, mp_pv, newid, freq, iw, pend)
+            }
+            if i + 2 < n {
+                u64 mp_nx = 0
+                unsafe { *((syms + (i + 2) * 4) as u32) -> mp_nx }
+                bpe_pc_add(pc, r, mp_nx, 0 - freq)
+                bpe_pc_add_pos(pc, newid, mp_nx, freq, iw, pend)
+            }
+            bpe_pc_add(pc, l, r, 0 - freq)
+            store32(syms + w * 4, newid)
+            w = w + 1
+            i = i + 2
+        } else {
+            store32(syms + w * 4, mp_a)
+            w = w + 1
+            i = i + 1
+        }
+    }
+    store64(nsym_ptr, w)
+    return w
+}
+
+// ---------------------------------------------------------------------------
+// bpe_train_merges — the incremental merge loop.
+//
+//   wt          a WordTable from bpe_count_words_1t (byte-mapped words).
+//   vocab_size  HF's target vocab size. The loop also stops when no pair with
+//               count >= 1 remains; min_frequency is 0, so a pair whose count
+//               is exactly 1 IS accepted.
+//   vocab_out   a FRESH, EMPTY Vocab from bpe_vocab_new(); filled per R1.
+//   merges_out  array of (left_id, right_id) pairs, 16 bytes each (two u64),
+//               in merge order. The caller MUST provide room for `vocab_size`
+//               entries; overflowing that is a loud death, not silent
+//               corruption. (More merges than `vocab_size` is only reachable
+//               through R6 id reuse, which does not grow the vocab.)
+//
+// Returns the number of merges written.
+// ---------------------------------------------------------------------------
+fn bpe_train_merges(u64 wt, u64 vocab_size, u64 vocab_out, u64 merges_out) -> u64 {
+    if bpe_vocab_count(vocab_out) != 0 {
+        print("bpe_train_merges: vocab_out must be a fresh empty Vocab\n")
+        exit(1)
+    }
+
+    // --- R1a: the four special tokens occupy ids 0-3, BEFORE the alphabet.
+    bpe_vocab_add(vocab_out, "<PAD>", 5)
+    bpe_vocab_add(vocab_out, "<UNK>", 5)
+    bpe_vocab_add(vocab_out, "<BOS>", 5)
+    bpe_vocab_add(vocab_out, "<EOS>", 5)
+
+    u64 nw = bpe_wt_count(wt)
+    u64 pptr = alloc(8)
+    u64 plen = alloc(8)
+    u64 cpb = alloc(8)
+
+    // --- R1b: alphabet = distinct byte-mapped codepoints present in the word
+    // set, sorted by codepoint, ids 4.. contiguous.
+    u64 seen = alloc(BPE_CP_LIMIT)
+    memset(seen, 0, BPE_CP_LIMIT)
+    u64 wi = 0
+    while wi < nw {
+        bpe_wt_word(wt, wi, pptr, plen)
+        u64 sp = load64(pptr)
+        u64 se = sp + load64(plen)
+        while sp < se {
+            u64 used = bpe_utf8_decode(sp, se, cpb)
+            u64 cp = 0
+            unsafe { *(cpb as u64) -> cp }
+            if cp >= BPE_CP_LIMIT {
+                print("bpe_train_merges: word codepoint ")
+                print(cp)
+                print(" is outside the byte-mapped range (word table was not byte-mapped?)\n")
+                exit(1)
+            }
+            store8(seen + cp, 1)
+            sp = sp + used
+        }
+        wi = wi + 1
+    }
+    u64 cpid = alloc(BPE_CP_LIMIT * 4)
+    memset(cpid, 0, BPE_CP_LIMIT * 4)
+    u64 enc = alloc(8)
+    u64 cp2 = 0
+    while cp2 < BPE_CP_LIMIT {
+        if load8(seen + cp2) == 1 {
+            u64 el = bpe_utf8_encode_cp(enc, cp2)
+            store32(cpid + cp2 * 4, bpe_vocab_add(vocab_out, enc, el))
+        }
+        cp2 = cp2 + 1
+    }
+    dealloc(seen)
+
+    // --- Words as symbol-id arrays (u32 per symbol) + their frequencies.
+    // A word's symbol array only ever SHRINKS, so its initial length is also
+    // its permanent capacity.
+    u64 wsyms = alloc(nw * 8 + 8)
+    u64 wnsym = alloc(nw * 8 + 8)
+    u64 wfreq = alloc(nw * 8 + 8)
+    wi = 0
+    while wi < nw {
+        u64 f = bpe_wt_word(wt, wi, pptr, plen)
+        u64 wp = load64(pptr)
+        u64 wpe = wp + load64(plen)
+        u64 ncp = 0
+        u64 q = wp
+        while q < wpe {
+            q = q + bpe_utf8_decode(q, wpe, cpb)
+            ncp = ncp + 1
+        }
+        u64 arr = alloc(ncp * 4 + 4)
+        u64 k = 0
+        q = wp
+        while q < wpe {
+            u64 u = bpe_utf8_decode(q, wpe, cpb)
+            u64 c = 0
+            unsafe { *(cpb as u64) -> c }
+            store32(arr + k * 4, load32(cpid + c * 4))
+            k = k + 1
+            q = q + u
+        }
+        store64(wsyms + wi * 8, arr)
+        store64(wnsym + wi * 8, ncp)
+        store64(wfreq + wi * 8, f)
+        wi = wi + 1
+    }
+    dealloc(cpid)
+    dealloc(cpb)
+    dealloc(pptr)
+    dealloc(plen)
+    dealloc(enc)
+
+    // --- R2: initial pair counts + occurrence lists.
+    u64 pc = bpe_pc_new(4096)
+    wi = 0
+    while wi < nw {
+        u64 arr2 = load64(wsyms + wi * 8)
+        u64 n2 = load64(wnsym + wi * 8)
+        u64 f2 = load64(wfreq + wi * 8)
+        u64 j2 = 0
+        while j2 + 1 < n2 {
+            u64 la = load32(arr2 + j2 * 4)
+            u64 ra = load32(arr2 + (j2 + 1) * 4)
+            u64 sl = bpe_pc_slot(pc, (la << 32) | ra)
+            store64(sl + 16, load64(sl + 16) + f2)
+            bpe_occ_append(sl, wi)
+            j2 = j2 + 1
+        }
+        wi = wi + 1
+    }
+
+    // --- Seed the heap once per distinct pair with count >= 1.
+    u64 heap = bpe_heap_new(load64(pc + 8) + 16)
+    u64 pcap = load64(pc)
+    u64 pslots = load64(pc + 16)
+    u64 si = 0
+    while si < pcap {
+        u64 s3 = pslots + si * 56
+        if load64(s3) == 1 {
+            u64 c3 = load64(s3 + 16)
+            if c3 >= 1 {
+                u64 k3 = load64(s3 + 8)
+                bpe_heap_push(heap, c3, k3 >> 32, k3 & 0xFFFFFFFF)
+            }
+        }
+        si = si + 1
+    }
+
+    // --- The merge loop.
+    u64 pend = bpe_uvec_new(256)
+    u64 top = alloc(24)
+    u64 tokcap = 256
+    u64 tokbuf = alloc(tokcap)
+    u64 lptr = alloc(8)
+    u64 llen = alloc(8)
+    u64 rptr = alloc(8)
+    u64 rlen = alloc(8)
+    u64 nmerges = 0
+
+    while bpe_vocab_count(vocab_out) < vocab_size {
+        if bpe_heap_pop(heap, top) == 0 { break }
+        u64 tc = load64(top)
+        u64 tl = load64(top + 8)
+        u64 tr = load64(top + 16)
+        u64 cur = bpe_pc_get(pc, tl, tr)
+        if tc != cur {
+            // R4: the entry's recorded count is stale. CORRECT IT AND PUSH IT
+            // BACK — never discard it, not even when `cur` is 0. Seeded pairs
+            // are pushed exactly once and only ever decrease, so discarding a
+            // stale entry would drop a still-maximal pair from the heap
+            // permanently.
+            bpe_heap_push(heap, cur, tl, tr)
+            continue
+        }
+        // Only a top whose recorded count already MATCHES pc can stop the loop.
+        if tc < 1 { break }
+
+        // R6: token string = left ++ right; reuse the id if it already exists.
+        bpe_vocab_str(vocab_out, tl, lptr, llen)
+        bpe_vocab_str(vocab_out, tr, rptr, rlen)
+        u64 tlen = load64(llen) + load64(rlen)
+        if tlen > tokcap {
+            dealloc(tokbuf)
+            while tokcap < tlen { tokcap = tokcap * 2 }
+            tokbuf = alloc(tokcap)
+        }
+        memcpy(tokbuf, load64(lptr), load64(llen))
+        memcpy(tokbuf + load64(llen), load64(rptr), load64(rlen))
+        u64 newid = bpe_vocab_id(vocab_out, tokbuf, tlen)
+        if newid == BPE_NOT_FOUND { newid = bpe_vocab_add(vocab_out, tokbuf, tlen) }
+
+        if nmerges >= vocab_size {
+            print("bpe_train_merges: merges_out overflow - it must hold vocab_size entries\n")
+            exit(1)
+        }
+        store64(merges_out + nmerges * 16, tl)
+        store64(merges_out + nmerges * 16 + 8, tr)
+        nmerges = nmerges + 1
+
+        // --- R5: sweep every word in this pair's occurrence list. The list is
+        // SNAPSHOTTED because the sweep appends to other pairs' lists, which
+        // can rehash the map and move every slot.
+        u64 slot4 = bpe_pc_slot(pc, (tl << 32) | tr)
+        u64 olen = load64(slot4 + 32)
+        u64 osnap = alloc(olen * 8 + 8)
+        if olen > 0 { memcpy(osnap, load64(slot4 + 24), olen * 8) }
+        u64 t4 = 0
+        while t4 < olen {
+            u64 iw = load64(osnap + t4 * 8)
+            bpe_word_merge_pair(load64(wsyms + iw * 8), wnsym + iw * 8, load64(wfreq + iw * 8),
+                                tl, tr, newid, pc, iw, pend)
+            t4 = t4 + 1
+        }
+        dealloc(osnap)
+
+        // --- Push protocol: after the ENTIRE sweep, exactly ONE refreshed
+        // entry per pair that received a POSITIVE delta, carrying its
+        // then-current count, skipping any count < 1. Pairs that only lost
+        // count are never re-pushed — R4 corrects their stale entries lazily
+        // when they pop.
+        u64 pn = load64(pend)
+        u64 pp = load64(pend + 16)
+        u64 q4 = 0
+        while q4 < pn {
+            u64 key4 = load64(pp + q4 * 8)
+            u64 s4 = bpe_pc_slot(pc, key4)
+            store64(s4 + 48, 0)
+            u64 c4 = load64(s4 + 16)
+            if c4 >= 1 { bpe_heap_push(heap, c4, key4 >> 32, key4 & 0xFFFFFFFF) }
+            q4 = q4 + 1
+        }
+        store64(pend, 0)
+    }
+
+    wi = 0
+    while wi < nw {
+        dealloc(load64(wsyms + wi * 8))
+        wi = wi + 1
+    }
+    dealloc(wsyms)
+    dealloc(wnsym)
+    dealloc(wfreq)
+    dealloc(lptr)
+    dealloc(llen)
+    dealloc(rptr)
+    dealloc(rlen)
+    dealloc(tokbuf)
+    dealloc(top)
+    bpe_uvec_free(pend)
+    bpe_heap_free(heap)
+    bpe_pc_free(pc)
+    return nmerges
+}
