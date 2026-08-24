@@ -7,6 +7,16 @@
 #
 #   G1  byte-exact       MLRift's tokenizer.json vs the HF oracle
 #                        (model.merges + model.vocab, and whole-document bytes)
+#                        PRECISELY: HF writes pretty-printed JSON, MLRift writes
+#                        minified JSON, so the whole-document half of G1 is NOT
+#                        a compare against the file HF saved. The oracle is
+#                        re-serialized once with
+#                        json.dumps(separators=(",",":"), ensure_ascii=False)
+#                        — no sort_keys, so HF's key ORDER is preserved — and
+#                        MLRift's bytes are compared against THAT. The claim
+#                        the gate earns is "byte-identical to HF's JSON content
+#                        after minification, including key order", never
+#                        "byte-identical to the file HF wrote".
 #   G2  1-thread speed   MLRift best-of-3 vs the recorded HF 1-thread bar
 #   G3  full speed       MLRift best-of-3 at $(nproc) vs the HF full bar
 #   G4  round-trip       decode(encode(x)) == x through std/tokenizer.mlr
@@ -516,7 +526,7 @@ sys.exit(0 if ok else 1)
 PYSUM
 
 # --- 3. G1: byte-exact ------------------------------------------------------
-hdr "G1 — byte-exact vs the HF oracle"
+hdr "G1 — byte-exact vs the HF oracle (minified; key order preserved)"
 G1LOG="$WORK/g1.log"
 if ! timed_run "$NTHREADS_FULL" "$G1LOG" > /dev/null; then
     record G1 FAIL "the trainer did not complete"

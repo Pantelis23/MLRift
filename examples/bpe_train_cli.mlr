@@ -48,7 +48,16 @@ fn print_secs(u64 ns) {
 // no overflow detection — it just keeps doing `result*10 + digit` and wraps —
 // so a 21-digit input would silently become an unrelated small number. Length
 // is checked here; the one remaining 20-digit wrap case (a value above
-// 2^64-1 but still 20 digits) is caught by each caller's own upper bound.
+// 2^64-1 but still 20 digits) is left to each caller to survive, and the two
+// callers survive it DIFFERENTLY:
+//   MLRIFT_BPE_VOCAB   has its own explicit >1000000 upper bound below, so a
+//                      wrapped value is rejected outright with a message.
+//   MLRIFT_BPE_THREADS has NO upper bound of its own on purpose (over-large
+//                      values are a legitimate "use every core" request). A
+//                      wrapped value is not rejected; it is clamped to TP_MAX
+//                      inside bpe_count_words, exactly as any other too-large
+//                      thread count is, so the run is correct but the worker
+//                      count it uses is not the number the user typed.
 static u64 ENV_MAX_DIGITS = 20
 
 // Reads a positive-integer env var. Returns `dflt` when the variable is unset;

@@ -1,7 +1,14 @@
 // Task 5 smoke test: bpe_write_tokenizer_json must produce a tokenizer.json
-// that (a) loads and round-trips through std/tokenizer.mlr, and (b) is
-// byte-for-byte identical, once JSON-parsed, to what HuggingFace itself
-// wrote for this corpus (tests/bpe/golden/tiny_tokenizer.json).
+// that (a) loads and round-trips through std/tokenizer.mlr, and (b) carries
+// the same JSON CONTENT as what HuggingFace itself wrote for this corpus
+// (tests/bpe/golden/tiny_tokenizer.json). HF pretty-prints and this writer
+// minifies, so "identical" here never means identical to HF's saved file: the
+// structural half compares parsed model.vocab/model.merges, and the
+// whole-document half compares against tests/bpe/golden/tiny_tokenizer.min.json
+// — the golden re-serialized with separators=(',',':'), ensure_ascii=False and
+// NO sort_keys, so HF's key order is preserved. What this test earns is
+// "byte-identical to HF's JSON content after minification, including key
+// order".
 //
 // If this test fails, the bug is in std/bpe_train.mlr's writer — never edit
 // the golden.

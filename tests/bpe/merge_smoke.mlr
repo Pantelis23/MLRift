@@ -1,5 +1,5 @@
-// Task 4 smoke test: the incremental merge loop must be BYTE-IDENTICAL to
-// HuggingFace `tokenizers` 0.23.1.
+// Task 4 smoke test: the incremental merge loop must produce the same merges
+// and the same vocab as HuggingFace `tokenizers` 0.23.1.
 //
 // Ground truth = tests/bpe/golden/tiny_tokenizer.json, written by HF itself
 // (BpeTrainer, vocab_size=320, special_tokens=["<PAD>","<UNK>","<BOS>","<EOS>"],
@@ -266,7 +266,319 @@ fn print_bytes(u64 p, u64 n) {
     syscall_raw(1, 1, p, n, 0, 0, 0)
 }
 
+// ===========================================================================
+// GROWTH COVERAGE — Vocab and PairCount.
+//
+// Modelled on test_growth in tests/bpe/wordcount_smoke.mlr, and added for the
+// same reason it was: the growth paths of these two containers are DEAD under
+// every other checked-in test, and a broken rehash here fails SILENTLY.
+//
+// What is uncovered without this:
+//   - bpe_vocab_grow_slots, plus the entries-array and blob growth branches
+//     inside bpe_vocab_add. bpe_vocab_new() starts at cap 1024 / ecap 1024 /
+//     blob 8192 and rehashes at 716 tokens, but the tiny-corpus training below
+//     stops at vocab 124, and writer_smoke's synthetic vocab is 7. None of the
+//     three branches ever runs.
+//   - bpe_pc_grow. bpe_train_merges builds its map with bpe_pc_new(4096),
+//     which grows only past 2867 distinct pairs; the 6.5 KB tiny corpus never
+//     gets near that.
+//
+// Why silence is the danger: a vocab rehash that drops or duplicates a slot
+// does not crash. It produces duplicate ids in the emitted `vocab` dict, or a
+// token that can no longer be looked up — a wrong tokenizer.json that still
+// exits 0. This is structurally the same gap that once let a fully-broken
+// WordTable rehash ship green on this branch.
+//
+// The assertions are chosen so a dropped entry cannot hide: every id is
+// round-tripped in BOTH directions (id -> bytes via bpe_vocab_str, bytes -> id
+// via bpe_vocab_id) after all the growth has happened, and the id assigned at
+// insert time is required to still be the id the token resolves to — i.e.
+// insertion order and id assignment survive every rehash, not just the last.
+// ===========================================================================
+
+fn gz_u64_to_dec(u64 val, u64 out) -> u64 {
+    if val == 0 { store8(out, 0x30); return 1 }
+    u64 buf = alloc(24)
+    u64 len = 0
+    u64 tmp = val
+    while tmp > 0 {
+        store8(buf + len, (tmp % 10) + 0x30)
+        len = len + 1
+        tmp = tmp / 10
+    }
+    u64 i = 0
+    while i < len {
+        store8(out + i, load8(buf + (len - 1 - i)))
+        i = i + 1
+    }
+    dealloc(buf)
+    return len
+}
+
+// "tok" + decimal(i). Lengths run 4..7 over i in 0..1999, so 2000 of them sum
+// to 12890 bytes and force at least one blob grow past the initial 8192.
+fn gz_mk_tok(u64 i, u64 out) -> u64 {
+    store8(out + 0, 0x74); store8(out + 1, 0x6F); store8(out + 2, 0x6B)
+    u64 dl = gz_u64_to_dec(i, out + 3)
+    return 3 + dl
+}
+
+// 2000 synthetic tokens through a real Vocab. Crosses the rehash threshold
+// twice (cap 1024 -> 2048 at 716 tokens -> 4096 at 1433), the entries-array
+// doubling once (ecap 1024 at the 1025th token), and the blob doubling once.
+fn test_vocab_growth() {
+    u64 n = 2000
+    u64 v = bpe_vocab_new()
+    u64 tok = alloc(32)
+
+    // Pass 1: insert in order. bpe_vocab_add must hand out ids 0,1,2,... —
+    // that contract is what the writer's `vocab` dict depends on.
+    u64 i = 0
+    while i < n {
+        u64 tl = gz_mk_tok(i, tok)
+        u64 got = bpe_vocab_add(v, tok, tl)
+        if got != i {
+            print("FAIL vocab-growth: insert ")
+            print(i)
+            print(" was assigned id ")
+            print(got)
+            print(" (ids must be handed out in insertion order)\n")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    if bpe_vocab_count(v) != n {
+        print("FAIL vocab-growth: count got=")
+        print(bpe_vocab_count(v))
+        print(" want=")
+        print(n)
+        print("\n")
+        exit(1)
+    }
+
+    // Pass 2: re-add every 3rd token. This is the get-or-insert path AFTER all
+    // the growth: it must return the ORIGINAL id and must not append.
+    i = 0
+    while i < n {
+        if i % 3 == 0 {
+            u64 tl2 = gz_mk_tok(i, tok)
+            u64 again = bpe_vocab_add(v, tok, tl2)
+            if again != i {
+                print("FAIL vocab-growth: re-add of token ")
+                print(i)
+                print(" returned id ")
+                print(again)
+                print(" instead of reusing ")
+                print(i)
+                print("\n")
+                exit(1)
+            }
+        }
+        i = i + 1
+    }
+    if bpe_vocab_count(v) != n {
+        print("FAIL vocab-growth: re-adding existing tokens changed the count to ")
+        print(bpe_vocab_count(v))
+        print("\n")
+        exit(1)
+    }
+
+    // Pass 3: full bijection check, after every rehash has already happened.
+    // A rehash that dropped a slot shows up here as BPE_NOT_FOUND; one that
+    // duplicated or reassigned a slot shows up as a wrong id or wrong bytes.
+    u64 sp = alloc(8)
+    u64 sl = alloc(8)
+    i = 0
+    while i < n {
+        u64 tl3 = gz_mk_tok(i, tok)
+        u64 id = bpe_vocab_id(v, tok, tl3)
+        if id != i {
+            print("FAIL vocab-growth: lookup of token \"")
+            print_bytes(tok, tl3)
+            print("\" returned id ")
+            print(id)
+            print(" want ")
+            print(i)
+            print(" (a rehash lost or moved this entry)\n")
+            exit(1)
+        }
+        bpe_vocab_str(v, i, sp, sl)
+        u64 bad = 0
+        if load64(sl) != tl3 { bad = 1 } else {
+            if bpe_bytes_eq(load64(sp), tok, tl3) == 0 { bad = 1 }
+        }
+        if bad == 1 {
+            print("FAIL vocab-growth: id ")
+            print(i)
+            print(" resolves to \"")
+            print_bytes(load64(sp), load64(sl))
+            print("\" want \"")
+            print_bytes(tok, tl3)
+            print("\" (entries array or blob grew wrong)\n")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    // A token that was never added must still report absent — a rehash that
+    // smeared a used flag across the fresh slot array would fail here.
+    store8(tok + 0, 0x7A); store8(tok + 1, 0x7A); store8(tok + 2, 0x7A)
+    if bpe_vocab_id(v, tok, 3) != BPE_NOT_FOUND {
+        print("FAIL vocab-growth: an absent token resolved to an id\n")
+        exit(1)
+    }
+
+    dealloc(sp)
+    dealloc(sl)
+    dealloc(tok)
+    bpe_vocab_free(v)
+    print("PASS vocab-growth ")
+    print(n)
+    print(" tokens through 2 rehashes\n")
+}
+
+// Non-inserting probe: bpe_pc_slot would CREATE a missing key and hide exactly
+// the defect this test is looking for, so the occurrence-list checks below
+// find their slot by hand.
+fn gz_pc_find(u64 pc, u64 key) -> u64 {
+    u64 cap = load64(pc)
+    u64 slots = load64(pc + 16)
+    u64 i = bpe_pc_hash(key) & (cap - 1)
+    u64 probes = 0
+    while probes < cap {
+        u64 slot = slots + i * 56
+        if load64(slot) == 0 { return 0 }
+        if load64(slot + 8) == key { return slot }
+        i = (i + 1) & (cap - 1)
+        probes = probes + 1
+    }
+    return 0
+}
+
+// 3000 distinct pairs through a real PairCount built the way bpe_train_merges
+// builds it. cap starts at 4096 and grows once past 2867 distinct keys, so the
+// memcpy-based slot move in bpe_pc_grow runs for real. Counts, occurrence
+// lists and the `pending` flag all have to survive it.
+fn test_pc_growth() {
+    u64 n = 3000
+    u64 pc = bpe_pc_new(4096)
+    u64 pend = bpe_uvec_new(16)
+
+    u64 i = 0
+    while i < n {
+        u64 l = (i / 50) + 1
+        u64 r = (i % 50) + 1
+        bpe_pc_add_pos(pc, l, r, (i % 97) + 1, i, pend)
+        i = i + 1
+    }
+
+    if load64(pc + 8) != n {
+        print("FAIL pc-growth: distinct keys got=")
+        print(load64(pc + 8))
+        print(" want=")
+        print(n)
+        print("\n")
+        exit(1)
+    }
+    if load64(pend) != n {
+        print("FAIL pc-growth: pending list got=")
+        print(load64(pend))
+        print(" want=")
+        print(n)
+        print("\n")
+        exit(1)
+    }
+    if load64(pc) <= 4096 {
+        print("FAIL pc-growth: the map never grew (cap still ")
+        print(load64(pc))
+        print(") — this test no longer covers bpe_pc_grow\n")
+        exit(1)
+    }
+
+    i = 0
+    while i < n {
+        u64 l2 = (i / 50) + 1
+        u64 r2 = (i % 50) + 1
+        u64 want = (i % 97) + 1
+        u64 got = bpe_pc_get(pc, l2, r2)
+        if got != want {
+            print("FAIL pc-growth: count for pair (")
+            print(l2)
+            print(",")
+            print(r2)
+            print(") got=")
+            print(got)
+            print(" want=")
+            print(want)
+            print(" (the rehash lost or corrupted this slot)\n")
+            exit(1)
+        }
+        u64 slot = gz_pc_find(pc, (l2 << 32) | r2)
+        if slot == 0 {
+            print("FAIL pc-growth: pair (")
+            print(l2)
+            print(",")
+            print(r2)
+            print(") vanished from the slot array\n")
+            exit(1)
+        }
+        if load64(slot + 32) != 1 {
+            print("FAIL pc-growth: occurrence list for pair index ")
+            print(i)
+            print(" has len ")
+            print(load64(slot + 32))
+            print(" want 1 (bpe_pc_grow must carry occ_ptr/occ_len across)\n")
+            exit(1)
+        }
+        if load64(load64(slot + 24)) != i {
+            print("FAIL pc-growth: occurrence list for pair index ")
+            print(i)
+            print(" holds word ")
+            print(load64(load64(slot + 24)))
+            print(" want ")
+            print(i)
+            print("\n")
+            exit(1)
+        }
+        if load64(slot + 48) != 1 {
+            print("FAIL pc-growth: pending flag lost for pair index ")
+            print(i)
+            print("\n")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    // Decrement through the wrapping-add idiom after growth, then confirm the
+    // count is exactly zero — the same arithmetic bpe_word_merge_pair uses.
+    bpe_pc_add(pc, 1, 1, 0 - 1)
+    if bpe_pc_get(pc, 1, 1) != 0 {
+        print("FAIL pc-growth: `0 - freq` decrement after growth left ")
+        print(bpe_pc_get(pc, 1, 1))
+        print(" want 0\n")
+        exit(1)
+    }
+    // A pair never inserted must still read 0, not a stale neighbour's count.
+    if bpe_pc_get(pc, 999, 999) != 0 {
+        print("FAIL pc-growth: an absent pair reported a non-zero count\n")
+        exit(1)
+    }
+
+    u64 final_cap = load64(pc)
+    bpe_uvec_free(pend)
+    bpe_pc_free(pc)
+    print("PASS pc-growth ")
+    print(n)
+    print(" pairs, cap 4096 -> ")
+    print(final_cap)
+    print("\n")
+}
+
 fn main() {
+    test_vocab_growth()
+    test_pc_growth()
+
     parse_golden("tests/bpe/golden/tiny_tokenizer.json")
 
     u64 szp = alloc(8)

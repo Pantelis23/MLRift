@@ -285,8 +285,9 @@ fn bpe_pretok_split(u64 text, u64 len, u64 offs, u64 lens, u64 max, u64 cpbuf) -
 // Kept dependency-light on purpose (controller ruling): NO import of
 // tokenizer.mlr or wzma_data.mlr — both a local FNV-1a 64 and a local mmap
 // helper are implemented right here instead of reusing tk_fnv1a /
-// wzma_data_open, so this file's only imports stay io.mlr, string.mlr,
-// bpe_unicode.mlr.
+// wzma_data_open. The full import list (line 1-4) is io.mlr, string.mlr,
+// bpe_unicode.mlr and thread.mlr; thread.mlr was added by the Task 6a
+// parallel counter below and is the only addition since this rule was set.
 // ---------------------------------------------------------------------------
 
 // Standard FNV-1a, 64-bit (offset basis 0xcbf29ce484222325, prime
@@ -771,6 +772,13 @@ fn bpe_count_words(u64 corpus_base, u64 corpus_size, u64 nthreads) -> u64 {
         print("bpe_count_words: re-entered while a dispatch is in flight\n")
         exit(1)
     }
+    // M-4: the flag is raised HERE, above the two early returns, not just
+    // before the dispatch. It used to be set after them, which made the two
+    // clears below dead stores — they could only ever write 0 over 0, so a
+    // sabotage drill on either could not fail and neither was testable. With
+    // the raise hoisted, all three clears are live and every exit from this
+    // function is a real release of the guard.
+    bpe_wc_in_flight = 1
 
     if nthreads <= 1 {
         u64 r1t = bpe_count_words_1t(corpus_base, corpus_size)
@@ -785,8 +793,6 @@ fn bpe_count_words(u64 corpus_base, u64 corpus_size, u64 nthreads) -> u64 {
 
     u64 nw = nthreads
     if nw > TP_MAX { nw = TP_MAX }
-
-    bpe_wc_in_flight = 1
 
     // Force both lazy table builds on this thread — see the section header.
     bpe_b2c_ensure()
@@ -1286,10 +1292,6 @@ fn bpe_heap_new(u64 cap) -> u64 {
     return h
 }
 
-fn bpe_heap_len(u64 h) -> u64 {
-    return load64(h + 8)
-}
-
 // R3: 1 iff (ca,la,ra) outranks (cb,lb,rb). Higher count first; on an EQUAL
 // count the SMALLER (left,right) tuple wins, comparing left then right as
 // integers.
@@ -1396,9 +1398,18 @@ fn bpe_heap_free(u64 h) {
 // "previous symbol" for the next match is read back from syms[w-1] (i.e. the
 // already-written newid), exactly as HF's `Word::merge` does.
 //
-// Neighbour deltas are emitted against the ORIGINAL sequence: the destroyed
-// (prev,l) and (r,next) pairs lose `freq`, the created (prev,newid) and
-// (newid,next) pairs gain `freq`.
+// The neighbour deltas therefore read from TWO DIFFERENT sequences, and that
+// asymmetry is load-bearing — do NOT "fix" it: `prev` comes from the
+// already-REWRITTEN prefix (`syms[w-1]`, the `mp_pv` read below) while `next`
+// comes from the still-UNTOUCHED suffix (`syms[i+2]`, the `mp_nx` read below,
+// indexed off the READ cursor `i`). HF's `Word::merge`
+// has exactly the same asymmetry. Concretely, merging (a,a) in `a a a a`: the
+// first replacement charges `(prev,a) -= freq`, the second charges
+// `(newid,a) -= freq` — NOT `(a,a) -= freq` — because by then `syms[w-1]` is
+// the `newid` the first replacement wrote. Each destroyed pair loses `freq`
+// and each created pair ((prev,newid) and (newid,next)) gains `freq`, but
+// "destroyed" is judged against that mixed rewritten-prefix/original-suffix
+// view, not against the original sequence.
 //
 // It also emits `(l,r) -= freq` per replacement. That self-delta is a
 // DELIBERATE DEVIATION from HF, not a match: HF's `Word::merge` (word.rs)
@@ -1461,7 +1472,11 @@ fn bpe_word_merge_pair(u64 syms, u64 nsym_ptr, u64 freq, u64 l, u64 r, u64 newid
 // ---------------------------------------------------------------------------
 // bpe_train_merges — the incremental merge loop.
 //
-//   wt          a WordTable from bpe_count_words_1t (byte-mapped words).
+//   wt          a WordTable of byte-mapped words, from EITHER
+//               bpe_count_words_1t (as tests/bpe/merge_smoke.mlr does) or
+//               bpe_count_words (as examples/bpe_train_cli.mlr does). The two
+//               produce identical tables by construction — see the contract on
+//               bpe_count_words — so this loop cannot tell them apart.
 //   vocab_size  HF's target vocab size. The loop also stops when no pair with
 //               count >= 1 remains; min_frequency is 0, so a pair whose count
 //               is exactly 1 IS accepted.
@@ -1718,11 +1733,18 @@ fn bpe_train_merges(u64 wt, u64 vocab_size, u64 vocab_out, u64 merges_out) -> u6
 // Emits the exact shape HF `tokenizers` 0.23.1 writes (verified against
 // tests/bpe/golden/tiny_tokenizer.json): version, truncation, padding,
 // added_tokens (the 4 specials, ids 0-3), normalizer, pre_tokenizer,
-// post_processor, decoder, model (BPE, vocab + merges). Whitespace is
-// compact (no pretty-printing) — every consumer here (std/tokenizer.mlr's
-// reader, HF's own `tokenizers`, and Python's `json` module) is
-// whitespace-agnostic, and the golden's own pretty-printing is not part of
-// its semantic content.
+// post_processor, decoder, model (BPE, vocab + merges), in HF's key order.
+// Whitespace is compact (no pretty-printing) — every consumer here
+// (std/tokenizer.mlr's reader, HF's own `tokenizers`, and Python's `json`
+// module) is whitespace-agnostic, and the golden's own pretty-printing is not
+// part of its semantic content.
+//
+// So the bar this writer meets is "byte-identical to HF's JSON content after
+// minification, including key order", NOT "byte-identical to the file HF
+// saved" — HF saves pretty-printed. Both whole-document checks in the tree
+// (tests/bpe/writer_smoke.mlr and G1 in scripts/bpe_verify.sh) compare against
+// a MINIFIED re-serialization of HF's output, produced with
+// json.dumps(separators=(",",":"), ensure_ascii=False) and no sort_keys.
 //
 // Token strings are byte-mapped UTF-8 and MUST be appended with an explicit
 // length, never via sb_append_str (which scans for a NUL terminator and
