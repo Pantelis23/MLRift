@@ -40,8 +40,15 @@ import "bpe_pretok.mlr"
 // ---------------------------------------------------------------------------
 
 struct Tokenizer {
-    u64 file_size         // bytes — used by munmap on free
-    u64 file_base         // mmap base of the raw tokenizer.json
+    u64 file_size         // bytes — size of the raw tokenizer.json region
+    u64 file_base         // base of the raw tokenizer.json region (mmap or alloc)
+    // How file_base was obtained, so tokenizer_free releases it the right way:
+    //   1 = mmap  -> munmap(file_base, file_size)
+    //   0 = alloc -> dealloc(file_base)
+    // Only consulted when file_base != 0 && file_size != 0, so the default 0
+    // on a never-loaded / GGUF-loaded Tokenizer can never trigger a dealloc
+    // of something that was never allocated.
+    u64 file_mapped
 
     u64 vocab_count       // total token count (262 144 for Gemma)
     u64 strs_blob         // heap buffer holding decoded token strings back-to-back
@@ -424,6 +431,7 @@ fn tokenizer_load(u64 path) -> Tokenizer {
     Tokenizer tk = alloc(136)
     tk.file_size = 0
     tk.file_base = 0
+    tk.file_mapped = 0
 
     u64 fd = file_open(path, 0)
     if is_errno(fd) != 0 {
@@ -432,16 +440,62 @@ fn tokenizer_load(u64 path) -> Tokenizer {
         return tk
     }
     u64 sz = file_size(fd)
-    // mmap PROT_READ MAP_PRIVATE
-    u64 base = syscall_raw(9, 0, sz, 1, 2, fd, 0)
-    if is_errno(base) != 0 {
-        print("[tokenizer] mmap failed\n")
+    if sz == 0 {
+        // mmap with length 0 is EINVAL, so an empty file has always been
+        // reported as a load failure here. The read fallback below would
+        // instead hand back a 0-byte buffer and let the parser run off it,
+        // so answer the old way on both paths.
+        print("[tokenizer] empty file: ")
+        println_str(path)
         file_close(fd)
         return tk
+    }
+    // mmap(NULL, sz, PROT_READ=1, MAP_PRIVATE=2, fd, 0). Syscall 9 is mmap on
+    // Linux x86_64 ONLY; on aarch64 syscall 9 is lgetxattr and this errors.
+    // The read fallback below is what makes this loader work off-x86_64 —
+    // same shape as bpe_mmap_file in std/bpe_train.mlr.
+    u64 base = syscall_raw(9, 0, sz, 1, 2, fd, 0)
+    u64 mapped = 1
+    if is_errno(base) != 0 {
+        // Fallback: read the whole file into an alloc()'d buffer.
+        mapped = 0
+        base = alloc(sz)
+        if base == 0 {
+            print("[tokenizer] out of memory reading ")
+            println_str(path)
+            file_close(fd)
+            return tk
+        }
+        // file_read lowers to a SINGLE read(2) with no loop of its own
+        // (src/codegen.mlr), so a large tokenizer.json short-reads. This loop
+        // is what makes the buffer complete; without it the tail would be
+        // uninitialized garbage and the vocab would silently be wrong.
+        u64 got = 0
+        while got < sz {
+            u64 n = file_read(fd, base + got, sz - got)
+            if is_errno(n) != 0 { break }
+            if n == 0 { break }
+            got = got + n
+        }
+        if got != sz {
+            // Loud, not silent: a partially filled buffer would parse into a
+            // wrong vocabulary rather than an error.
+            print("[tokenizer] mmap unavailable and short read on ")
+            print(path)
+            print(" (got ")
+            print_int(got)
+            print(" of ")
+            print_int(sz)
+            print(" bytes)\n")
+            dealloc(base)
+            file_close(fd)
+            return tk
+        }
     }
     file_close(fd)
     tk.file_size = sz
     tk.file_base = base
+    tk.file_mapped = mapped
     // Fresh load — don't inherit an encoder mode or pre-tokenizer rule from a
     // previously-loaded tokenizer. The merges/byte-level checks at the end
     // re-enable them.
@@ -672,10 +726,10 @@ fn tokenizer_load(u64 path) -> Tokenizer {
 // GGUF mmap; tokenizer_chat_template() returns (ptr, len) for callers
 // that want to print it.
 //
-// Returns a Tokenizer with file_base = 0 / file_size = 0 (since we don't
-// own the mmap). tokenizer_free is safe to call on the result — it only
-// frees the heap arrays it allocated and skips the munmap path when
-// file_base is zero.
+// Returns a Tokenizer with file_base = 0 / file_size = 0 / file_mapped = 0
+// (since we don't own the GGUF mapping). tokenizer_free is safe to call on
+// the result — it only frees the heap arrays it allocated and skips the
+// whole release path (munmap and dealloc alike) when file_base is zero.
 // ---------------------------------------------------------------------------
 
 // Compare a (ptr,len) byte range against a NUL-terminated C string.
@@ -934,6 +988,7 @@ fn tokenizer_load_from_gguf(GGUFFile gf) -> Tokenizer {
     Tokenizer tk = alloc(136)
     tk.file_size = 0
     tk.file_base = 0
+    tk.file_mapped = 0
     tk.strs_blob = 0
     tk.id_to_off = 0
     tk.id_to_len = 0
@@ -1129,7 +1184,14 @@ fn tokenizer_free(Tokenizer tk) {
     tk_bpe_bare_bytelevel = 0
     tk_gpt2_kind = 0
     if tk.file_base != 0 && tk.file_size != 0 {
-        syscall_raw(11, tk.file_base, tk.file_size, 0, 0, 0, 0)    // munmap
+        if tk.file_mapped != 0 {
+            // Syscall 11 is munmap on Linux x86_64 only — but we only get
+            // here when syscall 9 (x86_64 mmap) succeeded, so the pair is
+            // always consistent.
+            syscall_raw(11, tk.file_base, tk.file_size, 0, 0, 0, 0)    // munmap
+        } else {
+            dealloc(tk.file_base)
+        }
     }
 }
 
