@@ -1403,10 +1403,14 @@ fn bpe_heap_free(u64 h) {
 // already-REWRITTEN prefix (`syms[w-1]`, the `mp_pv` read below) while `next`
 // comes from the still-UNTOUCHED suffix (`syms[i+2]`, the `mp_nx` read below,
 // indexed off the READ cursor `i`). HF's `Word::merge`
-// has exactly the same asymmetry. Concretely, merging (a,a) in `a a a a`: the
-// first replacement charges `(prev,a) -= freq`, the second charges
-// `(newid,a) -= freq` — NOT `(a,a) -= freq` — because by then `syms[w-1]` is
-// the `newid` the first replacement wrote. Each destroyed pair loses `freq`
+// has exactly the same asymmetry. Concretely, merging (a,a) in `x a a a a`:
+// the first replacement charges `(prev,a) -= freq` (prev=x, read from the
+// still-untouched prefix), the second charges `(newid,a) -= freq` — NOT
+// `(a,a) -= freq` — because by then `syms[w-1]` is the `newid` the first
+// replacement wrote. (A leading non-merging symbol is needed to see the prev
+// delta at all: in `a a a a` itself the first replacement sits at `w == 0`,
+// so the `if w > 0` guard suppresses it and only the second replacement's
+// `(newid,a) -= freq` fires.) Each destroyed pair loses `freq`
 // and each created pair ((prev,newid) and (newid,next)) gains `freq`, but
 // "destroyed" is judged against that mixed rewritten-prefix/original-suffix
 // view, not against the original sequence.

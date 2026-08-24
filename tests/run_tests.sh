@@ -7523,6 +7523,9 @@ case "$MLRC" in
     /*) BPE_MLRC="$MLRC" ;;
     *)  BPE_MLRC="$(cd "$(dirname "$MLRC")" 2>/dev/null && pwd)/$(basename "$MLRC")" ;;
 esac
+# roundtrip_probe.mlr is deliberately NOT in this list: it needs a full-corpus
+# artifact (MLRIFT_BPE_OUT) that only a real training run produces, so it
+# can't run standalone here — scripts/bpe_verify.sh owns it instead.
 for BPE_T in util_smoke pretok_smoke wordcount_smoke merge_smoke writer_smoke; do
     BPE_BIN="/tmp/mlrc_bpe_${BPE_T}_$$"
     rm -f "$BPE_BIN"

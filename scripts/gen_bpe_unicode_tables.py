@@ -21,6 +21,11 @@
 #   1. The generated file now carries a PROVENANCE line naming the backend,
 #      its version, unicodedata.unidata_version, and the interpreter. A
 #      regeneration that shifts behaviour now leaves a trace in the diff.
+#      `regex` does not expose the UCD version it bundles internally (checked:
+#      no such attribute on the module) — so the stamp does not claim to have
+#      measured that version directly. The `regex` wheel VERSION above pins it
+#      transitively: reinstalling the same wheel version reinstalls the same
+#      bundled UCD.
 #   2. The fallback no longer happens by accident. Without `regex` this script
 #      REFUSES to write, because a silent fallback is exactly how a wrong
 #      table ships. Set MLRIFT_ALLOW_UNICODEDATA_FALLBACK=1 to override it
@@ -66,7 +71,8 @@ L = ranges(isL); N = ranges(isN)
 OUT = sys.argv[1] if len(sys.argv) > 1 else "std/bpe_unicode.mlr"
 with open(OUT, "w") as f:
     f.write("// GENERATED — \\p{L}/\\p{N} range tables for the BPE pre-tokenizer.\n")
-    f.write("// Regenerate with: python3 scripts/gen_bpe_unicode_tables.py std/bpe_unicode.mlr\n")
+    f.write("// Regenerate with: a python that has the `regex` module installed, e.g.\n")
+    f.write("//   /home/pantelis/Desktop/Projects/Work/AtlasLM/.venv/bin/python3 scripts/gen_bpe_unicode_tables.py std/bpe_unicode.mlr\n")
     f.write(f"// PROVENANCE: {PROVENANCE}\n")
     f.write(f"static u64 uni_L_count = {len(L)}\n")
     f.write(f"static u64 uni_N_count = {len(N)}\n")

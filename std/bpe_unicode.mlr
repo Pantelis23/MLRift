@@ -1,5 +1,6 @@
 // GENERATED — \p{L}/\p{N} range tables for the BPE pre-tokenizer.
-// Regenerate with: python3 scripts/gen_bpe_unicode_tables.py std/bpe_unicode.mlr
+// Regenerate with: a python that has the `regex` module installed, e.g.
+//   /home/pantelis/Desktop/Projects/Work/AtlasLM/.venv/bin/python3 scripts/gen_bpe_unicode_tables.py std/bpe_unicode.mlr
 // PROVENANCE: backend=regex 2026.7.19; unicodedata.unidata_version=15.0.0; python=3.12.3
 static u64 uni_L_count = 684
 static u64 uni_N_count = 146
