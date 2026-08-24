@@ -711,6 +711,14 @@ fn bpe_count_words_1t(u64 corpus_base, u64 corpus_size) -> u64 {
 static u64 bpe_wc_base = 0
 static u64 bpe_wc_tables = 0
 
+// Single-caller re-entry assertion — NOT a lock and NOT thread-safety. It
+// only catches a second call to bpe_count_words starting (recursively, or
+// from another call site) before the first one has returned, which would
+// otherwise silently corrupt bpe_wc_base/bpe_wc_tables the same way the fixed
+// shared-scratch bug once corrupted word counts. It does nothing to make two
+// legitimately-serialized callers safe beyond that hard stop.
+static u64 bpe_wc_in_flight = 0
+
 // Boundary for worker `w` of `nw`: the proportional split point moved FORWARD
 // to just past the next '\n', so workers only ever see whole lines and no line
 // is counted twice or skipped. w == 0 is 0 and w == nw is `size`, both exact.
@@ -759,11 +767,26 @@ fn bpe_wc_worker(u64 start, u64 end, u64 wid) {
 // concatenated per-worker lists is its first appearance in the corpus.
 // Completion order never enters into it.
 fn bpe_count_words(u64 corpus_base, u64 corpus_size, u64 nthreads) -> u64 {
-    if nthreads <= 1 { return bpe_count_words_1t(corpus_base, corpus_size) }
-    if corpus_size == 0 { return bpe_count_words_1t(corpus_base, 0) }
+    if bpe_wc_in_flight == 1 {
+        print("bpe_count_words: re-entered while a dispatch is in flight\n")
+        exit(1)
+    }
+
+    if nthreads <= 1 {
+        u64 r1t = bpe_count_words_1t(corpus_base, corpus_size)
+        bpe_wc_in_flight = 0
+        return r1t
+    }
+    if corpus_size == 0 {
+        u64 r0 = bpe_count_words_1t(corpus_base, 0)
+        bpe_wc_in_flight = 0
+        return r0
+    }
 
     u64 nw = nthreads
     if nw > TP_MAX { nw = TP_MAX }
+
+    bpe_wc_in_flight = 1
 
     // Force both lazy table builds on this thread — see the section header.
     bpe_b2c_ensure()
@@ -807,6 +830,7 @@ fn bpe_count_words(u64 corpus_base, u64 corpus_size, u64 nthreads) -> u64 {
     dealloc(plen)
     dealloc(tables)
     bpe_wc_tables = 0
+    bpe_wc_in_flight = 0
     return master
 }
 

@@ -536,8 +536,41 @@ fn test_mt_cold() {
     dealloc(sp)
 }
 
+// M-1: bpe_wc_in_flight must be cleared on EVERY return path of
+// bpe_count_words, not just the full-dispatch one — a leak on any path would
+// break the very next call with a spurious "re-entered" death. Deliberately
+// walks all three return paths back-to-back, twice, so a leak on any one of
+// them is caught by the very next call in the sequence:
+//   multi-thread dispatch -> nthreads<=1 delegation -> corpus_size==0
+//   short-circuit -> multi-thread dispatch (again) -> ... -> multi-thread
+// If bpe_count_words dies here, reaching "PASS wordcount-mt" is impossible,
+// so no separate assertion is needed beyond "did every call return".
+fn test_reentry_guard_paths() {
+    u64 buf = alloc(8)
+    memcpy(buf, "ab cd\n", 6)
+
+    u64 t1 = bpe_count_words(buf, 6, 4)     // multi-thread dispatch path
+    bpe_wt_free(t1)
+    u64 t2 = bpe_count_words(buf, 6, 1)     // nthreads<=1 delegation path
+    bpe_wt_free(t2)
+    u64 t3 = bpe_count_words(buf, 0, 4)     // corpus_size==0 short-circuit
+    bpe_wt_free(t3)
+    u64 t4 = bpe_count_words(buf, 6, 4)     // multi-thread dispatch again
+    bpe_wt_free(t4)
+    u64 t5 = bpe_count_words(buf, 0, 8)     // corpus_size==0 again
+    bpe_wt_free(t5)
+    u64 t6 = bpe_count_words(buf, 6, 1)     // nthreads<=1 again
+    bpe_wt_free(t6)
+    u64 t7 = bpe_count_words(buf, 6, 8)     // multi-thread, proves no leak
+    bpe_wt_free(t7)
+
+    dealloc(buf)
+}
+
 fn test_mt() {
     mt_counts_init()
+
+    test_reentry_guard_paths()
 
     // (a) the tiny corpus — same bytes the single-thread assertions above use.
     u64 tiny_size_p = alloc(8)
