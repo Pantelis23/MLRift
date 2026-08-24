@@ -109,12 +109,36 @@ fn bpe_cp_is_ws(u64 cp) -> u64 {
     return 0
 }
 
+static u64 bpe_pretok_cpbuf = 0
+static u64 bpe_pretok_cpbuf_init = 0
+
+// N-4: lazily-initialized 8-byte scratch for bpe_utf8_decode's one-codepoint
+// output inside bpe_pretok_split, hoisted out of that function — it used to
+// alloc/dealloc this buffer on EVERY call, i.e. once per corpus LINE
+// (millions of times on a real corpus). Lazy-init pattern matches
+// bpe_b2c_ensure above.
+//
+// CONCURRENCY NOTE: unlike bpe_b2c (write-once-then-read-only), this buffer
+// is overwritten on every decoded codepoint, so it is genuinely shared
+// mutable scratch. Safe under Task 3's single-thread counter and safe under
+// fork()-based parallelism (each child gets its own copy-on-write copy on
+// first write). NOT safe if a future Task 6 ever calls bpe_pretok_split
+// concurrently from multiple OS threads sharing one address space — that
+// would need this scratch to be thread-local or passed in by the caller
+// instead.
+fn bpe_pretok_cpbuf_ensure() {
+    if bpe_pretok_cpbuf_init == 1 { return }
+    bpe_pretok_cpbuf = alloc(8)
+    bpe_pretok_cpbuf_init = 1
+}
+
 // Fills offs[i]/lens[i] with each pre-token's offset+length in the ORIGINAL
 // bytes of `text`; returns the piece count.
 fn bpe_pretok_split(u64 text, u64 len, u64 offs, u64 lens, u64 max) -> u64 {
     u64 pos = 0
     u64 np = 0
-    u64 cpbuf = alloc(8)
+    bpe_pretok_cpbuf_ensure()
+    u64 cpbuf = bpe_pretok_cpbuf
     while pos < len {
         u64 start = pos
         u64 c = 0
@@ -259,7 +283,7 @@ fn bpe_pretok_split(u64 text, u64 len, u64 offs, u64 lens, u64 max) -> u64 {
         store64(lens + np * 8, pos - start)
         np = np + 1
     }
-    dealloc(cpbuf)
+    // N-4: cpbuf is the shared static scratch now — do NOT dealloc it here.
     return np
 }
 
@@ -521,16 +545,36 @@ fn bpe_wt_add(u64 wt, u64 s, u64 slen, u64 add) {
 
 // M-4: release everything owned by a WordTable (slots, entries, blob, the
 // header itself). The caller still owns `wt`'s corpus buffer separately.
+//
+// N-3: `cap` (offset 0) doubles as a "freed" sentinel — a live table always
+// has cap >= 8 (bpe_wt_next_pow2's floor), so a second call sees cap == 0
+// and returns immediately instead of double-dealloc'ing the inner buffers
+// (and the header itself).
 fn bpe_wt_free(u64 wt) {
+    if load64(wt) == 0 { return }   // already freed
     dealloc(load64(wt + 16))   // slots
     dealloc(load64(wt + 24))   // entries
     dealloc(load64(wt + 40))   // blob
+    store64(wt, 0)             // cap := 0 marks this header freed
+    store64(wt + 8, 0)         // count
+    store64(wt + 16, 0)        // slots_ptr
+    store64(wt + 24, 0)        // entries_ptr
+    store64(wt + 32, 0)        // entries_cap
+    store64(wt + 40, 0)        // blob_ptr
+    store64(wt + 48, 0)        // blob_len
+    store64(wt + 56, 0)        // blob_cap
     dealloc(wt)
 }
 
-// M-4: munmap a region returned by bpe_mmap_file.
+// M-4: munmap a region returned by bpe_mmap_file. N-3: check the syscall's
+// return like the rest of this file does (bpe_mmap_file itself checks both
+// file_open and the mmap syscall) instead of discarding it.
 fn bpe_munmap_file(u64 base, u64 size) {
-    syscall_raw(11, base, size, 0, 0, 0, 0)
+    u64 r = syscall_raw(11, base, size, 0, 0, 0, 0)
+    if is_errno(r) != 0 {
+        print("bpe_munmap_file: munmap failed\n")
+        exit(1)
+    }
 }
 
 // Hard ceiling on a single corpus LINE (including its trailing '\n') this
@@ -609,6 +653,20 @@ fn bpe_count_words_1t(u64 corpus_base, u64 corpus_size) -> u64 {
         // always line_start+1 or more (either nl+1, or corpus_size when the
         // final line has no trailing '\n', both strictly > line_start). No
         // `if line_len > 0` guard is reachable-false here, so none is used.
+
+        // N-1: offs/lens/mapped were sized from bpe_cw_max_line_len's own
+        // (hand-duplicated) copy of this exact line-splitting loop, not from
+        // `line_len` directly. If the two ever drift, this is the only thing
+        // standing between that drift and a silent heap overflow of
+        // offs/lens/mapped below — die loud instead, naming both values.
+        if line_len > line_cap {
+            print("bpe_count_words_1t: line_len ")
+            print(line_len)
+            print(" exceeds scratch sizing line_cap ")
+            print(line_cap)
+            print(" (bpe_cw_max_line_len drifted from the main loop's line-splitting rule)\n")
+            exit(1)
+        }
         u64 np = bpe_pretok_split(corpus_base + line_start, line_len, offs, lens, line_len + 1)
         u64 k = 0
         while k < np {

@@ -15,13 +15,22 @@ import "../../std/string.mlr"
 // R-T2b: only treat `\` as the start of a `\xNN` escape when the next byte
 // really is 'x' (0x78) — anything else is a malformed escape and FAILs
 // loudly instead of silently mis-decoding.
+// N-2: a `\` in the last <4 bytes of the field (not enough room left for a
+// full \xNN) used to fall through the old `i + 3 < slen` gate and get
+// copied verbatim, silently. A truncated escape now FAILs loudly too.
 fn unesc(u64 s, u64 slen, u64 out) -> u64 {
     u64 i = 0
     u64 o = 0
     while i < slen {
         u64 c = 0
         unsafe { *((s + i) as u8) -> c }
-        if c == 0x5C && i + 3 < slen {
+        if c == 0x5C {
+            if i + 3 >= slen {
+                print("FAIL unesc: truncated \\xNN escape at byte ")
+                print(i)
+                print("\n")
+                exit(1)
+            }
             u64 xc = 0
             unsafe { *((s + i + 1) as u8) -> xc }
             if xc != 0x78 {
