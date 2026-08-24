@@ -16,7 +16,7 @@
 // template processing, added_tokens merging order) is deliberately skipped.
 //
 // There are TWO pre-tokenizers behind the byte-level BPE path, picked by the
-// regex family the loaded tokenizer declares (see tk_bpe_gpt2_digits):
+// regex family the loaded tokenizer declares (see tk_bpe_bare_bytelevel):
 //   — GPT-2 / plain-ByteLevel family: bpe_pretok_split from std/bpe_pretok.mlr,
 //     the EXACT regex, verified against live HF tokenizers 0.23.1.
 //   — llama-bpe / qwen2 family (every GGUF-loaded model here): the older
@@ -128,9 +128,12 @@ static u64 tk_bpe_count    = 0
 static u64 tk_encoder_mode = 0
 
 // Which byte-level regex family the loaded tokenizer declares. The two
-// families disagree and the ids differ if you pick the wrong one; the digit
-// rule is the difference this flag is named for, but it selects the whole
-// pre-tokenizer, not just that rule (see tk_bpe_encode):
+// families disagree and the ids differ if you pick the wrong one, and this
+// flag selects the WHOLE pre-tokenizer, not one rule inside it (see
+// tk_bpe_encode). It was called tk_bpe_gpt2_digits, after the digit handling
+// that is only the most visible of the differences; the name is now the
+// condition it actually records — the loaded tokenizer.json declares a bare
+// ByteLevel pre_tokenizer — because that is what decides which splitter runs:
 //   0 (default) : llama-bpe / qwen2 regex — `\p{N}{1,3}`, digits split into
 //                 groups of at most 3 and a leading space never folds into
 //                 them. This is what the GGUF gpt2 path needs. Pre-tokenized
@@ -140,7 +143,7 @@ static u64 tk_encoder_mode = 0
 //                 space folded in. Set by tokenizer_load when the JSON's
 //                 pre_tokenizer is a bare ByteLevel. Pre-tokenized by the
 //                 exact bpe_pretok_split (std/bpe_pretok.mlr).
-static u64 tk_bpe_gpt2_digits = 0
+static u64 tk_bpe_bare_bytelevel = 0
 
 // ---------------------------------------------------------------------------
 // Small JSON scanning helpers — tailored to tokenizer.json's structure.
@@ -443,7 +446,7 @@ fn tokenizer_load(u64 path) -> Tokenizer {
     // previously-loaded tokenizer. The merges/byte-level checks at the end
     // re-enable them.
     tk_encoder_mode = 0
-    tk_bpe_gpt2_digits = 0
+    tk_bpe_bare_bytelevel = 0
 
     // -----------------------------------------------------------------------
     // Find the `"vocab":{` opening and the enclosing `}` that ends the dict.
@@ -641,7 +644,7 @@ fn tokenizer_load(u64 path) -> Tokenizer {
         // ByteLevel in a Sequence with an explicit Split regex — those keep
         // the default rule.
         if tk_find_sub(base, idx, 0, "\"Split\"") == 0xFFFFFFFFFFFFFFFF {
-            tk_bpe_gpt2_digits = 1
+            tk_bpe_bare_bytelevel = 1
         }
         if tk_bpe_count != 0 { tk_encoder_mode = 1 }
     }
@@ -950,7 +953,7 @@ fn tokenizer_load_from_gguf(GGUFFile gf) -> Tokenizer {
     // Fresh load — don't inherit an encoder mode or pre-tokenizer rule from a
     // previously-loaded tokenizer. The is_gpt2 check below re-enables them.
     tk_encoder_mode = 0
-    tk_bpe_gpt2_digits = 0
+    tk_bpe_bare_bytelevel = 0
     tk_gpt2_kind = 0
 
     // -----------------------------------------------------------------------
@@ -1123,7 +1126,7 @@ fn tokenizer_free(Tokenizer tk) {
     tk_bpe_cap = 0
     tk_bpe_count = 0
     tk_encoder_mode = 0
-    tk_bpe_gpt2_digits = 0
+    tk_bpe_bare_bytelevel = 0
     tk_gpt2_kind = 0
     if tk.file_base != 0 && tk.file_size != 0 {
         syscall_raw(11, tk.file_base, tk.file_size, 0, 0, 0, 0)    // munmap
@@ -1210,14 +1213,14 @@ fn tokenizer_lookup(Tokenizer tk, u64 id, u64 out_ptr, u64 out_len) {
 // for a byte-level tokenizer.json that carries merges). The algorithm:
 //
 //   1. Pre-tokenize the raw input into spans. Which splitter runs depends on
-//      tk_bpe_gpt2_digits — the regex family of the loaded tokenizer:
+//      tk_bpe_bare_bytelevel — the regex family of the loaded tokenizer:
 //
-//      · tk_bpe_gpt2_digits == 1 (GPT-2 / plain ByteLevel): bpe_pretok_split
+//      · tk_bpe_bare_bytelevel == 1 (GPT-2 / plain ByteLevel): bpe_pretok_split
 //        from std/bpe_pretok.mlr, which implements that regex EXACTLY
 //        (real \p{L}/\p{N} tables, UTF-8-aware, lowercase-only
 //        contractions). Nothing below applies to that path.
 //
-//      · tk_bpe_gpt2_digits == 0 (llama-bpe / qwen2 — every GGUF-loaded
+//      · tk_bpe_bare_bytelevel == 0 (llama-bpe / qwen2 — every GGUF-loaded
 //        model in this tree): tk_bpe_pretoken_end, an *approximation* of
 //        that family's regex. bpe_pretok_split is NOT the same regex and
 //        would give different ids here, so it is deliberately not used.
@@ -1474,7 +1477,7 @@ fn tk_bpe_encode_pretoken(Tokenizer tk, u64 in_ptr, u64 in_len,
     dealloc(tok_len)
 }
 
-// Pre-tokenizer core for the llama-bpe / qwen2 family (tk_bpe_gpt2_digits
+// Pre-tokenizer core for the llama-bpe / qwen2 family (tk_bpe_bare_bytelevel
 // == 0) — given the input and a start offset `p`, return the END offset of
 // the pre-token that starts there. Every regex alternative reduces to
 // exactly this question, so this family's encode loop is just
@@ -1486,7 +1489,7 @@ fn tk_bpe_encode_pretoken(Tokenizer tk, u64 in_ptr, u64 in_len,
 //
 // This models ONE family. GPT-2 / plain-ByteLevel tokenizers do not come
 // here at all — tk_bpe_encode routes them to bpe_pretok_split instead — so
-// there is no `tk_bpe_gpt2_digits != 0` case in the rules below.
+// there is no `tk_bpe_bare_bytelevel != 0` case in the rules below.
 //
 // Pre-tokenization rules — see the table at the top of this section.
 fn tk_bpe_pretoken_end(u64 input, u64 input_len, u64 p) -> u64 {
@@ -1628,7 +1631,7 @@ fn tk_bpe_pretoken_end(u64 input, u64 input_len, u64 p) -> u64 {
 // tk_bpe_encode_pretoken on each span. Pre-tokens are emitted in
 // input-order; each is a contiguous byte range of the original input.
 //
-// Two splitters, one per regex family (see tk_bpe_gpt2_digits):
+// Two splitters, one per regex family (see tk_bpe_bare_bytelevel):
 //   · GPT-2 / plain ByteLevel  → bpe_pretok_split (std/bpe_pretok.mlr), the
 //     exact regex.
 //   · llama-bpe / qwen2        → tk_bpe_pretoken_end, the approximation.
@@ -1646,9 +1649,9 @@ fn tk_bpe_encode(Tokenizer tk, u64 input, u64 input_len,
     u64 cnt_box = alloc(8); unsafe { *(cnt_box as u64) = out_cnt }
     u64 cap_box = alloc(8); unsafe { *(cap_box as u64) = out_cap }
 
-    if tk_gpt2_kind == 1 && tk_bpe_gpt2_digits == 1 && input_len != 0 {
+    if tk_gpt2_kind == 1 && tk_bpe_bare_bytelevel == 1 && input_len != 0 {
         // Exact GPT-2 ByteLevel split. tk_gpt2_kind is redundant here —
-        // tokenizer_load only raises tk_bpe_gpt2_digits inside its
+        // tokenizer_load only raises tk_bpe_bare_bytelevel inside its
         // byte-level branch — but it is spelled out so a non-byte-level
         // tokenizer provably cannot reach this arm.
         //

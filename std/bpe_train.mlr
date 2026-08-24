@@ -31,9 +31,97 @@ fn bpe_fnv1a(u64 ptr, u64 len) -> u64 {
     return h
 }
 
-// mmap a file read-only. Writes its size to *out_size and returns the mmap
-// base, or returns 0 (out_size := 0) on any failure. Mechanics copied from
-// wzma_data_open (std/wzma_data.mlr) without importing that file.
+// ---------------------------------------------------------------------------
+// Portable read-only whole-file loading for the BPE trainer.
+//
+// bpe_mmap_file used to be nothing but `syscall_raw(9, 0, sz, 1, 2, fd, 0)`,
+// mechanics copied from wzma_data_open (std/wzma_data.mlr). Syscall 9 is mmap
+// and syscall 11 is munmap on **Linux x86_64 only**. Other Linux
+// architectures number their tables differently: aarch64 uses the
+// asm-generic table, where mmap is 222 and munmap is 215, and where 9 is
+// lgetxattr and 11 is removexattr. So on Linux ARM64 the map call above was
+// really lgetxattr(NULL, sz, 1, 2), which returns -EFAULT for the NULL path;
+// bpe_mmap_file returned 0 for every file and the BPE tests failed in CI with
+// "cannot mmap ...". x86_64 CI never saw it.
+//
+// What makes the loader portable here is NOT a syscall-number table — this
+// file has no way to verify one — it is the fallback. The mmap is attempted
+// exactly as before, and if (and only if) it returns an error, the file is
+// read into an alloc()'d buffer through the compiler's portable
+// file_open/file_read builtins instead. On x86_64 the mmap succeeds and the
+// old code path is unchanged instruction-for-instruction; on aarch64, and on
+// any host that refuses the mapping for an unrelated reason, the read path
+// produces a byte-identical buffer at the cost of one copy.
+//
+// The two kinds of region must be released differently — munmap for the
+// mapping, dealloc for the buffer — and a caller holding only `base` cannot
+// tell them apart. Rather than change the signature at every call site, every
+// region handed out is recorded in the table below with the mode used to
+// obtain it, and bpe_munmap_file looks the mode up. The public API
+// (bpe_mmap_file / bpe_munmap_file) is unchanged.
+//
+// Scope note: this fix covers THIS loader only. std/tokenizer.mlr,
+// std/sys.mlr, std/wzma_data.mlr, std/safetensors.mlr and std/gguf.mlr still
+// hardcode 9/11 and are still x86_64-only; they were deliberately left alone.
+// ---------------------------------------------------------------------------
+
+static u64 BPE_MAP_MODE_MMAP  = 1   // released with munmap (syscall 11)
+static u64 BPE_MAP_MODE_ALLOC = 2   // released with dealloc
+
+// Registry of regions currently owned by callers of bpe_mmap_file. 16 bytes
+// per slot: base(8) + mode(8). base == 0 marks a free slot. Allocated lazily
+// and grown by doubling, so there is no fixed ceiling on live regions.
+static u64 bpe_map_reg     = 0
+static u64 bpe_map_reg_cap = 0
+
+fn bpe_map_reg_record(u64 base, u64 mode) {
+    if bpe_map_reg_cap == 0 {
+        bpe_map_reg_cap = 16
+        bpe_map_reg = alloc(bpe_map_reg_cap * 16)
+        memset(bpe_map_reg, 0, bpe_map_reg_cap * 16)
+    }
+    u64 i = 0
+    while i < bpe_map_reg_cap {
+        if load64(bpe_map_reg + i * 16) == 0 {
+            store64(bpe_map_reg + i * 16, base)
+            store64(bpe_map_reg + i * 16 + 8, mode)
+            return
+        }
+        i = i + 1
+    }
+    // Full: double and retry into the fresh half.
+    u64 ncap = bpe_map_reg_cap * 2
+    u64 nreg = alloc(ncap * 16)
+    memset(nreg, 0, ncap * 16)
+    memcpy(nreg, bpe_map_reg, bpe_map_reg_cap * 16)
+    dealloc(bpe_map_reg)
+    store64(nreg + bpe_map_reg_cap * 16, base)
+    store64(nreg + bpe_map_reg_cap * 16 + 8, mode)
+    bpe_map_reg = nreg
+    bpe_map_reg_cap = ncap
+}
+
+// Look up how `base` was obtained and free its slot. Returns the mode, or 0
+// if `base` was never handed out by bpe_mmap_file (or was already released).
+fn bpe_map_reg_take(u64 base) -> u64 {
+    u64 i = 0
+    while i < bpe_map_reg_cap {
+        if load64(bpe_map_reg + i * 16) == base {
+            u64 mode = load64(bpe_map_reg + i * 16 + 8)
+            store64(bpe_map_reg + i * 16, 0)
+            store64(bpe_map_reg + i * 16 + 8, 0)
+            return mode
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Load a file read-only. Writes its size to *out_size and returns the base of
+// a readable region holding the whole file, or returns 0 (out_size := 0) on
+// any failure. The region is either an mmap or an alloc()'d copy — see the
+// block comment above — and MUST be released with bpe_munmap_file, which
+// knows which of the two it is.
 fn bpe_mmap_file(u64 path, u64 out_size) -> u64 {
     u64 fd = file_open(path, 0)
     if is_errno(fd) != 0 {
@@ -41,16 +129,63 @@ fn bpe_mmap_file(u64 path, u64 out_size) -> u64 {
         return 0
     }
     u64 sz = file_size(fd)
-    // mmap PROT_READ (1) MAP_PRIVATE (2)
-    u64 base = syscall_raw(9, 0, sz, 1, 2, fd, 0)
-    if is_errno(base) != 0 {
+    if sz == 0 {
+        // Preserved from the mmap-only version rather than newly invented:
+        // mmap with length 0 is EINVAL, so a zero-length file has always been
+        // reported here as a failure (base 0, size 0). The read fallback
+        // would happily hand back a 0-byte buffer instead, which would change
+        // what every existing caller's `base == 0` check means. Answer the
+        // old way on both paths.
         file_close(fd)
         store64(out_size, 0)
         return 0
     }
+    // mmap(NULL, sz, PROT_READ=1, MAP_PRIVATE=2, fd, 0). Syscall 9 is mmap on
+    // Linux x86_64; on other arches it is some unrelated call and returns an
+    // error, which is what the fallback below handles.
+    u64 base = syscall_raw(9, 0, sz, 1, 2, fd, 0)
+    if is_errno(base) == 0 {
+        file_close(fd)
+        bpe_map_reg_record(base, BPE_MAP_MODE_MMAP)
+        store64(out_size, sz)
+        return base
+    }
+
+    // Fallback: read the file into an alloc()'d buffer.
+    u64 buf = alloc(sz)
+    if buf == 0 {
+        file_close(fd)
+        store64(out_size, 0)
+        return 0
+    }
+    // file_read lowers to a SINGLE read(2) with no loop of its own
+    // (src/codegen.mlr), so a large file can short-read. This loop is what
+    // makes the buffer complete; without it the tail would be uninitialized.
+    u64 got = 0
+    while got < sz {
+        u64 n = file_read(fd, buf + got, sz - got)
+        if is_errno(n) != 0 { break }
+        if n == 0 { break }
+        got = got + n
+    }
     file_close(fd)
+    if got != sz {
+        // Loud, not silent: a partially filled buffer would produce a wrong
+        // vocabulary rather than an error.
+        print("bpe_mmap_file: mmap unavailable and short read on ")
+        print(path)
+        print(" (got ")
+        print_int(got)
+        print(" of ")
+        print_int(sz)
+        print(" bytes)\n")
+        dealloc(buf)
+        store64(out_size, 0)
+        return 0
+    }
+    bpe_map_reg_record(buf, BPE_MAP_MODE_ALLOC)
     store64(out_size, sz)
-    return base
+    return buf
 }
 
 fn bpe_bytes_eq(u64 a, u64 b, u64 len) -> u64 {
@@ -279,10 +414,28 @@ fn bpe_wt_free(u64 wt) {
     dealloc(wt)
 }
 
-// M-4: munmap a region returned by bpe_mmap_file. N-3: check the syscall's
+// M-4: release a region returned by bpe_mmap_file. N-3: check the syscall's
 // return like the rest of this file does (bpe_mmap_file itself checks both
 // file_open and the mmap syscall) instead of discarding it.
+//
+// The region may be an mmap or an alloc()'d read buffer (see the block
+// comment above bpe_mmap_file), so the mode recorded at map time decides
+// which release call is made. Syscall 11 is munmap on Linux x86_64 only; it
+// is reached only for regions that syscall 9 actually mapped, which on any
+// other arch is none of them.
 fn bpe_munmap_file(u64 base, u64 size) {
+    u64 mode = bpe_map_reg_take(base)
+    if mode == BPE_MAP_MODE_ALLOC {
+        dealloc(base)
+        return
+    }
+    if mode == 0 {
+        // Not in the registry: either double-released, or never came from
+        // bpe_mmap_file. Both are caller bugs, and guessing munmap on an
+        // alloc()'d or already-freed pointer is worse than stopping.
+        print("bpe_munmap_file: unknown region\n")
+        exit(1)
+    }
     u64 r = syscall_raw(11, base, size, 0, 0, 0, 0)
     if is_errno(r) != 0 {
         print("bpe_munmap_file: munmap failed\n")
