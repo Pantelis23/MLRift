@@ -97,6 +97,9 @@ fn bytes_eq(u64 a, u64 b, u64 n) -> u64 {
 fn main() {
     u64 offs = alloc(4096 * 8)
     u64 lens = alloc(4096 * 8)
+    // Caller-owned codepoint scratch for bpe_pretok_split (Task 6a made it a
+    // parameter so concurrent splits cannot share one slot).
+    u64 cpbuf = alloc(8)
 
     // ---- Step 5 regression: split the RAW text, THEN byte-map. --------------
     // "café π" = 63 61 66 C3 A9 20 CF 80.  The byte map turns C3 -> "Ã" and
@@ -111,7 +114,7 @@ fn main() {
     store8(cafe + 5, 0x20)
     store8(cafe + 6, 0xCF)
     store8(cafe + 7, 0x80)
-    u64 cn = bpe_pretok_split(cafe, 8, offs, lens, 16)
+    u64 cn = bpe_pretok_split(cafe, 8, offs, lens, 16, cpbuf)
     u64 c_off0 = 0
     u64 c_len0 = 0
     u64 c_off1 = 0
@@ -200,7 +203,7 @@ fn main() {
             u64 ilen = unesc(data + pos, raw_in_len, inbuf)
             u64 elen = unesc(data + t + 1, raw_exp_len, expbuf)
 
-            u64 np = bpe_pretok_split(inbuf, ilen, offs, lens, 4096)
+            u64 np = bpe_pretok_split(inbuf, ilen, offs, lens, 4096, cpbuf)
 
             // R-T2d: pieces must exactly TILE the input — no gaps, no
             // overlaps — which also closes the `|`-join's blindness to a

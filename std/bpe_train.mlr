@@ -1,6 +1,7 @@
 import "io.mlr"
 import "string.mlr"
 import "bpe_unicode.mlr"
+import "thread.mlr"
 
 static u64 bpe_b2c = 0        // u32[256] byte -> codepoint
 static u64 bpe_b2c_init = 0
@@ -109,36 +110,27 @@ fn bpe_cp_is_ws(u64 cp) -> u64 {
     return 0
 }
 
-static u64 bpe_pretok_cpbuf = 0
-static u64 bpe_pretok_cpbuf_init = 0
-
-// N-4: lazily-initialized 8-byte scratch for bpe_utf8_decode's one-codepoint
-// output inside bpe_pretok_split, hoisted out of that function — it used to
-// alloc/dealloc this buffer on EVERY call, i.e. once per corpus LINE
-// (millions of times on a real corpus). Lazy-init pattern matches
-// bpe_b2c_ensure above.
-//
-// CONCURRENCY NOTE: unlike bpe_b2c (write-once-then-read-only), this buffer
-// is overwritten on every decoded codepoint, so it is genuinely shared
-// mutable scratch. Safe under Task 3's single-thread counter and safe under
-// fork()-based parallelism (each child gets its own copy-on-write copy on
-// first write). NOT safe if a future Task 6 ever calls bpe_pretok_split
-// concurrently from multiple OS threads sharing one address space — that
-// would need this scratch to be thread-local or passed in by the caller
-// instead.
-fn bpe_pretok_cpbuf_ensure() {
-    if bpe_pretok_cpbuf_init == 1 { return }
-    bpe_pretok_cpbuf = alloc(8)
-    bpe_pretok_cpbuf_init = 1
-}
-
 // Fills offs[i]/lens[i] with each pre-token's offset+length in the ORIGINAL
 // bytes of `text`; returns the piece count.
-fn bpe_pretok_split(u64 text, u64 len, u64 offs, u64 lens, u64 max) -> u64 {
+//
+// `cpbuf` is an 8-byte scratch slot the CALLER owns, used for
+// bpe_utf8_decode's one-codepoint output. It is a parameter, not a global,
+// for thread safety (Task 6a): std/thread.mlr's workers are clone()d with
+// CLONE_VM, so they share one address space, and this slot is written and
+// read back once per decoded codepoint. A process-global slot would let two
+// concurrent splits interleave that store/load pair and silently swap
+// codepoints — a wrong character class, a wrong split boundary, and wrong
+// word counts, nondeterministically and with no crash. It is a parameter
+// rather than a per-call alloc() because bpe_count_words_1t calls this once
+// per corpus LINE (millions of times on a real corpus), and an alloc/dealloc
+// pair there costs more than the whole split.
+//
+// The caller must give each concurrently-running split its own slot;
+// bpe_count_words_1t allocates one alongside its other scratch, so every
+// bpe_wc_worker automatically gets a private one.
+fn bpe_pretok_split(u64 text, u64 len, u64 offs, u64 lens, u64 max, u64 cpbuf) -> u64 {
     u64 pos = 0
     u64 np = 0
-    bpe_pretok_cpbuf_ensure()
-    u64 cpbuf = bpe_pretok_cpbuf
     while pos < len {
         u64 start = pos
         u64 c = 0
@@ -283,7 +275,7 @@ fn bpe_pretok_split(u64 text, u64 len, u64 offs, u64 lens, u64 max) -> u64 {
         store64(lens + np * 8, pos - start)
         np = np + 1
     }
-    // N-4: cpbuf is the shared static scratch now — do NOT dealloc it here.
+    // cpbuf is caller-owned scratch — do NOT dealloc it here.
     return np
 }
 
@@ -629,6 +621,10 @@ fn bpe_count_words_1t(u64 corpus_base, u64 corpus_size) -> u64 {
     u64 offs = alloc(max_pieces * 8)
     u64 lens = alloc(max_pieces * 8)
     u64 mapped = alloc(line_cap * 2 + 16)
+    // Private codepoint slot for bpe_pretok_split (see its header comment):
+    // every scratch buffer this function uses is alloc()ed here, per call, so
+    // two concurrent calls — one per bpe_wc_worker — share nothing.
+    u64 cpbuf = alloc(8)
 
     u64 pos = 0
     while pos < corpus_size {
@@ -661,7 +657,7 @@ fn bpe_count_words_1t(u64 corpus_base, u64 corpus_size) -> u64 {
             print(" (bpe_cw_max_line_len drifted from the main loop's line-splitting rule)\n")
             exit(1)
         }
-        u64 np = bpe_pretok_split(corpus_base + line_start, line_len, offs, lens, max_pieces)
+        u64 np = bpe_pretok_split(corpus_base + line_start, line_len, offs, lens, max_pieces, cpbuf)
         u64 k = 0
         while k < np {
             u64 off = load64(offs + k * 8)
@@ -680,7 +676,138 @@ fn bpe_count_words_1t(u64 corpus_base, u64 corpus_size) -> u64 {
     dealloc(offs)
     dealloc(lens)
     dealloc(mapped)
+    dealloc(cpbuf)
     return wt
+}
+
+// ---------------------------------------------------------------------------
+// Task 6a: parallel word-frequency counter.
+//
+// The corpus is split into `nthreads` byte ranges and each range is counted by
+// bpe_count_words_1t into a PRIVATE WordTable; the per-worker tables are then
+// merged on the main thread. Nothing mutable is shared:
+//
+//   * the corpus bytes are read-only for the whole dispatch;
+//   * every scratch buffer (offs / lens / mapped / the pre-tokenizer's
+//     codepoint slot) is alloc()ed inside bpe_count_words_1t, so each worker
+//     gets its own set — MLRift's alloc/dealloc are raw mmap/munmap syscalls,
+//     which are thread-safe, and its scratch stack slots live on each
+//     thread's own stack;
+//   * each worker writes exactly one slot of bpe_wc_tables, its own;
+//   * the two lazily-built lookup tables workers read (bpe_b2c and
+//     bpe_unicode's range tables) are forced to completion on the MAIN thread
+//     before any worker is submitted, so they are write-once/read-only for the
+//     dispatch. Their `_init` flags are plain non-atomic globals: two workers
+//     racing the lazy init would each alloc a table and one would publish its
+//     pointer while the other was still filling the buffer it published.
+//
+// So no atomics beyond the ones thread_pool_submit/wait already use are
+// needed.
+// ---------------------------------------------------------------------------
+
+// Shared, READ-ONLY for the duration of one dispatch. Main writes them before
+// the first thread_pool_submit, whose atomic_store is a `lock xchg` (a full
+// barrier), so a worker that observes state == 1 observes these values too.
+static u64 bpe_wc_base = 0
+static u64 bpe_wc_tables = 0
+
+// Boundary for worker `w` of `nw`: the proportional split point moved FORWARD
+// to just past the next '\n', so workers only ever see whole lines and no line
+// is counted twice or skipped. w == 0 is 0 and w == nw is `size`, both exact.
+//
+// Correctness of the split rests on two facts. (1) The adjustment is monotone
+// non-decreasing in the raw split point, and the raw points are
+// non-decreasing, so bound(w) <= bound(w+1) and the chunks tile [0, size)
+// exactly. (2) HF trains per line, and bpe_count_words_1t already feeds
+// bpe_pretok_split one line-with-ending at a time, so a chunk that begins just
+// after a '\n' produces exactly the pieces the whole-corpus pass produces for
+// those lines.
+//
+// `size * w` cannot overflow: w <= TP_MAX == 32, so `size` would have to
+// exceed 2^59 bytes.
+fn bpe_wc_bound(u64 base, u64 size, u64 w, u64 nw) -> u64 {
+    if w == 0 { return 0 }
+    if w >= nw { return size }
+    u64 p = (size * w) / nw
+    while p < size {
+        if load8(base + p) == 10 { return p + 1 }   // '\n'
+        p = p + 1
+    }
+    // No '\n' at or after the raw split point: everything from here on belongs
+    // to an earlier chunk, so this boundary and every later one collapse to
+    // `size` and the chunks in between are empty.
+    return size
+}
+
+// Counts [start, end) of bpe_wc_base into a fresh WordTable and publishes the
+// handle in slot `wid`. An empty range yields an empty table, which the merge
+// below contributes nothing from.
+fn bpe_wc_worker(u64 start, u64 end, u64 wid) {
+    u64 wt = bpe_count_words_1t(bpe_wc_base + start, end - start)
+    store64(bpe_wc_tables + wid * 8, wt)
+}
+
+// Parallel word-frequency counter. Returns a WordTable handle the caller owns
+// (release it with bpe_wt_free). `nthreads <= 1` delegates to
+// bpe_count_words_1t; larger values are clamped to thread.mlr's TP_MAX.
+//
+// The result is IDENTICAL to bpe_count_words_1t's for every `nthreads` — not
+// just the same (word, freq) set, but the same words at the same insertion
+// indices with the same freqs. Merging in ascending worker order, and within a
+// worker in its table's insertion order, is what makes that hold: chunk w
+// precedes chunk w+1 in the corpus, so a word's first appearance across the
+// concatenated per-worker lists is its first appearance in the corpus.
+// Completion order never enters into it.
+fn bpe_count_words(u64 corpus_base, u64 corpus_size, u64 nthreads) -> u64 {
+    if nthreads <= 1 { return bpe_count_words_1t(corpus_base, corpus_size) }
+    if corpus_size == 0 { return bpe_count_words_1t(corpus_base, 0) }
+
+    u64 nw = nthreads
+    if nw > TP_MAX { nw = TP_MAX }
+
+    // Force both lazy table builds on this thread — see the section header.
+    bpe_b2c_ensure()
+    uni_tables_ensure()
+
+    thread_pool_init(nw)
+    u64 tables = alloc(nw * 8)
+    bpe_wc_base = corpus_base
+    bpe_wc_tables = tables
+
+    u64 job = fn_addr("bpe_wc_worker")
+    u64 w = 0
+    while w < nw {
+        u64 s = bpe_wc_bound(corpus_base, corpus_size, w, nw)
+        u64 e = bpe_wc_bound(corpus_base, corpus_size, w + 1, nw)
+        thread_pool_submit(w, job, s, e, w)
+        w = w + 1
+    }
+    thread_pool_wait()
+
+    // thread_pool_wait returns only after every submitted worker has flipped
+    // its state word to 2 with an atomic_store, which it does after its job
+    // returned — so every slot below holds a published, live table handle.
+    u64 master = bpe_wt_new(4096)
+    u64 pptr = alloc(8)
+    u64 plen = alloc(8)
+    w = 0
+    while w < nw {
+        u64 wt = load64(tables + w * 8)
+        u64 n = bpe_wt_count(wt)
+        u64 i = 0
+        while i < n {
+            u64 f = bpe_wt_word(wt, i, pptr, plen)
+            bpe_wt_add(master, load64(pptr), load64(plen), f)
+            i = i + 1
+        }
+        bpe_wt_free(wt)          // one-shot, and this is that one shot
+        w = w + 1
+    }
+    dealloc(pptr)
+    dealloc(plen)
+    dealloc(tables)
+    bpe_wc_tables = 0
+    return master
 }
 
 // ===========================================================================
