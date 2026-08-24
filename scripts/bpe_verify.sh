@@ -23,8 +23,11 @@
 #                               full      (all cores)         ->  8.64 best
 #                             They are machine-specific: re-measure with
 #                             HF_TIME=1 before trusting them elsewhere.
-#   HF_TIME=1                 re-measure both HF bars on this machine instead
-#                             of using the recorded ones (adds ~3 minutes).
+#   HF_TIME=1                 re-measure both HF bars on this machine and
+#                             DECIDE G2/G3 against those numbers instead of the
+#                             defaults (adds ~3 minutes). A measurement taken
+#                             back-to-back with the MLRift runs beats a stored
+#                             constant, so it replaces the bar outright.
 #   REPS                      timing repetitions per gate (default 3).
 #
 # Exits non-zero if any gate FAILs.
@@ -38,8 +41,16 @@ CORPUS="${1:-/home/pantelis/Desktop/Projects/Work/AtlasLM/checkpoints/wzma_embed
 VOCAB_SIZE=8192
 NTHREADS_FULL="$(nproc)"
 REPS="${REPS:-3}"
-HF_BAR_1T="${HF_BAR_1T:-54.59}"
-HF_BAR_FULL="${HF_BAR_FULL:-8.64}"
+# Bars, in whole-process wall-clock seconds. These are TODAY's numbers, taken
+# back-to-back with the MLRift runs on this 24-core machine with tokenizers
+# 0.23.1 (1-thread best 50.069s; full-throttle best 7.088s here and 7.084s in
+# an independent interleaved re-measurement). They REPLACE an older recorded
+# pair (54.59s / 8.64s) that a fresh measurement could not reproduce; the gap
+# is machine state, not clock boundary — HF's whole-process overhead beyond
+# train() is only 0.021s (0.019s import + 0.002s save). With HF_TIME=1 the
+# bars are re-derived from this run and those values, not these, decide G2/G3.
+HF_BAR_1T="${HF_BAR_1T:-50.07}"
+HF_BAR_FULL="${HF_BAR_FULL:-7.09}"
 
 PY=/home/pantelis/Desktop/Projects/Work/AtlasLM/.venv/bin/python3
 MLRC=./build/mlrc
@@ -61,10 +72,15 @@ declare -A VERDICT
 declare -A DETAIL
 FAILED=0
 
+# A gate's verdict lives ONLY in VERDICT[]; the final exit status is derived
+# from that map at the end. Accumulating a monotonic FAILED flag here would
+# mean a gate re-decided later (see `regate`) could print PASS in the summary
+# while the script still exited non-zero — the same class of self-contradiction
+# as printing a warning and a PASS side by side. FAILED is reserved for
+# non-gate problems (a crashed profiling run, a digest mismatch).
 record() {            # record <gate> <PASS|FAIL> <detail...>
     VERDICT["$1"]="$2"
     DETAIL["$1"]="${*:3}"
-    [ "$2" = "FAIL" ] && FAILED=1
     printf '  -> %s %s: %s\n' "$2" "$1" "${*:3}"
 }
 
@@ -100,10 +116,15 @@ timed_run() {         # timed_run <threads> <logfile>
 # downstream `awk 'a<b'` comparison sees a=0 and passes vacuously.
 best_of() { tr ' ' '\n' | grep -v '^$' | sort -g | head -1; }
 
-# Dies rather than let an empty/garbage "best" turn into a free PASS.
+# Dies rather than let an empty/garbage "best" turn into a free PASS. This is
+# the last guard between the harness and a vacuous PASS, so it rejects by
+# EXCLUSION (any byte that is not a digit or '.') rather than by a prefix
+# glob: `[0-9]*` would happily accept "16abc" and "1e3", both of which awk
+# then truncates to a smaller number and compares as a pass.
 require_number() {    # require_number <value> <what>
     case "$1" in
-        [0-9]*.[0-9]*|[0-9]*) return 0 ;;
+        ''|*[!0-9.]*|*.*.*|.) ;;
+        *) return 0 ;;
     esac
     echo "FATAL: $2 is not a number (got '$1')" >&2
     exit 1
@@ -130,10 +151,20 @@ if [ ! -x "$MLRC" ]; then
     echo "FATAL: $MLRC not found — build the compiler first" >&2
     exit 1
 fi
-"$MLRC" --arch=x86_64 examples/bpe_train_cli.mlr -o "$CLI_BIN" 2>&1 | tail -1
-[ -x "$CLI_BIN" ] || { echo "FATAL: CLI build failed" >&2; exit 1; }
-"$MLRC" --arch=x86_64 tests/bpe/roundtrip_probe.mlr -o "$RT_BIN" 2>&1 | tail -1
-[ -x "$RT_BIN" ] || { echo "FATAL: round-trip probe build failed" >&2; exit 1; }
+# $WORK persists between runs and mlrc leaves the PREVIOUS output in place when
+# it rejects the source, so an existence check after a failed compile would
+# happily hand the gates a stale binary that no longer corresponds to the tree.
+# Delete first, then gate on mlrc's own exit status (which `| tail -1` would
+# discard, pipefail or not, because the pipeline's status is never tested).
+rm -f "$CLI_BIN" "$RT_BIN"
+"$MLRC" --arch=x86_64 examples/bpe_train_cli.mlr -o "$CLI_BIN" > "$WORK/build_cli.log" 2>&1 \
+    || { echo "FATAL: CLI build failed" >&2; tail -5 "$WORK/build_cli.log" >&2; exit 1; }
+tail -1 "$WORK/build_cli.log"
+[ -x "$CLI_BIN" ] || { echo "FATAL: mlrc reported success but produced no CLI binary" >&2; exit 1; }
+"$MLRC" --arch=x86_64 tests/bpe/roundtrip_probe.mlr -o "$RT_BIN" > "$WORK/build_rt.log" 2>&1 \
+    || { echo "FATAL: round-trip probe build failed" >&2; tail -5 "$WORK/build_rt.log" >&2; exit 1; }
+tail -1 "$WORK/build_rt.log"
+[ -x "$RT_BIN" ] || { echo "FATAL: mlrc reported success but produced no probe binary" >&2; exit 1; }
 
 # --- 2. the HF oracle -------------------------------------------------------
 hdr "HF oracle"
@@ -266,19 +297,34 @@ fi
 
 hdr "M — peak RSS of the ${NTHREADS_FULL}-thread run"
 # A separate, untimed run: /usr/bin/time -v adds noise the speed gates must not
-# absorb. All $NTHREADS_FULL partial WordTables coexist until the merge frees
-# them, so this is the high-water mark for the whole pipeline.
+# absorb. Measurement (not assumption) puts the high-water mark inside
+# bpe_train_merges, not in the counter: counting tops out near 366 MiB with
+# every partial WordTable live, and the 1-thread peak is marginally HIGHER
+# than the 24-thread peak, so the mark is thread-count independent and one
+# full-throttle run captures it for the whole pipeline.
 MEMLOG="$WORK/mem.log"
 MLRIFT_BPE_CORPUS="$CORPUS" MLRIFT_BPE_OUT="$OUT_JSON" \
 MLRIFT_BPE_VOCAB="$VOCAB_SIZE" MLRIFT_BPE_THREADS="$NTHREADS_FULL" \
     /usr/bin/time -v "$CLI_BIN" > "$MEMLOG" 2>&1
-printf '%s %s\n' "$NTHREADS_FULL" "$(md5sum < "$OUT_JSON" | cut -d' ' -f1)" >> "$DIGESTS"
+MEM_RC=$?
 PEAK_KB=$(awk -F': *' '/Maximum resident set size/{print $2}' "$MEMLOG")
-if [ -z "$PEAK_KB" ]; then
+if [ $MEM_RC -ne 0 ]; then
+    # $OUT_JSON still holds the PREVIOUS run's output, so recording a digest
+    # for it here would credit a crashed run with a passing determinism check.
+    echo "  the memory-profiling run exited $MEM_RC — no digest recorded"
+    # The trainer's own output comes FIRST in $MEMLOG; /usr/bin/time -v appends
+    # its 20-line report afterwards, so `tail` here would show only that
+    # boilerplate and hide the actual error.
+    head -6 "$MEMLOG" | sed 's/^/    | /'
+    PEAK_HUMAN="unavailable (run exited $MEM_RC)"
+    FAILED=1
+elif [ -z "$PEAK_KB" ]; then
+    printf '%s %s\n' "$NTHREADS_FULL" "$(md5sum < "$OUT_JSON" | cut -d' ' -f1)" >> "$DIGESTS"
     echo "  could not read the peak RSS from /usr/bin/time -v"
     PEAK_HUMAN="unknown"
     FAILED=1
 else
+    printf '%s %s\n' "$NTHREADS_FULL" "$(md5sum < "$OUT_JSON" | cut -d' ' -f1)" >> "$DIGESTS"
     PEAK_HUMAN=$(awk -v k="$PEAK_KB" 'BEGIN{printf "%d KB (%.2f GiB)", k, k/1048576}')
     echo "  peak RSS: $PEAK_HUMAN"
 fi
@@ -287,15 +333,22 @@ fi
 hdr "D — every run produced the same tokenizer.json"
 REF_MD5=$(md5sum < "$REF_MIN" | cut -d' ' -f1)
 sort "$DIGESTS" | uniq -c | awk '{printf "  %d run(s) at threads=%s -> %s\n", $1, $2, $3}'
+NRUNS=$(wc -l < "$DIGESTS")
 NDIGESTS=$(cut -d' ' -f2 "$DIGESTS" | sort -u | wc -l)
-if [ "$NDIGESTS" != "1" ]; then
+if [ "$NRUNS" = "0" ]; then
+    # Zero successful runs is a different failure from disagreeing runs, and
+    # saying "the trainer is not thread-count independent" here would blame
+    # the wrong thing entirely.
+    echo "  no successful runs to compare — every trainer invocation failed"
+    FAILED=1
+elif [ "$NDIGESTS" != "1" ]; then
     echo "  RUNS DISAGREE — the trainer is not thread-count independent"
     FAILED=1
 elif [ "$(cut -d' ' -f2 "$DIGESTS" | head -1)" != "$REF_MD5" ]; then
     echo "  all runs agree with each other but NOT with the oracle ($REF_MD5)"
     FAILED=1
 else
-    echo "  all $(wc -l < "$DIGESTS") runs -> $REF_MD5 == the minified oracle"
+    echo "  all $NRUNS runs -> $REF_MD5 == the minified oracle"
 fi
 
 # --- 6. G4: round-trip ------------------------------------------------------
@@ -336,28 +389,49 @@ PYHF
         fi
         local rc=$?
         t1=$(date +%s%N)
-        [ $rc -ne 0 ] && { echo "FATAL: the HF timing run exited $rc" >&2; exit 1; }
+        # Same contract as timed_run: this body runs inside $(...), so `exit`
+        # would kill only the subshell and leave an EMPTY entry that best_of
+        # silently skips — reporting the best of the surviving runs as if
+        # nothing had gone wrong. Signal through the return status instead.
+        if [ $rc -ne 0 ]; then
+            echo "     the HF timing run exited $rc" >&2
+            echo "FAILED"
+            return 1
+        fi
         awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", (b-a)/1e9}'
     }
     hf1=""; hfn=""
     for i in $(seq 1 "$REPS"); do
-        hf1="$hf1 $(hf_timed 1)"
-        hfn="$hfn $(hf_timed "")"
+        t=$(hf_timed 1)  || { echo "FATAL: an HF 1-thread timing run failed" >&2; exit 1; }
+        hf1="$hf1 $t"
+        t=$(hf_timed "") || { echo "FATAL: an HF full-throttle timing run failed" >&2; exit 1; }
+        hfn="$hfn $t"
     done
     HF1_BEST=$(echo "$hf1" | best_of)
     HFN_BEST=$(echo "$hfn" | best_of)
     require_number "$HF1_BEST" "the HF 1-thread best time"
     require_number "$HFN_BEST" "the HF full-throttle best time"
-    echo "  HF 1-thread runs:$hf1  best ${HF1_BEST}s   (gate bar was ${HF_BAR_1T}s)"
-    echo "  HF full runs:$hfn  best ${HFN_BEST}s   (gate bar was ${HF_BAR_FULL}s)"
+    echo "  HF 1-thread runs:$hf1  best ${HF1_BEST}s   (default bar ${HF_BAR_1T}s)"
+    echo "  HF full runs:$hfn  best ${HFN_BEST}s   (default bar ${HF_BAR_FULL}s)"
     echo "  MLRift best:      1-thread ${G2_BEST:-n/a}s   full ${G3_BEST:-n/a}s"
-    echo "  NOTE: the G2/G3 verdicts above used the RECORDED bars, not these."
-    if awk -v a="${G3_BEST:-0}" -v b="$HFN_BEST" 'BEGIN{exit !(a>=b)}'; then
-        echo "  WARNING: against THIS re-measurement MLRift does NOT beat HF at full throttle."
-    fi
-    if awk -v a="${G2_BEST:-0}" -v b="$HF1_BEST" 'BEGIN{exit !(a>=b)}'; then
-        echo "  WARNING: against THIS re-measurement MLRift does NOT beat HF single-threaded."
-    fi
+
+    # A measurement taken THIS run, on THIS machine, back-to-back with the
+    # MLRift runs, is strictly better evidence than a stored constant — so it
+    # REPLACES the bar rather than being printed as a footnote beside a verdict
+    # that contradicts it. Printing "MLRift does NOT beat HF" and then "G3 PASS"
+    # in the same output is worse than either verdict alone.
+    echo "  the G2/G3 verdicts are re-decided below against these measurements."
+    regate() {        # regate <gate> <mlrift-best> <hf-best>
+        local g="$1" mine="$2" theirs="$3"
+        require_number "$mine" "the $g best time"
+        if awk -v a="$mine" -v b="$theirs" 'BEGIN{exit !(a<b)}'; then
+            record "$g" PASS "best ${mine}s <  HF re-measured ${theirs}s (this run)"
+        else
+            record "$g" FAIL "best ${mine}s >= HF re-measured ${theirs}s (this run)"
+        fi
+    }
+    regate G2 "${G2_BEST:-}" "$HF1_BEST"
+    regate G3 "${G3_BEST:-}" "$HFN_BEST"
 fi
 
 # --- summary ----------------------------------------------------------------
@@ -365,7 +439,10 @@ hdr "SUMMARY"
 printf '%-4s %-6s %s\n' "GATE" "RESULT" "DETAIL"
 printf '%-4s %-6s %s\n' "----" "------" "------"
 for g in G1 G2 G3 G4; do
-    printf '%-4s %-6s %s\n' "$g" "${VERDICT[$g]:-FAIL}" "${DETAIL[$g]:-not run}"
+    v="${VERDICT[$g]:-FAIL}"
+    # A gate that never ran is a failure, not a silent omission.
+    [ "$v" = "PASS" ] || FAILED=1
+    printf '%-4s %-6s %s\n' "$g" "$v" "${DETAIL[$g]:-not run}"
 done
 printf '%-4s %-6s %s\n' "M" "INFO" "peak RSS $PEAK_HUMAN (${NTHREADS_FULL} threads)"
 echo
