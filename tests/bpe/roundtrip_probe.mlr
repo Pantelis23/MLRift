@@ -1,0 +1,110 @@
+// G4 round-trip probe (Task 6, step 6e).
+//
+// Loads a tokenizer.json written by examples/bpe_train_cli.mlr through
+// std/tokenizer.mlr and asserts decode(encode(x)) == x for several probes,
+// including a non-ASCII one. This checks a DIFFERENT property than
+// tests/bpe/writer_smoke.mlr's round-trip: writer_smoke exercises a 320-entry
+// tokenizer trained on tests/bpe/tiny_corpus.txt, while this runs against the
+// real full-corpus artifact (8192 entries, 7980 merges), where the merge
+// table is deep enough that a mis-ordered or mis-scored merge would show up
+// as an encode that no longer decodes back.
+//
+//   MLRIFT_BPE_OUT   required   path of the tokenizer.json to probe
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 tests/bpe/roundtrip_probe.mlr -o /tmp/bpe_roundtrip
+import "../../std/bpe_train.mlr"
+import "../../std/io.mlr"
+import "../../std/string.mlr"
+import "../../std/sys.mlr"
+import "../../std/tokenizer.mlr"
+
+static u64 NPROBES = 5
+
+// Every probe's bytes are known to be in the full-corpus alphabet (the 208
+// byte-mapped characters the trainer emits): probe 2 is the non-ASCII one and
+// carries U+00E9, U+03C0, U+00BD, U+2014 and U+00EF, whose UTF-8 bytes
+// (c3 a9 / cf 80 / c2 bd / e2 80 94 / c3 af) all map to alphabet characters.
+// If a byte were absent, std/tokenizer.mlr's BPE encoder would silently DROP
+// it and the round-trip would fail loudly here rather than pass vacuously.
+fn probe_text(u64 i) -> u64 {
+    if i == 0 { return "the quick brown fox" }
+    if i == 1 { return "def get_lr(it: int, warmup_iters: int) -> float:" }
+    if i == 2 { return "caf\xc3\xa9 \xcf\x80 \xc2\xbd \xe2\x80\x94 na\xc3\xafve" }
+    if i == 3 { return "    return min_lr + coeff * (learning_rate - min_lr)" }
+    if i == 4 { return "torch.optim.Optimizer" }
+    print("FAIL roundtrip: probe index out of range\n")
+    exit(1)
+}
+
+fn main() {
+    u64 path = sys_getenv("MLRIFT_BPE_OUT")
+    if path == 0 {
+        print("FAIL roundtrip: MLRIFT_BPE_OUT is not set\n")
+        exit(1)
+    }
+
+    Tokenizer tk = tokenizer_load(path)
+    if tk.file_size == 0 {
+        print("FAIL roundtrip: tokenizer_load could not open ")
+        print_str(path)
+        print("\n")
+        exit(1)
+    }
+    if tk_encoder_mode != 1 {
+        print("FAIL roundtrip: tokenizer.json did not select the BPE encoder (tk_encoder_mode=")
+        print(tk_encoder_mode)
+        print(")\n")
+        exit(1)
+    }
+
+    u64 i = 0
+    while i < NPROBES {
+        u64 text = probe_text(i)
+        u64 tlen = str_len(text)
+
+        uint64[1] ids_slot
+        uint64[1] cnt_slot
+        u64 ids_p = ids_slot
+        u64 cnt_p = cnt_slot
+        tokenizer_encode(tk, text, tlen, ids_p, cnt_p)
+        u64 ids = 0
+        u64 cnt = 0
+        unsafe { *(ids_p as u64) -> ids }
+        unsafe { *(cnt_p as u64) -> cnt }
+
+        // A zero-token encode of a non-empty probe means every byte was
+        // dropped — that must never silently "round-trip" to an empty string.
+        if cnt == 0 {
+            print("FAIL roundtrip: probe ")
+            print(i)
+            print(" encoded to 0 tokens\n")
+            exit(1)
+        }
+
+        u64 dec = tokenizer_decode(tk, ids, cnt)
+        if str_compare(dec, text) != 0 {
+            print("FAIL roundtrip: probe ")
+            print(i)
+            print("\n  got  \"")
+            print_str(dec)
+            print("\"\n  want \"")
+            print_str(text)
+            print("\"\n")
+            exit(1)
+        }
+        print("  probe ")
+        print(i)
+        print(": ")
+        print(tlen)
+        print(" bytes -> ")
+        print(cnt)
+        print(" tokens -> exact\n")
+
+        dealloc(dec)
+        if ids != 0 { dealloc(ids) }
+        i = i + 1
+    }
+    tokenizer_free(tk)
+    print("PASS roundtrip\n")
+}
