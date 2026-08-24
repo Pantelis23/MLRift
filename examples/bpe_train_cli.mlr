@@ -1,0 +1,230 @@
+// BPE trainer CLI (Task 6, step 5).
+//
+// Trains a byte-level BPE tokenizer over a plain-text corpus and writes a
+// HuggingFace-shaped tokenizer.json, using only std/bpe_train.mlr — no
+// tokenizers, no Rust, no Python.
+//
+// Configuration is environment-driven (MLRift has no argument parser yet and
+// the verification harness drives this from a shell script anyway):
+//
+//   MLRIFT_BPE_CORPUS   required   path to the training corpus (UTF-8 text)
+//   MLRIFT_BPE_OUT      required   path of the tokenizer.json to write
+//   MLRIFT_BPE_VOCAB    default 8192   target vocabulary size
+//   MLRIFT_BPE_THREADS  default 1      worker threads for the word counter
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 examples/bpe_train_cli.mlr -o /tmp/bpe_train_cli
+import "../std/bpe_train.mlr"
+import "../std/io.mlr"
+import "../std/string.mlr"
+import "../std/sys.mlr"
+import "../std/thread.mlr"
+import "../std/time.mlr"
+
+// Every failure below is a usage/environment error the caller must see and a
+// script must be able to detect, so each one prints a single self-explanatory
+// line to stdout and exits non-zero. There is no partial-success path: if any
+// stage fails the process dies rather than writing a half-trained file.
+fn die(u64 msg) {
+    print("bpe_train_cli: ")
+    print_str(msg)
+    print("\n")
+    exit(1)
+}
+
+// Prints `ns` as seconds with 3 decimal places (e.g. "54.591"). The fraction
+// is zero-padded so 1_002_000_000 ns prints as "1.002", not "1.2".
+fn print_secs(u64 ns) {
+    u64 sec = ns / 1000000000
+    u64 ms = (ns % 1000000000) / 1000000
+    print(sec)
+    print(".")
+    if ms < 100 { print("0") }
+    if ms < 10 { print("0") }
+    print(ms)
+}
+
+// Longest u64 in decimal is 20 digits (18446744073709551615). str_to_int has
+// no overflow detection — it just keeps doing `result*10 + digit` and wraps —
+// so a 21-digit input would silently become an unrelated small number. Length
+// is checked here; the one remaining 20-digit wrap case (a value above
+// 2^64-1 but still 20 digits) is left to each caller to survive, and the two
+// callers survive it DIFFERENTLY:
+//   MLRIFT_BPE_VOCAB   has its own explicit >1000000 upper bound below, so a
+//                      wrapped value is rejected outright with a message.
+//   MLRIFT_BPE_THREADS has NO upper bound of its own on purpose (over-large
+//                      values are a legitimate "use every core" request). A
+//                      wrapped value is not rejected; it is clamped to TP_MAX
+//                      inside bpe_count_words, exactly as any other too-large
+//                      thread count is, so the run is correct but the worker
+//                      count it uses is not the number the user typed.
+static u64 ENV_MAX_DIGITS = 20
+
+// Reads a positive-integer env var. Returns `dflt` when the variable is unset;
+// dies when it is set to something that is not a positive decimal integer
+// (str_to_int returns 0 for unparseable input, which would otherwise silently
+// become "0 threads" / "vocab 0").
+fn env_u64_or_die(u64 name, u64 dflt) -> u64 {
+    u64 s = sys_getenv(name)
+    if s == 0 { return dflt }
+    if load8(s) == 0 {
+        print("bpe_train_cli: ")
+        print_str(name)
+        print(" is set but empty\n")
+        exit(1)
+    }
+    // str_to_int stops at the first non-digit, so validate every byte here
+    // rather than trusting its return value.
+    u64 i = 0
+    while load8(s + i) != 0 {
+        if i >= ENV_MAX_DIGITS {
+            print("bpe_train_cli: ")
+            print_str(name)
+            print(" has more than ")
+            print(ENV_MAX_DIGITS)
+            print(" digits — too large for a 64-bit value\n")
+            exit(1)
+        }
+        u64 c = load8(s + i)
+        if c < 0x30 || c > 0x39 {
+            print("bpe_train_cli: ")
+            print_str(name)
+            print("=\"")
+            print_str(s)
+            print("\" is not a decimal integer\n")
+            exit(1)
+        }
+        i = i + 1
+    }
+    u64 v = str_to_int(s)
+    if v == 0 {
+        print("bpe_train_cli: ")
+        print_str(name)
+        print(" must be greater than 0\n")
+        exit(1)
+    }
+    return v
+}
+
+fn main() {
+    u64 corpus = sys_getenv("MLRIFT_BPE_CORPUS")
+    if corpus == 0 { die("MLRIFT_BPE_CORPUS is not set (path to the training corpus)") }
+    if load8(corpus) == 0 { die("MLRIFT_BPE_CORPUS is empty") }
+
+    u64 out_path = sys_getenv("MLRIFT_BPE_OUT")
+    if out_path == 0 { die("MLRIFT_BPE_OUT is not set (path of the tokenizer.json to write)") }
+    if load8(out_path) == 0 { die("MLRIFT_BPE_OUT is empty") }
+
+    u64 vocab_size = env_u64_or_die("MLRIFT_BPE_VOCAB", 8192)
+    // 4 specials + at least one alphabet symbol; bpe_train_merges adds the
+    // specials unconditionally, so anything below 5 cannot produce a usable
+    // tokenizer and would only fail deeper in with a less obvious message.
+    if vocab_size < 5 { die("MLRIFT_BPE_VOCAB must be at least 5 (4 special tokens + alphabet)") }
+    // Upper bound, because the merge table below is `alloc(vocab_size * 16)`
+    // and that multiply is a plain 64-bit wrap. Without this, a typo'd
+    // 1000000000000 asks for 16 TB and segfaults with no message, and
+    // 2^60 wraps `* 16` to EXACTLY 0 — a zero-byte allocation that the merge
+    // loop then writes 16 bytes per merge into, corrupting the heap while
+    // exiting 0 as if it had succeeded. A vocabulary of 10^6 is already two
+    // orders of magnitude past any real tokenizer.
+    if vocab_size > 1000000 { die("MLRIFT_BPE_VOCAB must be at most 1000000") }
+
+    u64 nthreads = env_u64_or_die("MLRIFT_BPE_THREADS", 1)
+
+    print("bpe_train_cli: corpus=")
+    print_str(corpus)
+    print("\n               out=")
+    print_str(out_path)
+    print("\n               vocab_size=")
+    print(vocab_size)
+    print(" threads=")
+    print(nthreads)
+    if nthreads > TP_MAX {
+        print(" (clamped to ")
+        print(TP_MAX)
+        print(")")
+    }
+    print("\n")
+
+    u64 t_start = time_now()
+
+    u64 szp = alloc(8)
+    u64 base = bpe_mmap_file(corpus, szp)
+    if base == 0 {
+        print("bpe_train_cli: cannot open/mmap corpus: ")
+        print_str(corpus)
+        print("\n")
+        exit(1)
+    }
+    u64 size = load64(szp)
+    dealloc(szp)
+    if size == 0 {
+        print("bpe_train_cli: corpus is empty: ")
+        print_str(corpus)
+        print("\n")
+        exit(1)
+    }
+    print("corpus bytes:   ")
+    print(size)
+    print("\n")
+
+    // --- stage 1: word frequencies -----------------------------------------
+    u64 t_count0 = time_now()
+    u64 wt = bpe_count_words(base, size, nthreads)
+    u64 t_count1 = time_now()
+    u64 distinct = bpe_wt_count(wt)
+    print("distinct words: ")
+    print(distinct)
+    print("  (counting took ")
+    print_secs(t_count1 - t_count0)
+    print(" s)\n")
+    if distinct == 0 { die("corpus produced 0 distinct pre-tokens — nothing to train on") }
+
+    // --- stage 2: merges ---------------------------------------------------
+    u64 v = bpe_vocab_new()
+    u64 merges = alloc(vocab_size * 16)     // 16 bytes per merge, one per new id
+    // The bound above makes a wrap impossible, but alloc can still fail on a
+    // legitimately large request; writing merges into a null pointer would
+    // fault with no explanation of why.
+    if merges == 0 { die("cannot allocate the merge table — MLRIFT_BPE_VOCAB too large") }
+    u64 t_merge0 = time_now()
+    u64 nm = bpe_train_merges(wt, vocab_size, v, merges)
+    u64 t_merge1 = time_now()
+    u64 vcount = bpe_vocab_count(v)
+    print("merges:         ")
+    print(nm)
+    print("  (training took ")
+    print_secs(t_merge1 - t_merge0)
+    print(" s)\n")
+    print("vocab entries:  ")
+    print(vcount)
+    print("\n")
+
+    // --- stage 3: write ----------------------------------------------------
+    u64 t_write0 = time_now()
+    bpe_write_tokenizer_json(v, merges, nm, out_path)
+    u64 t_write1 = time_now()
+    print("wrote ")
+    print_str(out_path)
+    print("  (")
+    print_secs(t_write1 - t_write0)
+    print(" s)\n")
+
+    dealloc(merges)
+    bpe_vocab_free(v)
+    bpe_wt_free(wt)
+    bpe_munmap_file(base, size)
+    if nthreads > 1 { thread_pool_shutdown() }
+
+    u64 t_end = time_now()
+    print("timing: count=")
+    print_secs(t_count1 - t_count0)
+    print(" s  merge=")
+    print_secs(t_merge1 - t_merge0)
+    print(" s  write=")
+    print_secs(t_write1 - t_write0)
+    print(" s  total=")
+    print_secs(t_end - t_start)
+    print(" s\n")
+    exit(0)
+}

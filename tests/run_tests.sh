@@ -7493,6 +7493,72 @@ done
 rm -f "$MF_SRC" "$MF_BIN"
 rm -f "$MA_SRC" "$MA_BIN" "$MA_OBJ"
 
+# --- bpe trainer -----------------------------------------------------------
+# Important finding 1 (final review): five of the six programs under tests/bpe
+# had NO runner. `grep -rn 'tests/bpe' --include='*.sh' --include=Makefile`
+# returned exactly one hit — scripts/bpe_verify.sh, which builds only
+# roundtrip_probe.mlr — and this file never mentioned tests/bpe at all. That
+# left 2,234 lines of test code plus the checked-in HuggingFace golden fixtures
+# they consume executed by nothing, free to rot silently. The one thing that
+# did exercise them, scripts/bpe_verify.sh, needs a 276 MB corpus stored
+# outside the repo and a working `tokenizers` install, so it is not a substitute
+# for suite coverage.
+#
+# All five are self-contained: they read only tests/bpe/tiny_corpus.txt and
+# tests/bpe/golden/*, both in-repo, and finish in seconds. They use REPO-ROOT
+# relative fixture paths (e.g. merge_smoke.mlr's "tests/bpe/tiny_corpus.txt"),
+# so both the compile and the run happen from the repo root.
+#
+# The verdict is exit code AND the absence of "FAIL" in the output, not exit
+# code alone: util_smoke.mlr prints "FAIL <case>" for a wrong answer but never
+# calls exit(1), so an exit-code-only check would score it green no matter what
+# it computed. The other four do exit non-zero, and the belt-and-braces check
+# costs nothing.
+echo ""
+echo "--- bpe trainer (tests/bpe) ---"
+BPE_ROOT="$DIR/.."
+# The compile runs from a different directory than this script was invoked in,
+# so a relative $MLRC (MLRC=build/mlrc) would stop resolving. Absolutize once.
+case "$MLRC" in
+    /*) BPE_MLRC="$MLRC" ;;
+    *)  BPE_MLRC="$(cd "$(dirname "$MLRC")" 2>/dev/null && pwd)/$(basename "$MLRC")" ;;
+esac
+# roundtrip_probe.mlr is deliberately NOT in this list: it needs a full-corpus
+# artifact (MLRIFT_BPE_OUT) that only a real training run produces, so it
+# can't run standalone here — scripts/bpe_verify.sh owns it instead.
+for BPE_T in util_smoke pretok_smoke wordcount_smoke merge_smoke writer_smoke; do
+    BPE_BIN="/tmp/mlrc_bpe_${BPE_T}_$$"
+    rm -f "$BPE_BIN"
+    TOTAL=$((TOTAL + 1))
+    BPE_BUILD=$(cd "$BPE_ROOT" && $BPE_MLRC --arch=$RUN_ARCH "tests/bpe/$BPE_T.mlr" -o "$BPE_BIN" 2>&1)
+    if [ $? -ne 0 ] || [ ! -s "$BPE_BIN" ]; then
+        echo "FAIL: bpe_$BPE_T (compilation failed)"
+        echo "$BPE_BUILD" | grep -i error | head -3
+        FAIL=$((FAIL + 1))
+        rm -f "$BPE_BIN"
+        continue
+    fi
+    chmod +x "$BPE_BIN"
+    BPE_OUT=$(cd "$BPE_ROOT" && timeout 300 "$BPE_BIN" 2>&1)
+    BPE_RC=$?
+    if [ "$BPE_RC" = "124" ]; then
+        echo "FAIL: bpe_$BPE_T (exceeded 300s wall clock)"
+        FAIL=$((FAIL + 1))
+    elif [ "$BPE_RC" != "0" ]; then
+        echo "FAIL: bpe_$BPE_T (exit $BPE_RC)"
+        echo "$BPE_OUT" | tail -5 | sed 's/^/    /'
+        FAIL=$((FAIL + 1))
+    elif echo "$BPE_OUT" | grep -q "FAIL"; then
+        echo "FAIL: bpe_$BPE_T (exit 0 but reported a failing case)"
+        echo "$BPE_OUT" | grep "FAIL" | head -3 | sed 's/^/    /'
+        FAIL=$((FAIL + 1))
+    else
+        PASS=$((PASS + 1))
+        echo "  bpe_$BPE_T: PASS ($(echo "$BPE_OUT" | tail -1))"
+    fi
+    rm -f "$BPE_BIN"
+done
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS/$TOTAL passed, $FAIL failed ==="

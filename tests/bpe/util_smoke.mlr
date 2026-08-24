@@ -1,0 +1,22 @@
+import "../../std/bpe_train.mlr"
+import "../../std/io.mlr"
+fn main() {
+    bpe_b2c_ensure()
+    // space -> U+0120 -> UTF-8 C4 A0
+    u64 src = alloc(4); store8(src, 32)
+    u64 dst = alloc(8)
+    u64 n = bpe_byte_map_piece(src, 1, dst)
+    u8 b0 = 0; u8 b1 = 0
+    unsafe { *(dst as u8) -> b0 } unsafe { *((dst+1) as u8) -> b1 }
+    if n == 2 && b0 == 0xC4 && b1 == 0xA0 { print("PASS space->G-dot\n") } else { print("FAIL space\n") }
+    // 'a' (0x61) is printable -> maps to itself
+    store8(src, 0x61); n = bpe_byte_map_piece(src, 1, dst)
+    unsafe { *(dst as u8) -> b0 }
+    if n == 1 && b0 == 0x61 { print("PASS a->a\n") } else { print("FAIL a\n") }
+    // utf8 decode of 'π' (CF 80) -> U+03C0, 2 bytes
+    u64 pi = alloc(4); store8(pi, 0xCF); store8(pi+1, 0x80)
+    u64 cpout = alloc(8)
+    u64 used = bpe_utf8_decode(pi, pi+2, cpout)
+    u64 cp = 0; unsafe { *(cpout as u64) -> cp }
+    if used == 2 && cp == 0x3C0 { print("PASS pi decode\n") } else { print("FAIL pi\n") }
+}

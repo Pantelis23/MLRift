@@ -1,0 +1,314 @@
+// Golden test for the exact GPT-2 ByteLevel pre-tokenizer.
+//
+// Reads tests/bpe/golden/pretok_cases.tsv (generated from HuggingFace
+// tokenizers 0.23.1). Each line is  ESCAPED_INPUT <TAB> ESCAPED_PIECES
+// where the escaping is `\xNN` per byte (so the file itself is pure ASCII)
+// and the pieces are the BYTE-MAPPED forms joined with '|'.
+//
+// The test splits the RAW (un-mapped) input with bpe_pretok_split, byte-maps
+// each returned [offset,len) slice, joins with '|', and compares bytes.
+import "../../std/bpe_train.mlr"
+import "../../std/io.mlr"
+import "../../std/string.mlr"
+
+// "\xNN" -> byte; everything else copied verbatim. Returns raw length.
+// R-T2b: only treat `\` as the start of a `\xNN` escape when the next byte
+// really is 'x' (0x78) — anything else is a malformed escape and FAILs
+// loudly instead of silently mis-decoding.
+// N-2: a `\` in the last <4 bytes of the field (not enough room left for a
+// full \xNN) used to fall through the old `i + 3 < slen` gate and get
+// copied verbatim, silently. A truncated escape now FAILs loudly too.
+fn unesc(u64 s, u64 slen, u64 out) -> u64 {
+    u64 i = 0
+    u64 o = 0
+    while i < slen {
+        u64 c = 0
+        unsafe { *((s + i) as u8) -> c }
+        if c == 0x5C {
+            if i + 3 >= slen {
+                print("FAIL unesc: truncated \\xNN escape at byte ")
+                print(i)
+                print("\n")
+                exit(1)
+            }
+            u64 xc = 0
+            unsafe { *((s + i + 1) as u8) -> xc }
+            if xc != 0x78 {
+                print("FAIL unesc: malformed escape (not \\xNN) at byte ")
+                print(i)
+                print("\n")
+                exit(1)
+            }
+            u64 h1 = 0
+            u64 h2 = 0
+            unsafe { *((s + i + 2) as u8) -> h1 }
+            unsafe { *((s + i + 3) as u8) -> h2 }
+            u64 v = hex_digit_val(h1) * 16 + hex_digit_val(h2)
+            store8(out + o, v)
+            o = o + 1
+            i = i + 4
+        } else {
+            store8(out + o, c)
+            o = o + 1
+            i = i + 1
+        }
+    }
+    return o
+}
+
+fn hexch(u64 v) -> u64 {
+    if v < 10 { return 0x30 + v }
+    return 0x61 + (v - 10)
+}
+
+// print a byte range as \xNN escapes (ASCII-safe diagnostics)
+fn dump_hex(u64 p, u64 n) {
+    u64 buf = alloc(n * 4 + 8)
+    u64 o = 0
+    u64 i = 0
+    while i < n {
+        u64 b = 0
+        unsafe { *((p + i) as u8) -> b }
+        store8(buf + o, 0x5C)
+        store8(buf + o + 1, 0x78)
+        store8(buf + o + 2, hexch((b >> 4) & 0xF))
+        store8(buf + o + 3, hexch(b & 0xF))
+        o = o + 4
+        i = i + 1
+    }
+    store8(buf + o, 0)
+    print_str(buf)
+    dealloc(buf)
+}
+
+fn bytes_eq(u64 a, u64 b, u64 n) -> u64 {
+    u64 i = 0
+    while i < n {
+        u64 x = 0
+        u64 y = 0
+        unsafe { *((a + i) as u8) -> x }
+        unsafe { *((b + i) as u8) -> y }
+        if x != y { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn main() {
+    u64 offs = alloc(4096 * 8)
+    u64 lens = alloc(4096 * 8)
+    // Caller-owned codepoint scratch for bpe_pretok_split (Task 6a made it a
+    // parameter so concurrent splits cannot share one slot).
+    u64 cpbuf = alloc(8)
+
+    // ---- Step 5 regression: split the RAW text, THEN byte-map. --------------
+    // "café π" = 63 61 66 C3 A9 20 CF 80.  The byte map turns C3 -> "Ã" and
+    // A9 -> "©" (a symbol!), so splitting the MAPPED text would tear "café"
+    // apart at the ©.  Splitting raw keeps "café" (5 bytes) whole.
+    u64 cafe = alloc(16)
+    store8(cafe + 0, 0x63)
+    store8(cafe + 1, 0x61)
+    store8(cafe + 2, 0x66)
+    store8(cafe + 3, 0xC3)
+    store8(cafe + 4, 0xA9)
+    store8(cafe + 5, 0x20)
+    store8(cafe + 6, 0xCF)
+    store8(cafe + 7, 0x80)
+    u64 cn = bpe_pretok_split(cafe, 8, offs, lens, 16, cpbuf)
+    u64 c_off0 = 0
+    u64 c_len0 = 0
+    u64 c_off1 = 0
+    u64 c_len1 = 0
+    unsafe { *((offs + 0) as u64) -> c_off0 }
+    unsafe { *((lens + 0) as u64) -> c_len0 }
+    unsafe { *((offs + 8) as u64) -> c_off1 }
+    unsafe { *((lens + 8) as u64) -> c_len1 }
+    u64 cafe_ok = 1
+    if cn != 2 { cafe_ok = 0 }
+    if c_off0 != 0 || c_len0 != 5 { cafe_ok = 0 }
+    if c_off1 != 5 || c_len1 != 3 { cafe_ok = 0 }
+    if cafe_ok == 0 {
+        print("FAIL cafe-order: expected 2 pieces [0,5)+[5,3), got ")
+        print(cn)
+        print(" pieces\n")
+        exit(1)
+    }
+
+    // ---- golden cases ------------------------------------------------------
+    u64 data = read_file("tests/bpe/golden/pretok_cases.tsv")
+    if data == 0 {
+        print("FAIL: cannot open tests/bpe/golden/pretok_cases.tsv\n")
+        exit(1)
+    }
+    u64 dlen = str_len(data)
+
+    u64 INBUF_CAP = 8192
+    u64 EXPBUF_CAP = 16384
+    u64 ACTBUF_CAP = 16384
+    u64 inbuf = alloc(INBUF_CAP)
+    u64 expbuf = alloc(EXPBUF_CAP)
+    u64 actbuf = alloc(ACTBUF_CAP)
+
+    u64 pos = 0
+    u64 total = 0
+    u64 passed = 0
+    u64 reported = 0
+    u64 lineno = 0
+
+    while pos < dlen {
+        u64 e = pos
+        while e < dlen {
+            u64 ch = 0
+            unsafe { *((data + e) as u8) -> ch }
+            if ch == 0x0A { break }
+            e = e + 1
+        }
+        u64 linelen = e - pos
+        if linelen > 0 {
+            u64 t = pos
+            while t < e {
+                u64 ch2 = 0
+                unsafe { *((data + t) as u8) -> ch2 }
+                if ch2 == 0x09 { break }
+                t = t + 1
+            }
+            // R-T2a: no TAB on this line — `e - (t + 1)` would underflow to
+            // ~2^64 and send unesc on a wild read. FAIL loudly instead.
+            if t >= e {
+                print("FAIL pretok_cases.tsv: no TAB on line ")
+                print(lineno)
+                print("\n")
+                exit(1)
+            }
+
+            // R-T2c: the raw (still-escaped) slice length is always >= the
+            // decoded length (each \xNN shrinks 4 bytes -> 1; anything else
+            // is 1:1), so it's a safe upper bound to guard BEFORE decoding —
+            // catches an oversized golden line before any heap corruption.
+            u64 raw_in_len = t - pos
+            u64 raw_exp_len = e - (t + 1)
+            if raw_in_len > INBUF_CAP {
+                print("FAIL pretok_cases.tsv: input too long on line ")
+                print(lineno)
+                print("\n")
+                exit(1)
+            }
+            if raw_exp_len > EXPBUF_CAP {
+                print("FAIL pretok_cases.tsv: expected pieces too long on line ")
+                print(lineno)
+                print("\n")
+                exit(1)
+            }
+
+            u64 ilen = unesc(data + pos, raw_in_len, inbuf)
+            u64 elen = unesc(data + t + 1, raw_exp_len, expbuf)
+
+            u64 np = bpe_pretok_split(inbuf, ilen, offs, lens, 4096, cpbuf)
+
+            // R-T2d: pieces must exactly TILE the input — no gaps, no
+            // overlaps — which also closes the `|`-join's blindness to a
+            // literal 0x7C byte inside a piece (a tiling mismatch would
+            // still be caught here even if the joined-and-compared bytes
+            // happened to line up).
+            u64 tile_ok = 1
+            u64 sum_lens = 0
+            u64 expect_off = 0
+            u64 ti = 0
+            while ti < np {
+                u64 t_off = load64(offs + ti * 8)
+                u64 t_len = load64(lens + ti * 8)
+                if t_off != expect_off { tile_ok = 0 }
+                sum_lens = sum_lens + t_len
+                expect_off = t_off + t_len
+                ti = ti + 1
+            }
+            if np > 0 {
+                u64 first_off = load64(offs)
+                if first_off != 0 { tile_ok = 0 }
+            }
+            if sum_lens != ilen { tile_ok = 0 }
+            if tile_ok == 0 {
+                print("FAIL tiling: case on line ")
+                print(lineno)
+                print(" pieces do not exactly tile the input (sum_lens=")
+                print(sum_lens)
+                print(" input_len=")
+                print(ilen)
+                print(")\n")
+                exit(1)
+            }
+
+            // R-T2c: bound the actbuf write BEFORE calling bpe_byte_map_piece
+            // — a byte-mapped piece is at most 2x its raw length, plus one
+            // '|' separator byte per piece after the first.
+            u64 alen = 0
+            u64 k = 0
+            while k < np {
+                if k > 0 {
+                    if alen + 1 > ACTBUF_CAP {
+                        print("FAIL pretok: actbuf overflow (separator) on line ")
+                        print(lineno)
+                        print("\n")
+                        exit(1)
+                    }
+                    store8(actbuf + alen, 0x7C)
+                    alen = alen + 1
+                }
+                u64 off = 0
+                u64 pl = 0
+                unsafe { *((offs + k * 8) as u64) -> off }
+                unsafe { *((lens + k * 8) as u64) -> pl }
+                if alen + pl * 2 > ACTBUF_CAP {
+                    print("FAIL pretok: actbuf overflow (piece) on line ")
+                    print(lineno)
+                    print("\n")
+                    exit(1)
+                }
+                alen = alen + bpe_byte_map_piece(inbuf + off, pl, actbuf + alen)
+                k = k + 1
+            }
+
+            total = total + 1
+            u64 ok = 1
+            if alen != elen { ok = 0 }
+            if ok == 1 { ok = bytes_eq(actbuf, expbuf, alen) }
+            if ok == 1 {
+                passed = passed + 1
+            } else {
+                if reported == 0 {
+                    reported = 1
+                    print("FAIL case ")
+                    print(total)
+                    print("\n  input: ")
+                    dump_hex(inbuf, ilen)
+                    print("\n  got  : ")
+                    dump_hex(actbuf, alen)
+                    print("\n  want : ")
+                    dump_hex(expbuf, elen)
+                    print("\n")
+                }
+            }
+        }
+        pos = e + 1
+        lineno = lineno + 1
+    }
+
+    if total == 0 {
+        print("FAIL pretok: no cases read\n")
+        exit(1)
+    }
+    if passed == total {
+        print("PASS pretok ")
+        print(passed)
+        print("/")
+        print(total)
+        print("\n")
+    } else {
+        print("FAIL pretok ")
+        print(passed)
+        print("/")
+        print(total)
+        print("\n")
+        exit(1)
+    }
+}

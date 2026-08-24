@@ -1,0 +1,716 @@
+// Task 4 smoke test: the incremental merge loop must produce the same merges
+// and the same vocab as HuggingFace `tokenizers` 0.23.1.
+//
+// Ground truth = tests/bpe/golden/tiny_tokenizer.json, written by HF itself
+// (BpeTrainer, vocab_size=320, special_tokens=["<PAD>","<UNK>","<BOS>","<EOS>"],
+// ByteLevel pre-tokenizer, min_frequency=0) trained on tests/bpe/tiny_corpus.txt.
+// HF stops early on this corpus. Every expected number below (merge count,
+// vocab size, every merge string, every token id) is READ FROM THE GOLDEN at
+// run time — nothing is hardcoded here, so regenerating the golden with a
+// different corpus keeps this test meaningful.
+//
+// The corpus deliberately contains the overlap runs `wwwww aaa abab ababab`,
+// which is what exercises R5 (left-to-right NON-overlapping replacement: in
+// `a a a`, merging (a,a) yields `aa a`, ONE merge) and the residual-count
+// behaviour that R4's correct-and-repush pop discipline has to survive.
+//
+// If this test fails, THE BUG IS IN std/bpe_train.mlr — never edit the golden.
+import "../../std/bpe_train.mlr"
+import "../../std/io.mlr"
+
+// ---------------------------------------------------------------------------
+// Minimal JSON reader — deliberately kept in the test, NOT in std/. It only
+// understands the two shapes this golden needs: `model.vocab` (object of
+// string -> int) and `model.merges` (array of 2-element string arrays).
+// ---------------------------------------------------------------------------
+
+static u64 GJ_B = 0        // mmap base of the golden
+static u64 GJ_E = 0        // one past its last byte
+static u64 GJ_P = 0        // read cursor
+static u64 GJ_BLOB = 0     // decoded-string arena
+static u64 GJ_BLEN = 0
+static u64 GJ_BCAP = 0
+
+fn gj_fail(u64 msg) {
+    print_str(msg)
+    print(" at byte offset ")
+    print(GJ_P - GJ_B)
+    print("\n")
+    exit(1)
+}
+
+fn gj_put(u64 b) {
+    if GJ_BLEN >= GJ_BCAP {
+        u64 nc = GJ_BCAP * 2
+        u64 np = alloc(nc)
+        memcpy(np, GJ_BLOB, GJ_BLEN)
+        dealloc(GJ_BLOB)
+        GJ_BLOB = np
+        GJ_BCAP = nc
+    }
+    store8(GJ_BLOB + GJ_BLEN, b)
+    GJ_BLEN = GJ_BLEN + 1
+}
+
+fn gj_ws() {
+    while GJ_P < GJ_E {
+        u64 c = load8(GJ_P)
+        if c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D {
+            GJ_P = GJ_P + 1
+        } else {
+            break
+        }
+    }
+}
+
+fn gj_expect(u64 ch, u64 msg) {
+    gj_ws()
+    if GJ_P >= GJ_E { gj_fail(msg) }
+    if load8(GJ_P) != ch { gj_fail(msg) }
+    GJ_P = GJ_P + 1
+}
+
+// Reads a JSON string into the arena; writes its arena OFFSET to *out_off and
+// its byte length to *out_len. Offsets (not pointers) because the arena moves
+// when it grows.
+fn gj_string(u64 out_off, u64 out_len) {
+    gj_expect(0x22, "json: expected a string")
+    u64 off = GJ_BLEN
+    while 1 {
+        if GJ_P >= GJ_E { gj_fail("json: unterminated string") }
+        u64 c = load8(GJ_P)
+        GJ_P = GJ_P + 1
+        if c == 0x22 { break }
+        if c == 0x5C {
+            if GJ_P >= GJ_E { gj_fail("json: truncated escape") }
+            u64 e = load8(GJ_P)
+            GJ_P = GJ_P + 1
+            u64 v = 0x100                      // 0x100 == "not a known escape"
+            if e == 0x22 { v = 0x22 }
+            if e == 0x5C { v = 0x5C }
+            if e == 0x2F { v = 0x2F }
+            if e == 0x62 { v = 8 }
+            if e == 0x66 { v = 12 }
+            if e == 0x6E { v = 10 }
+            if e == 0x72 { v = 13 }
+            if e == 0x74 { v = 9 }
+            if v == 0x100 { gj_fail("json: unsupported escape (\\u is not handled)") }
+            gj_put(v)
+        } else {
+            gj_put(c)
+        }
+    }
+    store64(out_off, off)
+    store64(out_len, GJ_BLEN - off)
+}
+
+fn gj_int() -> u64 {
+    gj_ws()
+    u64 v = 0
+    u64 any = 0
+    while GJ_P < GJ_E {
+        u64 c = load8(GJ_P)
+        if c < 0x30 || c > 0x39 { break }
+        v = v * 10 + (c - 0x30)
+        any = 1
+        GJ_P = GJ_P + 1
+    }
+    if any == 0 { gj_fail("json: expected an integer") }
+    return v
+}
+
+// Builds `"name"` (quoted, NUL-terminated) into `out`; returns its length.
+fn gj_mk_key(u64 name, u64 out) -> u64 {
+    store8(out, 0x22)
+    u64 i = 0
+    while load8(name + i) != 0 {
+        store8(out + 1 + i, load8(name + i))
+        i = i + 1
+    }
+    store8(out + 1 + i, 0x22)
+    store8(out + 2 + i, 0)
+    return i + 2
+}
+
+// Moves the cursor just past the next occurrence of the quoted key `name`,
+// searching FORWARD FROM THE CURRENT CURSOR — not from the start of the file.
+//
+// That matters: token strings inside `model.vocab` are quoted too, so a corpus
+// containing the bare word `merges` puts a literal `"merges"` key in the vocab
+// object, which sorts before `model.merges` and would capture a from-the-start
+// scan. Seeking `"merges"` from the cursor (which sits just past the vocab
+// object, since BPE serialization always writes vocab before merges) skips
+// every vocab token, and also skips the earlier `"ignore_merges"` field.
+fn gj_seek(u64 name) {
+    u64 key = alloc(64)
+    u64 klen = gj_mk_key(name, key)
+    u64 p = GJ_P
+    while p + klen <= GJ_E {
+        if bpe_bytes_eq(p, key, klen) == 1 {
+            GJ_P = p + klen
+            dealloc(key)
+            return
+        }
+        p = p + 1
+    }
+    print("json: key not found: ")
+    print_str(name)
+    print("\n")
+    exit(1)
+}
+
+// ---------------------------------------------------------------------------
+// Golden tables
+// ---------------------------------------------------------------------------
+
+static u64 GOLD_MAX = 65536
+
+static u64 gv_off = 0      // u64[] arena offset of each vocab token
+static u64 gv_len = 0      // u64[] its byte length
+static u64 gv_id = 0       // u64[] its HF id
+static u64 gvn = 0
+
+static u64 gm_loff = 0     // u64[] left  piece of merge i
+static u64 gm_llen = 0
+static u64 gm_roff = 0     // u64[] right piece of merge i
+static u64 gm_rlen = 0
+static u64 gmn = 0
+
+fn gold_overflow(u64 what) {
+    print("golden: too many ")
+    print_str(what)
+    print(" (raise GOLD_MAX)\n")
+    exit(1)
+}
+
+fn parse_golden(u64 path) {
+    u64 szp = alloc(8)
+    u64 base = bpe_mmap_file(path, szp)
+    if base == 0 {
+        print("FAIL: cannot mmap ")
+        print_str(path)
+        print("\n")
+        exit(1)
+    }
+    u64 sz = load64(szp)
+    dealloc(szp)
+    GJ_B = base
+    GJ_E = base + sz
+    GJ_P = base
+    GJ_BCAP = 65536
+    GJ_BLOB = alloc(GJ_BCAP)
+    GJ_BLEN = 0
+
+    gv_off = alloc(GOLD_MAX * 8)
+    gv_len = alloc(GOLD_MAX * 8)
+    gv_id = alloc(GOLD_MAX * 8)
+    gm_loff = alloc(GOLD_MAX * 8)
+    gm_llen = alloc(GOLD_MAX * 8)
+    gm_roff = alloc(GOLD_MAX * 8)
+    gm_rlen = alloc(GOLD_MAX * 8)
+
+    // model.vocab : { "<tok>": <id>, ... }
+    gj_seek("vocab")
+    gj_expect(0x3A, "json: expected ':' after \"vocab\"")
+    gj_expect(0x7B, "json: expected '{' opening \"vocab\"")
+    gj_ws()
+    if GJ_P < GJ_E && load8(GJ_P) == 0x7D { GJ_P = GJ_P + 1 } else {
+        while 1 {
+            if gvn >= GOLD_MAX { gold_overflow("vocab entries") }
+            gj_string(gv_off + gvn * 8, gv_len + gvn * 8)
+            gj_expect(0x3A, "json: expected ':' in \"vocab\"")
+            store64(gv_id + gvn * 8, gj_int())
+            gvn = gvn + 1
+            gj_ws()
+            if GJ_P >= GJ_E { gj_fail("json: unterminated \"vocab\"") }
+            u64 c = load8(GJ_P)
+            GJ_P = GJ_P + 1
+            if c == 0x7D { break }
+            if c != 0x2C { gj_fail("json: expected ',' or '}' in \"vocab\"") }
+        }
+    }
+
+    // model.merges : [ [ "<l>", "<r>" ], ... ]
+    gj_seek("merges")
+    gj_expect(0x3A, "json: expected ':' after \"merges\"")
+    gj_expect(0x5B, "json: expected '[' opening \"merges\"")
+    gj_ws()
+    if GJ_P < GJ_E && load8(GJ_P) == 0x5D { GJ_P = GJ_P + 1 } else {
+        while 1 {
+            if gmn >= GOLD_MAX { gold_overflow("merges") }
+            gj_expect(0x5B, "json: expected '[' opening a merge")
+            gj_string(gm_loff + gmn * 8, gm_llen + gmn * 8)
+            gj_expect(0x2C, "json: expected ',' inside a merge")
+            gj_string(gm_roff + gmn * 8, gm_rlen + gmn * 8)
+            gj_expect(0x5D, "json: expected ']' closing a merge")
+            gmn = gmn + 1
+            gj_ws()
+            if GJ_P >= GJ_E { gj_fail("json: unterminated \"merges\"") }
+            u64 c2 = load8(GJ_P)
+            GJ_P = GJ_P + 1
+            if c2 == 0x5D { break }
+            if c2 != 0x2C { gj_fail("json: expected ',' or ']' in \"merges\"") }
+        }
+    }
+
+    bpe_munmap_file(base, sz)
+    GJ_B = 0
+    GJ_E = 0
+    GJ_P = 0
+}
+
+// ---------------------------------------------------------------------------
+
+fn print_bytes(u64 p, u64 n) {
+    if n == 0 { return }
+    syscall_raw(1, 1, p, n, 0, 0, 0)
+}
+
+// ===========================================================================
+// GROWTH COVERAGE — Vocab and PairCount.
+//
+// Modelled on test_growth in tests/bpe/wordcount_smoke.mlr, and added for the
+// same reason it was: the growth paths of these two containers are DEAD under
+// every other checked-in test, and a broken rehash here fails SILENTLY.
+//
+// What is uncovered without this:
+//   - bpe_vocab_grow_slots, plus the entries-array and blob growth branches
+//     inside bpe_vocab_add. bpe_vocab_new() starts at cap 1024 / ecap 1024 /
+//     blob 8192 and rehashes at 716 tokens, but the tiny-corpus training below
+//     stops at vocab 124, and writer_smoke's synthetic vocab is 7. None of the
+//     three branches ever runs.
+//   - bpe_pc_grow. bpe_train_merges builds its map with bpe_pc_new(4096),
+//     which grows only past 2867 distinct pairs; the 6.5 KB tiny corpus never
+//     gets near that.
+//
+// Why silence is the danger: a vocab rehash that drops or duplicates a slot
+// does not crash. It produces duplicate ids in the emitted `vocab` dict, or a
+// token that can no longer be looked up — a wrong tokenizer.json that still
+// exits 0. This is structurally the same gap that once let a fully-broken
+// WordTable rehash ship green on this branch.
+//
+// The assertions are chosen so a dropped entry cannot hide: every id is
+// round-tripped in BOTH directions (id -> bytes via bpe_vocab_str, bytes -> id
+// via bpe_vocab_id) after all the growth has happened, and the id assigned at
+// insert time is required to still be the id the token resolves to — i.e.
+// insertion order and id assignment survive every rehash, not just the last.
+// ===========================================================================
+
+fn gz_u64_to_dec(u64 val, u64 out) -> u64 {
+    if val == 0 { store8(out, 0x30); return 1 }
+    u64 buf = alloc(24)
+    u64 len = 0
+    u64 tmp = val
+    while tmp > 0 {
+        store8(buf + len, (tmp % 10) + 0x30)
+        len = len + 1
+        tmp = tmp / 10
+    }
+    u64 i = 0
+    while i < len {
+        store8(out + i, load8(buf + (len - 1 - i)))
+        i = i + 1
+    }
+    dealloc(buf)
+    return len
+}
+
+// "tok" + decimal(i). Lengths run 4..7 over i in 0..1999, so 2000 of them sum
+// to 12890 bytes and force at least one blob grow past the initial 8192.
+fn gz_mk_tok(u64 i, u64 out) -> u64 {
+    store8(out + 0, 0x74); store8(out + 1, 0x6F); store8(out + 2, 0x6B)
+    u64 dl = gz_u64_to_dec(i, out + 3)
+    return 3 + dl
+}
+
+// 2000 synthetic tokens through a real Vocab. Crosses the rehash threshold
+// twice (cap 1024 -> 2048 at 716 tokens -> 4096 at 1433), the entries-array
+// doubling once (ecap 1024 at the 1025th token), and the blob doubling once.
+fn test_vocab_growth() {
+    u64 n = 2000
+    u64 v = bpe_vocab_new()
+    u64 tok = alloc(32)
+
+    // Pass 1: insert in order. bpe_vocab_add must hand out ids 0,1,2,... —
+    // that contract is what the writer's `vocab` dict depends on.
+    u64 i = 0
+    while i < n {
+        u64 tl = gz_mk_tok(i, tok)
+        u64 got = bpe_vocab_add(v, tok, tl)
+        if got != i {
+            print("FAIL vocab-growth: insert ")
+            print(i)
+            print(" was assigned id ")
+            print(got)
+            print(" (ids must be handed out in insertion order)\n")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    if bpe_vocab_count(v) != n {
+        print("FAIL vocab-growth: count got=")
+        print(bpe_vocab_count(v))
+        print(" want=")
+        print(n)
+        print("\n")
+        exit(1)
+    }
+
+    // Pass 2: re-add every 3rd token. This is the get-or-insert path AFTER all
+    // the growth: it must return the ORIGINAL id and must not append.
+    i = 0
+    while i < n {
+        if i % 3 == 0 {
+            u64 tl2 = gz_mk_tok(i, tok)
+            u64 again = bpe_vocab_add(v, tok, tl2)
+            if again != i {
+                print("FAIL vocab-growth: re-add of token ")
+                print(i)
+                print(" returned id ")
+                print(again)
+                print(" instead of reusing ")
+                print(i)
+                print("\n")
+                exit(1)
+            }
+        }
+        i = i + 1
+    }
+    if bpe_vocab_count(v) != n {
+        print("FAIL vocab-growth: re-adding existing tokens changed the count to ")
+        print(bpe_vocab_count(v))
+        print("\n")
+        exit(1)
+    }
+
+    // Pass 3: full bijection check, after every rehash has already happened.
+    // A rehash that dropped a slot shows up here as BPE_NOT_FOUND; one that
+    // duplicated or reassigned a slot shows up as a wrong id or wrong bytes.
+    u64 sp = alloc(8)
+    u64 sl = alloc(8)
+    i = 0
+    while i < n {
+        u64 tl3 = gz_mk_tok(i, tok)
+        u64 id = bpe_vocab_id(v, tok, tl3)
+        if id != i {
+            print("FAIL vocab-growth: lookup of token \"")
+            print_bytes(tok, tl3)
+            print("\" returned id ")
+            print(id)
+            print(" want ")
+            print(i)
+            print(" (a rehash lost or moved this entry)\n")
+            exit(1)
+        }
+        bpe_vocab_str(v, i, sp, sl)
+        u64 bad = 0
+        if load64(sl) != tl3 { bad = 1 } else {
+            if bpe_bytes_eq(load64(sp), tok, tl3) == 0 { bad = 1 }
+        }
+        if bad == 1 {
+            print("FAIL vocab-growth: id ")
+            print(i)
+            print(" resolves to \"")
+            print_bytes(load64(sp), load64(sl))
+            print("\" want \"")
+            print_bytes(tok, tl3)
+            print("\" (entries array or blob grew wrong)\n")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    // A token that was never added must still report absent — a rehash that
+    // smeared a used flag across the fresh slot array would fail here.
+    store8(tok + 0, 0x7A); store8(tok + 1, 0x7A); store8(tok + 2, 0x7A)
+    if bpe_vocab_id(v, tok, 3) != BPE_NOT_FOUND {
+        print("FAIL vocab-growth: an absent token resolved to an id\n")
+        exit(1)
+    }
+
+    dealloc(sp)
+    dealloc(sl)
+    dealloc(tok)
+    bpe_vocab_free(v)
+    print("PASS vocab-growth ")
+    print(n)
+    print(" tokens through 2 rehashes\n")
+}
+
+// Non-inserting probe: bpe_pc_slot would CREATE a missing key and hide exactly
+// the defect this test is looking for, so the occurrence-list checks below
+// find their slot by hand.
+fn gz_pc_find(u64 pc, u64 key) -> u64 {
+    u64 cap = load64(pc)
+    u64 slots = load64(pc + 16)
+    u64 i = bpe_pc_hash(key) & (cap - 1)
+    u64 probes = 0
+    while probes < cap {
+        u64 slot = slots + i * 56
+        if load64(slot) == 0 { return 0 }
+        if load64(slot + 8) == key { return slot }
+        i = (i + 1) & (cap - 1)
+        probes = probes + 1
+    }
+    return 0
+}
+
+// 3000 distinct pairs through a real PairCount built the way bpe_train_merges
+// builds it. cap starts at 4096 and grows once past 2867 distinct keys, so the
+// memcpy-based slot move in bpe_pc_grow runs for real. Counts, occurrence
+// lists and the `pending` flag all have to survive it.
+fn test_pc_growth() {
+    u64 n = 3000
+    u64 pc = bpe_pc_new(4096)
+    u64 pend = bpe_uvec_new(16)
+
+    u64 i = 0
+    while i < n {
+        u64 l = (i / 50) + 1
+        u64 r = (i % 50) + 1
+        bpe_pc_add_pos(pc, l, r, (i % 97) + 1, i, pend)
+        i = i + 1
+    }
+
+    if load64(pc + 8) != n {
+        print("FAIL pc-growth: distinct keys got=")
+        print(load64(pc + 8))
+        print(" want=")
+        print(n)
+        print("\n")
+        exit(1)
+    }
+    if load64(pend) != n {
+        print("FAIL pc-growth: pending list got=")
+        print(load64(pend))
+        print(" want=")
+        print(n)
+        print("\n")
+        exit(1)
+    }
+    if load64(pc) <= 4096 {
+        print("FAIL pc-growth: the map never grew (cap still ")
+        print(load64(pc))
+        print(") — this test no longer covers bpe_pc_grow\n")
+        exit(1)
+    }
+
+    i = 0
+    while i < n {
+        u64 l2 = (i / 50) + 1
+        u64 r2 = (i % 50) + 1
+        u64 want = (i % 97) + 1
+        u64 got = bpe_pc_get(pc, l2, r2)
+        if got != want {
+            print("FAIL pc-growth: count for pair (")
+            print(l2)
+            print(",")
+            print(r2)
+            print(") got=")
+            print(got)
+            print(" want=")
+            print(want)
+            print(" (the rehash lost or corrupted this slot)\n")
+            exit(1)
+        }
+        u64 slot = gz_pc_find(pc, (l2 << 32) | r2)
+        if slot == 0 {
+            print("FAIL pc-growth: pair (")
+            print(l2)
+            print(",")
+            print(r2)
+            print(") vanished from the slot array\n")
+            exit(1)
+        }
+        if load64(slot + 32) != 1 {
+            print("FAIL pc-growth: occurrence list for pair index ")
+            print(i)
+            print(" has len ")
+            print(load64(slot + 32))
+            print(" want 1 (bpe_pc_grow must carry occ_ptr/occ_len across)\n")
+            exit(1)
+        }
+        if load64(load64(slot + 24)) != i {
+            print("FAIL pc-growth: occurrence list for pair index ")
+            print(i)
+            print(" holds word ")
+            print(load64(load64(slot + 24)))
+            print(" want ")
+            print(i)
+            print("\n")
+            exit(1)
+        }
+        if load64(slot + 48) != 1 {
+            print("FAIL pc-growth: pending flag lost for pair index ")
+            print(i)
+            print("\n")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    // Decrement through the wrapping-add idiom after growth, then confirm the
+    // count is exactly zero — the same arithmetic bpe_word_merge_pair uses.
+    bpe_pc_add(pc, 1, 1, 0 - 1)
+    if bpe_pc_get(pc, 1, 1) != 0 {
+        print("FAIL pc-growth: `0 - freq` decrement after growth left ")
+        print(bpe_pc_get(pc, 1, 1))
+        print(" want 0\n")
+        exit(1)
+    }
+    // A pair never inserted must still read 0, not a stale neighbour's count.
+    if bpe_pc_get(pc, 999, 999) != 0 {
+        print("FAIL pc-growth: an absent pair reported a non-zero count\n")
+        exit(1)
+    }
+
+    u64 final_cap = load64(pc)
+    bpe_uvec_free(pend)
+    bpe_pc_free(pc)
+    print("PASS pc-growth ")
+    print(n)
+    print(" pairs, cap 4096 -> ")
+    print(final_cap)
+    print("\n")
+}
+
+fn main() {
+    test_vocab_growth()
+    test_pc_growth()
+
+    parse_golden("tests/bpe/golden/tiny_tokenizer.json")
+
+    u64 szp = alloc(8)
+    u64 base = bpe_mmap_file("tests/bpe/tiny_corpus.txt", szp)
+    if base == 0 {
+        print("FAIL: cannot mmap tests/bpe/tiny_corpus.txt\n")
+        exit(1)
+    }
+    u64 size = load64(szp)
+    dealloc(szp)
+
+    u64 wt = bpe_count_words_1t(base, size)
+
+    u64 vocab_size = 320
+    u64 v = bpe_vocab_new()
+    // bpe_train_merges' contract: room for `vocab_size` (left,right) u64 pairs.
+    u64 merges = alloc(vocab_size * 16)
+    u64 nm = bpe_train_merges(wt, vocab_size, v, merges)
+
+    // ---- (a) merge COUNT -------------------------------------------------
+    if nm != gmn {
+        print("FAIL merges: count got=")
+        print(nm)
+        print(" want=")
+        print(gmn)
+        print("\n")
+        exit(1)
+    }
+
+    // ---- (b) every merge [left,right] string, in order -------------------
+    u64 sp = alloc(8)
+    u64 sl = alloc(8)
+    u64 i = 0
+    while i < nm {
+        u64 lid = load64(merges + i * 16)
+        u64 rid = load64(merges + i * 16 + 8)
+        u64 bad = 0
+
+        bpe_vocab_str(v, lid, sp, sl)
+        u64 gp = GJ_BLOB + load64(gm_loff + i * 8)
+        u64 gl = load64(gm_llen + i * 8)
+        if load64(sl) != gl { bad = 1 } else {
+            if bpe_bytes_eq(load64(sp), gp, gl) == 0 { bad = 1 }
+        }
+        u64 got_lp = load64(sp)
+        u64 got_ll = load64(sl)
+
+        bpe_vocab_str(v, rid, sp, sl)
+        u64 gp2 = GJ_BLOB + load64(gm_roff + i * 8)
+        u64 gl2 = load64(gm_rlen + i * 8)
+        if load64(sl) != gl2 { bad = 1 } else {
+            if bpe_bytes_eq(load64(sp), gp2, gl2) == 0 { bad = 1 }
+        }
+
+        if bad == 1 {
+            print("FAIL merges: first mismatch at index ")
+            print(i)
+            print("\n  got  [")
+            print_bytes(got_lp, got_ll)
+            print(", ")
+            print_bytes(load64(sp), load64(sl))
+            print("]  (ids ")
+            print(lid)
+            print(",")
+            print(rid)
+            print(")\n  want [")
+            print_bytes(gp, gl)
+            print(", ")
+            print_bytes(gp2, gl2)
+            print("]\n")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    // ---- (c) the full vocab id<->string map ------------------------------
+    u64 nv = bpe_vocab_count(v)
+    if nv != gvn {
+        print("FAIL vocab: size got=")
+        print(nv)
+        print(" want=")
+        print(gvn)
+        print("\n")
+        exit(1)
+    }
+    // gvn distinct golden ids all resolving correctly against a vocab of
+    // exactly gvn tokens makes this a bijection, so both directions are
+    // checked below (id -> string via bpe_vocab_str, string -> id via
+    // bpe_vocab_id).
+    u64 k = 0
+    while k < gvn {
+        u64 gsp = GJ_BLOB + load64(gv_off + k * 8)
+        u64 gsl = load64(gv_len + k * 8)
+        u64 gid = load64(gv_id + k * 8)
+        u64 got_id = bpe_vocab_id(v, gsp, gsl)
+        u64 bad2 = 0
+        if got_id != gid { bad2 = 1 }
+        if bad2 == 0 {
+            bpe_vocab_str(v, gid, sp, sl)
+            if load64(sl) != gsl { bad2 = 1 } else {
+                if bpe_bytes_eq(load64(sp), gsp, gsl) == 0 { bad2 = 1 }
+            }
+        }
+        if bad2 == 1 {
+            print("FAIL vocab: first mismatch at golden entry ")
+            print(k)
+            print(" token \"")
+            print_bytes(gsp, gsl)
+            print("\"\n  got id=")
+            print(got_id)
+            print(" want id=")
+            print(gid)
+            print("\n")
+            exit(1)
+        }
+        k = k + 1
+    }
+
+    dealloc(sp)
+    dealloc(sl)
+    dealloc(merges)
+    bpe_vocab_free(v)
+    bpe_wt_free(wt)
+    bpe_munmap_file(base, size)
+
+    print("PASS merges ")
+    print(nm)
+    print("/")
+    print(gmn)
+    print(" vocab ")
+    print(nv)
+    print("/")
+    print(gvn)
+    print("\n")
+}

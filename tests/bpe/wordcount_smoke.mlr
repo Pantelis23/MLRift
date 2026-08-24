@@ -1,0 +1,737 @@
+// Smoke test for the single-thread word-frequency counter (Task 3).
+//
+// Ground truth was derived INDEPENDENTLY from HuggingFace `tokenizers`
+// (NOT from this implementation) via:
+//
+//   .venv/bin/python3 -c "
+//   from tokenizers import pre_tokenizers
+//   from collections import Counter
+//   bl = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True)
+//   c = Counter()
+//   for l in open('tests/bpe/tiny_corpus.txt', newline='').readlines():
+//       c.update(p for p,_ in bl.pre_tokenize_str(l))
+//   print('distinct:', len(c))
+//   for w,n in sorted(c.items()): print(repr(w), n)
+//   "
+//
+// `readlines()` keeps each line's trailing '\n' — that is exactly the rule
+// this trainer must follow (feed bpe_pretok_split one line-with-ending at a
+// time, never the whole buffer). tests/bpe/tiny_corpus.txt now has TWO
+// consecutive blank lines (a "\n\n\n" region, added for I-2) specifically so
+// a whole-buffer bug fuses them into a "ĊĊ" token that must NEVER appear
+// here. Per-line output (34 distinct pieces total):
+//
+//   "'"        40      ","        40      "cafÃ©"    40
+//   "don"      40      "er"       40      "jumps"    40
+//   "'t"       40      "ll"       40      "trailing" 40
+//   "ve"       40      "wwwww"    40      "Ċ"        360
+//   "Ġ"        40      "Ġ'"       80      "Ġaaa"     40
+//   "Ġabab"    40      "Ġababab"  40      "Ġbrown"   40
+//   "Ġdog"     40      "Ġe"       40      "Ġend"     40
+//   "Ġfox"     40      "Ġindented"40      "Ġlazy"    40
+//   "Ġover"    40      "Ġquick"   120     "Ġstart"   40
+//   "Ġstop"    40      "Ġthe"     120     "ĠÂ½"      40
+//   "ĠÅĥ"      40      "ĠÏĢ"      40      "ĠĠĊ"      40
+//   "the"      80   (line1 "the quick..." + line4's leading "the the the")
+//
+// (Ċ went from 320 -> 360 solely because of the added blank line: 40 reps *
+// 1 extra "\n"-only piece per rep.) The whole-buffer oracle on this SAME
+// corpus instead yields distinct=35 with "Ċ"=280, "ĊĊ"=40, "ĊĠ"=40, "ĠĠ"=40
+// replacing "Ċ"=360/"Ġ"=40/"ĠĠĊ"=40 — i.e. checking "Ġ", "Ċ"=360 and
+// "ĠĠĊ" present while "ĊĊ" is ABSENT discriminates the two implementations
+// on every one of those four counts, not just one.
+//
+// If this implementation ever disagrees with these numbers, the BUG IS IN
+// THE IMPLEMENTATION — never edit these expectations to match its output.
+import "../../std/bpe_train.mlr"
+import "../../std/io.mlr"
+import "../../std/thread.mlr"
+
+fn bytes_eq(u64 a, u64 b, u64 n) -> u64 {
+    u64 i = 0
+    while i < n {
+        if load8(a + i) != load8(b + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Linear scan over the WordTable's entries (small corpus, fine for a smoke
+// test). Returns the freq of the first entry whose bytes match `want`, or
+// the sentinel 0xFFFFFFFFFFFFFFFF if no entry matches.
+fn wt_find_freq(u64 wt, u64 want, u64 wlen) -> u64 {
+    u64 n = bpe_wt_count(wt)
+    u64 pptr = alloc(8)
+    u64 plen = alloc(8)
+    u64 i = 0
+    u64 result = 0xFFFFFFFFFFFFFFFF
+    while i < n {
+        u64 freq = bpe_wt_word(wt, i, pptr, plen)
+        u64 p = load64(pptr)
+        u64 l = load64(plen)
+        if l == wlen {
+            if bytes_eq(p, want, wlen) == 1 {
+                result = freq
+                break
+            }
+        }
+        i = i + 1
+    }
+    dealloc(pptr)
+    dealloc(plen)
+    return result
+}
+
+static u64 NOT_FOUND = 0xFFFFFFFFFFFFFFFF
+static u64 g_ok = 1
+
+fn check(u64 wt, u64 want, u64 wlen, u64 want_freq, u64 label) {
+    u64 got = wt_find_freq(wt, want, wlen)
+    if got == want_freq { return }
+    g_ok = 0
+    print("FAIL wordcount: word=")
+    print_str(label)
+    print(" got=")
+    print(got)
+    print(" want=")
+    print(want_freq)
+    print("\n")
+}
+
+// I-2: direct guard against whole-buffer blank-line fusion — asserts `want`
+// is NOT a key in the table at all (freq must be the not-found sentinel).
+fn check_absent(u64 wt, u64 want, u64 wlen, u64 label) {
+    u64 got = wt_find_freq(wt, want, wlen)
+    if got == NOT_FOUND { return }
+    g_ok = 0
+    print("FAIL wordcount: word=")
+    print_str(label)
+    print(" should be ABSENT but got freq=")
+    print(got)
+    print("\n")
+}
+
+// ---------------------------------------------------------------------------
+// I-1: growth stress test. bpe_wt_new(4096) with only 34 distinct words
+// (the tiny-corpus check above) never rehashes the hash table, never grows
+// the entries array, and never grows the string blob — all three growth
+// paths (bpe_wt_grow_slots, bpe_wt_grow_entries, bpe_wt_ensure_blob) are
+// dead code under that test alone. Task 4+ runs a real corpus with tens of
+// thousands of distinct words, where all three run constantly.
+//
+// bpe_wt_new(8) + 700 distinct "word<i>" strings forces:
+//   - multiple slot rehashes (cap 8 -> 16 -> 32 -> ... well past 700/0.7),
+//   - multiple entries-array grows (ecap starts at 8, doubles each time),
+//   - at least one blob grow (initial blob is only 4096B; 700 words of
+//     4-7 bytes each sum past that).
+// It also updates every 5th word a second time (bpe_wt_add called again on
+// an existing word) to exercise the add-to-existing path under growth, and
+// checks EVERY index 0..699 returns exactly the i-th inserted word — i.e.
+// insertion order survives every rehash along the way.
+// ---------------------------------------------------------------------------
+
+fn u64_to_dec(u64 val, u64 out) -> u64 {
+    if val == 0 { store8(out, 0x30); return 1 }
+    u64 buf = alloc(24)
+    u64 len = 0
+    u64 tmp = val
+    while tmp > 0 {
+        store8(buf + len, (tmp % 10) + 0x30)
+        len = len + 1
+        tmp = tmp / 10
+    }
+    u64 i = 0
+    while i < len {
+        store8(out + i, load8(buf + (len - 1 - i)))
+        i = i + 1
+    }
+    dealloc(buf)
+    return len
+}
+
+// "word" + decimal(i)
+fn mk_synth_word(u64 i, u64 out) -> u64 {
+    store8(out + 0, 0x77); store8(out + 1, 0x6F); store8(out + 2, 0x72); store8(out + 3, 0x64)
+    u64 dl = u64_to_dec(i, out + 4)
+    return 4 + dl
+}
+
+fn synth_expected_freq(u64 i) -> u64 {
+    u64 base = (i % 7) + 1
+    if i % 5 == 0 { return base + 7 }
+    return base
+}
+
+fn test_growth() -> u64 {
+    u64 ok = 1
+    u64 n = 700
+    u64 wt2 = bpe_wt_new(8)
+    u64 word = alloc(16)
+
+    // Pass 1: insert all 700 words in order 0..699.
+    u64 i = 0
+    while i < n {
+        u64 wl = mk_synth_word(i, word)
+        bpe_wt_add(wt2, word, wl, (i % 7) + 1)
+        i = i + 1
+    }
+    // Pass 2: bump every 5th word again — must land on the SAME entry
+    // (add-to-existing), not create a new one.
+    i = 0
+    while i < n {
+        if i % 5 == 0 {
+            u64 wl2 = mk_synth_word(i, word)
+            bpe_wt_add(wt2, word, wl2, 7)
+        }
+        i = i + 1
+    }
+
+    u64 cnt = bpe_wt_count(wt2)
+    if cnt != n {
+        ok = 0
+        print("FAIL growth: distinct got=")
+        print(cnt)
+        print(" want=")
+        print(n)
+        print("\n")
+    }
+
+    u64 pptr = alloc(8)
+    u64 plen = alloc(8)
+    u64 fails = 0
+    i = 0
+    while i < n {
+        u64 freq = bpe_wt_word(wt2, i, pptr, plen)
+        u64 p = load64(pptr)
+        u64 l = load64(plen)
+        u64 wl3 = mk_synth_word(i, word)
+        u64 want_freq = synth_expected_freq(i)
+        u64 this_ok = 1
+        if l != wl3 { this_ok = 0 }
+        if this_ok == 1 {
+            if bytes_eq(p, word, wl3) == 0 { this_ok = 0 }
+        }
+        if freq != want_freq { this_ok = 0 }
+        if this_ok == 0 {
+            ok = 0
+            if fails == 0 {
+                print("FAIL growth: index ")
+                print(i)
+                print(" got_len=")
+                print(l)
+                print(" got_freq=")
+                print(freq)
+                print(" want_freq=")
+                print(want_freq)
+                print("\n")
+            }
+            fails = fails + 1
+        }
+        i = i + 1
+    }
+    if fails > 1 {
+        print("FAIL growth: ")
+        print(fails)
+        print(" total index mismatches\n")
+    }
+
+    dealloc(pptr)
+    dealloc(plen)
+    dealloc(word)
+    bpe_wt_free(wt2)
+    return ok
+}
+
+// ---------------------------------------------------------------------------
+// Task 6a: determinism of the PARALLEL counter.
+//
+// The parallel counter must produce a WordTable that is identical to
+// bpe_count_words_1t's — not merely "the same set of (word, freq) pairs", but
+// the same words at the same INSERTION INDICES with the same freqs. That
+// stronger property holds by construction: worker w's chunk precedes worker
+// w+1's in the corpus, so merging the per-worker tables in ascending worker
+// order reproduces global first-occurrence order exactly. Asserting the
+// index-wise form (rather than set equality) also catches merge-order bugs
+// that a set comparison would wave through — Task 4's alphabet/pair-count
+// seeding walks the table BY INDEX, so index order is byte-exactness-relevant.
+//
+// A thread-safety bug in the shared pre-tokenizer scratch shows up here as a
+// wrong character class -> a wrong split boundary -> a word that exists in one
+// table and not the other, i.e. a distinct-count or index mismatch.
+// ---------------------------------------------------------------------------
+
+// Compares `got` (parallel, `nthreads` workers) against `want`
+// (single-threaded) index by index. Prints the first mismatch with enough
+// context to bisect it and exits(1); returns normally when they agree.
+fn assert_same_table(u64 got, u64 want, u64 nthreads, u64 tag) {
+    u64 gn = bpe_wt_count(got)
+    u64 wn = bpe_wt_count(want)
+    if gn != wn {
+        print("FAIL wordcount-mt: corpus=")
+        print_str(tag)
+        print(" nthreads=")
+        print(nthreads)
+        print(" distinct got=")
+        print(gn)
+        print(" want=")
+        print(wn)
+        print("\n")
+        exit(1)
+    }
+    u64 gp = alloc(8)
+    u64 gl = alloc(8)
+    u64 wp = alloc(8)
+    u64 wl = alloc(8)
+    u64 i = 0
+    while i < gn {
+        u64 gf = bpe_wt_word(got, i, gp, gl)
+        u64 wf = bpe_wt_word(want, i, wp, wl)
+        u64 glen = load64(gl)
+        u64 wlen = load64(wl)
+        u64 bad = 0
+        if glen != wlen {
+            bad = 1
+        } else if bytes_eq(load64(gp), load64(wp), wlen) == 0 {
+            bad = 1
+        } else if gf != wf {
+            bad = 1
+        }
+        if bad == 1 {
+            print("FAIL wordcount-mt: corpus=")
+            print_str(tag)
+            print(" nthreads=")
+            print(nthreads)
+            print(" index=")
+            print(i)
+            print(" got=\"")
+            write(1, load64(gp), glen)
+            print("\" (len ")
+            print(glen)
+            print(", freq ")
+            print(gf)
+            print(") want=\"")
+            write(1, load64(wp), wlen)
+            print("\" (len ")
+            print(wlen)
+            print(", freq ")
+            print(wf)
+            print(")\n")
+            exit(1)
+        }
+        i = i + 1
+    }
+    dealloc(gp)
+    dealloc(gl)
+    dealloc(wp)
+    dealloc(wl)
+}
+
+// Thread counts exercised. 3 matters: it divides neither the tiny corpus's
+// 360 lines nor the synthetic fixture's line count evenly. 24 = this machine's
+// core count, for maximum real overlap; 31 is odd, prime, and near thread.mlr's
+// TP_MAX=32 cap.
+static u64 MT_NCOUNTS = 8
+static u64 mt_counts = 0
+
+fn mt_counts_init() {
+    mt_counts = alloc(MT_NCOUNTS * 8)
+    store64(mt_counts + 0 * 8, 1)
+    store64(mt_counts + 1 * 8, 2)
+    store64(mt_counts + 2 * 8, 3)
+    store64(mt_counts + 3 * 8, 4)
+    store64(mt_counts + 4 * 8, 8)
+    store64(mt_counts + 5 * 8, 16)
+    store64(mt_counts + 6 * 8, 24)
+    store64(mt_counts + 7 * 8, 31)
+}
+
+fn test_determinism(u64 base, u64 size, u64 tag) {
+    u64 want = bpe_count_words_1t(base, size)
+    u64 k = 0
+    while k < MT_NCOUNTS {
+        u64 n = load64(mt_counts + k * 8)
+        // A 0 here means MT_NCOUNTS and mt_counts_init have drifted apart, and
+        // bpe_count_words(...,0) would silently fall through to the
+        // single-threaded path — a test that passes while checking nothing.
+        if n == 0 {
+            print("FAIL wordcount-mt: mt_counts[")
+            print(k)
+            print("] is 0 (MT_NCOUNTS drifted)\n")
+            exit(1)
+        }
+        u64 got = bpe_count_words(base, size, n)
+        assert_same_table(got, want, n, tag)
+        bpe_wt_free(got)
+        k = k + 1
+    }
+    bpe_wt_free(want)
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic multi-MiB fixture. The tiny corpus is 360 short lines (~10 KiB),
+// so with 24 workers most chunk boundaries fall in the first few lines and the
+// workers barely overlap in time. A few MiB of varied lines puts every chunk
+// boundary deep inside the file and keeps all workers busy simultaneously,
+// which is what makes a shared-scratch race actually fire.
+//
+// Content is deterministic (fixed LCG seed) so a failure is reproducible, and
+// deliberately varied: ASCII words, contractions, digits, punctuation, 2-, 3-
+// and 4-byte UTF-8, tabs, double spaces, trailing spaces, blank lines, and a
+// final line with NO trailing newline.
+// ---------------------------------------------------------------------------
+
+static u64 mt_rng = 0x243F6A8885A308D3
+
+fn mt_rand() -> u64 {
+    mt_rng = mt_rng * 6364136223846793005 + 1442695040888963407
+    return mt_rng >> 33
+}
+
+// Writes one word from a fixed 16-entry pool; returns its byte length.
+// The non-ASCII entries are built with store8 so the source file stays ASCII.
+fn mt_emit_word(u64 dst, u64 k) -> u64 {
+    if k == 0 { memcpy(dst, "the", 3); return 3 }
+    if k == 1 { memcpy(dst, "quick", 5); return 5 }
+    if k == 2 { memcpy(dst, "brown", 5); return 5 }
+    if k == 3 { memcpy(dst, "fox", 3); return 3 }
+    if k == 4 { memcpy(dst, "don't", 5); return 5 }
+    if k == 5 { memcpy(dst, "we've", 5); return 5 }
+    if k == 6 { memcpy(dst, "jumps", 5); return 5 }
+    if k == 7 { memcpy(dst, "42", 2); return 2 }
+    if k == 8 { memcpy(dst, "1234567", 7); return 7 }
+    if k == 9 { memcpy(dst, ",", 1); return 1 }
+    if k == 10 { memcpy(dst, "...", 3); return 3 }
+    if k == 11 { memcpy(dst, "wwwww", 5); return 5 }
+    // "cafe" + U+00E9 (2-byte UTF-8)
+    if k == 12 {
+        memcpy(dst, "caf", 3)
+        store8(dst + 3, 0xC3); store8(dst + 4, 0xA9)
+        return 5
+    }
+    // U+03C0 (2-byte) + U+00BD (2-byte)
+    if k == 13 {
+        store8(dst + 0, 0xCF); store8(dst + 1, 0x80)
+        store8(dst + 2, 0xC2); store8(dst + 3, 0xBD)
+        return 4
+    }
+    // U+4E2D (3-byte UTF-8 letter)
+    if k == 14 {
+        store8(dst + 0, 0xE4); store8(dst + 1, 0xB8); store8(dst + 2, 0xAD)
+        return 3
+    }
+    if k == 15 {
+        // U+1D400 (4-byte UTF-8 letter) — exercises the 4-byte decode path.
+        store8(dst + 0, 0xF0); store8(dst + 1, 0x9D)
+        store8(dst + 2, 0x90); store8(dst + 3, 0x80)
+        return 4
+    }
+    print("FAIL wordcount-mt: mt_emit_word index out of range\n")
+    exit(1)
+}
+
+// Hard cap on one generated line, INCLUDING its trailing '\n'. mt_gen_line
+// enforces it (rather than leaving it as arithmetic over the word pool's
+// sizes), so mt_write_fixture's headroom is a guarantee and not a claim.
+static u64 MT_LINE_CAP = 2048
+
+// Writes one line INCLUDING its trailing '\n'; returns the byte count.
+fn mt_gen_line(u64 dst) -> u64 {
+    u64 kind = mt_rand() % 32
+    if kind == 0 {
+        store8(dst, 10)                        // blank line
+        return 1
+    }
+    u64 nwords = 3 + (mt_rand() % 12)
+    if kind == 1 { nwords = 120 + (mt_rand() % 80) }   // occasional long line
+    u64 o = 0
+    u64 i = 0
+    while i < nwords {
+        // 11 = longest pool word (7) + widest separator (2) + a possible
+        // trailing space + the '\n'. A line that would pass MT_LINE_CAP just
+        // ends early: the fixture only has to be varied, not exact.
+        if o + 11 > MT_LINE_CAP { break }
+        if i > 0 {
+            u64 s = mt_rand() % 10
+            if s == 0 {
+                store8(dst + o, 9)             // tab
+                o = o + 1
+            } else if s == 1 {
+                store8(dst + o, 0x20)          // double space
+                store8(dst + o + 1, 0x20)
+                o = o + 2
+            } else {
+                store8(dst + o, 0x20)
+                o = o + 1
+            }
+        }
+        o = o + mt_emit_word(dst + o, mt_rand() % 16)
+        i = i + 1
+    }
+    if mt_rand() % 16 == 0 {
+        store8(dst + o, 0x20)                  // trailing space before '\n'
+        o = o + 1
+    }
+    store8(dst + o, 10)
+    return o + 1
+}
+
+// Builds ~`target` bytes of corpus at `path`. Every mt_gen_line output ends
+// with '\n', and the very last one is dropped so the fixture's final line has
+// no line ending (the chunker must still count it exactly once). Returns the
+// number of bytes written. `target` must be > 0.
+fn mt_write_fixture(u64 path, u64 target) -> u64 {
+    u64 cap = target + MT_LINE_CAP
+    u64 buf = alloc(cap)
+    u64 len = 0
+    while len < target {
+        len = len + mt_gen_line(buf + len)
+    }
+    len = len - 1                              // drop the final '\n'
+    u64 fd = file_open(path, 1)
+    if is_errno(fd) != 0 {
+        print("FAIL wordcount-mt: cannot create the synthetic fixture\n")
+        exit(1)
+    }
+    u64 w = file_write(fd, buf, len)
+    file_close(fd)
+    dealloc(buf)
+    if w != len {
+        print("FAIL wordcount-mt: short write of the synthetic fixture\n")
+        exit(1)
+    }
+    return len
+}
+
+fn mt_unlink(u64 path) {
+    u64 r = syscall_raw(87, path, 0, 0, 0, 0, 0)
+    if is_errno(r) != 0 {
+        print("FAIL wordcount-mt: cannot unlink the synthetic fixture\n")
+        exit(1)
+    }
+}
+
+// Cold-start check: the FIRST bpe_* call this process makes is a PARALLEL
+// count, so bpe_b2c and bpe_unicode's range tables are still unbuilt when the
+// workers start. bpe_count_words must force both lazy builds on the main
+// thread before submitting: their `_init` flags are plain non-atomic globals,
+// and workers racing that init would each alloc a table while one publishes a
+// pointer to a buffer another is still filling. Every other MT check in this
+// file runs after a single-threaded pass has already warmed those tables, so
+// this is the only place that ordering is exercised. Must be main's first
+// statement.
+fn test_mt_cold() {
+    u64 sp = alloc(8)
+    u64 base = bpe_mmap_file("tests/bpe/tiny_corpus.txt", sp)
+    if base == 0 {
+        print("FAIL wordcount-mt: cannot mmap tests/bpe/tiny_corpus.txt (cold)\n")
+        exit(1)
+    }
+    u64 size = load64(sp)
+    u64 got = bpe_count_words(base, size, 24)
+    u64 want = bpe_count_words_1t(base, size)
+    assert_same_table(got, want, 24, "cold")
+    bpe_wt_free(got)
+    bpe_wt_free(want)
+    bpe_munmap_file(base, size)
+    dealloc(sp)
+}
+
+// M-1: bpe_wc_in_flight must be cleared on EVERY return path of
+// bpe_count_words, not just the full-dispatch one — a leak on any path would
+// break the very next call with a spurious "re-entered" death. Deliberately
+// walks all three return paths back-to-back, twice, so a leak on any one of
+// them is caught by the very next call in the sequence:
+//   multi-thread dispatch -> nthreads<=1 delegation -> corpus_size==0
+//   short-circuit -> multi-thread dispatch (again) -> ... -> multi-thread
+// If bpe_count_words dies here, reaching "PASS wordcount-mt" is impossible,
+// so no separate assertion is needed beyond "did every call return".
+fn test_reentry_guard_paths() {
+    u64 buf = alloc(8)
+    memcpy(buf, "ab cd\n", 6)
+
+    u64 t1 = bpe_count_words(buf, 6, 4)     // multi-thread dispatch path
+    bpe_wt_free(t1)
+    u64 t2 = bpe_count_words(buf, 6, 1)     // nthreads<=1 delegation path
+    bpe_wt_free(t2)
+    u64 t3 = bpe_count_words(buf, 0, 4)     // corpus_size==0 short-circuit
+    bpe_wt_free(t3)
+    u64 t4 = bpe_count_words(buf, 6, 4)     // multi-thread dispatch again
+    bpe_wt_free(t4)
+    u64 t5 = bpe_count_words(buf, 0, 8)     // corpus_size==0 again
+    bpe_wt_free(t5)
+    u64 t6 = bpe_count_words(buf, 6, 1)     // nthreads<=1 again
+    bpe_wt_free(t6)
+    u64 t7 = bpe_count_words(buf, 6, 8)     // multi-thread, proves no leak
+    bpe_wt_free(t7)
+
+    dealloc(buf)
+}
+
+fn test_mt() {
+    mt_counts_init()
+
+    test_reentry_guard_paths()
+
+    // (a) the tiny corpus — same bytes the single-thread assertions above use.
+    u64 tiny_size_p = alloc(8)
+    u64 tiny = bpe_mmap_file("tests/bpe/tiny_corpus.txt", tiny_size_p)
+    if tiny == 0 {
+        print("FAIL wordcount-mt: cannot mmap tests/bpe/tiny_corpus.txt\n")
+        exit(1)
+    }
+    u64 tiny_size = load64(tiny_size_p)
+    test_determinism(tiny, tiny_size, "tiny")
+    bpe_munmap_file(tiny, tiny_size)
+    dealloc(tiny_size_p)
+
+    // (b) a multi-MiB synthetic corpus, so chunk boundaries land mid-file and
+    // all workers are live at the same time.
+    u64 fsize = mt_write_fixture("/tmp/bpe_wc_mt_fixture.txt", 6 * 1024 * 1024)
+    u64 fsize_p = alloc(8)
+    u64 fbase = bpe_mmap_file("/tmp/bpe_wc_mt_fixture.txt", fsize_p)
+    if fbase == 0 {
+        print("FAIL wordcount-mt: cannot mmap the synthetic fixture\n")
+        exit(1)
+    }
+    if load64(fsize_p) != fsize {
+        print("FAIL wordcount-mt: fixture size mismatch\n")
+        exit(1)
+    }
+    test_determinism(fbase, fsize, "synth")
+    bpe_munmap_file(fbase, fsize)
+    dealloc(fsize_p)
+    mt_unlink("/tmp/bpe_wc_mt_fixture.txt")
+
+    // (c) an empty corpus, a corpus with fewer bytes than workers, and one
+    // with no '\n' at all (worker 0 gets everything, every other chunk is
+    // empty after boundary adjustment).
+    u64 tiny2 = alloc(8)
+    memcpy(tiny2, "ab cd", 5)
+    u64 empty = bpe_count_words(tiny2, 0, 8)
+    if bpe_wt_count(empty) != 0 {
+        print("FAIL wordcount-mt: empty corpus produced ")
+        print(bpe_wt_count(empty))
+        print(" words\n")
+        exit(1)
+    }
+    bpe_wt_free(empty)
+    test_determinism(tiny2, 5, "no-newline")
+    test_determinism(tiny2, 1, "one-byte")
+    dealloc(tiny2)
+
+    thread_pool_shutdown()
+}
+
+fn main() {
+    // FIRST — see test_mt_cold's header: it only tests what it is meant to
+    // test while nothing has warmed the lazily-built lookup tables yet.
+    test_mt_cold()
+
+    u64 out_size = alloc(8)
+    u64 base = bpe_mmap_file("tests/bpe/tiny_corpus.txt", out_size)
+    if base == 0 {
+        print("FAIL: cannot mmap tests/bpe/tiny_corpus.txt\n")
+        exit(1)
+    }
+    u64 size = load64(out_size)
+
+    u64 wt = bpe_count_words_1t(base, size)
+
+    // "the" (no leading space — first word of the block)
+    u64 w_the = alloc(3)
+    store8(w_the + 0, 0x74); store8(w_the + 1, 0x68); store8(w_the + 2, 0x65)
+    check(wt, w_the, 3, 80, "the")
+
+    // "Ġthe" (space + the, byte-mapped: 0x20 -> C4 A0)
+    u64 w_gthe = alloc(5)
+    store8(w_gthe + 0, 0xC4); store8(w_gthe + 1, 0xA0)
+    store8(w_gthe + 2, 0x74); store8(w_gthe + 3, 0x68); store8(w_gthe + 4, 0x65)
+    check(wt, w_gthe, 5, 120, "Gthe")
+
+    // "Ċ" — a bare newline byte (0x0A -> C4 8A). 360 now (was 320 before the
+    // I-2 corpus edit added a second consecutive blank line).
+    u64 w_nl = alloc(2)
+    store8(w_nl + 0, 0xC4); store8(w_nl + 1, 0x8A)
+    check(wt, w_nl, 2, 360, "NL")
+
+    // "Ġ" — a single leading space with nothing else on its own piece (the
+    // "  indented start" line's first space, per-line-only token: I-2(e)).
+    u64 w_sp = alloc(2)
+    store8(w_sp + 0, 0xC4); store8(w_sp + 1, 0xA0)
+    check(wt, w_sp, 2, 40, "G-alone")
+
+    // "ĠĠĊ" — the trailing "end  \n" line's two spaces + newline, fused into
+    // one \s+ piece since nothing follows on the line.
+    u64 w_2sp_nl = alloc(6)
+    store8(w_2sp_nl + 0, 0xC4); store8(w_2sp_nl + 1, 0xA0)
+    store8(w_2sp_nl + 2, 0xC4); store8(w_2sp_nl + 3, 0xA0)
+    store8(w_2sp_nl + 4, 0xC4); store8(w_2sp_nl + 5, 0x8A)
+    check(wt, w_2sp_nl, 6, 40, "2sp+NL")
+
+    // "cafÃ©" — byte-mapped form of raw UTF-8 "café" (63 61 66 C3 A9).
+    // 0xC3 and 0xA9 are both in the printable high range so map to
+    // themselves, then get UTF-8 re-encoded as codepoints (mojibake).
+    u64 w_cafe = alloc(7)
+    store8(w_cafe + 0, 0x63); store8(w_cafe + 1, 0x61); store8(w_cafe + 2, 0x66)
+    store8(w_cafe + 3, 0xC3); store8(w_cafe + 4, 0x83)
+    store8(w_cafe + 5, 0xC2); store8(w_cafe + 6, 0xA9)
+    check(wt, w_cafe, 7, 40, "cafe-mapped")
+
+    // "ĠÂ½" — space + byte-mapped raw UTF-8 "½" (C2 BD).
+    u64 w_half = alloc(6)
+    store8(w_half + 0, 0xC4); store8(w_half + 1, 0xA0)
+    store8(w_half + 2, 0xC3); store8(w_half + 3, 0x82)
+    store8(w_half + 4, 0xC2); store8(w_half + 5, 0xBD)
+    check(wt, w_half, 6, 40, "half-mapped")
+
+    // "'t" — contraction piece (both bytes ASCII-printable, map to self).
+    u64 w_qt = alloc(2)
+    store8(w_qt + 0, 0x27); store8(w_qt + 1, 0x74)
+    check(wt, w_qt, 2, 40, "'t")
+
+    // "," — punctuation piece.
+    u64 w_comma = alloc(1)
+    store8(w_comma + 0, 0x2C)
+    check(wt, w_comma, 1, 40, "comma")
+
+    // "Ġquick" — appears twice per block ("the quick..." and "quick quick").
+    u64 w_quick = alloc(7)
+    store8(w_quick + 0, 0xC4); store8(w_quick + 1, 0xA0)
+    store8(w_quick + 2, 0x71); store8(w_quick + 3, 0x75); store8(w_quick + 4, 0x69)
+    store8(w_quick + 5, 0x63); store8(w_quick + 6, 0x6B)
+    check(wt, w_quick, 7, 120, "Gquick")
+
+    // I-2(d): "ĊĊ" (C4 8A C4 8A) must be ABSENT. It only exists if the
+    // implementation ever splits the whole buffer instead of per-line.
+    u64 w_nlnl = alloc(4)
+    store8(w_nlnl + 0, 0xC4); store8(w_nlnl + 1, 0x8A)
+    store8(w_nlnl + 2, 0xC4); store8(w_nlnl + 3, 0x8A)
+    check_absent(wt, w_nlnl, 4, "CC-double-newline")
+
+    u64 distinct = bpe_wt_count(wt)
+    if distinct != 34 {
+        g_ok = 0
+        print("FAIL wordcount: distinct got=")
+        print(distinct)
+        print(" want=34\n")
+    }
+
+    // M-4: exercise + release the corpus mapping and the WordTable.
+    bpe_wt_free(wt)
+    bpe_munmap_file(base, size)
+
+    if test_growth() == 0 { g_ok = 0 }
+
+    if g_ok == 1 {
+        print("PASS wordcount\n")
+    } else {
+        exit(1)
+    }
+
+    // Task 6a: the parallel counter. Runs last so a failure here can never be
+    // confused with a single-thread counter failure above. assert_same_table
+    // exits(1) on the first mismatch, so reaching the print means every
+    // thread count agreed with the single-threaded table exactly.
+    test_mt()
+    print("PASS wordcount-mt\n")
+}
