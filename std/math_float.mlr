@@ -4,9 +4,12 @@
 // Software sqrt / rsqrt via Newton-Raphson (V1 has no hardware sqrt builtin).
 // All functions operate on f64 unless suffixed with _f32.
 //
-// NOTE: KernRift V1 has a codegen limitation where f64 local variables
-// cannot be reassigned after declaration. All code here uses fresh
-// variable names and recursive helpers instead.
+// NOTE: the polynomial kernels here (sin/cos/exp/log series) still use fresh
+// variable names per term — that dates from a KernRift V1 codegen limitation
+// where f64 locals could not be reassigned, and the unrolled form is now kept
+// simply because it is the bit-exact reference these results are validated
+// against. f64 reassignment itself works, so the scaling helpers below are
+// plain `while` loops rather than recursion (see f64_double_n).
 
 import "fmt.mlr"
 import "string.mlr"
@@ -124,18 +127,46 @@ fn tan_f64(f64 x) -> f64 {
 }
 fn tan(f64 x) -> f64 { return tan_f64(x) }
 
-// ── Recursive helpers ────────────────────────────────────────────────
+// ── Scaling helpers ──────────────────────────────────────────────────
+//
+// Both of these used to be self-recursive with no tail-call optimization —
+// one stack frame (~89 B) per step.  exp_f64 derives the step count from the
+// magnitude of its argument, so a large-magnitude input walked the recursion
+// hundreds of thousands of frames deep and SIGSEGV'd: the reported case was
+// examples/llm/attn_decode_smoke.mlr feeding exp_f64 a score difference of
+// ~831653, i.e. n = 971255, which died at depth 93772 on the default 8 MiB
+// stack (it completes under `ulimit -s 524288` — plain stack exhaustion, not
+// a memory-safety bug).  As `while` loops the step count is irrelevant to the
+// stack, and the arithmetic is unchanged: same operations, same order, so the
+// results are bit-identical to the recursive form (verified over n = 0..1199
+// for both signs, and n = 0..339 for scale10).
 
 // Multiply x by 2, n times: double_n(x, n) = x * 2^n
 fn f64_double_n(f64 x, u64 n) -> f64 {
-    if n == 0 { return x }
-    return f64_double_n(x + x, n - 1)
+    f64 acc = x
+    u64 i = 0
+    while i < n {
+        acc = acc + acc
+        i = i + 1
+    }
+    return acc
 }
 
 // Multiply x by 10, n times: scale10(x, n) = x * 10^n
 fn f64_scale10(f64 x, u64 n) -> f64 {
-    if n == 0 { return x }
-    return f64_scale10(x * int_to_f64(10), n - 1)
+    f64 acc = x
+    u64 i = 0
+    while i < n {
+        acc = acc * int_to_f64(10)
+        i = i + 1
+    }
+    return acc
+}
+
+// +Inf as an f64.  2^1023 is the largest finite power of two, so one more
+// doubling overflows: 2^1024 > (2 - 2^-52) * 2^1023 = DBL_MAX.
+fn f64_inf() -> f64 {
+    return f64_double_n(int_to_f64(1), 1024)
 }
 
 // ── exp ──────────────────────────────────────────────────────────────
@@ -145,6 +176,34 @@ fn f64_scale10(f64 x, u64 n) -> f64 {
 
 fn exp_f64(f64 x) -> f64 {
     f64 ln2 = f64_ln2()
+
+    // ── Saturation cut-offs (IEEE-754 binary64) ──────────────────────
+    // Everything below is exp(x) = 2^k * exp(r) with k = floor(x/ln2), so the
+    // representable range of the RESULT is exactly the representable range of
+    // 2^k, and both ends are integer multiples of ln2:
+    //
+    //   overflow: the largest finite binary64 is (2 - 2^-52)*2^1023, so any
+    //     result >= 2^1024 rounds to +Inf.  2^k >= 2^1024 <=> k >= 1024
+    //     <=> x >= 1024*ln2 = 709.7827128933840.
+    //   underflow: the smallest positive binary64 is the subnormal 2^-1074,
+    //     and round-to-nearest-even flushes anything <= 2^-1075 to +0.  That
+    //     is x <= -1075*ln2 = -745.1332191019412.
+    //
+    // Deriving them as multiples of THIS function's own ln2 keeps the cut-off
+    // exactly where k crosses 1024 / -1075, so no in-range argument changes
+    // value: the general path already returns +Inf at or above the first
+    // bound (2^1024 overflows in f64_double_n) and exactly 0.0 at or below
+    // the second (the 2^nk divisor is itself +Inf), just after up to ~10^6
+    // wasted doublings.  Past the cut-offs k is bounded by [-1076, 1024], so
+    // f64_double_n now runs at most ~1076 iterations for any argument.
+    if x >= int_to_f64(1024) * ln2 { return f64_inf() }
+    if x <= int_to_f64(0) - int_to_f64(1075) * ln2 { return int_to_f64(0) }
+    // NaN propagates unchanged.  Without this, floor_f64(NaN/ln2) feeds
+    // f64_to_int(NaN) — an out-of-range conversion whose 0x8000... result made
+    // the old recursion blow the stack immediately and would make the new loop
+    // spin ~9*10^18 times.  x != x is true only for NaN.
+    if x != x { return x }
+
     f64 k_f = floor_f64(x / ln2)
     u64 k = f64_to_int(k_f)
     f64 r = x - k_f * ln2
