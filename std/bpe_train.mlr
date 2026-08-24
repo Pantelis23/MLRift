@@ -646,6 +646,12 @@ fn bpe_wc_worker(u64 start, u64 end, u64 wid) {
 // precedes chunk w+1 in the corpus, so a word's first appearance across the
 // concatenated per-worker lists is its first appearance in the corpus.
 // Completion order never enters into it.
+//
+// ARCH: `nthreads > 1` requires x86_64. It goes through std/thread.mlr, whose
+// spawn path is raw x86_64 inline asm, so on any other architecture the
+// process dies with SIGILL rather than returning an error. `nthreads <= 1`
+// (the bpe_count_words_1t delegation) is portable and gives an identical
+// result — use it off x86_64.
 fn bpe_count_words(u64 corpus_base, u64 corpus_size, u64 nthreads) -> u64 {
     if bpe_wc_in_flight == 1 {
         print("bpe_count_words: re-entered while a dispatch is in flight\n")
