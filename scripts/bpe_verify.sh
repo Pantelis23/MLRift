@@ -42,11 +42,23 @@
 #                             whole-process overhead beyond train() is 0.021s).
 #                             They are machine-specific: re-measure with
 #                             HF_TIME=1 before trusting them elsewhere.
+#                             SETTING EITHER FROM THE ENVIRONMENT DOES NOT MAKE
+#                             IT A BAR: the harness cannot attribute a number it
+#                             did not measure, so a supplied value is displayed
+#                             for reference and the run falls back to measuring
+#                             HF itself. Otherwise `HF_BAR_FULL=999` would print
+#                             "ALL GATES PASS" and exit 0.
 #   HF_TIME=1                 re-measure both HF bars on this machine and
 #                             DECIDE G2/G3 against those numbers instead of the
 #                             defaults (adds ~3 minutes). A measurement taken
 #                             back-to-back with the MLRift runs beats a stored
-#                             constant, so it replaces the bar outright.
+#                             constant, so it replaces the bar outright. Forced
+#                             automatically whenever the stored bars do not
+#                             apply to this run's input.
+#   VOCAB_SIZE                target vocabulary (default 8192). Flows to the
+#                             CLI, the oracle, the oracle's provenance stamp and
+#                             the HF timing runs together, and any value other
+#                             than the bars' invalidates them.
 #   REPS                      timing repetitions per gate (default 3).
 #
 # Exits non-zero if any gate FAILs.
@@ -66,7 +78,20 @@ BAR_CORES=24              # the core count they were measured on — HF_BAR_FULL
                           # invalidates the full-throttle bar just as surely as
                           # a different corpus does
 CORPUS="${1:-$DEFAULT_CORPUS}"
-VOCAB_SIZE=8192
+# Overridable so the $BAR_VOCAB guard below is a live check rather than a
+# branch that can never fire. It flows to the CLI, to the oracle generator, to
+# the oracle's provenance stamp and to the HF timing runs, so changing it moves
+# all four together and invalidates the stored bars automatically. Bounds match
+# examples/bpe_train_cli.mlr's own so a bad value is rejected here rather than
+# deeper in.
+VOCAB_SIZE="${VOCAB_SIZE:-8192}"
+case "$VOCAB_SIZE" in
+    *[!0-9]*) echo "FATAL: VOCAB_SIZE must be a positive integer (got '$VOCAB_SIZE')" >&2; exit 1 ;;
+esac
+if [ "${#VOCAB_SIZE}" -gt 7 ] || [ "$VOCAB_SIZE" -lt 5 ] || [ "$VOCAB_SIZE" -gt 1000000 ]; then
+    echo "FATAL: VOCAB_SIZE must be between 5 and 1000000 (got '$VOCAB_SIZE')" >&2
+    exit 1
+fi
 NTHREADS_FULL="$(nproc)"
 REPS="${REPS:-3}"
 # Validated HERE, before any gate runs, rather than tolerated downstream:
@@ -100,6 +125,17 @@ fi
 # another is the same self-contradiction the summary logic was fixed for.
 # With HF_TIME=1 the bars are re-derived from this run and those measurements,
 # not these constants, decide G2/G3.
+# S-2: remember whether these came from the environment BEFORE defaulting.
+# A number the harness did not measure and cannot attribute must never be the
+# thing a PASS rests on -- `HF_BAR_FULL=999` would otherwise print
+# "ALL GATES PASS", exit 0, and describe the bar as "valid for this input".
+# Operator-supplied bars are therefore treated as not-applicable below, which
+# forces HF to be re-measured on the input under test; the supplied values are
+# still displayed, but they decide nothing.
+BARS_FROM_ENV=0
+if [ -n "${HF_BAR_1T+set}" ] || [ -n "${HF_BAR_FULL+set}" ]; then
+    BARS_FROM_ENV=1
+fi
 HF_BAR_1T="${HF_BAR_1T:-50.07}"
 HF_BAR_FULL="${HF_BAR_FULL:-7.09}"
 
@@ -127,12 +163,15 @@ mkdir -p "$WORK" "$REF_DIR" || exit 1
 # the previous run's tokenizer.json after a total crash (P-1).
 #
 # Every reusable artifact is therefore deleted, and each gate treats "missing"
-# as a failure rather than skipping the check:
-#   $DIGESTS   truncated here            (never carries a prior run's md5)
+# as a failure rather than skipping the check. Destroying a previous run's
+# artifacts is itself a side effect, so each deletion happens only AFTER every
+# check that could still abort this run -- otherwise a typo'd corpus path or a
+# failed compile takes a good tokenizer down with it:
 #   $CLI_BIN   deleted before mlrc       (see the build section)
 #   $RT_BIN    deleted before mlrc       (see the build section)
-#   $OUT_JSON  deleted after the corpus  (G1 recreates it; G4 refuses without
-#              check, NOT here            it) -- deleting before the corpus is
+#   $DIGESTS   truncated after the build (never carries a prior run's md5)
+#   $OUT_JSON  deleted after the build   (G1 recreates it; G4 refuses without
+#                                         it) -- deleting before the corpus is
 #                                         validated would destroy the previous
 #                                         run's tokenizer over a typo'd path.
 #
@@ -148,7 +187,6 @@ mkdir -p "$WORK" "$REF_DIR" || exit 1
 #                    HF_TIME=1 is forced and the bars are re-measured on the
 #                    input actually under test.
 # ---------------------------------------------------------------------------
-: > "$DIGESTS"
 
 # --- result bookkeeping -----------------------------------------------------
 declare -A VERDICT
@@ -221,16 +259,16 @@ if [ ! -r "$CORPUS" ]; then
     exit 1
 fi
 CORPUS_REAL="$(readlink -f "$CORPUS")"
-CORPUS_BYTES="$(stat -c %s "$CORPUS")"
+# S-1: -L dereferences. Without it a symlinked corpus reports the LINK's own
+# size (e.g. 34 bytes), which is both a false "corpus bytes:" line and — far
+# worse — a stamp whose size field never changes when the target's content
+# does, silently disarming the oracle cache's content guard for symlinked
+# datasets. Symlinked corpora are ordinary, so this is not a corner case.
+CORPUS_BYTES="$(stat -Lc %s "$CORPUS")"
 echo "corpus bytes:  $CORPUS_BYTES"
 echo "cores:         $NTHREADS_FULL"
 echo "vocab_size:    $VOCAB_SIZE"
 echo "reps:          $REPS"
-
-# N-4: only now that the corpus is known good is it safe to destroy the
-# previous run's tokenizer. Doing it at startup meant a typo'd path deleted a
-# good artifact on its way to "FATAL: corpus is missing or unreadable".
-rm -f "$OUT_JSON"
 
 # R-2: the stored bars are a measurement of ($DEFAULT_CORPUS, $BAR_VOCAB).
 # Comparing this run's seconds against them on any other input would print
@@ -240,7 +278,10 @@ rm -f "$OUT_JSON"
 # on the input actually under test, and the stored constants decide nothing.
 BARS_APPLY=1
 BARS_WHY=""
-if [ "$CORPUS_REAL" != "$(readlink -f "$DEFAULT_CORPUS")" ]; then
+if [ "$BARS_FROM_ENV" = "1" ]; then
+    BARS_APPLY=0
+    BARS_WHY="HF_BAR_* were supplied from the environment — provenance unknown"
+elif [ "$CORPUS_REAL" != "$(readlink -f "$DEFAULT_CORPUS")" ]; then
     BARS_APPLY=0
     BARS_WHY="corpus is not the one the bars were measured on"
 elif [ "$VOCAB_SIZE" != "$BAR_VOCAB" ]; then
@@ -251,9 +292,18 @@ elif [ "$NTHREADS_FULL" != "$BAR_CORES" ]; then
     BARS_WHY="this box has $NTHREADS_FULL cores, the bars were measured on $BAR_CORES"
 fi
 if [ "$BARS_APPLY" = "1" ]; then
-    echo "HF bars:       1-thread ${HF_BAR_1T}s   full ${HF_BAR_FULL}s (valid for this input)"
+    # "measured on this input" states only what the checks above established:
+    # same corpus (by realpath and content size), same vocab size, same core
+    # count as the stored measurement. It is not a claim that the box is
+    # otherwise identical.
+    echo "HF bars:       1-thread ${HF_BAR_1T}s   full ${HF_BAR_FULL}s"
+    echo "               (measured on this corpus, vocab and core count)"
 else
     echo "HF bars:       NOT APPLICABLE — $BARS_WHY"
+    if [ "$BARS_FROM_ENV" = "1" ]; then
+        echo "               supplied values (1-thread ${HF_BAR_1T}s full ${HF_BAR_FULL}s)"
+        echo "               are shown for reference only and decide nothing."
+    fi
     echo "               forcing HF_TIME=1 so G2/G3 are decided against HF"
     echo "               measured on THIS corpus at THIS vocab size."
     HF_TIME=1
@@ -282,6 +332,13 @@ tail -1 "$WORK/build_cli.log"
 tail -1 "$WORK/build_rt.log"
 [ -x "$RT_BIN" ] || { echo "FATAL: mlrc reported success but produced no probe binary" >&2; exit 1; }
 
+# Only here -- past the corpus check AND past the build, the two stages that
+# can still abort -- is it safe to destroy the previous run's results. Earlier
+# placements meant a typo'd corpus path (N-4) or a rejected source file took a
+# good tokenizer down with them on the way to a FATAL.
+: > "$DIGESTS"
+rm -f "$OUT_JSON"
+
 # --- 2. the HF oracle -------------------------------------------------------
 hdr "HF oracle"
 # R-1: this file is GENERATED BY THIS HARNESS from $CORPUS at $VOCAB_SIZE, so
@@ -302,7 +359,10 @@ if [ -z "$HF_VER" ]; then
     exit 1
 fi
 WANT_STAMP="corpus=$CORPUS_REAL bytes=$CORPUS_BYTES vocab=$VOCAB_SIZE tokenizers=$HF_VER"
-if [ -s "$REF_JSON" ] && [ -s "$REF_MIN" ] && [ -f "$REF_STAMP" ] \
+# $REF_MIN is deliberately NOT part of the validity test: it is re-derived from
+# $REF_JSON a few lines below on every run, so requiring it here would turn a
+# missing derived file into a needless ~60s HF retrain.
+if [ -s "$REF_JSON" ] && [ -f "$REF_STAMP" ] \
    && [ "$(cat "$REF_STAMP")" = "$WANT_STAMP" ]; then
     echo "reusing $REF_JSON"
     echo "  stamp: $WANT_STAMP"
@@ -503,11 +563,11 @@ MLRIFT_BPE_VOCAB="$VOCAB_SIZE" MLRIFT_BPE_THREADS="$NTHREADS_FULL" \
 MEM_RC=$?
 PEAK_KB=$(awk -F': *' '/Maximum resident set size/{print $2}' "$MEMLOG")
 if [ $MEM_RC -ne 0 ]; then
-    # $OUT_JSON is either absent (nothing in this run produced one) or holds an
-    # EARLIER run-of-this-invocation's output, never this crashed run's. Either
-    # way, digesting it here would credit a crashed run with a determinism
-    # result it did not earn -- and on the absent path md5sum would fail
-    # outright. So the digest is recorded only on the success branches below.
+    # $OUT_JSON here is absent, or an EARLIER run-of-this-invocation's output,
+    # or -- if this run died between the trainer's truncating open and its
+    # completed write -- a partial file. None of those is a result this run
+    # earned, and on the absent path md5sum would fail outright. So the digest
+    # is recorded only on the success branches below.
     echo "  the memory-profiling run exited $MEM_RC — no digest recorded"
     # The trainer's own output comes FIRST in $MEMLOG; /usr/bin/time -v appends
     # its 20-line report afterwards, so `tail` here would show only that
@@ -555,7 +615,9 @@ hdr "G4 — round-trip through std/tokenizer.mlr"
 # whatever happened to be on disk would report a green gate backed by a file
 # this run did not create — the stale-artifact failure this harness has already
 # been bitten by twice.
-if [ ! -f "$OUT_JSON" ]; then
+# -s, not -f: a zero-byte leftover is not a tokenizer, and letting one through
+# would send the probe to tokenizer_load only to fail with a less clear message.
+if [ ! -s "$OUT_JSON" ]; then
     record G4 FAIL "no tokenizer produced by this run — nothing to round-trip"
 elif MLRIFT_BPE_OUT="$OUT_JSON" "$RT_BIN"; then
     record G4 PASS "decode(encode(x)) == x for every probe (incl. non-ASCII)"
@@ -607,19 +669,41 @@ PYHF
         fi
         awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", (b-a)/1e9}'
     }
-    hf1=""; hfn=""
+    # S-3: this block is now REACHED WITHOUT THE OPERATOR OPTING IN whenever the
+    # stored bars do not apply, so an HF failure here must not abort the run.
+    # Aborting would lose the SUMMARY on any foreign-corpus run — the same
+    # "report lost" shape fixed on the MLRift side in round 2. Record the
+    # affected gates FAIL instead and let the summary print.
+    hf1=""; hfn=""; HF_OK=1
     for i in $(seq 1 "$REPS"); do
-        t=$(hf_timed 1)  || { echo "FATAL: an HF 1-thread timing run failed" >&2; exit 1; }
+        t=$(hf_timed 1)  || { HF_OK=0; break; }
         hf1="$hf1 $t"
-        t=$(hf_timed "") || { echo "FATAL: an HF full-throttle timing run failed" >&2; exit 1; }
+        t=$(hf_timed "") || { HF_OK=0; break; }
         hfn="$hfn $t"
     done
+    if [ "$HF_OK" = "0" ]; then
+        echo "  the HF re-measurement did not complete — no bar could be established"
+        for g in G2 G3; do
+            # Only fill in gates that have no verdict yet: one already recorded
+            # FAIL for a crashed trainer keeps that more specific reason.
+            if [ -z "${VERDICT[$g]:-}" ]; then
+                record "$g" FAIL "HF re-measurement failed; no applicable bar for this input"
+            fi
+        done
+    else
     HF1_BEST=$(echo "$hf1" | best_of)
     HFN_BEST=$(echo "$hfn" | best_of)
     require_number "$HF1_BEST" "the HF 1-thread best time"
     require_number "$HFN_BEST" "the HF full-throttle best time"
-    echo "  HF 1-thread runs:$hf1  best ${HF1_BEST}s   (default bar ${HF_BAR_1T}s)"
-    echo "  HF full runs:$hfn  best ${HFN_BEST}s   (default bar ${HF_BAR_FULL}s)"
+    # Tidiness 5: naming a stored bar beside a measurement it has no bearing on
+    # invites the reader to compare them. Show it only when it actually applies.
+    if [ "$BARS_APPLY" = "1" ]; then
+        echo "  HF 1-thread runs:$hf1  best ${HF1_BEST}s   (stored bar ${HF_BAR_1T}s)"
+        echo "  HF full runs:$hfn  best ${HFN_BEST}s   (stored bar ${HF_BAR_FULL}s)"
+    else
+        echo "  HF 1-thread runs:$hf1  best ${HF1_BEST}s"
+        echo "  HF full runs:$hfn  best ${HFN_BEST}s"
+    fi
     echo "  MLRift best:      1-thread ${G2_BEST:-n/a}s   full ${G3_BEST:-n/a}s"
 
     # A measurement taken THIS run, on THIS machine, back-to-back with the
@@ -650,6 +734,7 @@ PYHF
     }
     regate G2 "${G2_BEST:-}" "$HF1_BEST"
     regate G3 "${G3_BEST:-}" "$HFN_BEST"
+    fi   # HF_OK
 fi
 
 # --- summary ----------------------------------------------------------------
