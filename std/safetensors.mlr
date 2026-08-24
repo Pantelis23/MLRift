@@ -58,30 +58,26 @@ fn safetensors_open(u64 path) -> SafetensorFile {
     st.data_offset = 0
     st.data_ptr = 0
 
-    u64 fd = file_open(path, 0)
-    if is_errno(fd) != 0 {
-        print("[safetensors] open failed: ")
+    // Portable map-or-read (std/io.mlr) — the inline mmap this replaces used
+    // syscall 9, which is mmap only on x86_64. mlr_map_file owns the open and
+    // the close; on the mmap path the fd is dropped once mapped, exactly as
+    // before, because the kernel holds its own reference.
+    u64 szbox = alloc(8)
+    store64(szbox, 0)
+    u64 base = mlr_map_file(path, szbox)
+    u64 sz = load64(szbox)
+    dealloc(szbox)
+    if base == 0 {
+        print("[safetensors] could not load: ")
         println_str(path)
         return st
     }
 
-    u64 sz = file_size(fd)
     if sz < 8 {
         print("[safetensors] file too small (< 8 bytes)\n")
-        file_close(fd)
+        mlr_unmap_file(base, sz)
         return st
     }
-
-    // mmap(addr=0, len=sz, prot=PROT_READ(1), flags=MAP_PRIVATE(2), fd, offset=0)
-    u64 base = syscall_raw(9, 0, sz, 1, 2, fd, 0)
-    if is_errno(base) != 0 {
-        print("[safetensors] mmap failed\n")
-        file_close(fd)
-        return st
-    }
-
-    // Once mapped, the fd can be dropped — the kernel holds a reference.
-    file_close(fd)
 
     // Header length: 8 little-endian bytes at offset 0.
     u64 json_len = 0
@@ -99,7 +95,7 @@ fn safetensors_open(u64 path) -> SafetensorFile {
         print(", file_size=")
         print(sz)
         print(")\n")
-        syscall_raw(11, base, sz, 0, 0, 0, 0)   // munmap
+        mlr_unmap_file(base, sz)
         return st
     }
 
@@ -126,9 +122,15 @@ fn safetensors_open(u64 path) -> SafetensorFile {
 fn safetensors_free(SafetensorFile st) {
     if st.json_ptr != 0 {
         dealloc(st.json_ptr)
+        st.json_ptr = 0
     }
     if st.base_addr != 0 && st.file_size != 0 {
-        syscall_raw(11, st.base_addr, st.file_size, 0, 0, 0, 0)  // munmap
+        mlr_unmap_file(st.base_addr, st.file_size)
+        // Zero the handle: with the read fallback in play a second free would
+        // be a heap double-dealloc rather than a harmless failing munmap.
+        st.base_addr = 0
+        st.file_size = 0
+        st.data_ptr = 0
     }
 }
 

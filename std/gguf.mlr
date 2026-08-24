@@ -585,20 +585,19 @@ fn gguf_open(u64 path) -> GGUFFile {
     gf.data_start = 0
     gguf_align_bytes = 32
 
-    u64 fd = file_open(path, 0)
-    if is_errno(fd) != 0 {
-        print("[gguf] open failed: ")
+    // Portable map-or-read (std/io.mlr). The old inline mmap here used syscall
+    // 9, which is mmap on x86_64 but lgetxattr on aarch64 — GGUF loading, and
+    // with it every GGUF-backed tokenizer and model, failed on ARM64.
+    u64 szbox = alloc(8)
+    store64(szbox, 0)
+    u64 base = mlr_map_file(path, szbox)
+    u64 sz = load64(szbox)
+    dealloc(szbox)
+    if base == 0 {
+        print("[gguf] could not load: ")
         println_str(path)
         return gf
     }
-    u64 sz = file_size(fd)
-    u64 base = syscall_raw(9, 0, sz, 1, 2, fd, 0)   // mmap PROT_READ MAP_PRIVATE
-    if is_errno(base) != 0 {
-        print("[gguf] mmap failed\n")
-        file_close(fd)
-        return gf
-    }
-    file_close(fd)
     gf.file_size = sz
     gf.base_addr = base
 
@@ -609,7 +608,7 @@ fn gguf_open(u64 path) -> GGUFFile {
     u64 m3 = load8(base + 3)
     if m0 != 71 || m1 != 71 || m2 != 85 || m3 != 70 {     // 'G' 'G' 'U' 'F'
         print("[gguf] bad magic\n")
-        syscall_raw(11, base, sz, 0, 0, 0, 0)
+        mlr_unmap_file(base, sz)
         gf.base_addr = 0
         gf.file_size = 0
         return gf
@@ -1010,6 +1009,10 @@ fn gguf_free(GGUFFile gf) {
     if gf.tensor_types     != 0 { dealloc(gf.tensor_types) }
     if gf.tensor_offsets   != 0 { dealloc(gf.tensor_offsets) }
     if gf.base_addr != 0 && gf.file_size != 0 {
-        syscall_raw(11, gf.base_addr, gf.file_size, 0, 0, 0, 0)    // munmap
+        mlr_unmap_file(gf.base_addr, gf.file_size)
+        // Zero the handle: with the read fallback in play a second free would
+        // be a heap double-dealloc rather than a harmless failing munmap.
+        gf.base_addr = 0
+        gf.file_size = 0
     }
 }

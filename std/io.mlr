@@ -161,3 +161,228 @@ fn get_errno(u64 r) -> u64 {
     if is_errno(r) != 0 { return 0 - r }
     return 0
 }
+
+// ---------------------------------------------------------------------------
+// Portable read-only whole-file loading (map-or-read)
+//
+// Syscall 9 is mmap and syscall 11 is munmap on **Linux x86_64 only**. Other
+// Linux architectures number their tables differently: aarch64 uses the
+// asm-generic table, where mmap is 222 and munmap is 215, and where 9 is
+// lgetxattr and 11 is removexattr. Code that hardcoded 9/11 therefore failed
+// on ARM64 with a misleading "mmap failed", and x86_64 CI never saw it.
+//
+// What makes this portable is NOT a syscall-number table — there is no way to
+// verify one here — it is the fallback. The mmap is attempted exactly as
+// before, and if (and only if) it errors, the file is read into an alloc()'d
+// buffer through the compiler's portable file_open/file_read builtins. On
+// x86_64 the mmap succeeds and the old path is unchanged; on aarch64, and on
+// any host that refuses the mapping for an unrelated reason, the read path
+// produces a byte-identical buffer at the cost of one copy.
+//
+// Deliberately NOT done: selecting the syscall number by architecture at
+// runtime. Falling back from 9 to 222 would invoke io_setup with mmap's
+// arguments on x86_64, which is a real side effect.
+//
+// The two kinds of region must be released differently — munmap for the
+// mapping, dealloc for the buffer — and a caller holding only `base` cannot
+// tell them apart. Rather than add a discriminator field to every file handle
+// struct (GGUFFile is already at the hard 16-u64-field ceiling documented at
+// gguf.mlr:109, so it *cannot* take one), every region handed out is recorded
+// below with the mode used to obtain it, and mlr_unmap_file looks the mode up.
+//
+// This lives in io.mlr because every module that loads a file this way
+// (tokenizer, gguf, bpe_train, wzma_data, safetensors) already imports io.mlr,
+// so routing them through it adds no new dependency edge anywhere — and in
+// particular cannot drag the x86_64-only std/thread.mlr into the LLM drivers.
+// ---------------------------------------------------------------------------
+
+static u64 MLR_MAP_MODE_MMAP  = 1   // released with munmap (syscall 11)
+static u64 MLR_MAP_MODE_ALLOC = 2   // released with dealloc
+
+// Registry of regions currently owned by callers of mlr_map_file. 16 bytes per
+// slot: base(8) + mode(8). base == 0 marks a free slot. Allocated lazily and
+// grown by doubling, so there is no fixed ceiling on live regions.
+static u64 _mlr_map_reg     = 0
+static u64 _mlr_map_reg_cap = 0
+
+fn _mlr_map_reg_record(u64 base, u64 mode) {
+    if _mlr_map_reg_cap == 0 {
+        _mlr_map_reg_cap = 16
+        _mlr_map_reg = alloc(_mlr_map_reg_cap * 16)
+        memset(_mlr_map_reg, 0, _mlr_map_reg_cap * 16)
+    }
+    u64 i = 0
+    while i < _mlr_map_reg_cap {
+        if load64(_mlr_map_reg + i * 16) == 0 {
+            store64(_mlr_map_reg + i * 16, base)
+            store64(_mlr_map_reg + i * 16 + 8, mode)
+            return
+        }
+        i = i + 1
+    }
+    // Full: double and retry into the fresh half.
+    u64 ncap = _mlr_map_reg_cap * 2
+    u64 nreg = alloc(ncap * 16)
+    memset(nreg, 0, ncap * 16)
+    memcpy(nreg, _mlr_map_reg, _mlr_map_reg_cap * 16)
+    dealloc(_mlr_map_reg)
+    store64(nreg + _mlr_map_reg_cap * 16, base)
+    store64(nreg + _mlr_map_reg_cap * 16 + 8, mode)
+    _mlr_map_reg = nreg
+    _mlr_map_reg_cap = ncap
+}
+
+// Look up how `base` was obtained and free its slot. Returns the mode, or 0
+// if `base` was never handed out by mlr_map_file (or was already released).
+fn _mlr_map_reg_take(u64 base) -> u64 {
+    u64 i = 0
+    while i < _mlr_map_reg_cap {
+        if load64(_mlr_map_reg + i * 16) == base {
+            u64 mode = load64(_mlr_map_reg + i * 16 + 8)
+            store64(_mlr_map_reg + i * 16, 0)
+            store64(_mlr_map_reg + i * 16 + 8, 0)
+            return mode
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Load `path` read-only in its entirety. Writes the byte count to *out_size
+// and returns the base of a readable region holding the whole file, or returns
+// 0 (with *out_size := 0) on any failure, having printed the precise reason.
+// The region MUST be released with mlr_unmap_file, which knows which of the
+// two kinds it is.
+//
+// A zero-length file is reported as a failure. mmap with length 0 is EINVAL,
+// so that is what every caller has always seen; the read path would instead
+// hand back a 0-byte buffer and change what a caller's `base == 0` check
+// means, so both paths answer the old way.
+fn mlr_map_file(u64 path, u64 out_size) -> u64 {
+    store64(out_size, 0)
+
+    u64 fd = file_open(path, 0)
+    if is_errno(fd) != 0 {
+        print("[mlr_map_file] open failed (errno ")
+        print(get_errno(fd))
+        print(") on ")
+        println_str(path)
+        return 0
+    }
+
+    // fstat can fail (EBADF, EIO, an overflowing st_size on a 32-bit stat).
+    // Unchecked, the error code is a huge unsigned value that would be passed
+    // straight to alloc() and reported as a bogus out-of-memory.
+    u64 sz = file_size(fd)
+    if is_errno(sz) != 0 {
+        print("[mlr_map_file] stat failed (errno ")
+        print(get_errno(sz))
+        print(") on ")
+        println_str(path)
+        file_close(fd)
+        return 0
+    }
+    if sz == 0 {
+        print("[mlr_map_file] empty file: ")
+        println_str(path)
+        file_close(fd)
+        return 0
+    }
+
+    // mmap(NULL, sz, PROT_READ=1, MAP_PRIVATE=2, fd, 0) — x86_64 numbering.
+    u64 base = syscall_raw(9, 0, sz, 1, 2, fd, 0)
+    if is_errno(base) == 0 {
+        file_close(fd)
+        _mlr_map_reg_record(base, MLR_MAP_MODE_MMAP)
+        store64(out_size, sz)
+        return base
+    }
+
+    // Fallback: read the whole file into an alloc()'d buffer.
+    u64 buf = alloc(sz)
+    if buf == 0 {
+        print("[mlr_map_file] out of memory reserving ")
+        print(sz)
+        print(" bytes for ")
+        println_str(path)
+        file_close(fd)
+        return 0
+    }
+    // file_read lowers to a SINGLE read(2) with no loop of its own
+    // (src/codegen.mlr), so a large file short-reads. This loop is what makes
+    // the buffer complete; without it the tail would be uninitialized.
+    u64 got = 0
+    u64 eintr_run = 0
+    u64 failed = 0
+    while got < sz {
+        u64 n = file_read(fd, buf + got, sz - got)
+        if is_errno(n) != 0 {
+            // EINTR (4) means a signal arrived mid-read and nothing was
+            // consumed; the correct response is to reissue the read, not to
+            // fail the load. Every other errno stays fatal and loud. The
+            // consecutive-EINTR cap keeps a pathological signal storm from
+            // spinning here forever instead of failing.
+            if get_errno(n) == 4 {
+                eintr_run = eintr_run + 1
+                if eintr_run > 1024 {
+                    print("[mlr_map_file] read interrupted repeatedly (EINTR) on ")
+                    println_str(path)
+                    failed = 1
+                    break
+                }
+                continue
+            }
+            print("[mlr_map_file] read failed (errno ")
+            print(get_errno(n))
+            print(") on ")
+            println_str(path)
+            failed = 1
+            break
+        }
+        if n == 0 { break }        // premature EOF — caught by the got != sz check
+        eintr_run = 0
+        got = got + n
+    }
+    file_close(fd)
+    if failed != 0 || got != sz {
+        // Loud, not silent: a partially filled buffer would be parsed as real
+        // content rather than reported as an error.
+        print("[mlr_map_file] mmap unavailable and short read on ")
+        print_str(path)
+        print(" (got ")
+        print(got)
+        print(" of ")
+        print(sz)
+        print(" bytes)\n")
+        dealloc(buf)
+        return 0
+    }
+    _mlr_map_reg_record(buf, MLR_MAP_MODE_ALLOC)
+    store64(out_size, sz)
+    return buf
+}
+
+// Release a region obtained from mlr_map_file, using whichever of munmap /
+// dealloc matches how it was obtained. `size` is ignored on the alloc path.
+fn mlr_unmap_file(u64 base, u64 size) {
+    if base == 0 { return }
+    u64 mode = _mlr_map_reg_take(base)
+    if mode == MLR_MAP_MODE_ALLOC {
+        dealloc(base)
+        return
+    }
+    if mode == 0 {
+        // Not in the registry: either already released, or never came from
+        // mlr_map_file. Both are caller bugs, and guessing munmap on an
+        // alloc()'d or already-freed pointer is worse than stopping.
+        print("[mlr_unmap_file] unknown region — double free?\n")
+        exit(1)
+    }
+    u64 r = syscall_raw(11, base, size, 0, 0, 0, 0)   // munmap
+    if is_errno(r) != 0 {
+        print("[mlr_unmap_file] munmap failed (errno ")
+        print(get_errno(r))
+        print(")\n")
+        exit(1)
+    }
+}
