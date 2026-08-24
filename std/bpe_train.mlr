@@ -705,7 +705,13 @@ fn bpe_count_words_1t(u64 corpus_base, u64 corpus_size) -> u64 {
 //   R5 Applying a merge: left-to-right, NON-OVERLAPPING replacement with
 //      exact +/-freq neighbour deltas; see bpe_word_merge_pair.
 //   R6 Vocab-id reuse: if the concatenated token already exists, reuse its id
-//      and do not grow the vocab, but still append (l,r) to merges.
+//      and do not grow the vocab, but still append (l,r) to merges. Kept
+//      because HF has it, but it is dead-by-construction in this
+//      configuration: a merge token is `left ++ right` for a pair that is
+//      currently adjacent somewhere, and any earlier token with those exact
+//      bytes would already have consumed that adjacency, so the lookup never
+//      hits. HF is dead here for the same reason. 4,000 randomized HF
+//      trainings produced zero reuse events.
 // ===========================================================================
 
 // M-6: constants-by-convention (MLRift has no `const`, only mutable
@@ -1046,7 +1052,13 @@ fn bpe_pc_get(u64 pc, u64 l, u64 r) -> u64 {
         i = (i + 1) & (cap - 1)
         probes = probes + 1
     }
-    return 0
+    // The in-loop `return 0` on an empty slot is the legitimate "not found".
+    // Reaching HERE instead means the probe wrapped the whole table, i.e. the
+    // <=0.7-load invariant bpe_pc_slot maintains has broken. Returning 0 there
+    // would look like a count of zero to the R4 stale-check and silently
+    // corrupt the merge tail — die loud instead, as bpe_vocab_id does.
+    print("bpe_pc_get: hash table full\n")
+    exit(1)
 }
 
 // Appends word index `iw` to a pc slot's occurrence list.
@@ -1237,11 +1249,20 @@ fn bpe_heap_free(u64 h) {
 // (prev,l) and (r,next) pairs lose `freq`, the created (prev,newid) and
 // (newid,next) pairs gain `freq`.
 //
-// It also emits `(l,r) -= freq` per replacement. On an overlapping run that
-// does NOT drive the count to zero (`a a a` has two (a,a) adjacencies but only
-// one replacement), so a residue can remain in `pc`. That is benign and
-// matches HF: this pair's heap entry was just popped and is never re-pushed
-// (only POSITIVELY changed pairs are), so the residue cannot resurrect it.
+// It also emits `(l,r) -= freq` per replacement. That self-delta is a
+// DELIBERATE DEVIATION from HF, not a match: HF's `Word::merge` (word.rs)
+// emits only neighbour changes and its trainer never decrements the popped
+// pair's own count, so after `wwwww` HF's residual `pair_counts[(w,w)]` is
+// 2*freq where this code's is 0. Nor does the self-delta reliably zero the
+// count here — an overlapping run has more (l,r) adjacencies than replacements
+// (`a a a` has two but merges once), so a residue can remain either way.
+//
+// Both variants are OBSERVABLY IDENTICAL because neither residual is ever
+// read: the pair's heap entry was just popped, and only pairs with a POSITIVE
+// delta are re-pushed. The popped pair cannot receive one — positive deltas
+// only ever name `newid`, which is freshly minted — so no live heap entry
+// exists to resurrect it. (That argument depends on R6 id-reuse never firing,
+// which is unreachable in this configuration; see the R6 note above.)
 //
 // `iw`/`pend` are the recording side-channel for the push protocol; the delta
 // arithmetic in bpe_pc_add_pos is identical to plain bpe_pc_add.
@@ -1296,9 +1317,12 @@ fn bpe_word_merge_pair(u64 syms, u64 nsym_ptr, u64 freq, u64 l, u64 r, u64 newid
 //   vocab_out   a FRESH, EMPTY Vocab from bpe_vocab_new(); filled per R1.
 //   merges_out  array of (left_id, right_id) pairs, 16 bytes each (two u64),
 //               in merge order. The caller MUST provide room for `vocab_size`
-//               entries; overflowing that is a loud death, not silent
-//               corruption. (More merges than `vocab_size` is only reachable
-//               through R6 id reuse, which does not grow the vocab.)
+//               entries; the write is bounds-checked and overflowing it is a
+//               loud death, not silent corruption. Exceeding `vocab_size`
+//               merges would require R6 id reuse (the only iteration that
+//               appends a merge without growing the vocab), which is itself
+//               unreachable in this configuration — so the check guards the
+//               caller's buffer contract, not an expected code path.
 //
 // Returns the number of merges written.
 // ---------------------------------------------------------------------------

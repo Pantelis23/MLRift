@@ -132,13 +132,19 @@ fn gj_mk_key(u64 name, u64 out) -> u64 {
     return i + 2
 }
 
-// Moves the cursor just past the first occurrence of the quoted key `name`.
-// Quoting the key is what keeps `"merges"` from matching inside the earlier
-// `"ignore_merges"` field.
+// Moves the cursor just past the next occurrence of the quoted key `name`,
+// searching FORWARD FROM THE CURRENT CURSOR — not from the start of the file.
+//
+// That matters: token strings inside `model.vocab` are quoted too, so a corpus
+// containing the bare word `merges` puts a literal `"merges"` key in the vocab
+// object, which sorts before `model.merges` and would capture a from-the-start
+// scan. Seeking `"merges"` from the cursor (which sits just past the vocab
+// object, since BPE serialization always writes vocab before merges) skips
+// every vocab token, and also skips the earlier `"ignore_merges"` field.
 fn gj_seek(u64 name) {
     u64 key = alloc(64)
     u64 klen = gj_mk_key(name, key)
-    u64 p = GJ_B
+    u64 p = GJ_P
     while p + klen <= GJ_E {
         if bpe_bytes_eq(p, key, klen) == 1 {
             GJ_P = p + klen
