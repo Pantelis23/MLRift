@@ -2193,6 +2193,7 @@ fn parse_module() -> uint64 {
             advance_tok()
             uint64 name_tok = expect(1)
             static_declare(name_tok)
+            uint64 c_guard_val = 0
             if eat(34) != 0 {
                 // Accept literal initializers, including leading unary - or ~.
                 // Anything else (calls, named constants, expressions) is
@@ -2208,6 +2209,7 @@ fn parse_module() -> uint64 {
                     if init_neg != 0 { init_val = 0 - init_val }
                     if init_inv != 0 { init_val = ~init_val }
                     static_set_init_last(init_val)
+                    c_guard_val = init_val
                 } else {
                     // Skip unsupported initializer (function calls, etc.) — value stays 0.
                     while cur_kind() != 60 && cur_kind() != 71 && cur_kind() != 70 && cur_kind() != 72 && cur_kind() != 73 && cur_kind() != 21 && cur_kind() != 89 && cur_kind() != 0 {
@@ -2215,6 +2217,13 @@ fn parse_module() -> uint64 {
                     }
                 }
             }
+            // GPU launcher constants that must agree with the value mlrc bakes
+            // into the emitted code object; a silent disagreement wedges the
+            // GPU.  Runs for EVERY const, initialiser or not — the declared
+            // value of a bare `const u64 WZMA_MEGA_NW` is 0, and 0 must trip
+            // the guard rather than slip past it.  See wzm_check_launcher_const
+            // for what is and is not covered.
+            wzm_check_launcher_const(name_tok, c_guard_val)
         } else if kind == 71 {
             // static TYPE name = value  OR  static TYPE[N] name
             advance_tok()
@@ -2323,6 +2332,7 @@ fn parse_module() -> uint64 {
                 else if wstk_s == 95 { static_set_fkind_last(2) }
                 else if wstk_s == 94 { static_set_fkind_last(3) }
                 // Capture literal initializer if present
+                uint64 s_guard_val = 0
                 if eat(34) != 0 {
                     uint64 sinit_neg = 0
                     uint64 sinit_inv = 0
@@ -2335,6 +2345,7 @@ fn parse_module() -> uint64 {
                         if sinit_neg != 0 { sinit_val = 0 - sinit_val }
                         if sinit_inv != 0 { sinit_val = ~sinit_val }
                         static_set_init_last(sinit_val)
+                        s_guard_val = sinit_val
                     } else if sinit_kind == 5 {
                         // FloatLit: parse digits+dot into int_val, frac_val,
                         // frac_divisor; compute as f64; pack bits via the
@@ -2434,6 +2445,12 @@ fn parse_module() -> uint64 {
                         }
                     }
                 }
+                // See wzm_check_launcher_const: GPU launcher grid / slot-stride
+                // constants that MUST equal what mlrc bakes into the code
+                // object it emits.  Runs for EVERY scalar static, initialiser
+                // or not — a bare `static u64 WZMA_MEGA_NW` declares the value
+                // 0, and 0 must trip the guard rather than slip past it.
+                wzm_check_launcher_const(name_tok, s_guard_val)
             }
         } else if kind == 72 {
             // struct NAME { TYPE field; TYPE field; ... }

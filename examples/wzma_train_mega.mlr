@@ -51,13 +51,19 @@ static u64 K_DIM     = 4
 static u64 R_DIM     = 32
 
 // Task 1: number of workgroups the WZMA training mega-kernel launches.
-//   Must equal MEGA_TRAIN_NW in src/format_amdgpu_megakernel.mlr (the kernel
-//   splits BS=128 rows into NW per-WG ranges).  Keep NW=1 for now: launches
-//   ONE 512-thread dispatch per step — byte-identical to the single-WG oracle.
+//   MUST equal WZM_MEGA_NW in src/format_amdgpu_megakernel.mlr — the value the
+//   emitter BAKES into wzma_train_mega.co (rows_per_wg = BS/NW and the cross-WG
+//   barrier thresholds).  mlrc ENFORCES the equality and refuses to compile this
+//   file on a mismatch (wzm_check_launcher_const), because dispatching a grid
+//   the code object was not emitted for wedges the GPU: every extra WG re-runs
+//   the whole [0,BS) row range over the shared scratch → GFXHUB SQC-instruction
+//   page fault → "MES might be in unrecoverable state" → MODE1 reset.
+//   Change both together (tools/wzma_t4_validate.sh set_nw does exactly that)
+//   and rebuild mlrc, the kernel .co AND this launcher.
 static u64 WZMA_MEGA_NW = 8
 
 // Task 3: per-WG dense-grad partial slot stride (bytes).  Must match
-// WZM_PART_SLOT in src/format_amdgpu_megakernel.mlr:
+// WZM_PART_SLOT in src/format_amdgpu_megakernel.mlr (also compiler-enforced):
 //   dU(49152)+dV(49152)+dgw(1536)+dgb(4)+dbias(384) = 100228 f32 = 400912 bytes.
 static u64 WZMA_PART_SLOT = 400912
 

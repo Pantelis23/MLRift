@@ -1,5 +1,8 @@
 // wzma_bwd_reduce — full-occupancy backward phase 4: deterministic fixed-order
 // reduce of the WZM_BWD_NW per-WG partial slots → final dU/dV/dgw/dgb/dbias.
+// (WZM_BWD_NW is the EMITTER static in src/format_amdgpu_megakernel.mlr; the
+//  launcher-side copy of the same number is WZMA_BWD_NW in
+//  examples/wzma_train_md.mlr, and mlrc enforces that the two agree.)
 // NAME-ROUTED stub: real ISA from amdgpu_lower_wzma_bwd_reduce in
 // src/format_amdgpu_megakernel.mlr.  grid=WZM_BWD_NW.  Same 63-arg kernarg
 // block as wzma_train_bwd.

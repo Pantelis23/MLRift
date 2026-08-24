@@ -19,7 +19,7 @@
 // _wzm_emit_* ISA byte-for-byte (so still bit-exact vs the NW=1 oracle):
 //   wzma_bwd_pre    grid=1   InfoNCE-bwd (dv1/dv2) + renorm/L2/meanpool (dz1/dz2)
 //   wzma_bwd_uv     grid=NW  wzma_bwd ×2 → per-WG PARTIAL dU/dV/dgw/dgb/dbias + dx
-//                            (BS rows split across WZM_BWD_NW WGs; race-free)
+//                            (BS rows split across WZMA_BWD_NW WGs; race-free)
 //   wzma_bwd_embed  grid=1   embed_bwd ×2 scatter → demb (serial; dup-id safe)
 //   wzma_bwd_reduce grid=NW  fixed-order reduce of NW partial slots → final grads
 // then AdamW: standalone full-occupancy adamw_step_f32 ×6 (5 dense + embed).
@@ -63,17 +63,20 @@ static u64 K_DIM     = 4
 static u64 R_DIM     = 32
 static u64 VOCAB_DIM = 8192
 static u64 BS_DIM    = 128
-// WZM_BWD_NW: workgroups for the full-occupancy backward UV + reduce phases.
+// WZMA_BWD_NW: workgroups for the full-occupancy backward UV + reduce phases.
 // MUST match the WZM_BWD_NW static in src/format_amdgpu_megakernel.mlr (the
 // per-WG partial slot layout + the bs-row split depend on it).  Divides BS=128.
-static u64 WZM_BWD_NW = 8
+// mlrc ENFORCES the equality at compile time (wzm_check_launcher_const); the
+// launcher-side name is deliberately WZMA_ (not WZM_) so the guard cannot
+// trip on the compiler's own copy of the constant while self-hosting.
+static u64 WZMA_BWD_NW = 8
 // NW-scaling: workgroups for the parallelized wzma_bwd_pre phase.
 // NW_pre is now a PER-BATCH LOCAL computed in main() (= min(cap, B)), NOT a static.
 // bwd_pre's per-WG row ownership is RUNTIME (rpw_b=s22, rpw_bs=s8 kernargs from
 // P-own + wg_id offset) — so NW is purely the launch grid and a PURE PARTITION
 // (each dv1/dv2/dz owned by one WG => byte-identical across NW).  Constraints:
 // NW_pre <= B and NW_pre divides B (partition is over the B batch-rows).
-// WZM_BWD_NW stays 8 ONLY as the emit-time NW>1 path selector (no NW value baked).
+// WZMA_BWD_NW stays 8 ONLY as the emit-time NW>1 path selector (no NW value baked).
 
 fn abs_f32(f32 v) -> f32 {
     if v < 0.0f { return 0.0f - v }
@@ -1314,9 +1317,9 @@ fn main() {
     u64 d_dv1 = gpu_malloc(B * D * 4,  "mdV1");  u64 d_dv2 = gpu_malloc(B * D * 4,  "mdV2")
     u64 d_dz1 = gpu_malloc(BS * D * 4, "mdZ1");  u64 d_dz2 = gpu_malloc(BS * D * 4, "mdZ2")
     u64 d_dx1 = gpu_malloc(BS * D * 4, "mdX1");  u64 d_dx2 = gpu_malloc(BS * D * 4, "mdX2")
-    // per-WG partial grad slots: WZM_BWD_NW slots of the oracle layout, summed
-    // by the reduce phase into d_grads.  At WZM_BWD_NW=1 the reduce is identity.
-    u64 d_partial = gpu_malloc(WZM_BWD_NW * PART_N * 4, "mPartial")
+    // per-WG partial grad slots: WZMA_BWD_NW slots of the oracle layout, summed
+    // by the reduce phase into d_grads.  At WZMA_BWD_NW=1 the reduce is identity.
+    u64 d_partial = gpu_malloc(WZMA_BWD_NW * PART_N * 4, "mPartial")
     u64 d_barrier = gpu_malloc(4096, "mBarrier")  // dummy (no in-kernel cross-WG barrier)
     // P4b-1: global scratch for the InfoNCE [B,B] dlogits matrix (relocated out
     // of LDS so it scales past the 64KB LDS ceiling at large B).  The lane-parallel
@@ -1849,7 +1852,7 @@ fn main() {
         // set_arg_ptr writes a raw 8-byte slot, same as the by-value uint at idx 12.
         set_arg_ptr(kp, 63, VOCAB)     // 0x1F8 (by-value uint)
         set_arg_ptr(kp, 64, B)         // 0x200 (by-value uint)
-        set_arg_ptr(kp, 65, WZM_BWD_NW) // 0x208 (by-value uint; current NW)
+        set_arg_ptr(kp, 65, WZMA_BWD_NW) // 0x208 (by-value uint; current NW)
         set_arg_ptr(kp, 66, id_chunk)   // 0x210 (by-value uint; P3 bwd_embed id-partition)
         // P4a: inv_B = 1/B (by-value f32; bwd_pre InfoNCE dlogits scale). B=8 → exactly 0.125.
         f32 inv_B = 1.0f / f64_to_f32(int_to_f64(B))
@@ -1870,7 +1873,7 @@ fn main() {
         if NW_pre < 1            { die_gpu("NW_pre < 1", NW_pre) }
         if NW_pre > B            { die_gpu("NW_pre > B (bwd_pre partitions B-rows)", NW_pre) }
         if (B % NW_pre) != 0     { die_gpu("NW_pre must divide B exactly", NW_pre) }
-        u64 rpw_bs = BS / NW_pre   // 0x228 → s8   (was / WZM_BWD_NW; must track NW_pre)
+        u64 rpw_bs = BS / NW_pre   // 0x228 → s8   (was / WZMA_BWD_NW; must track NW_pre)
         u64 rpw_b  = B  / NW_pre   // 0x230 → s22
         set_arg_ptr(kp, 69, rpw_bs)    // 0x228 (by-value uint)
         set_arg_ptr(kp, 70, rpw_b)     // 0x230 (by-value uint)
@@ -1883,7 +1886,7 @@ fn main() {
         // 63-arg kernarg block (validated _wzm_emit_* ISA, byte-for-byte the
         // NW=1 oracle math).
         u32 berr = 0
-        u32 NW32 = WZM_BWD_NW
+        u32 NW32 = WZMA_BWD_NW
 
         // Phase 1: wzma_bwd_pre — L1 SPLIT into two driver-synced dispatches
         // (de-redundant).  Both grid=NW_pre, same kp block (shared prologue ABI).

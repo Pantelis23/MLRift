@@ -42,7 +42,41 @@ static uint64 MEGA_WG_PERSIST = 512
 //   Phases inherently over all B (pool/L2, InfoNCE fwd/bwd, AdamW over params)
 //   stay single-WG for now — at NW=1 every WG runs everything, which is
 //   correct; multi-WG correctness for those phases is a later task.
+//
+//   MEGA_TRAIN_NW is the AMBIENT value used by whichever emit is running; it
+//   is NOT the wzma_train_mega grid.  Every lowerer that dispatches at NW>1
+//   SAVES it, sets it to its own grid constant for the duration of its emit,
+//   and restores it (see amdgpu_lower_wzma_bwd_* → WZM_BWD_NW and
+//   amdgpu_lower_wzma_train_mega → WZM_MEGA_NW).  The default of 1 belongs to
+//   amdgpu_lower_wzma_train_bwd, the standalone single-WG backward, which
+//   REQUIRES NW=1 (intra-WG s_barrier only, no cross-WG spin barrier).
 static uint64 MEGA_TRAIN_NW = 1
+
+// WZM_MEGA_NW: the grid amdgpu_lower_wzma_train_mega emits the wzma_train_mega
+//   megakernel for.  MUST equal WZMA_MEGA_NW in examples/wzma_train_mega.mlr,
+//   which is the grid the launcher actually dispatches — mlrc ENFORCES this
+//   (see wzm_check_launcher_const, called from the parser) because a mismatch
+//   is not a wrong answer, it WEDGES THE GPU: dispatching N workgroups against
+//   a code object emitted for M<N makes every extra WG run the full [0,BS)
+//   row range, racing the shared scratch, and the observed result was an
+//   8-way sq_intr storm → GFXHUB SQC-instruction page fault (PERMISSION_FAULTS
+//   0xb) → "MES might be in unrecoverable state" → MODE1 reset.
+//   Must divide BS=128.  8 is the value both sides were last deliberately set
+//   to, and the last NW the megakernel was ever run at (42b6add: bit-exact
+//   loss + grads vs the NW=1 oracle, 55.6 ms/step, no wedge in 3 back-to-back
+//   50-step runs).
+//
+//   *** THE CODE OBJECT THIS NOW EMITS HAS NEVER BEEN EXECUTED. ***
+//   It is NOT 42b6add's bytes and does not match any hardware-validated
+//   object: ~2338 lines of this emitter changed since May (Tasks 1-3 tiling,
+//   e48c26d's dU revert, 7ea5d4e, 8858fc5/1f18edc, ...), and 42b6add's own
+//   compiler emits a 34416-byte object where this one is 28448.  All that was
+//   verified here is the narrower claim that the fix is exactly the NW flip
+//   and nothing else: pristine 9484c6c with MEGA_TRAIN_NW=8 emits bytes
+//   identical to what the fixed compiler emits.  The next dispatch of
+//   wzma_train_mega is a FIRST RUN of never-executed ISA and must be treated
+//   as one — kfd-safe-run discipline, from a cold GPU, watched.
+static uint64 WZM_MEGA_NW = 8
 
 // ── speck4 mega-kernel constants ──────────────────────────────────────────
 // Slice 4.20.0: scaffold for the M_EFF=4 multi-query mega-kernel
@@ -10366,6 +10400,16 @@ fn amdgpu_lower_wzma_bwd_reduce(uint64 kname_ptr, uint64 nl) -> uint64 {
 }
 
 fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
+    // Emit for OUR grid, exactly as amdgpu_lower_wzma_bwd_* do: save the
+    // ambient MEGA_TRAIN_NW (whose default 1 belongs to the standalone
+    // single-WG amdgpu_lower_wzma_train_bwd), set it to WZM_MEGA_NW for the
+    // whole emit so every wzm_train_b_*/gate helper bakes rows_per_wg=BS/NW
+    // and the cross-WG barrier thresholds, then restore it at the end.
+    // Before this, the megakernel silently inherited MEGA_TRAIN_NW=1 while
+    // examples/wzma_train_mega.mlr dispatched WZMA_MEGA_NW=8 workgroups —
+    // which page-faults the GPU (see WZM_MEGA_NW's comment above).
+    uint64 saved_nw = MEGA_TRAIN_NW
+    MEGA_TRAIN_NW = WZM_MEGA_NW
     asm_init()
 
     // ── Prologue: stash wg_id_x (s3) + load 17 kernargs into the SGPR map ──
@@ -11185,5 +11229,86 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
                 80, 48,
                 rsrc1, rsrc2, rsrc3, props,
                 2560)
+    MEGA_TRAIN_NW = saved_nw
     return 0
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Cross-file constant coupling guard.
+//
+// A handful of GPU launchers under examples/ hand-duplicate constants that
+// mlrc BAKES into the code object it emits (grid width, per-WG scratch slot
+// stride).  Nothing used to check the copies: tools/wzma_t4_validate.sh's
+// set_nw() rewrote both in lockstep, and that was the entire safety net.  When
+// commit 7e97289 reset the emitter's NW to 1 for the standalone-backward
+// scaffold and left examples/wzma_train_mega.mlr at 8, the pair silently
+// disagreed — and a disagreement here is not a wrong number, it is a WEDGED
+// GPU (see WZM_MEGA_NW at the top of this file).
+//
+// So mlrc now refuses to compile a launcher whose copy disagrees.  The parser
+// calls this for every scalar `static`/`const` with an integer literal
+// initializer; the names below are reserved for the coupling and appear ONLY
+// in launchers (never in the compiler's own sources, so this cannot deadlock
+// the self-hosting bootstrap).
+fn _wzm_coupling_fail(uint64 name, uint64 nlen, uint64 got,
+                      uint64 want, uint64 srcname, uint64 srclen) {
+    uint8[24] nb
+    write(2, "mlrc: error: ", 13)
+    write(2, name, nlen)
+    write(2, " = ", 3)
+    uint64 gl = fmt_uint(nb, got)
+    write(2, nb, gl)
+    write(2, " in this launcher, but mlrc emits the wzma training\n", 52)
+    write(2, "  code objects with ", 20)
+    write(2, srcname, srclen)
+    write(2, " = ", 3)
+    uint64 wl = fmt_uint(nb, want)
+    write(2, nb, wl)
+    write(2, " (src/format_amdgpu_megakernel.mlr).\n", 37)
+    write(2, "  These two MUST be equal.  Dispatching a grid the code object was not\n", 71)
+    write(2, "  emitted for makes every extra workgroup re-run the whole row range over\n", 74)
+    write(2, "  shared scratch: the observed failure is a GFXHUB SQC-instruction page\n", 72)
+    write(2, "  fault (PERMISSION_FAULTS 0xb) -> MES might be in unrecoverable state\n", 71)
+    write(2, "  -> MODE1 reset, i.e. a WEDGED GPU, not a wrong answer.\n", 57)
+    write(2, "  Fix: edit ", 12)
+    write(2, srcname, srclen)
+    write(2, " in src/format_amdgpu_megakernel.mlr and rebuild\n", 49)
+    write(2, "  mlrc (make build), or change ", 31)
+    write(2, name, nlen)
+    write(2, " to match.  tools/wzma_t4_validate.sh\n", 38)
+    write(2, "  set_nw() rewrites both and rebuilds.\n", 39)
+    exit(1)
+}
+
+// COVERAGE — what this does and does not catch:
+//   caught: `static/const T WZMA_* = <int literal>` (with unary -/~), an
+//           expression initialiser whose first token is an int literal (the
+//           parser takes that literal as the declared value and the guard
+//           checks the same value it records), and a declaration with NO
+//           initialiser at all (declared value 0, which trips the guard —
+//           `static u64 WZMA_MEGA_NW` used to slip through before that hole
+//           was closed).
+//   NOT caught: a RUNTIME reassignment of the static (`WZMA_MEGA_NW = 4`
+//           somewhere in a function body).  The guard is a parse-time check on
+//           the DECLARED value and there is no constant-propagation pass here
+//           to see later stores.  These constants are declared once and read
+//           many times by design; if that ever changes, this check has to move
+//           to a whole-program pass.  A float-literal initialiser is also not
+//           checked — none of the coupled constants is a float.
+fn wzm_check_launcher_const(uint64 name_tok, uint64 val) {
+    if tok_matches(name_tok, "WZMA_MEGA_NW", 12) != 0 {
+        if val != WZM_MEGA_NW {
+            _wzm_coupling_fail("WZMA_MEGA_NW", 12, val, WZM_MEGA_NW, "WZM_MEGA_NW", 11)
+        }
+    }
+    if tok_matches(name_tok, "WZMA_PART_SLOT", 14) != 0 {
+        if val != WZM_PART_SLOT {
+            _wzm_coupling_fail("WZMA_PART_SLOT", 14, val, WZM_PART_SLOT, "WZM_PART_SLOT", 13)
+        }
+    }
+    if tok_matches(name_tok, "WZMA_BWD_NW", 11) != 0 {
+        if val != WZM_BWD_NW {
+            _wzm_coupling_fail("WZMA_BWD_NW", 11, val, WZM_BWD_NW, "WZM_BWD_NW", 10)
+        }
+    }
 }

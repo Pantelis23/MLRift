@@ -1,7 +1,9 @@
 // wzma_bwd_uv — full-occupancy backward phase 2: wzma_bwd ×2 views.
 // NAME-ROUTED stub: real ISA from amdgpu_lower_wzma_bwd_uv in
 // src/format_amdgpu_megakernel.mlr (reuses the validated _wzm_emit_wzma_bwd_view
-// math, the run-validated 42b6add per-bs dU/dV global-RMW form).  grid=WZM_BWD_NW;
+// math, the run-validated 42b6add per-bs dU/dV global-RMW form).  grid=WZM_BWD_NW
+// (the EMITTER static in src/format_amdgpu_megakernel.mlr; the launcher-side copy
+//  is WZMA_BWD_NW in examples/wzma_train_md.mlr, kept in step by mlrc);
 // BS rows split across WGs, each WG → private per-WG partial-grad slot.  Same
 // 63-arg kernarg block as wzma_train_bwd.
 //

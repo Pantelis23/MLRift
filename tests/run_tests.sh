@@ -7580,6 +7580,69 @@ for BPE_T in util_smoke pretok_smoke wordcount_smoke merge_smoke writer_smoke; d
     rm -f "$BPE_BIN"
 done
 
+# --- GPU launcher constant coupling guard (src/format_amdgpu_megakernel.mlr:
+# wzm_check_launcher_const) ---
+# examples/wzma_train_mega.mlr's WZMA_MEGA_NW is the grid the launcher
+# dispatches; WZM_MEGA_NW in the emitter is the grid the .co is BAKED for.
+# When they drifted apart (commit 7e97289 reset the emitter to 1 and left the
+# launcher at 8) the result was not a wrong number, it was a wedged GPU:
+# sq_intr x8 -> GFXHUB SQC-instruction page fault -> "MES might be in
+# unrecoverable state" -> MODE1 reset. mlrc must now refuse to compile such a
+# launcher. This test asserts BOTH directions: matching values compile, a
+# mismatch is a hard error that names the constant.
+# The probe sources live in /tmp, not the repo root: a run that is aborted
+# mid-test must not leave a stray test_tmp_*.mlr behind in the user's tree.
+GUARD_SRC="/tmp/mlrc_nwguard_src_$$.mlr"
+GUARD_BIN="/tmp/mlrc_nwguard_$$"
+trap 'rm -f "$GUARD_SRC" "$GUARD_BIN"' EXIT
+
+# The value the emitter bakes in, read straight out of the source, so neither
+# half of this test hardcodes an NW that a legitimate re-tune would break.
+GUARD_NW=$(grep -E '^static uint64 WZM_MEGA_NW = [0-9]+$' "$DIR/../src/format_amdgpu_megakernel.mlr" | grep -oE '[0-9]+$')
+GUARD_BAD=$((GUARD_NW + 1))
+
+TOTAL=$((TOTAL + 1))
+printf 'static u64 WZMA_MEGA_NW = %s\nfn main() { exit(0) }\n' "$GUARD_BAD" > "$GUARD_SRC"
+GUARD_OUT=$($MLRC $MLRC_FLAGS "$GUARD_SRC" -o "$GUARD_BIN" 2>&1)
+GUARD_RC=$?
+if [ -z "$GUARD_NW" ]; then
+    echo "FAIL: nw_coupling_guard_rejects_mismatch (could not read WZM_MEGA_NW from the emitter)"
+    FAIL=$((FAIL + 1))
+elif [ "$GUARD_RC" = "0" ]; then
+    echo "FAIL: nw_coupling_guard_rejects_mismatch (mlrc accepted WZMA_MEGA_NW=$GUARD_BAD)"
+    FAIL=$((FAIL + 1))
+elif ! echo "$GUARD_OUT" | grep -q "WZMA_MEGA_NW"; then
+    echo "FAIL: nw_coupling_guard_rejects_mismatch (error does not name the constant)"
+    echo "$GUARD_OUT" | head -3 | sed 's/^/    /'
+    FAIL=$((FAIL + 1))
+else
+    PASS=$((PASS + 1))
+fi
+rm -f "$GUARD_SRC" "$GUARD_BIN"
+
+TOTAL=$((TOTAL + 1))
+# A bare declaration has the implicit value 0, which must trip the guard too --
+# `static u64 WZMA_MEGA_NW` with no initialiser used to slip through unchecked.
+printf 'static u64 WZMA_MEGA_NW\nfn main() { exit(0) }\n' > "$GUARD_SRC"
+if $MLRC $MLRC_FLAGS "$GUARD_SRC" -o "$GUARD_BIN" > /dev/null 2>&1; then
+    echo "FAIL: nw_coupling_guard_rejects_no_initialiser (mlrc accepted a bare WZMA_MEGA_NW)"
+    FAIL=$((FAIL + 1))
+else
+    PASS=$((PASS + 1))
+fi
+rm -f "$GUARD_SRC" "$GUARD_BIN"
+
+TOTAL=$((TOTAL + 1))
+printf 'static u64 WZMA_MEGA_NW = %s\nfn main() { exit(0) }\n' "$GUARD_NW" > "$GUARD_SRC"
+if [ -n "$GUARD_NW" ] && $MLRC $MLRC_FLAGS "$GUARD_SRC" -o "$GUARD_BIN" > /dev/null 2>&1; then
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: nw_coupling_guard_accepts_match (WZM_MEGA_NW='$GUARD_NW')"
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$GUARD_SRC" "$GUARD_BIN"
+trap - EXIT
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS/$TOTAL passed, $FAIL failed ==="

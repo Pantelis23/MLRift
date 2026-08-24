@@ -18,13 +18,23 @@ LAUN=examples/wzma_train_mega.mlr
 KSRC=examples/llm/wzma_train_mega_kernel.mlr
 
 set_nw () {  # $1 = NW value
-  sed -i "s/^static uint64 MEGA_TRAIN_NW = .*/static uint64 MEGA_TRAIN_NW = $1/" "$MEGA"
+  # WZM_MEGA_NW (emitter, baked into the .co) and WZMA_MEGA_NW (launcher grid)
+  # MUST move together — a disagreement wedges the GPU.  mlrc now refuses to
+  # compile the launcher on a mismatch, so this is belt AND braces.
+  sed -i "s/^static uint64 WZM_MEGA_NW = .*/static uint64 WZM_MEGA_NW = $1/" "$MEGA"
   sed -i "s/^static u64 WZMA_MEGA_NW = .*/static u64 WZMA_MEGA_NW = $1/" "$LAUN"
+  grep -q "^static uint64 WZM_MEGA_NW = $1\$" "$MEGA" || { echo "set_nw: failed to set WZM_MEGA_NW=$1 in $MEGA"; exit 1; }
+  grep -q "^static u64 WZMA_MEGA_NW = $1\$"    "$LAUN" || { echo "set_nw: failed to set WZMA_MEGA_NW=$1 in $LAUN"; exit 1; }
 }
 build_all () {
+  # mlrc MUST be rebuilt before the .co: the emitter constant lives inside it.
   make build >/dev/null 2>&1
-  rm -f "$BIN/wzma_train_mega.co.co"
+  rm -f "$BIN/wzma_train_mega.co.co" "$BIN/wzma_train_mega.co"
   ./build/mlrc --target=amdgpu-native "$KSRC" -o "$BIN/wzma_train_mega" 2>&1 | grep -E "error" || true
+  # A stale .co is the one mismatch the compile-time guard cannot see (the
+  # launcher would be rebuilt at the new NW against an old code object), so
+  # refuse to continue unless the .co was just re-emitted.
+  [ -f "$BIN/wzma_train_mega.co" ] || { echo "build_all: kernel .co was NOT emitted — refusing to run"; exit 1; }
   ./build/mlrc --target=amdgpu-native "$LAUN" -o "$BIN/wzma_train_mega_launcher" 2>&1 | grep -E "^[1-9][0-9]* error" || true
   echo "  kernarg: $(/usr/bin/llvm-readobj --notes "$BIN/wzma_train_mega.co" 2>/dev/null | grep kernarg_segment_size | tr -d ' ')"
 }
