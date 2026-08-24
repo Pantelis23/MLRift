@@ -947,6 +947,11 @@ fn tokenizer_load_from_gguf(GGUFFile gf) -> Tokenizer {
     tk_eot_id = 0xFFFFFFFFFFFFFFFF
     tk_chat_template_p = 0
     tk_chat_template_l = 0
+    // Fresh load — don't inherit an encoder mode or pre-tokenizer rule from a
+    // previously-loaded tokenizer. The is_gpt2 check below re-enables them.
+    tk_encoder_mode = 0
+    tk_bpe_gpt2_digits = 0
+    tk_gpt2_kind = 0
 
     // -----------------------------------------------------------------------
     // Decide kind from tokenizer.ggml.model
@@ -1693,10 +1698,11 @@ fn tk_bpe_encode(Tokenizer tk, u64 input, u64 input_len,
 // ---------------------------------------------------------------------------
 fn tokenizer_encode(Tokenizer tk, u64 input, u64 input_len,
                     u64 out_ids_ptr, u64 out_count_ptr) {
-    // Dispatch to the BPE encoder when tokenizer_load_from_gguf set the
-    // GPT-2 mode flag. The greedy code path below handles SPM models
-    // and any legacy tokenizer_load(tokenizer.json) caller that hasn't
-    // been routed through tokenizer_load_from_gguf yet.
+    // Dispatch to the canonical merge-rank BPE encoder when tk_encoder_mode
+    // is 1 — set by tokenizer_load for a byte-level tokenizer.json with a
+    // populated merge table, and by tokenizer_load_from_gguf for a GPT-2
+    // GGUF tokenizer. Everything else (SPM, or byte-level with no merges)
+    // falls through to the greedy longest-prefix-match path below.
     if tk_encoder_mode == 1 {
         tk_bpe_encode(tk, input, input_len, out_ids_ptr, out_count_ptr)
         return
