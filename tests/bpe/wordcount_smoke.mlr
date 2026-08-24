@@ -16,12 +16,15 @@
 //
 // `readlines()` keeps each line's trailing '\n' — that is exactly the rule
 // this trainer must follow (feed bpe_pretok_split one line-with-ending at a
-// time, never the whole buffer). Output (34 distinct pieces total):
+// time, never the whole buffer). tests/bpe/tiny_corpus.txt now has TWO
+// consecutive blank lines (a "\n\n\n" region, added for I-2) specifically so
+// a whole-buffer bug fuses them into a "ĊĊ" token that must NEVER appear
+// here. Per-line output (34 distinct pieces total):
 //
 //   "'"        40      ","        40      "cafÃ©"    40
 //   "don"      40      "er"       40      "jumps"    40
 //   "'t"       40      "ll"       40      "trailing" 40
-//   "ve"       40      "wwwww"    40      "Ċ"        320
+//   "ve"       40      "wwwww"    40      "Ċ"        360
 //   "Ġ"        40      "Ġ'"       80      "Ġaaa"     40
 //   "Ġabab"    40      "Ġababab"  40      "Ġbrown"   40
 //   "Ġdog"     40      "Ġe"       40      "Ġend"     40
@@ -30,6 +33,13 @@
 //   "Ġstop"    40      "Ġthe"     120     "ĠÂ½"      40
 //   "ĠÅĥ"      40      "ĠÏĢ"      40      "ĠĠĊ"      40
 //   "the"      80   (line1 "the quick..." + line4's leading "the the the")
+//
+// (Ċ went from 320 -> 360 solely because of the added blank line: 40 reps *
+// 1 extra "\n"-only piece per rep.) The whole-buffer oracle on this SAME
+// corpus instead yields distinct=35 with "Ċ"=280, "ĊĊ"=40, "ĊĠ"=40, "ĠĠ"=40
+// replacing "Ċ"=360/"Ġ"=40/"ĠĠĊ"=40 — i.e. checking "Ġ", "Ċ"=360 and
+// "ĠĠĊ" present while "ĊĊ" is ABSENT discriminates the two implementations
+// on every one of those four counts, not just one.
 //
 // If this implementation ever disagrees with these numbers, the BUG IS IN
 // THE IMPLEMENTATION — never edit these expectations to match its output.
@@ -71,6 +81,7 @@ fn wt_find_freq(u64 wt, u64 want, u64 wlen) -> u64 {
     return result
 }
 
+static u64 NOT_FOUND = 0xFFFFFFFFFFFFFFFF
 static u64 g_ok = 1
 
 fn check(u64 wt, u64 want, u64 wlen, u64 want_freq, u64 label) {
@@ -84,6 +95,150 @@ fn check(u64 wt, u64 want, u64 wlen, u64 want_freq, u64 label) {
     print(" want=")
     print(want_freq)
     print("\n")
+}
+
+// I-2: direct guard against whole-buffer blank-line fusion — asserts `want`
+// is NOT a key in the table at all (freq must be the not-found sentinel).
+fn check_absent(u64 wt, u64 want, u64 wlen, u64 label) {
+    u64 got = wt_find_freq(wt, want, wlen)
+    if got == NOT_FOUND { return }
+    g_ok = 0
+    print("FAIL wordcount: word=")
+    print_str(label)
+    print(" should be ABSENT but got freq=")
+    print(got)
+    print("\n")
+}
+
+// ---------------------------------------------------------------------------
+// I-1: growth stress test. bpe_wt_new(4096) with only 34 distinct words
+// (the tiny-corpus check above) never rehashes the hash table, never grows
+// the entries array, and never grows the string blob — all three growth
+// paths (bpe_wt_grow_slots, bpe_wt_grow_entries, bpe_wt_ensure_blob) are
+// dead code under that test alone. Task 4+ runs a real corpus with tens of
+// thousands of distinct words, where all three run constantly.
+//
+// bpe_wt_new(8) + 700 distinct "word<i>" strings forces:
+//   - multiple slot rehashes (cap 8 -> 16 -> 32 -> ... well past 700/0.7),
+//   - multiple entries-array grows (ecap starts at 8, doubles each time),
+//   - at least one blob grow (initial blob is only 4096B; 700 words of
+//     4-7 bytes each sum past that).
+// It also updates every 5th word a second time (bpe_wt_add called again on
+// an existing word) to exercise the add-to-existing path under growth, and
+// checks EVERY index 0..699 returns exactly the i-th inserted word — i.e.
+// insertion order survives every rehash along the way.
+// ---------------------------------------------------------------------------
+
+fn u64_to_dec(u64 val, u64 out) -> u64 {
+    if val == 0 { store8(out, 0x30); return 1 }
+    u64 buf = alloc(24)
+    u64 len = 0
+    u64 tmp = val
+    while tmp > 0 {
+        store8(buf + len, (tmp % 10) + 0x30)
+        len = len + 1
+        tmp = tmp / 10
+    }
+    u64 i = 0
+    while i < len {
+        store8(out + i, load8(buf + (len - 1 - i)))
+        i = i + 1
+    }
+    dealloc(buf)
+    return len
+}
+
+// "word" + decimal(i)
+fn mk_synth_word(u64 i, u64 out) -> u64 {
+    store8(out + 0, 0x77); store8(out + 1, 0x6F); store8(out + 2, 0x72); store8(out + 3, 0x64)
+    u64 dl = u64_to_dec(i, out + 4)
+    return 4 + dl
+}
+
+fn synth_expected_freq(u64 i) -> u64 {
+    u64 base = (i % 7) + 1
+    if i % 5 == 0 { return base + 7 }
+    return base
+}
+
+fn test_growth() -> u64 {
+    u64 ok = 1
+    u64 n = 700
+    u64 wt2 = bpe_wt_new(8)
+    u64 word = alloc(16)
+
+    // Pass 1: insert all 700 words in order 0..699.
+    u64 i = 0
+    while i < n {
+        u64 wl = mk_synth_word(i, word)
+        bpe_wt_add(wt2, word, wl, (i % 7) + 1)
+        i = i + 1
+    }
+    // Pass 2: bump every 5th word again — must land on the SAME entry
+    // (add-to-existing), not create a new one.
+    i = 0
+    while i < n {
+        if i % 5 == 0 {
+            u64 wl2 = mk_synth_word(i, word)
+            bpe_wt_add(wt2, word, wl2, 7)
+        }
+        i = i + 1
+    }
+
+    u64 cnt = bpe_wt_count(wt2)
+    if cnt != n {
+        ok = 0
+        print("FAIL growth: distinct got=")
+        print(cnt)
+        print(" want=")
+        print(n)
+        print("\n")
+    }
+
+    u64 pptr = alloc(8)
+    u64 plen = alloc(8)
+    u64 fails = 0
+    i = 0
+    while i < n {
+        u64 freq = bpe_wt_word(wt2, i, pptr, plen)
+        u64 p = load64(pptr)
+        u64 l = load64(plen)
+        u64 wl3 = mk_synth_word(i, word)
+        u64 want_freq = synth_expected_freq(i)
+        u64 this_ok = 1
+        if l != wl3 { this_ok = 0 }
+        if this_ok == 1 {
+            if bytes_eq(p, word, wl3) == 0 { this_ok = 0 }
+        }
+        if freq != want_freq { this_ok = 0 }
+        if this_ok == 0 {
+            ok = 0
+            if fails == 0 {
+                print("FAIL growth: index ")
+                print(i)
+                print(" got_len=")
+                print(l)
+                print(" got_freq=")
+                print(freq)
+                print(" want_freq=")
+                print(want_freq)
+                print("\n")
+            }
+            fails = fails + 1
+        }
+        i = i + 1
+    }
+    if fails > 1 {
+        print("FAIL growth: ")
+        print(fails)
+        print(" total index mismatches\n")
+    }
+
+    dealloc(pptr)
+    dealloc(plen)
+    dealloc(word)
+    bpe_wt_free(wt2)
+    return ok
 }
 
 fn main() {
@@ -108,11 +263,17 @@ fn main() {
     store8(w_gthe + 2, 0x74); store8(w_gthe + 3, 0x68); store8(w_gthe + 4, 0x65)
     check(wt, w_gthe, 5, 120, "Gthe")
 
-    // "Ċ" — a bare newline byte (0x0A -> C4 8A). 320 = 40 reps * 8 blank
-    // "\n"-only lines per block worth of newline-only pretok pieces.
+    // "Ċ" — a bare newline byte (0x0A -> C4 8A). 360 now (was 320 before the
+    // I-2 corpus edit added a second consecutive blank line).
     u64 w_nl = alloc(2)
     store8(w_nl + 0, 0xC4); store8(w_nl + 1, 0x8A)
-    check(wt, w_nl, 2, 320, "NL")
+    check(wt, w_nl, 2, 360, "NL")
+
+    // "Ġ" — a single leading space with nothing else on its own piece (the
+    // "  indented start" line's first space, per-line-only token: I-2(e)).
+    u64 w_sp = alloc(2)
+    store8(w_sp + 0, 0xC4); store8(w_sp + 1, 0xA0)
+    check(wt, w_sp, 2, 40, "G-alone")
 
     // "ĠĠĊ" — the trailing "end  \n" line's two spaces + newline, fused into
     // one \s+ piece since nothing follows on the line.
@@ -155,6 +316,13 @@ fn main() {
     store8(w_quick + 5, 0x63); store8(w_quick + 6, 0x6B)
     check(wt, w_quick, 7, 120, "Gquick")
 
+    // I-2(d): "ĊĊ" (C4 8A C4 8A) must be ABSENT. It only exists if the
+    // implementation ever splits the whole buffer instead of per-line.
+    u64 w_nlnl = alloc(4)
+    store8(w_nlnl + 0, 0xC4); store8(w_nlnl + 1, 0x8A)
+    store8(w_nlnl + 2, 0xC4); store8(w_nlnl + 3, 0x8A)
+    check_absent(wt, w_nlnl, 4, "CC-double-newline")
+
     u64 distinct = bpe_wt_count(wt)
     if distinct != 34 {
         g_ok = 0
@@ -162,6 +330,12 @@ fn main() {
         print(distinct)
         print(" want=34\n")
     }
+
+    // M-4: exercise + release the corpus mapping and the WordTable.
+    bpe_wt_free(wt)
+    bpe_munmap_file(base, size)
+
+    if test_growth() == 0 { g_ok = 0 }
 
     if g_ok == 1 {
         print("PASS wordcount\n")

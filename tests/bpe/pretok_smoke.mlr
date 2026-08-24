@@ -12,6 +12,9 @@ import "../../std/io.mlr"
 import "../../std/string.mlr"
 
 // "\xNN" -> byte; everything else copied verbatim. Returns raw length.
+// R-T2b: only treat `\` as the start of a `\xNN` escape when the next byte
+// really is 'x' (0x78) — anything else is a malformed escape and FAILs
+// loudly instead of silently mis-decoding.
 fn unesc(u64 s, u64 slen, u64 out) -> u64 {
     u64 i = 0
     u64 o = 0
@@ -19,6 +22,14 @@ fn unesc(u64 s, u64 slen, u64 out) -> u64 {
         u64 c = 0
         unsafe { *((s + i) as u8) -> c }
         if c == 0x5C && i + 3 < slen {
+            u64 xc = 0
+            unsafe { *((s + i + 1) as u8) -> xc }
+            if xc != 0x78 {
+                print("FAIL unesc: malformed escape (not \\xNN) at byte ")
+                print(i)
+                print("\n")
+                exit(1)
+            }
             u64 h1 = 0
             u64 h2 = 0
             unsafe { *((s + i + 2) as u8) -> h1 }
@@ -119,14 +130,18 @@ fn main() {
     }
     u64 dlen = str_len(data)
 
-    u64 inbuf = alloc(8192)
-    u64 expbuf = alloc(16384)
-    u64 actbuf = alloc(16384)
+    u64 INBUF_CAP = 8192
+    u64 EXPBUF_CAP = 16384
+    u64 ACTBUF_CAP = 16384
+    u64 inbuf = alloc(INBUF_CAP)
+    u64 expbuf = alloc(EXPBUF_CAP)
+    u64 actbuf = alloc(ACTBUF_CAP)
 
     u64 pos = 0
     u64 total = 0
     u64 passed = 0
     u64 reported = 0
+    u64 lineno = 0
 
     while pos < dlen {
         u64 e = pos
@@ -145,14 +160,85 @@ fn main() {
                 if ch2 == 0x09 { break }
                 t = t + 1
             }
-            u64 ilen = unesc(data + pos, t - pos, inbuf)
-            u64 elen = unesc(data + t + 1, e - (t + 1), expbuf)
+            // R-T2a: no TAB on this line — `e - (t + 1)` would underflow to
+            // ~2^64 and send unesc on a wild read. FAIL loudly instead.
+            if t >= e {
+                print("FAIL pretok_cases.tsv: no TAB on line ")
+                print(lineno)
+                print("\n")
+                exit(1)
+            }
+
+            // R-T2c: the raw (still-escaped) slice length is always >= the
+            // decoded length (each \xNN shrinks 4 bytes -> 1; anything else
+            // is 1:1), so it's a safe upper bound to guard BEFORE decoding —
+            // catches an oversized golden line before any heap corruption.
+            u64 raw_in_len = t - pos
+            u64 raw_exp_len = e - (t + 1)
+            if raw_in_len > INBUF_CAP {
+                print("FAIL pretok_cases.tsv: input too long on line ")
+                print(lineno)
+                print("\n")
+                exit(1)
+            }
+            if raw_exp_len > EXPBUF_CAP {
+                print("FAIL pretok_cases.tsv: expected pieces too long on line ")
+                print(lineno)
+                print("\n")
+                exit(1)
+            }
+
+            u64 ilen = unesc(data + pos, raw_in_len, inbuf)
+            u64 elen = unesc(data + t + 1, raw_exp_len, expbuf)
 
             u64 np = bpe_pretok_split(inbuf, ilen, offs, lens, 4096)
+
+            // R-T2d: pieces must exactly TILE the input — no gaps, no
+            // overlaps — which also closes the `|`-join's blindness to a
+            // literal 0x7C byte inside a piece (a tiling mismatch would
+            // still be caught here even if the joined-and-compared bytes
+            // happened to line up).
+            u64 tile_ok = 1
+            u64 sum_lens = 0
+            u64 expect_off = 0
+            u64 ti = 0
+            while ti < np {
+                u64 t_off = load64(offs + ti * 8)
+                u64 t_len = load64(lens + ti * 8)
+                if t_off != expect_off { tile_ok = 0 }
+                sum_lens = sum_lens + t_len
+                expect_off = t_off + t_len
+                ti = ti + 1
+            }
+            if np > 0 {
+                u64 first_off = load64(offs)
+                if first_off != 0 { tile_ok = 0 }
+            }
+            if sum_lens != ilen { tile_ok = 0 }
+            if tile_ok == 0 {
+                print("FAIL tiling: case on line ")
+                print(lineno)
+                print(" pieces do not exactly tile the input (sum_lens=")
+                print(sum_lens)
+                print(" input_len=")
+                print(ilen)
+                print(")\n")
+                exit(1)
+            }
+
+            // R-T2c: bound the actbuf write BEFORE calling bpe_byte_map_piece
+            // — a byte-mapped piece is at most 2x its raw length, plus one
+            // '|' separator byte per piece after the first.
             u64 alen = 0
             u64 k = 0
             while k < np {
                 if k > 0 {
+                    if alen + 1 > ACTBUF_CAP {
+                        print("FAIL pretok: actbuf overflow (separator) on line ")
+                        print(lineno)
+                        print("\n")
+                        exit(1)
+                    }
                     store8(actbuf + alen, 0x7C)
                     alen = alen + 1
                 }
@@ -160,6 +246,12 @@ fn main() {
                 u64 pl = 0
                 unsafe { *((offs + k * 8) as u64) -> off }
                 unsafe { *((lens + k * 8) as u64) -> pl }
+                if alen + pl * 2 > ACTBUF_CAP {
+                    print("FAIL pretok: actbuf overflow (piece) on line ")
+                    print(lineno)
+                    print("\n")
+                    exit(1)
+                }
                 alen = alen + bpe_byte_map_piece(inbuf + off, pl, actbuf + alen)
                 k = k + 1
             }
@@ -186,6 +278,7 @@ fn main() {
             }
         }
         pos = e + 1
+        lineno = lineno + 1
     }
 
     if total == 0 {

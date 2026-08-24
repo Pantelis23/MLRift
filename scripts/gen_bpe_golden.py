@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Offline oracle. Run with AtlasLM/.venv (tokenizers 0.23.1). NOT in runtime path.
-import json, os
+import os
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders, processors
 OUT = os.path.dirname(__file__) + "/../tests/bpe"
 os.makedirs(OUT + "/golden", exist_ok=True)
@@ -24,6 +24,11 @@ with open(OUT + "/golden/pretok_cases.tsv", "w", encoding="utf-8") as f:
 tiny = ("the quick brown fox\n"
         "jumps over the lazy dog\n"
         "\n"                              # blank line (must NOT create Ċ-fused tokens)
+        "\n"                              # 2nd consecutive blank line: "...dog\n\n\nthe..."
+                                          # is a \n\n\n region. Whole-buffer splitting fuses
+                                          # this into a "ĊĊ" token because \s+(?!\S) greedily
+                                          # spans the line boundary; per-line splitting must
+                                          # NOT produce that token.
         "the the the quick quick\n"
         "  indented start\n"             # leading spaces
         "trailing end  \n"               # trailing spaces

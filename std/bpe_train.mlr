@@ -58,20 +58,31 @@ fn bpe_utf8_decode(u64 p, u64 end, u64 out_cp) -> u64 {
     if p >= end { return 0 }
     u64 c0 = 0; unsafe { *(p as u8) -> c0 }
     if c0 < 0x80 { store64(out_cp, c0); return 1 }
+    // R-T1: stray continuation byte (0x80-0xBF) or an overlong/invalid lead
+    // (0xC0-0xC1, which can only ever overlong-encode 0x00-0x7F) — lenient
+    // single-byte fallback so offsets stay sane on malformed input instead
+    // of silently mis-decoding/mis-splitting. Never hit on valid UTF-8.
+    if c0 <= 0xC1 { store64(out_cp, c0); return 1 }
     if c0 >= 0xF0 {
         if p + 4 > end { store64(out_cp, c0); return 1 }
         u64 b1=0; u64 b2=0; u64 b3=0
         unsafe { *((p+1) as u8) -> b1 } unsafe { *((p+2) as u8) -> b2 } unsafe { *((p+3) as u8) -> b3 }
+        if b1 < 0x80 || b1 > 0xBF || b2 < 0x80 || b2 > 0xBF || b3 < 0x80 || b3 > 0xBF {
+            store64(out_cp, c0); return 1 }
         u64 cp = ((c0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
         store64(out_cp, cp); return 4 }
     if c0 >= 0xE0 {
         if p + 3 > end { store64(out_cp, c0); return 1 }
         u64 b1=0; u64 b2=0
         unsafe { *((p+1) as u8) -> b1 } unsafe { *((p+2) as u8) -> b2 }
+        if b1 < 0x80 || b1 > 0xBF || b2 < 0x80 || b2 > 0xBF {
+            store64(out_cp, c0); return 1 }
         u64 cp = ((c0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
         store64(out_cp, cp); return 3 }
+    // remaining range is 0xC2..0xDF: a valid 2-byte lead.
     if p + 2 > end { store64(out_cp, c0); return 1 }
     u64 b1=0; unsafe { *((p+1) as u8) -> b1 }
+    if b1 < 0x80 || b1 > 0xBF { store64(out_cp, c0); return 1 }
     u64 cp = ((c0 & 0x1F) << 6) | (b1 & 0x3F)
     store64(out_cp, cp); return 2
 }
@@ -369,6 +380,10 @@ fn bpe_wt_count(u64 wt) -> u64 {
 // Writes the i-th (in insertion order) word's blob pointer to *out_ptr and
 // its length to *out_len. Returns its freq.
 fn bpe_wt_word(u64 wt, u64 i, u64 out_ptr, u64 out_len) -> u64 {
+    if i >= load64(wt + 8) {
+        print("bpe_wt_word: index out of range\n")
+        exit(1)
+    }
     u64 entries = load64(wt + 24)
     u64 entry = entries + i * 24
     u64 off = load64(entry)
@@ -504,10 +519,54 @@ fn bpe_wt_add(u64 wt, u64 s, u64 slen, u64 add) {
     }
 }
 
-// Max bytes of a single corpus LINE (including its trailing '\n') this
-// counter will handle. Generous headroom over any realistic text line;
-// a longer line dies loud rather than silently truncating/corrupting.
+// M-4: release everything owned by a WordTable (slots, entries, blob, the
+// header itself). The caller still owns `wt`'s corpus buffer separately.
+fn bpe_wt_free(u64 wt) {
+    dealloc(load64(wt + 16))   // slots
+    dealloc(load64(wt + 24))   // entries
+    dealloc(load64(wt + 40))   // blob
+    dealloc(wt)
+}
+
+// M-4: munmap a region returned by bpe_mmap_file.
+fn bpe_munmap_file(u64 base, u64 size) {
+    syscall_raw(11, base, size, 0, 0, 0, 0)
+}
+
+// Hard ceiling on a single corpus LINE (including its trailing '\n') this
+// counter will handle — a backstop, not the normal sizing source (see
+// bpe_cw_max_line_len / M-5 below). A longer line dies loud rather than
+// silently truncating/corrupting.
+//
+// M-6: constant-by-convention. MLRift has no `const`, only `static`
+// (mutable) globals, so this relies on discipline: nothing in this file (or
+// any importer) may ever assign to BPE_CW_LINE_CAP after module init.
 static u64 BPE_CW_LINE_CAP = 1048576
+
+// One pass over the corpus using the exact same line-splitting rule as
+// bpe_count_words_1t below, to find the longest line (including its
+// trailing '\n'). Lets the counter size its scratch buffers from the real
+// corpus instead of always paying for a fixed multi-MiB guess — Task 6
+// parallelizes bpe_count_words_1t N-way, and N x a fixed ~18 MiB/call would
+// be wasted memory for no benefit.
+fn bpe_cw_max_line_len(u64 corpus_base, u64 corpus_size) -> u64 {
+    u64 max_len = 0
+    u64 pos = 0
+    while pos < corpus_size {
+        u64 line_start = pos
+        u64 nl = pos
+        while nl < corpus_size {
+            if load8(corpus_base + nl) == 10 { break }   // '\n'
+            nl = nl + 1
+        }
+        u64 line_end = nl
+        if nl < corpus_size { line_end = nl + 1 }        // keep the '\n'
+        u64 line_len = line_end - line_start
+        if line_len > max_len { max_len = line_len }
+        pos = line_end
+    }
+    return max_len
+}
 
 // Count word (byte-mapped pre-token) frequencies over the whole corpus.
 //
@@ -519,10 +578,19 @@ static u64 BPE_CW_LINE_CAP = 1048576
 fn bpe_count_words_1t(u64 corpus_base, u64 corpus_size) -> u64 {
     u64 wt = bpe_wt_new(4096)
 
-    u64 max_pieces = BPE_CW_LINE_CAP + 1
+    // M-5: size scratch buffers from the corpus's actual longest line, not
+    // a fixed BPE_CW_LINE_CAP guess; the ceiling stays as a loud-death
+    // backstop for a pathological single line.
+    u64 line_cap = bpe_cw_max_line_len(corpus_base, corpus_size)
+    if line_cap > BPE_CW_LINE_CAP {
+        print("bpe_count_words_1t: line too long\n")
+        exit(1)
+    }
+    if line_cap < 1 { line_cap = 1 }   // keep allocs non-zero for an empty corpus
+    u64 max_pieces = line_cap + 1
     u64 offs = alloc(max_pieces * 8)
     u64 lens = alloc(max_pieces * 8)
-    u64 mapped = alloc(BPE_CW_LINE_CAP * 2 + 16)
+    u64 mapped = alloc(line_cap * 2 + 16)
 
     u64 pos = 0
     while pos < corpus_size {
@@ -536,24 +604,25 @@ fn bpe_count_words_1t(u64 corpus_base, u64 corpus_size) -> u64 {
         if nl < corpus_size { line_end = nl + 1 }        // keep the '\n'
         u64 line_len = line_end - line_start
 
-        if line_len > 0 {
-            if line_len + 1 > max_pieces {
-                print("bpe_count_words_1t: line too long\n")
-                exit(1)
-            }
-            u64 np = bpe_pretok_split(corpus_base + line_start, line_len, offs, lens, line_len + 1)
-            u64 k = 0
-            while k < np {
-                u64 off = load64(offs + k * 8)
-                u64 plen = load64(lens + k * 8)
-                u64 mlen = bpe_byte_map_piece(corpus_base + line_start + off, plen, mapped)
-                bpe_wt_add(wt, mapped, mlen, 1)
-                k = k + 1
-            }
+        // M-7: line_len is always >= 1 here — the loop guard `pos <
+        // corpus_size` means line_start < corpus_size, and line_end is
+        // always line_start+1 or more (either nl+1, or corpus_size when the
+        // final line has no trailing '\n', both strictly > line_start). No
+        // `if line_len > 0` guard is reachable-false here, so none is used.
+        u64 np = bpe_pretok_split(corpus_base + line_start, line_len, offs, lens, line_len + 1)
+        u64 k = 0
+        while k < np {
+            u64 off = load64(offs + k * 8)
+            u64 plen = load64(lens + k * 8)
+            u64 mlen = bpe_byte_map_piece(corpus_base + line_start + off, plen, mapped)
+            bpe_wt_add(wt, mapped, mlen, 1)
+            k = k + 1
         }
 
+        // M-7: pos := line_end is always > line_start by the same
+        // invariant above, so this loop can never stall — no
+        // `if pos <= line_start` safety guard is needed.
         pos = line_end
-        if pos <= line_start { pos = line_start + 1 }    // safety: never stall
     }
 
     dealloc(offs)
