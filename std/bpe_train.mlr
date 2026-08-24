@@ -546,23 +546,17 @@ fn bpe_wt_add(u64 wt, u64 s, u64 slen, u64 add) {
 // M-4: release everything owned by a WordTable (slots, entries, blob, the
 // header itself). The caller still owns `wt`'s corpus buffer separately.
 //
-// N-3: `cap` (offset 0) doubles as a "freed" sentinel — a live table always
-// has cap >= 8 (bpe_wt_next_pow2's floor), so a second call sees cap == 0
-// and returns immediately instead of double-dealloc'ing the inner buffers
-// (and the header itself).
+// F-1: freeing is ONE-SHOT. Calling this twice on the same handle, or using
+// `wt` after calling this, is undefined behavior: MLRift's `dealloc` is
+// mmap-backed (munmap), so `dealloc(wt)` below unmaps the header page
+// itself — there is no "zero a freed-sentinel field and check it next time"
+// trick available here, because the page holding that field is gone the
+// instant this function returns, and its address may already be handed
+// back out by the next alloc(). Callers must track liveness themselves.
 fn bpe_wt_free(u64 wt) {
-    if load64(wt) == 0 { return }   // already freed
     dealloc(load64(wt + 16))   // slots
     dealloc(load64(wt + 24))   // entries
     dealloc(load64(wt + 40))   // blob
-    store64(wt, 0)             // cap := 0 marks this header freed
-    store64(wt + 8, 0)         // count
-    store64(wt + 16, 0)        // slots_ptr
-    store64(wt + 24, 0)        // entries_ptr
-    store64(wt + 32, 0)        // entries_cap
-    store64(wt + 40, 0)        // blob_ptr
-    store64(wt + 48, 0)        // blob_len
-    store64(wt + 56, 0)        // blob_cap
     dealloc(wt)
 }
 
@@ -667,7 +661,7 @@ fn bpe_count_words_1t(u64 corpus_base, u64 corpus_size) -> u64 {
             print(" (bpe_cw_max_line_len drifted from the main loop's line-splitting rule)\n")
             exit(1)
         }
-        u64 np = bpe_pretok_split(corpus_base + line_start, line_len, offs, lens, line_len + 1)
+        u64 np = bpe_pretok_split(corpus_base + line_start, line_len, offs, lens, max_pieces)
         u64 k = 0
         while k < np {
             u64 off = load64(offs + k * 8)
