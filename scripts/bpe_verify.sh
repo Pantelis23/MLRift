@@ -60,6 +60,30 @@ CORPUS="${1:-/home/pantelis/Desktop/Projects/Work/AtlasLM/checkpoints/wzma_embed
 VOCAB_SIZE=8192
 NTHREADS_FULL="$(nproc)"
 REPS="${REPS:-3}"
+# Validated HERE, before any gate runs, rather than tolerated downstream:
+# REPS=0 makes `seq 1 0` iterate zero times, so best_of sees no samples and the
+# run dies in require_number with a "not a number" FATAL *after* the gates but
+# *before* the summary — reporting a parse problem instead of the operator's
+# actual mistake, and losing the report. A misconfiguration should be rejected
+# at the point it is read.
+# The `:-` default above guarantees REPS is non-empty here (an unset OR empty
+# REPS becomes 3), so the patterns below only have to reject non-digits and
+# out-of-range values. The 6-digit cap keeps `-lt` away from values that
+# overflow the shell's integer parser and turn a clear message into a bash
+# error; 999999 repetitions is already about three years of run time.
+case "$REPS" in
+    *[!0-9]*)
+        echo "FATAL: REPS must be a positive integer (got '$REPS')" >&2
+        exit 1 ;;
+esac
+if [ "${#REPS}" -gt 6 ]; then
+    echo "FATAL: REPS is implausibly large (got '$REPS')" >&2
+    exit 1
+fi
+if [ "$REPS" -lt 1 ]; then
+    echo "FATAL: REPS must be at least 1 (got '$REPS') — a timing gate needs at least one run" >&2
+    exit 1
+fi
 # Bars, in whole-process wall-clock seconds. Provenance — every sweep behind
 # these two numbers, and why the older 54.59/8.64 pair was dropped — is in the
 # HF_BAR_1T / HF_BAR_FULL entry of the usage block at the top of this file.
@@ -83,7 +107,29 @@ RT_BIN="$WORK/bpe_roundtrip"
 DIGESTS="$WORK/digests.txt"
 
 mkdir -p "$WORK" "$REF_DIR" || exit 1
+
+# ---------------------------------------------------------------------------
+# INVARIANT: every gate asserts only about artifacts produced by THIS run.
+#
+# $WORK persists between runs, so anything left there by a previous, possibly
+# successful, run is a live hazard: a gate that reads it reports a verdict
+# about a file this run never created. That has bitten this harness twice --
+# a stale CLI binary surviving a failed compile (I-1), and G4 round-tripping
+# the previous run's tokenizer.json after a total crash (P-1).
+#
+# Every reusable artifact is therefore deleted up front, and each gate treats
+# "missing" as a failure rather than skipping the check:
+#   $DIGESTS   truncated here          (never carries a prior run's md5)
+#   $CLI_BIN   deleted before mlrc     (see the build section)
+#   $RT_BIN    deleted before mlrc     (see the build section)
+#   $OUT_JSON  deleted here            (G1 recreates it; G4 refuses without it)
+# $REF_JSON is deliberately NOT in this list: it is external ground truth, not
+# an artifact of this run. It is instead re-validated for self-consistency
+# below, so a truncated or substituted oracle cannot silently become the thing
+# G1 compares against.
+# ---------------------------------------------------------------------------
 : > "$DIGESTS"
+rm -f "$OUT_JSON"
 
 # --- result bookkeeping -----------------------------------------------------
 declare -A VERDICT
@@ -210,13 +256,34 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 open(sys.argv[2], "w").write(json.dumps(d, separators=(",", ":"), ensure_ascii=False))
 PYMIN
-"$PY" - "$REF_JSON" <<'PYSUM' || exit 1
+# The oracle is the one input the invariant above deliberately does NOT
+# recreate each run, so it is validated instead of trusted. `[ -s ]` only
+# proves the file is non-empty; these assertions prove it is a structurally
+# whole byte-level BPE tokenizer. They are corpus-agnostic on purpose (no
+# hardcoded 8192/7980), so the harness stays usable on any corpus:
+#   - exactly the 4 special tokens we train with,
+#   - at least one merge (an oracle with none would make G1 near-vacuous),
+#   - and the ByteLevel BPE size identity vocab == 4 + alphabet + merges,
+#     which pins alphabet and merge counts to the vocab in one check and fails
+#     on any truncation or substitution that disturbs their relationship.
+"$PY" - "$REF_JSON" <<'PYSUM' || { echo "FATAL: the HF oracle failed its self-consistency check" >&2; exit 1; }
 import json, sys
 d = json.load(open(sys.argv[1]))
-m, v = d["model"]["merges"], d["model"]["vocab"]
-print("oracle: vocab %d  merges %d  added_tokens %d  alphabet %d" %
-      (len(v), len(m), len(d["added_tokens"]), sum(1 for t in v if len(t) == 1)))
-print("oracle: first merges", [ "".join(x) for x in m[:5] ])
+m, v, at = d["model"]["merges"], d["model"]["vocab"], d["added_tokens"]
+alpha = sum(1 for t in v if len(t) == 1)
+print("oracle: vocab %d  merges %d  added_tokens %d  alphabet %d"
+      % (len(v), len(m), len(at), alpha))
+print("oracle: first merges", ["".join(x) for x in m[:5]])
+ok = True
+if len(at) != 4:
+    ok = False; print("  ORACLE INVALID: expected 4 added_tokens, got %d" % len(at))
+if len(m) < 1:
+    ok = False; print("  ORACLE INVALID: no merges — G1 would assert almost nothing")
+if len(v) != 4 + alpha + len(m):
+    ok = False
+    print("  ORACLE INVALID: vocab %d != 4 + alphabet %d + merges %d = %d"
+          % (len(v), alpha, len(m), 4 + alpha + len(m)))
+sys.exit(0 if ok else 1)
 PYSUM
 
 # --- 3. G1: byte-exact ------------------------------------------------------
@@ -371,7 +438,14 @@ fi
 
 # --- 6. G4: round-trip ------------------------------------------------------
 hdr "G4 — round-trip through std/tokenizer.mlr"
-if MLRIFT_BPE_OUT="$OUT_JSON" "$RT_BIN"; then
+# $OUT_JSON was deleted before the first training run, so if it is absent now
+# no trainer invocation in this run ever produced a tokenizer. Round-tripping
+# whatever happened to be on disk would report a green gate backed by a file
+# this run did not create — the stale-artifact failure this harness has already
+# been bitten by twice.
+if [ ! -f "$OUT_JSON" ]; then
+    record G4 FAIL "no tokenizer produced by this run — nothing to round-trip"
+elif MLRIFT_BPE_OUT="$OUT_JSON" "$RT_BIN"; then
     record G4 PASS "decode(encode(x)) == x for every probe (incl. non-ASCII)"
 else
     record G4 FAIL "a probe did not round-trip (see the output above)"
