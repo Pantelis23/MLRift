@@ -251,3 +251,313 @@ fn bpe_pretok_split(u64 text, u64 len, u64 offs, u64 lens, u64 max) -> u64 {
     dealloc(cpbuf)
     return np
 }
+
+// ---------------------------------------------------------------------------
+// Task 3: single-thread word-frequency counter.
+//
+// Kept dependency-light on purpose (controller ruling): NO import of
+// tokenizer.mlr or wzma_data.mlr — both a local FNV-1a 64 and a local mmap
+// helper are implemented right here instead of reusing tk_fnv1a /
+// wzma_data_open, so this file's only imports stay io.mlr, string.mlr,
+// bpe_unicode.mlr.
+// ---------------------------------------------------------------------------
+
+// Standard FNV-1a, 64-bit (offset basis 0xcbf29ce484222325, prime
+// 0x100000001b3), byte-wise. u64 multiply/xor wrap mod 2^64 already, so no
+// masking is needed (unlike the 32-bit tk_fnv1a in tokenizer.mlr).
+fn bpe_fnv1a(u64 ptr, u64 len) -> u64 {
+    u64 h = 0xCBF29CE484222325
+    u64 i = 0
+    while i < len {
+        u64 b = load8(ptr + i)
+        h = h ^ b
+        h = h * 0x100000001B3
+        i = i + 1
+    }
+    return h
+}
+
+// mmap a file read-only. Writes its size to *out_size and returns the mmap
+// base, or returns 0 (out_size := 0) on any failure. Mechanics copied from
+// wzma_data_open (std/wzma_data.mlr) without importing that file.
+fn bpe_mmap_file(u64 path, u64 out_size) -> u64 {
+    u64 fd = file_open(path, 0)
+    if is_errno(fd) != 0 {
+        store64(out_size, 0)
+        return 0
+    }
+    u64 sz = file_size(fd)
+    // mmap PROT_READ (1) MAP_PRIVATE (2)
+    u64 base = syscall_raw(9, 0, sz, 1, 2, fd, 0)
+    if is_errno(base) != 0 {
+        file_close(fd)
+        store64(out_size, 0)
+        return 0
+    }
+    file_close(fd)
+    store64(out_size, sz)
+    return base
+}
+
+fn bpe_bytes_eq(u64 a, u64 b, u64 len) -> u64 {
+    u64 i = 0
+    while i < len {
+        if load8(a + i) != load8(b + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// ---------------------------------------------------------------------------
+// WordTable — open-addressed hash of byte-mapped word bytes -> u64 freq,
+// with a stable insertion index for deterministic iteration.
+//
+// Design: the hash table only maps hash -> entry index (for lookup); the
+// actual (blob offset, length, freq) triples live in a separate `entries`
+// array in pure insertion order, so iteration by index (bpe_wt_word) never
+// needs a stored "index" field or a search — entries[i] IS the i-th
+// inserted word. Growing the hash table (rehash at 0.7 load) only touches
+// the `slots` array; entries and the string blob are untouched by it.
+//
+// Header (64 bytes), all u64 fields:
+//   +0  cap          hash-slot capacity (power of two)
+//   +8  count        number of distinct words == entries used
+//   +16 slots_ptr    array of cap slots, 24B each: used(8)+hash(8)+entry_idx(8)
+//   +24 entries_ptr  array of entries, 24B each: blob_off(8)+len(8)+freq(8)
+//   +32 entries_cap  allocated capacity (in entries) of entries_ptr
+//   +40 blob_ptr     growable byte blob holding word bytes
+//   +48 blob_len     bytes used in the blob
+//   +56 blob_cap     bytes allocated for the blob
+// ---------------------------------------------------------------------------
+
+fn bpe_wt_next_pow2(u64 n) -> u64 {
+    u64 p = 8
+    while p < n { p = p * 2 }
+    return p
+}
+
+fn bpe_wt_new(u64 cap) -> u64 {
+    u64 wt = alloc(64)
+    u64 c = bpe_wt_next_pow2(cap)
+    store64(wt, c)          // cap
+    store64(wt + 8, 0)      // count
+
+    u64 slots = alloc(c * 24)
+    memset(slots, 0, c * 24)
+    store64(wt + 16, slots)
+
+    u64 ecap = c
+    u64 entries = alloc(ecap * 24)
+    memset(entries, 0, ecap * 24)
+    store64(wt + 24, entries)
+    store64(wt + 32, ecap)
+
+    u64 bcap = c * 8
+    if bcap < 4096 { bcap = 4096 }
+    u64 blob = alloc(bcap)
+    store64(wt + 40, blob)
+    store64(wt + 48, 0)
+    store64(wt + 56, bcap)
+
+    return wt
+}
+
+fn bpe_wt_count(u64 wt) -> u64 {
+    return load64(wt + 8)
+}
+
+// Writes the i-th (in insertion order) word's blob pointer to *out_ptr and
+// its length to *out_len. Returns its freq.
+fn bpe_wt_word(u64 wt, u64 i, u64 out_ptr, u64 out_len) -> u64 {
+    u64 entries = load64(wt + 24)
+    u64 entry = entries + i * 24
+    u64 off = load64(entry)
+    u64 len = load64(entry + 8)
+    u64 freq = load64(entry + 16)
+    u64 blob = load64(wt + 40)
+    store64(out_ptr, blob + off)
+    store64(out_len, len)
+    return freq
+}
+
+// Rehash the hash-slot array into a doubled table. entries/blob untouched —
+// only the (hash -> entry_idx) placement changes, so all indices, offsets
+// and freqs are preserved exactly (iteration order stays stable).
+fn bpe_wt_grow_slots(u64 wt) {
+    u64 cap = load64(wt)
+    u64 slots = load64(wt + 16)
+    u64 new_cap = cap * 2
+    u64 new_slots = alloc(new_cap * 24)
+    memset(new_slots, 0, new_cap * 24)
+
+    u64 i = 0
+    while i < cap {
+        u64 slot = slots + i * 24
+        if load64(slot) == 1 {
+            u64 hash = load64(slot + 8)
+            u64 idx = load64(slot + 16)
+            u64 j = hash & (new_cap - 1)
+            while load64(new_slots + j * 24) != 0 {
+                j = (j + 1) & (new_cap - 1)
+            }
+            store64(new_slots + j * 24, 1)
+            store64(new_slots + j * 24 + 8, hash)
+            store64(new_slots + j * 24 + 16, idx)
+        }
+        i = i + 1
+    }
+    dealloc(slots)
+    store64(wt, new_cap)
+    store64(wt + 16, new_slots)
+}
+
+fn bpe_wt_grow_entries(u64 wt) {
+    u64 ecap = load64(wt + 32)
+    u64 entries = load64(wt + 24)
+    u64 new_ecap = ecap * 2
+    u64 new_entries = alloc(new_ecap * 24)
+    memset(new_entries, 0, new_ecap * 24)
+    u64 count = load64(wt + 8)
+    memcpy(new_entries, entries, count * 24)
+    dealloc(entries)
+    store64(wt + 24, new_entries)
+    store64(wt + 32, new_ecap)
+}
+
+fn bpe_wt_ensure_blob(u64 wt, u64 need) {
+    u64 blen = load64(wt + 48)
+    u64 bcap = load64(wt + 56)
+    if blen + need <= bcap { return }
+    u64 new_cap = bcap * 2
+    while new_cap < blen + need { new_cap = new_cap * 2 }
+    u64 blob = load64(wt + 40)
+    u64 new_blob = alloc(new_cap)
+    memcpy(new_blob, blob, blen)
+    dealloc(blob)
+    store64(wt + 40, new_blob)
+    store64(wt + 56, new_cap)
+}
+
+// Adds `add` to an existing word's freq, or inserts it (freq := add) if not
+// present. `s`/`slen` must already be byte-mapped bytes.
+fn bpe_wt_add(u64 wt, u64 s, u64 slen, u64 add) {
+    u64 hash = bpe_fnv1a(s, slen)
+
+    // Grow (rehash) BEFORE probing if this insert could push load >= 0.7 —
+    // guarantees the probe loop below always finds an empty slot.
+    u64 count = load64(wt + 8)
+    u64 cap = load64(wt)
+    if (count + 1) * 10 >= cap * 7 {
+        bpe_wt_grow_slots(wt)
+        cap = load64(wt)
+    }
+
+    u64 slots = load64(wt + 16)
+    u64 i = hash & (cap - 1)
+    while 1 {
+        u64 slot = slots + i * 24
+        u64 used = load64(slot)
+        if used == 0 {
+            // New word: append its bytes to the blob, append a new entry,
+            // and record the (hash -> entry_idx) mapping in this slot.
+            u64 idx = load64(wt + 8)
+            if idx >= load64(wt + 32) {
+                bpe_wt_grow_entries(wt)
+            }
+            bpe_wt_ensure_blob(wt, slen)
+
+            u64 blob = load64(wt + 40)
+            u64 blen = load64(wt + 48)
+            memcpy(blob + blen, s, slen)
+            store64(wt + 48, blen + slen)
+
+            u64 entries = load64(wt + 24)
+            u64 entry = entries + idx * 24
+            store64(entry, blen)
+            store64(entry + 8, slen)
+            store64(entry + 16, add)
+
+            store64(slot, 1)
+            store64(slot + 8, hash)
+            store64(slot + 16, idx)
+
+            store64(wt + 8, idx + 1)
+            return
+        }
+
+        u64 ehash = load64(slot + 8)
+        if ehash == hash {
+            u64 eidx = load64(slot + 16)
+            u64 entries2 = load64(wt + 24)
+            u64 entry2 = entries2 + eidx * 24
+            u64 elen = load64(entry2 + 8)
+            if elen == slen {
+                u64 eoff = load64(entry2)
+                u64 blob2 = load64(wt + 40)
+                if bpe_bytes_eq(blob2 + eoff, s, slen) == 1 {
+                    store64(entry2 + 16, load64(entry2 + 16) + add)
+                    return
+                }
+            }
+        }
+        i = (i + 1) & (cap - 1)
+    }
+}
+
+// Max bytes of a single corpus LINE (including its trailing '\n') this
+// counter will handle. Generous headroom over any realistic text line;
+// a longer line dies loud rather than silently truncating/corrupting.
+static u64 BPE_CW_LINE_CAP = 1048576
+
+// Count word (byte-mapped pre-token) frequencies over the whole corpus.
+//
+// CRITICAL: iterates LINES, feeding each line INCLUDING its trailing '\n'
+// to bpe_pretok_split ONE LINE AT A TIME — never the whole buffer. HF
+// trains on lines-with-ending; whole-buffer splitting would fuse adjacent
+// blank lines into "ĊĊ" tokens HF never emits (empirically verified by a
+// Fable review), which would fail the project's byte-exact gate.
+fn bpe_count_words_1t(u64 corpus_base, u64 corpus_size) -> u64 {
+    u64 wt = bpe_wt_new(4096)
+
+    u64 max_pieces = BPE_CW_LINE_CAP + 1
+    u64 offs = alloc(max_pieces * 8)
+    u64 lens = alloc(max_pieces * 8)
+    u64 mapped = alloc(BPE_CW_LINE_CAP * 2 + 16)
+
+    u64 pos = 0
+    while pos < corpus_size {
+        u64 line_start = pos
+        u64 nl = pos
+        while nl < corpus_size {
+            if load8(corpus_base + nl) == 10 { break }   // '\n'
+            nl = nl + 1
+        }
+        u64 line_end = nl
+        if nl < corpus_size { line_end = nl + 1 }        // keep the '\n'
+        u64 line_len = line_end - line_start
+
+        if line_len > 0 {
+            if line_len + 1 > max_pieces {
+                print("bpe_count_words_1t: line too long\n")
+                exit(1)
+            }
+            u64 np = bpe_pretok_split(corpus_base + line_start, line_len, offs, lens, line_len + 1)
+            u64 k = 0
+            while k < np {
+                u64 off = load64(offs + k * 8)
+                u64 plen = load64(lens + k * 8)
+                u64 mlen = bpe_byte_map_piece(corpus_base + line_start + off, plen, mapped)
+                bpe_wt_add(wt, mapped, mlen, 1)
+                k = k + 1
+            }
+        }
+
+        pos = line_end
+        if pos <= line_start { pos = line_start + 1 }    // safety: never stall
+    }
+
+    dealloc(offs)
+    dealloc(lens)
+    dealloc(mapped)
+    return wt
+}

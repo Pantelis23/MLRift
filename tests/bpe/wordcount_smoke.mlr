@@ -1,0 +1,171 @@
+// Smoke test for the single-thread word-frequency counter (Task 3).
+//
+// Ground truth was derived INDEPENDENTLY from HuggingFace `tokenizers`
+// (NOT from this implementation) via:
+//
+//   .venv/bin/python3 -c "
+//   from tokenizers import pre_tokenizers
+//   from collections import Counter
+//   bl = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True)
+//   c = Counter()
+//   for l in open('tests/bpe/tiny_corpus.txt', newline='').readlines():
+//       c.update(p for p,_ in bl.pre_tokenize_str(l))
+//   print('distinct:', len(c))
+//   for w,n in sorted(c.items()): print(repr(w), n)
+//   "
+//
+// `readlines()` keeps each line's trailing '\n' — that is exactly the rule
+// this trainer must follow (feed bpe_pretok_split one line-with-ending at a
+// time, never the whole buffer). Output (34 distinct pieces total):
+//
+//   "'"        40      ","        40      "cafÃ©"    40
+//   "don"      40      "er"       40      "jumps"    40
+//   "'t"       40      "ll"       40      "trailing" 40
+//   "ve"       40      "wwwww"    40      "Ċ"        320
+//   "Ġ"        40      "Ġ'"       80      "Ġaaa"     40
+//   "Ġabab"    40      "Ġababab"  40      "Ġbrown"   40
+//   "Ġdog"     40      "Ġe"       40      "Ġend"     40
+//   "Ġfox"     40      "Ġindented"40      "Ġlazy"    40
+//   "Ġover"    40      "Ġquick"   120     "Ġstart"   40
+//   "Ġstop"    40      "Ġthe"     120     "ĠÂ½"      40
+//   "ĠÅĥ"      40      "ĠÏĢ"      40      "ĠĠĊ"      40
+//   "the"      80   (line1 "the quick..." + line4's leading "the the the")
+//
+// If this implementation ever disagrees with these numbers, the BUG IS IN
+// THE IMPLEMENTATION — never edit these expectations to match its output.
+import "../../std/bpe_train.mlr"
+import "../../std/io.mlr"
+
+fn bytes_eq(u64 a, u64 b, u64 n) -> u64 {
+    u64 i = 0
+    while i < n {
+        if load8(a + i) != load8(b + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Linear scan over the WordTable's entries (small corpus, fine for a smoke
+// test). Returns the freq of the first entry whose bytes match `want`, or
+// the sentinel 0xFFFFFFFFFFFFFFFF if no entry matches.
+fn wt_find_freq(u64 wt, u64 want, u64 wlen) -> u64 {
+    u64 n = bpe_wt_count(wt)
+    u64 pptr = alloc(8)
+    u64 plen = alloc(8)
+    u64 i = 0
+    u64 result = 0xFFFFFFFFFFFFFFFF
+    while i < n {
+        u64 freq = bpe_wt_word(wt, i, pptr, plen)
+        u64 p = load64(pptr)
+        u64 l = load64(plen)
+        if l == wlen {
+            if bytes_eq(p, want, wlen) == 1 {
+                result = freq
+                break
+            }
+        }
+        i = i + 1
+    }
+    dealloc(pptr)
+    dealloc(plen)
+    return result
+}
+
+static u64 g_ok = 1
+
+fn check(u64 wt, u64 want, u64 wlen, u64 want_freq, u64 label) {
+    u64 got = wt_find_freq(wt, want, wlen)
+    if got == want_freq { return }
+    g_ok = 0
+    print("FAIL wordcount: word=")
+    print_str(label)
+    print(" got=")
+    print(got)
+    print(" want=")
+    print(want_freq)
+    print("\n")
+}
+
+fn main() {
+    u64 out_size = alloc(8)
+    u64 base = bpe_mmap_file("tests/bpe/tiny_corpus.txt", out_size)
+    if base == 0 {
+        print("FAIL: cannot mmap tests/bpe/tiny_corpus.txt\n")
+        exit(1)
+    }
+    u64 size = load64(out_size)
+
+    u64 wt = bpe_count_words_1t(base, size)
+
+    // "the" (no leading space — first word of the block)
+    u64 w_the = alloc(3)
+    store8(w_the + 0, 0x74); store8(w_the + 1, 0x68); store8(w_the + 2, 0x65)
+    check(wt, w_the, 3, 80, "the")
+
+    // "Ġthe" (space + the, byte-mapped: 0x20 -> C4 A0)
+    u64 w_gthe = alloc(5)
+    store8(w_gthe + 0, 0xC4); store8(w_gthe + 1, 0xA0)
+    store8(w_gthe + 2, 0x74); store8(w_gthe + 3, 0x68); store8(w_gthe + 4, 0x65)
+    check(wt, w_gthe, 5, 120, "Gthe")
+
+    // "Ċ" — a bare newline byte (0x0A -> C4 8A). 320 = 40 reps * 8 blank
+    // "\n"-only lines per block worth of newline-only pretok pieces.
+    u64 w_nl = alloc(2)
+    store8(w_nl + 0, 0xC4); store8(w_nl + 1, 0x8A)
+    check(wt, w_nl, 2, 320, "NL")
+
+    // "ĠĠĊ" — the trailing "end  \n" line's two spaces + newline, fused into
+    // one \s+ piece since nothing follows on the line.
+    u64 w_2sp_nl = alloc(6)
+    store8(w_2sp_nl + 0, 0xC4); store8(w_2sp_nl + 1, 0xA0)
+    store8(w_2sp_nl + 2, 0xC4); store8(w_2sp_nl + 3, 0xA0)
+    store8(w_2sp_nl + 4, 0xC4); store8(w_2sp_nl + 5, 0x8A)
+    check(wt, w_2sp_nl, 6, 40, "2sp+NL")
+
+    // "cafÃ©" — byte-mapped form of raw UTF-8 "café" (63 61 66 C3 A9).
+    // 0xC3 and 0xA9 are both in the printable high range so map to
+    // themselves, then get UTF-8 re-encoded as codepoints (mojibake).
+    u64 w_cafe = alloc(7)
+    store8(w_cafe + 0, 0x63); store8(w_cafe + 1, 0x61); store8(w_cafe + 2, 0x66)
+    store8(w_cafe + 3, 0xC3); store8(w_cafe + 4, 0x83)
+    store8(w_cafe + 5, 0xC2); store8(w_cafe + 6, 0xA9)
+    check(wt, w_cafe, 7, 40, "cafe-mapped")
+
+    // "ĠÂ½" — space + byte-mapped raw UTF-8 "½" (C2 BD).
+    u64 w_half = alloc(6)
+    store8(w_half + 0, 0xC4); store8(w_half + 1, 0xA0)
+    store8(w_half + 2, 0xC3); store8(w_half + 3, 0x82)
+    store8(w_half + 4, 0xC2); store8(w_half + 5, 0xBD)
+    check(wt, w_half, 6, 40, "half-mapped")
+
+    // "'t" — contraction piece (both bytes ASCII-printable, map to self).
+    u64 w_qt = alloc(2)
+    store8(w_qt + 0, 0x27); store8(w_qt + 1, 0x74)
+    check(wt, w_qt, 2, 40, "'t")
+
+    // "," — punctuation piece.
+    u64 w_comma = alloc(1)
+    store8(w_comma + 0, 0x2C)
+    check(wt, w_comma, 1, 40, "comma")
+
+    // "Ġquick" — appears twice per block ("the quick..." and "quick quick").
+    u64 w_quick = alloc(7)
+    store8(w_quick + 0, 0xC4); store8(w_quick + 1, 0xA0)
+    store8(w_quick + 2, 0x71); store8(w_quick + 3, 0x75); store8(w_quick + 4, 0x69)
+    store8(w_quick + 5, 0x63); store8(w_quick + 6, 0x6B)
+    check(wt, w_quick, 7, 120, "Gquick")
+
+    u64 distinct = bpe_wt_count(wt)
+    if distinct != 34 {
+        g_ok = 0
+        print("FAIL wordcount: distinct got=")
+        print(distinct)
+        print(" want=34\n")
+    }
+
+    if g_ok == 1 {
+        print("PASS wordcount\n")
+    } else {
+        exit(1)
+    }
+}
